@@ -17,6 +17,7 @@
 ## Inhaltsverzeichnis
 
 - [Überblick](#überblick)
+- [Bildschirmfotos](#bildschirmfotos)
 - [Funktionen](#funktionen)
 - [Installation](#installation)
 - [Aus dem Quellcode ausführen](#aus-dem-quellcode-ausführen)
@@ -48,6 +49,35 @@ legen los.
 
 **Für wen:** Stundenplanbüros von Hochschulen, Schulleitungen, Fachbereichskoordinatoren und
 alle, die überschneidungsfreie Wochenpläne benötigen.
+
+---
+
+## Bildschirmfotos
+
+> Die Oberfläche ist in 22 Sprachen verfügbar; die folgenden Aufnahmen zeigen die englische Sprachversion.
+
+<p align="center">
+  <img src="docs/screenshots/en/main-timetable.png" alt="Wochenstundenplan mit platzierten Kursen" width="900">
+</p>
+<p align="center"><i>Der Wochenstundenplan — Kurse je Raum platziert, mit Live-Panels für freie Slots und nicht platzierte Kurse sowie einer Qualitätswarnung in der Statusleiste.</i></p>
+
+### Einrichtung und Kurse hinzufügen
+
+<p align="center">
+  <img src="docs/screenshots/en/setup-dialog.png" alt="Einrichtungsdialog: Tage, Zeitfenster, Räume und Gruppen" width="430">
+  &nbsp;
+  <img src="docs/screenshots/en/add-class.png" alt="Dialog zum Hinzufügen eines Kurses" width="430">
+</p>
+<p align="center"><i>Links: Wochentage, Zeitfenster, Räume und Lerngruppen konfigurieren. Rechts: einen Kurs mit Lehrkraft, Zielgruppen, Dauer und Schutzstufe hinzufügen.</i></p>
+
+### Intelligente Platzierung und Analyse
+
+<p align="center">
+  <img src="docs/screenshots/en/placement.png" alt="Platzierungsdialog mit allen gültigen Slots" width="430">
+  &nbsp;
+  <img src="docs/screenshots/en/dashboard.png" alt="Qualitäts-Analyse-Dashboard" width="430">
+</p>
+<p align="center"><i>Links: Die konfliktbewusste Platzierung listet jeden gültigen Tag/Zeit/Raum für einen nicht platzierten Kurs auf. Rechts: Das Analyse-Dashboard bewertet Platzierung, Raumnutzung und Lücken.</i></p>
 
 ---
 
