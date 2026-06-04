@@ -17,6 +17,7 @@
 ## Índice
 
 - [Descripción general](#descripción-general)
+- [Capturas de pantalla](#capturas-de-pantalla)
 - [Funciones](#funciones)
 - [Instalación](#instalación)
 - [Ejecutar desde el código fuente](#ejecutar-desde-el-código-fuente)
@@ -49,6 +50,35 @@ ni conexión a internet** — nunca. Abre la aplicación y empieza a trabajar.
 **Para quién es:** oficinas de horarios universitarias, equipos directivos de centros
 escolares, coordinadores de departamento y cualquier persona que necesite horarios semanales
 sin conflictos.
+
+---
+
+## Capturas de pantalla
+
+> La interfaz está disponible en 22 idiomas; las siguientes capturas muestran la versión en inglés.
+
+<p align="center">
+  <img src="docs/screenshots/en/main-timetable.png" alt="Horario semanal con clases colocadas" width="900">
+</p>
+<p align="center"><i>El horario semanal — clases colocadas por aula, con paneles en vivo de franjas libres y clases sin colocar, y un aviso de calidad en la barra de estado.</i></p>
+
+### Configuración y alta de clases
+
+<p align="center">
+  <img src="docs/screenshots/en/setup-dialog.png" alt="Diálogo de configuración: días, franjas, aulas y grupos" width="430">
+  &nbsp;
+  <img src="docs/screenshots/en/add-class.png" alt="Diálogo para añadir una clase" width="430">
+</p>
+<p align="center"><i>Izquierda: configura días, franjas horarias, aulas y grupos de estudiantes. Derecha: añade una clase con su docente, grupos destinatarios, duración y nivel de protección.</i></p>
+
+### Colocación inteligente y analíticas
+
+<p align="center">
+  <img src="docs/screenshots/en/placement.png" alt="Diálogo de colocación con todas las franjas válidas" width="430">
+  &nbsp;
+  <img src="docs/screenshots/en/dashboard.png" alt="Panel de analíticas de calidad" width="430">
+</p>
+<p align="center"><i>Izquierda: la colocación con detección de conflictos enumera todos los días/horas/aulas válidos para una clase sin colocar. Derecha: el panel de analíticas puntúa la colocación, el uso de aulas y los huecos.</i></p>
 
 ---
 

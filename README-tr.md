@@ -17,6 +17,7 @@
 ## İçindekiler
 
 - [Genel Bakış](#genel-bakış)
+- [Ekran Görüntüleri](#ekran-görüntüleri)
 - [Özellikler](#özellikler)
 - [Kurulum](#kurulum)
 - [Kaynak Koddan Çalıştırma](#kaynak-koddan-çalıştırma)
@@ -46,6 +47,33 @@ gerektirmez** — hiçbir zaman. Uygulamayı açar ve çalışmaya başlarsını
 
 **Kimler için:** üniversite ders programı birimleri, okul yöneticileri, bölüm
 koordinatörleri ve çakışmasız haftalık programlara ihtiyaç duyan herkes.
+
+---
+
+## Ekran Görüntüleri
+
+<p align="center">
+  <img src="docs/screenshots/tr/main-timetable.png" alt="Yerleştirilmiş derslerle haftalık program" width="900">
+</p>
+<p align="center"><i>Haftalık ders programı — dersler dersliklere yerleştirilmiş; canlı boş slot ve yerleştirilmemiş ders panelleri ile durum çubuğunda bir kalite uyarısı.</i></p>
+
+### Kurulum ve ders ekleme
+
+<p align="center">
+  <img src="docs/screenshots/tr/setup-dialog.png" alt="Kurulum penceresi: günler, zaman dilimleri, derslikler ve gruplar" width="430">
+  &nbsp;
+  <img src="docs/screenshots/tr/add-class.png" alt="Ders ekleme penceresi" width="430">
+</p>
+<p align="center"><i>Solda: hafta günlerini, zaman dilimlerini, derslikleri ve öğrenci gruplarını yapılandırın. Sağda: öğretim elemanı, hedef gruplar, süre ve koruma düzeyiyle bir ders ekleyin.</i></p>
+
+### Akıllı yerleştirme ve analizler
+
+<p align="center">
+  <img src="docs/screenshots/tr/placement.png" alt="Geçerli slotları listeleyen akıllı yerleştirme penceresi" width="430">
+  &nbsp;
+  <img src="docs/screenshots/tr/dashboard.png" alt="Kalite analiz paneli" width="430">
+</p>
+<p align="center"><i>Solda: çakışmaya duyarlı yerleştirme, yerleştirilmemiş bir ders için geçerli tüm gün/saat/derslik seçeneklerini listeler. Sağda: analiz paneli yerleştirmeyi, derslik kullanımını ve boşlukları puanlar.</i></p>
 
 ---
 

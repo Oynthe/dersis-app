@@ -17,6 +17,7 @@
 ## Table of Contents
 
 - [Overview](#overview)
+- [Screenshots](#screenshots)
 - [Features](#features)
 - [Installation for Everyone](#installation-for-everyone)
 - [Running From Source](#running-from-source)
@@ -46,6 +47,33 @@ connection required** — ever. You open the app and start working.
 
 **Who it is for:** university scheduling offices, school administrators, department
 coordinators, and anyone who needs conflict-free weekly schedules.
+
+---
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/en/main-timetable.png" alt="Weekly timetable with placed classes" width="900">
+</p>
+<p align="center"><i>The weekly timetable — classes placed per room, with live open-slot and unplaced-class panels and a quality warning in the status bar.</i></p>
+
+### Setup and adding classes
+
+<p align="center">
+  <img src="docs/screenshots/en/setup-dialog.png" alt="Setup dialog: days, time slots, rooms and groups" width="430">
+  &nbsp;
+  <img src="docs/screenshots/en/add-class.png" alt="Add class dialog" width="430">
+</p>
+<p align="center"><i>Left: configure weekdays, time slots, rooms and student groups. Right: add a class with its lecturer, target groups, duration and protection level.</i></p>
+
+### Smart placement and analytics
+
+<p align="center">
+  <img src="docs/screenshots/en/placement.png" alt="Smart placement dialog listing valid slots" width="430">
+  &nbsp;
+  <img src="docs/screenshots/en/dashboard.png" alt="Quality analytics dashboard" width="430">
+</p>
+<p align="center"><i>Left: conflict-aware placement lists every valid day/time/room for an unplaced class. Right: the analytics dashboard scores placement, room utilization and gaps.</i></p>
 
 ---
 
