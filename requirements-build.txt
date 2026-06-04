@@ -1,0 +1,10 @@
+# DERSİS — Build Dependencies
+# Only needed for creating Windows installers.
+#
+# Install:  pip install -r requirements-build.txt
+
+-r requirements.txt
+
+nuitka>=2.0            # Nuitka compilation (optional build method)
+ordered-set>=4.1       # Nuitka dependency
+Pillow>=10.0           # Installer wizard image generation

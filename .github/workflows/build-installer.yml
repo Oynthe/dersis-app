@@ -1,0 +1,426 @@
+# ============================================================================
+# DERSİS — Build Installer
+#
+# Builds the DERSİS desktop app on a Windows runner and produces the
+# Inno Setup installer + SHA-256 checksum as workflow artifacts.
+#
+# Build methods:
+#   - embed  (default) — Embeddable Python bundle via build_embed.bat (~2 min)
+#   - nuitka            — Native compilation via build_nuitka.bat (~5-15 min)
+#
+# Dependencies:
+#   - embed method:  build_embed.bat handles its own dependency installation
+#                    into the embeddable Python environment.
+#   - nuitka method: Dependencies installed from requirements-lock.txt for
+#                    reproducibility, plus nuitka build tools.
+#
+# Triggers:
+#   - Manual dispatch (workflow_dispatch) with build method choice
+#   - Version tags (v*) — uses embed method
+# ============================================================================
+
+name: Build Installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_method:
+        description: "Build method"
+        required: false
+        default: "embed"
+        type: choice
+        options:
+          - embed
+          - nuitka
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    name: Build DERSİS Installer (${{ github.event.inputs.build_method || 'embed' }})
+    runs-on: windows-latest
+
+    env:
+      BUILD_METHOD: ${{ github.event.inputs.build_method || 'embed' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Version validation ────────────────────────────────────────────
+      - name: Read and validate version
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "VERSION")) {
+            Write-Error "VERSION file not found"
+            exit 1
+          }
+
+          $version = (Get-Content "VERSION" -Raw).Trim()
+          echo "APP_VERSION=$version" >> $env:GITHUB_ENV
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "VERSION '$version' is not valid semver (expected X.Y.Z)"
+            exit 1
+          }
+
+          Write-Host "Version: $version"
+
+      - name: Verify tag matches VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $version = $env:APP_VERSION
+
+          if ($tag -ne $version) {
+            Write-Error "Tag 'v$tag' does not match VERSION file '$version'"
+            exit 1
+          }
+
+          Write-Host "Tag v$tag matches VERSION $version"
+
+      # ── Python setup ──────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      # ── Build (embed method) ──────────────────────────────────────────
+      - name: Run build_embed.bat
+        if: env.BUILD_METHOD == 'embed'
+        shell: cmd
+        run: build_embed.bat < NUL
+
+      - name: Verify embed dependencies installed
+        if: env.BUILD_METHOD == 'embed'
+        shell: cmd
+        run: |
+          build\Dersis.dist\python\python.exe verify_deps.py
+          if errorlevel 1 (
+            echo FATAL: Dependencies missing in embeddable Python after build_embed.bat.
+            echo The build cannot produce a working installer.
+            exit /b 1
+          )
+
+      # ── Build (nuitka method) ─────────────────────────────────────────
+      - name: Upgrade pip
+        if: env.BUILD_METHOD == 'nuitka'
+        run: python -m pip install --upgrade pip
+
+      - name: Install runtime dependencies
+        if: env.BUILD_METHOD == 'nuitka'
+        run: pip install -r requirements-lock.txt
+
+      - name: Install Nuitka build tools
+        if: env.BUILD_METHOD == 'nuitka'
+        run: pip install nuitka ordered-set
+
+      - name: Verify dependency installation
+        if: env.BUILD_METHOD == 'nuitka'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip check
+          python verify_deps.py
+
+      - name: Compile with Nuitka
+        if: env.BUILD_METHOD == 'nuitka'
+        shell: cmd
+        run: |
+          set APP_NAME=Dersis
+          set APP_VERSION=%APP_VERSION%
+          set ENTRY=scheduler_gui.py
+          set DIST_DIR=build\Dersis.dist
+          set COMPANY=Uygun
+
+          python -m nuitka --version
+
+          python -m nuitka ^
+              --standalone ^
+              --enable-plugin=pyqt6 ^
+              --disable-console ^
+              --output-dir=build ^
+              --jobs=%NUMBER_OF_PROCESSORS% ^
+              --follow-imports ^
+              --nofollow-import-to=test_* ^
+              --nofollow-import-to=tests.* ^
+              --nofollow-import-to=conftest ^
+              --nofollow-import-to=unittest ^
+              --nofollow-import-to=doctest ^
+              --nofollow-import-to=setuptools ^
+              --include-package=scheduler_app ^
+              --include-package=scheduler_app.core ^
+              --include-package=scheduler_app.ui ^
+              --include-package=scheduler_app.storage ^
+              --include-package=scheduler_app.learning ^
+              --include-package=scheduler_app.data_io ^
+              --include-package=scheduler_app.assets ^
+              --include-package=packaging ^
+              --include-package=cryptography ^
+              --include-package=openpyxl ^
+              --include-package=pandas ^
+              --include-package=numpy ^
+              --include-package=reportlab ^
+              --include-package=deepdiff ^
+              --include-package=ortools ^
+              --include-package-data=certifi ^
+              --include-package-data=reportlab ^
+              --include-package-data=ortools ^
+              --include-data-dir=scheduler_app/assets=scheduler_app/assets ^
+              --include-data-dir=flags=flags ^
+              --include-data-files=docs/dersis.png=docs/dersis.png ^
+              --windows-icon-from-ico=scheduler_app/assets/app_icon.ico ^
+              --company-name="%COMPANY%" ^
+              --product-name="%APP_NAME%" ^
+              --product-version="%APP_VERSION%" ^
+              --file-description="Dersis - Class Scheduling System" ^
+              --copyright="(c) %COMPANY%" ^
+              --assume-yes-for-downloads ^
+              %ENTRY%
+
+          if errorlevel 1 (
+              echo ERROR: Nuitka build failed.
+              exit /b 1
+          )
+
+      - name: Rename Nuitka output and generate version.iss
+        if: env.BUILD_METHOD == 'nuitka'
+        shell: pwsh
+        run: |
+          $version = $env:APP_VERSION
+          $srcDist = "build\scheduler_gui.dist"
+          $dist = "build\Dersis.dist"
+
+          if (-not (Test-Path $srcDist)) {
+            Write-Error "Nuitka output not found at $srcDist"
+            Get-ChildItem "build\*.dist" -Directory -ErrorAction SilentlyContinue
+            exit 1
+          }
+
+          # Rename exe
+          if (Test-Path "$srcDist\scheduler_gui.exe") {
+            Rename-Item "$srcDist\scheduler_gui.exe" "Dersis.exe"
+            Write-Host "Renamed scheduler_gui.exe -> Dersis.exe"
+          }
+
+          # Rename dist folder
+          if (-not (Test-Path $dist)) {
+            Rename-Item $srcDist "Dersis.dist"
+            Write-Host "Renamed folder -> Dersis.dist"
+          }
+
+          # Generate version.iss for Inno Setup
+          "#define AppVersion `"$version`"" | Out-File -FilePath "build\version.iss" -Encoding ascii -NoNewline
+          Write-Host "Generated build\version.iss"
+
+          # Copy VERSION file into dist
+          if (-not (Test-Path "$dist\VERSION")) {
+            Copy-Item "VERSION" "$dist\VERSION"
+            Write-Host "Copied VERSION into $dist"
+          }
+
+      # ── Verify critical imports in build environment ──────────────────
+      - name: Verify ortools is importable in build environment
+        shell: pwsh
+        run: |
+          $dist = "build\Dersis.dist"
+          $method = $env:BUILD_METHOD
+
+          if ($method -eq "embed") {
+            # Test inside the embeddable Python that ships with the build
+            & "$dist\python\python.exe" -c "from ortools.sat.python import cp_model; print('ortools OK:', cp_model.__name__)"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "FATAL: ortools is not importable in the embeddable Python build. The CP-SAT solver will not work."
+              exit 1
+            }
+          } else {
+            # Nuitka: verify in the build-time Python (Nuitka bundles what it can import)
+            python -c "from ortools.sat.python import cp_model; print('ortools OK:', cp_model.__name__)"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "FATAL: ortools is not importable. Nuitka cannot bundle it."
+              exit 1
+            }
+          }
+          Write-Host "ortools import verified for $method build"
+
+      # ── Verify build output ──────────────────────────────────────────
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $dist = "build\Dersis.dist"
+          $method = $env:BUILD_METHOD
+
+          # Common checks for both methods
+          $required = @(
+            "$dist\docs\dersis.png",
+            "$dist\VERSION"
+          )
+
+          foreach ($f in $required) {
+            if (-not (Test-Path $f)) {
+              Write-Error "Missing build output: $f"
+              exit 1
+            }
+            Write-Host "OK: $f"
+          }
+
+          # Method-specific executable check
+          if ($method -eq "embed") {
+            if (-not (Test-Path "$dist\python\pythonw.exe")) {
+              Write-Error "Missing: $dist\python\pythonw.exe"
+              exit 1
+            }
+            Write-Host "OK: python\pythonw.exe"
+
+            if (-not (Test-Path "$dist\scheduler_gui.py")) {
+              Write-Error "Missing: $dist\scheduler_gui.py"
+              exit 1
+            }
+            Write-Host "OK: scheduler_gui.py"
+          } else {
+            # Nuitka produces Dersis.exe directly
+            if (-not (Test-Path "$dist\Dersis.exe")) {
+              Write-Error "Missing: $dist\Dersis.exe"
+              exit 1
+            }
+            Write-Host "OK: Dersis.exe (Nuitka compiled)"
+          }
+
+          # Verify flags directory has content
+          $flags = Get-ChildItem "$dist\flags\*.png" -ErrorAction SilentlyContinue
+          if ($flags.Count -eq 0) {
+            Write-Error "No flag icons found in $dist\flags\"
+            exit 1
+          }
+          Write-Host "OK: flags\ ($($flags.Count) flags)"
+
+          # Verify scheduler_app exists (embed has .pyc, Nuitka has compiled modules)
+          if (-not (Test-Path "$dist\scheduler_app")) {
+            Write-Error "Missing: $dist\scheduler_app\"
+            exit 1
+          }
+          Write-Host "OK: scheduler_app\"
+
+          # Verify version.iss was generated
+          if (-not (Test-Path "build\version.iss")) {
+            Write-Error "Missing: build\version.iss"
+            exit 1
+          }
+
+          $issContent = Get-Content "build\version.iss" -Raw
+          Write-Host "version.iss: $($issContent.Trim())"
+
+          if ($issContent -notmatch $env:APP_VERSION) {
+            Write-Error "version.iss does not contain expected version $env:APP_VERSION"
+            exit 1
+          }
+          Write-Host "OK: version.iss matches VERSION"
+
+      # ── Install Inno Setup ────────────────────────────────────────────
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $url = "https://jrsoftware.org/download.php/is.exe"
+          $installer = "$env:TEMP\innosetup.exe"
+
+          Write-Host "Downloading Inno Setup..."
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+
+          Write-Host "Installing Inno Setup silently..."
+          Start-Process -FilePath $installer -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\InnoSetup" -Wait -NoNewWindow
+
+          echo "C:\InnoSetup" >> $env:GITHUB_PATH
+          Write-Host "Inno Setup installed to C:\InnoSetup"
+
+      # ── Create installer ──────────────────────────────────────────────
+      - name: Build installer with Inno Setup
+        shell: cmd
+        run: |
+          "C:\InnoSetup\iscc.exe" installer.iss
+
+      - name: Verify installer output
+        shell: pwsh
+        run: |
+          $installer = "Output\Dersis_Setup_v$($env:APP_VERSION).exe"
+
+          if (-not (Test-Path $installer)) {
+            Write-Error "Installer not found: $installer"
+            Write-Host "Contents of Output\:"
+            Get-ChildItem "Output\" -ErrorAction SilentlyContinue | Format-Table Name, Length
+            exit 1
+          }
+
+          $size = (Get-Item $installer).Length
+          $sizeMB = [math]::Round($size / 1MB, 2)
+          Write-Host "Installer: $installer ($sizeMB MB)"
+
+          if ($size -lt 1MB) {
+            Write-Error "Installer is suspiciously small ($sizeMB MB). Build may be incomplete."
+            exit 1
+          }
+
+          echo "INSTALLER_PATH=$installer" >> $env:GITHUB_ENV
+          echo "INSTALLER_NAME=Dersis_Setup_v$($env:APP_VERSION).exe" >> $env:GITHUB_ENV
+
+      # ── Generate SHA-256 checksum ─────────────────────────────────────
+      - name: Generate SHA-256 checksum
+        shell: pwsh
+        run: |
+          $installer = $env:INSTALLER_PATH
+          $checksumFile = "$installer.sha256"
+
+          $hash = (Get-FileHash -Path $installer -Algorithm SHA256).Hash.ToLower()
+          $filename = Split-Path $installer -Leaf
+
+          # Format: hash  filename (two spaces, GNU coreutils style)
+          "$hash  $filename" | Out-File -FilePath $checksumFile -Encoding ascii -NoNewline
+
+          Write-Host "SHA-256: $hash"
+          Write-Host "Checksum file: $checksumFile"
+
+          echo "CHECKSUM_PATH=$checksumFile" >> $env:GITHUB_ENV
+          echo "CHECKSUM_NAME=$($filename).sha256" >> $env:GITHUB_ENV
+
+      # ── Upload artifacts ──────────────────────────────────────────────
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.INSTALLER_NAME }}
+          path: ${{ env.INSTALLER_PATH }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.CHECKSUM_NAME }}
+          path: ${{ env.CHECKSUM_PATH }}
+          if-no-files-found: error
+          retention-days: 90
+
+      # ── Summary ───────────────────────────────────────────────────────
+      - name: Build summary
+        shell: pwsh
+        run: |
+          $hash = (Get-Content $env:CHECKSUM_PATH -Raw).Split(" ")[0]
+          $size = [math]::Round((Get-Item $env:INSTALLER_PATH).Length / 1MB, 2)
+          $method = if ($env:BUILD_METHOD -eq "nuitka") { "Nuitka (native compiled)" } else { "Embeddable Python" }
+
+          $summary = @"
+          ## DERSİS Build Summary
+
+          | Property | Value |
+          |----------|-------|
+          | **Version** | ``$($env:APP_VERSION)`` |
+          | **Installer** | ``$($env:INSTALLER_NAME)`` |
+          | **Size** | $size MB |
+          | **SHA-256** | ``$hash`` |
+          | **Build method** | $method |
+          | **Runner** | ``$($env:RUNNER_OS)`` |
+          "@
+
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

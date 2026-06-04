@@ -1,0 +1,1414 @@
+"""QGraphicsView-based timetable renderer.
+
+Replaces the old QGridLayout/QFrame rendering with a QGraphicsScene/QGraphicsView
+pipeline. The scheduling engine and business rules remain untouched — this module
+is purely a rendering and interaction layer.
+
+Classes
+-------
+RendererAdapter      — reads schedule state, produces layout blocks
+LessonItem           — interactive lesson cell (click, drag, context menu)
+EmptySlotItem        — drop-target cell for empty slots
+MatrixLessonItem     — read-only lesson cell for "Show Everything" view
+HeaderItem           — day / time / corner header cell
+TimetableScene       — assembles items into a grid
+TimetableView        — QGraphicsView with scroll and drop support
+"""
+
+from PyQt6.QtWidgets import (
+    QGraphicsView, QGraphicsScene, QGraphicsRectItem,
+    QGraphicsItem, QMenu, QApplication, QLabel,
+)
+from PyQt6.QtCore import Qt, QRectF, QPointF, QMimeData, QPoint
+from PyQt6.QtGui import (
+    QColor, QPen, QBrush, QFont, QPainter, QDrag, QPixmap, QTransform,
+)
+
+from scheduler_app.constants import (
+    MIN_CELL_W, MIN_CELL_H, EMPTY_BG, HEADER_BG_DARK, TIME_BG, CORNER_BG,
+    MATRIX_BORDER, MATRIX_DAY_BG, MATRIX_DAY_FG, MATRIX_BRANCH_BG,
+    MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CELL_FG,
+    MATRIX_CORNER_BG,
+)
+from scheduler_app.translations import tr
+from scheduler_app.logic import (
+    get_placed_classes, total_duration, classroom_of,
+    get_year_color, lighten_color, build_virtual_classroom_day_layout,
+)
+from scheduler_app.models import (
+    get_protection_label, effective_day, effective_time,
+    is_sequential_class, slot_offset_for_target,
+)
+from scheduler_app.ui.badge_formatter import get_badge, badge_text
+from scheduler_app.ui.cell_formatter import tooltip_text
+
+# ── Layout constants ─────────────────────────────────────────────────
+
+COL_TIME_W = 85
+COL_DAY_W = MIN_CELL_W       # 150
+ROW_HEADER_H = 38
+ROW_SLOT_H = MIN_CELL_H      # 70
+GRID_GAP = 1
+
+FILTER_MODE_DEFAULT = "default_filtered"
+FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP = "virtual_classroom_overlap"
+
+# "Show Everything" layout
+COL_SESSION_W = 35
+COL_ETIME_W = 65
+COL_BRANCH_W = 120
+ROW_DAY_HDR_H = 25
+ROW_BRANCH_HDR_H = 22
+ROW_ESLOT_H = 80
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  ADAPTER — schedule state  →  layout blocks
+# ═════════════════════════════════════════════════════════════════════
+
+class RendererAdapter:
+    """Pure-data adapter: reads schedule state and emits layout blocks."""
+
+    @staticmethod
+    def _filtered_entries(state, filter_fn):
+        """Return normalized placed-class entries for a filtered timetable."""
+        placed = get_placed_classes(state)
+        days = state["days"]
+        slots = state["slots"]
+        entries = []
+
+        for order, cls in enumerate(placed):
+            if not filter_fn(cls):
+                continue
+            day = effective_day(cls)
+            start = effective_time(cls)
+            if day not in days or start not in slots:
+                continue
+            row = slots.index(start)
+            span = min(total_duration(cls), len(slots) - row)
+            if span <= 0:
+                continue
+            col = days.index(day)
+            yr_name = cls["targets"][0]["year"] if cls["targets"] else ""
+            base_color = get_year_color(state, yr_name)
+            bg_color = lighten_color(base_color, 0.45)
+            entries.append({
+                "cls": cls,
+                "col": col,
+                "row": row,
+                "end_row": row + span,
+                "span": span,
+                "base_color": base_color,
+                "bg_color": bg_color,
+                "day": day,
+                "slot": start,
+                "order": order,
+                "lane": 0,
+                "lane_count": 1,
+            })
+        return entries
+
+    @staticmethod
+    def _default_filtered_blocks(state, filter_fn):
+        """Yield layout blocks for the legacy single-column filtered timetable."""
+        entries = RendererAdapter._filtered_entries(state, filter_fn)
+        occupied = {}
+
+        for entry in entries:
+            for d in range(entry["span"]):
+                r = entry["row"] + d
+                if r < len(state["slots"]):
+                    if d == 0:
+                        occupied[(r, entry["col"])] = ("start", entry)
+                    else:
+                        occupied[(r, entry["col"])] = ("span", entry)
+
+        blocks = []
+        for key, val in occupied.items():
+            kind, entry = val
+            if kind != "start":
+                continue
+            blocks.append(dict(entry))
+
+        occ_set = set()
+        for b in blocks:
+            for d in range(b["span"]):
+                occ_set.add((b["row"] + d, b["col"]))
+        return blocks, occ_set
+
+    @staticmethod
+    def _virtual_overlap_filtered_blocks(state, filter_fn):
+        """Yield filtered blocks for the virtual classroom day-subcolumn layout."""
+        layout = build_virtual_classroom_day_layout(state, filter_fn)
+        return layout["blocks"], layout["occupied_subcolumns"]
+
+    @staticmethod
+    def filtered_layout(state, filter_fn, mode=FILTER_MODE_DEFAULT):
+        """Return filtered blocks plus any mode-specific geometry metadata."""
+        if mode == FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP:
+            layout = build_virtual_classroom_day_layout(state, filter_fn)
+            return {
+                "blocks": layout["blocks"],
+                "occ": layout["occupied_subcolumns"],
+                "day_groups": layout["day_groups"],
+                "total_subcolumns": layout["total_subcolumns"],
+                "virtual_day_subcolumns": True,
+            }
+        blocks, occ = RendererAdapter._default_filtered_blocks(state, filter_fn)
+        return {
+            "blocks": blocks,
+            "occ": occ,
+            "day_groups": [],
+            "total_subcolumns": len(state.get("days", [])),
+            "virtual_day_subcolumns": False,
+        }
+
+    @staticmethod
+    def filtered_blocks(state, filter_fn, mode=FILTER_MODE_DEFAULT):
+        """Yield layout blocks for a filtered (single-grid) timetable."""
+        layout = RendererAdapter.filtered_layout(state, filter_fn, mode=mode)
+        return layout["blocks"], layout["occ"]
+
+    @staticmethod
+    def everything_blocks(state, year):
+        """Yield layout blocks for the everything-matrix of *year*."""
+        placed = get_placed_classes(state)
+        days = state["days"]
+        slots = state["slots"]
+        branches = state["years"].get(year, [])
+        if not branches:
+            return []
+        n_branches = len(branches)
+
+        occupied = {}
+        for c in placed:
+            c_day = effective_day(c)
+            c_start = effective_time(c)
+            if c_day not in days or c_start not in slots:
+                continue
+            d_idx = days.index(c_day)
+            start_si = slots.index(c_start)
+            dur = c["duration"]
+
+            for t in c["targets"]:
+                if t["year"] != year or t["branch"] not in branches:
+                    continue
+                b_idx = branches.index(t["branch"])
+                t_idx = c["targets"].index(t)
+                slot_off = slot_offset_for_target(c, t_idx)
+                actual_start = start_si + slot_off
+                for d_off in range(dur):
+                    si = actual_start + d_off
+                    if si >= len(slots):
+                        break
+                    okey = (si, d_idx, b_idx)
+                    if d_off == 0:
+                        span = min(dur, len(slots) - actual_start)
+                        occupied[okey] = ("start", c, span)
+                    else:
+                        occupied[okey] = ("span", None, 0)
+
+        blocks = []
+        for okey, val in occupied.items():
+            kind, c, span = val
+            if kind != "start":
+                continue
+            si, d_idx, b_idx = okey
+            col = d_idx * n_branches + b_idx
+            yr_color = get_year_color(state, year)
+            bg = lighten_color(yr_color, 0.6)
+            room = classroom_of(c)
+            blocks.append({
+                "cls": c, "col": col, "row": si, "span": span,
+                "base_color": yr_color, "bg_color": bg, "room": room,
+            })
+        return blocks
+
+
+# ── Adaptive height helpers ──────────────────────────────────────────
+
+def _measure_text_height(text, font, width, wrap=True):
+    """Return the pixel height needed to render *text* in *font* within *width*."""
+    from PyQt6.QtGui import QFontMetrics
+    fm = QFontMetrics(font)
+    if wrap:
+        flags = int(Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap)
+    else:
+        flags = int(Qt.AlignmentFlag.AlignHCenter)
+    br = fm.boundingRect(0, 0, int(width), 9999, flags, text)
+    return br.height()
+
+
+def _needed_height_for_class(cls, cell_w, is_matrix=False):
+    """Compute the minimum pixel height to display *cls* content.
+
+    *cell_w* is the available cell width (before internal margin/padding).
+    """
+    m = 4 if is_matrix else 6
+    pad = 3 if is_matrix else 4
+    inner_w = cell_w - 2 * m - 2 * pad
+    if inner_w < 20:
+        inner_w = 20
+
+    total = m  # top margin
+
+    code = cls.get("class_code", "")
+    if code:
+        f = QFont("Segoe UI", 7 if is_matrix else 8)
+        f.setBold(True)
+        total += _measure_text_height(code, f, inner_w, wrap=False) + 1
+
+    # name
+    f_name = QFont("Segoe UI", 8 if is_matrix else 9)
+    f_name.setBold(True)
+    total += _measure_text_height(cls["name"], f_name, inner_w, wrap=True) + 2
+
+    # lecturer
+    f_lec = QFont("Segoe UI", 8)
+    f_lec.setBold(False)
+    total += _measure_text_height(cls["lecturer"], f_lec, inner_w, wrap=True) + 2
+
+    # room
+    room = classroom_of(cls)
+    if room:
+        f_room = QFont("Segoe UI", 7 if is_matrix else 8)
+        total += _measure_text_height(room, f_room, inner_w, wrap=False) + 1
+
+    # protection / pinned badge — measure actual label text
+    bt = badge_text(cls)
+    if bt:
+        f_badge = QFont("Segoe UI", 7)
+        f_badge.setBold(True)
+        total += _measure_text_height(bt, f_badge, inner_w, wrap=False) + 2
+
+    total += m  # bottom margin
+    return total
+
+
+def _filtered_block_width(block, mode):
+    """Return the width used to render a filtered timetable block."""
+    return COL_DAY_W
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  GRAPHICS ITEMS
+# ═════════════════════════════════════════════════════════════════════
+
+class HeaderItem(QGraphicsRectItem):
+    """Non-interactive header cell (day, time, corner)."""
+
+    def __init__(self, rect, text, bg_color, fg_color,
+                 font_size=10, bold=True):
+        super().__init__(rect)
+        self._text = text
+        self._bg = QColor(bg_color)
+        self._fg = QColor(fg_color)
+        self._font_size = font_size
+        self._bold = bold
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+        self.setBrush(QBrush(self._bg))
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        rect = self.rect()
+        painter.setPen(QPen(Qt.PenStyle.NoPen))
+        painter.setBrush(QBrush(self._bg))
+        painter.drawRoundedRect(rect, 4, 4)
+        font = QFont("Segoe UI", self._font_size)
+        font.setBold(self._bold)
+        painter.setFont(font)
+        painter.setPen(self._fg)
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, self._text)
+
+
+class LessonItem(QGraphicsRectItem):
+    """Interactive lesson block in the filtered timetable."""
+
+    def __init__(self, cls, state, base_color, bg_color, rect,
+                 app, day, slot):
+        super().__init__(rect)
+        self.cls = cls
+        self.state = state
+        self._base_color = base_color
+        self._bg_color = bg_color
+        self.app = app
+        self.day = day
+        self.slot = slot
+        self._drag_start = None
+        self._selected = False
+
+        self._is_sequential = is_sequential_class(cls)
+
+        self._ghost = False
+
+        self.setAcceptHoverEvents(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+
+        # Tooltip with class details
+        self.setToolTip(tooltip_text(cls))
+
+    def set_ghost(self, enabled):
+        """Toggle ghost (semi-transparent) mode during drag."""
+        self._ghost = enabled
+        self.setOpacity(0.3 if enabled else 1.0)
+        self.update()
+
+    # ── painting ─────────────────────────────────────────────────
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        if self._is_sequential:
+            self._paint_sequential(painter)
+        else:
+            self._paint_joint(painter)
+
+    def _paint_joint(self, painter):
+        rect = self.rect()
+        bw = 3 if self._selected else 2
+        bc = QColor("#000000") if self._selected else QColor(self._base_color)
+        painter.setPen(QPen(bc, bw))
+        painter.setBrush(QBrush(QColor(self._bg_color)))
+        painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6, 6)
+
+        cls = self.cls
+        m = 6
+        pad = 4
+        x, w = rect.x() + m + pad, rect.width() - 2 * m - 2 * pad
+        y = rect.y() + m
+        bottom_limit = rect.bottom() - m
+        center = Qt.AlignmentFlag.AlignHCenter
+        wrap_center = center | Qt.TextFlag.TextWordWrap
+        fm = painter.fontMetrics()
+
+        # class_code (if present)
+        code = cls.get("class_code", "")
+        if code:
+            f = QFont("Segoe UI", 8); f.setBold(True)
+            painter.setFont(f); painter.setPen(QColor("#1D4ED8"))
+            painter.drawText(QRectF(x, y, w, 14), center, code)
+            y += 14
+
+        # name (wrapped, centered)
+        f = QFont("Segoe UI", 9); f.setBold(True)
+        painter.setFont(f); painter.setPen(QColor("#1E293B"))
+        name_rect = QRectF(x, y, w, bottom_limit - y)
+        br = painter.fontMetrics().boundingRect(
+            int(x), int(y), int(w), int(bottom_limit - y),
+            int(wrap_center), cls["name"])
+        painter.drawText(name_rect, wrap_center, cls["name"])
+        y += br.height() + 2
+
+        # lecturer
+        if y < bottom_limit:
+            f.setBold(False); f.setPointSize(8); painter.setFont(f)
+            painter.setPen(QColor("#475569"))
+            lec_rect = QRectF(x, y, w, bottom_limit - y)
+            br = painter.fontMetrics().boundingRect(
+                int(x), int(y), int(w), int(bottom_limit - y),
+                int(wrap_center), cls["lecturer"])
+            painter.drawText(lec_rect, wrap_center, cls["lecturer"])
+            y += br.height() + 2
+
+        # room / location
+        room = classroom_of(cls)
+        if room and y < bottom_limit:
+            painter.setPen(QColor("#16A34A"))
+            painter.drawText(QRectF(x, y, w, 13), center, room)
+            y += 13
+
+        # pinned / protection badge
+        badge = self._protection_badge()
+        if badge and y < bottom_limit:
+            f.setPointSize(7); f.setBold(True); painter.setFont(f)
+            painter.setPen(QColor(badge[1]))
+            painter.drawText(QRectF(x, y, w, 12), center, badge[0])
+
+    def _protection_badge(self):
+        """Return (text, color) for the protection/pinned badge, or None."""
+        emoji, label, color = get_badge(self.cls)
+        if emoji:
+            return (f"{emoji} {label}" if label else emoji, color)
+        return None
+
+    def _paint_sequential(self, painter):
+        rect = self.rect()
+        cls = self.cls
+        n = len(cls["targets"])
+        bw = 3 if self._selected else 2
+        bc = QColor("#000000") if self._selected else QColor(self._base_color)
+
+        # outer border + base fill
+        painter.setPen(QPen(bc, bw))
+        painter.setBrush(QBrush(QColor(self._base_color)))
+        painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6, 6)
+
+        inner = rect.adjusted(bw, bw, -bw, -bw)
+        sec_h = inner.height() / n
+
+        for i, t in enumerate(cls["targets"]):
+            t_bg = lighten_color(get_year_color(self.state, t["year"]), 0.50)
+            sy = inner.y() + i * sec_h
+            sh = sec_h if i < n - 1 else inner.bottom() - sy
+            sr = QRectF(inner.x(), sy, inner.width(), sh)
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(t_bg)))
+            painter.drawRect(sr)
+
+            if i > 0:
+                painter.setPen(QPen(QColor(self._base_color), 1))
+                painter.drawLine(QPointF(inner.x(), sy),
+                                 QPointF(inner.right(), sy))
+
+            mx, my, mw = sr.x() + 5, sr.y() + 3, sr.width() - 10
+            center = Qt.AlignmentFlag.AlignHCenter
+
+            # class_code
+            code = cls.get("class_code", "")
+            if code:
+                f = QFont("Segoe UI", 7); f.setBold(True)
+                painter.setFont(f); painter.setPen(QColor("#1D4ED8"))
+                painter.drawText(QRectF(mx, my, mw, 11), center, code)
+                my += 11
+
+            f = QFont("Segoe UI", 7); f.setBold(True)
+            painter.setFont(f); painter.setPen(QColor("#6D28D9"))
+            painter.drawText(QRectF(mx, my, mw, 11), center, t["branch"])
+            my += 11
+
+            f.setPointSize(9)
+            painter.setFont(f); painter.setPen(QColor("#1E293B"))
+            painter.drawText(QRectF(mx, my, mw, 14),
+                             center | Qt.TextFlag.TextWordWrap, cls["name"])
+            my += 14
+
+            f.setPointSize(8); f.setBold(False)
+            painter.setFont(f); painter.setPen(QColor("#475569"))
+            painter.drawText(QRectF(mx, my, mw, 12), center, cls["lecturer"])
+            my += 14
+
+            if i == n - 1:
+                badge = self._protection_badge()
+                if badge:
+                    f.setPointSize(7); f.setBold(True); painter.setFont(f)
+                    painter.setPen(QColor(badge[1]))
+                    painter.drawText(QRectF(mx, my, mw, 11),
+                                     Qt.AlignmentFlag.AlignLeft, badge[0])
+                    my += 11
+
+            if i == n - 1:
+                f.setPointSize(7); f.setBold(True); painter.setFont(f)
+                painter.setPen(QColor("#7C3AED"))
+                painter.drawText(QRectF(mx, my, mw, 11),
+                                 Qt.AlignmentFlag.AlignLeft, tr("badges.sequential"))
+
+    # ── selection helper ─────────────────────────────────────────
+
+    def mark_selected(self, selected):
+        self._selected = selected
+        self.update()
+
+    # ── interaction ──────────────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            modifiers = event.modifiers()
+            keep_multi = (
+                self._selected
+                and len(getattr(self.app, "_selected_cells", [])) > 1
+                and not (modifiers & Qt.KeyboardModifier.ControlModifier)
+                and not (modifiers & Qt.KeyboardModifier.ShiftModifier)
+            )
+            if not keep_multi:
+                self.app._select_class_gfx(self.cls, self, modifiers)
+            from scheduler_app.models import is_immovable
+            if not is_immovable(self.cls):
+                self._drag_start = event.pos()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.app._edit_class(self.cls)
+
+    def mouseMoveEvent(self, event):
+        from scheduler_app.models import is_immovable
+        if (self._drag_start is not None
+                and not is_immovable(self.cls)
+                and (event.pos() - self._drag_start).manhattanLength() > 10):
+            self.app._start_drag_gfx(self.cls, self)
+            self._drag_start = None
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start = None
+        event.accept()
+
+    def contextMenuEvent(self, event):
+        from scheduler_app.models import is_immovable, PROTECTION_LEVELS
+        menu = QMenu()
+        _ctx_code = self.cls.get("class_code", "")
+        _ctx_name = f"[{_ctx_code}] {self.cls['name']}" if _ctx_code else self.cls["name"]
+        title = menu.addAction("\U0001F4D6  " + _ctx_name)
+        title.setEnabled(False)
+        menu.addSeparator()
+        edit_menu = menu.addMenu("\u270E  " + tr("menus.edit"))
+        edit_class_act = edit_menu.addAction(tr("dialogs.edit_class.title"))
+        edit_class_act.triggered.connect(lambda: self.app._edit_class(self.cls))
+        edit_lecturer_act = edit_menu.addAction(f"{tr('menus.edit')} {tr('labels.lecturer')}")
+        edit_lecturer_act.triggered.connect(
+            lambda: self.app._edit_lecturer_from_class(self.cls))
+        if not is_immovable(self.cls) and self.cls["placed"]:
+            unplace_act = menu.addAction("\u25B2  " + tr("buttons.unplace"))
+            unplace_act.triggered.connect(
+                lambda: self.app._unplace_specific(self.cls))
+        if not is_immovable(self.cls):
+            move_act = menu.addAction("\u2194  " + tr("tooltips.drag_to_move"))
+            move_act.setEnabled(False)
+        # Protection submenu (only for non-pinned placed classes)
+        if not self.cls["pinned"] and self.cls["placed"]:
+            prot_menu = menu.addMenu("\U0001F6E1  " + tr("protection.title"))
+            current = self.cls.get("protection", "none")
+            for level in PROTECTION_LEVELS:
+                label = get_protection_label(level)
+                act = prot_menu.addAction(label)
+                act.setCheckable(True)
+                act.setChecked(level == current)
+                act.triggered.connect(
+                    lambda checked, lv=level: self.app._set_protection(
+                        self.cls, lv))
+        menu.addSeparator()
+        remove_act = menu.addAction("\u2715  " + tr("buttons.remove"))
+        remove_act.triggered.connect(
+            lambda: self.app._remove_specific(self.cls))
+        menu.exec(event.screenPos())
+
+
+class EmptySlotItem(QGraphicsRectItem):
+    """Empty timetable cell (double-click to add class)."""
+
+    _IDLE = QColor(EMPTY_BG)
+
+    def __init__(self, day, slot, rect, app):
+        super().__init__(rect)
+        self.day = day
+        self.slot = slot
+        self.app = app
+        self._selected = False
+        self.setPen(QPen(Qt.PenStyle.NoPen))
+        self.setBrush(QBrush(self._IDLE))
+        self.setToolTip(tr("tooltips.double_click_add"))
+
+    def mark_selected(self, selected):
+        self._selected = selected
+        self.update()
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._selected:
+            painter.setPen(QPen(QColor("#1D4ED8"), 2))
+        else:
+            painter.setPen(QPen(Qt.PenStyle.NoPen))
+        painter.setBrush(QBrush(self._IDLE))
+        painter.drawRoundedRect(self.rect(), 4, 4)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.app:
+            self.app._select_empty_slot(self)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.app._add_class_at(self.day, self.slot)
+
+    def contextMenuEvent(self, event):
+        if self.app:
+            self.app._show_empty_slot_context_menu(
+                self.day, self.slot, event.screenPos())
+            event.accept()
+            return
+        super().contextMenuEvent(event)
+
+
+class MatrixLessonItem(QGraphicsRectItem):
+    """Interactive lesson cell for the 'Show Everything' matrix view."""
+
+    def __init__(self, rect, cls, room, border_color, bg_color, app=None):
+        super().__init__(rect)
+        self.cls = cls
+        self.app = app
+        self._room = room
+        self._bc = QColor(border_color)
+        self._bg = QColor(bg_color)
+        self._selected = False
+        self._drag_start = None
+        self._ghost = False
+        self.setPen(QPen(self._bc, 2))
+        self.setBrush(QBrush(self._bg))
+        self.setAcceptHoverEvents(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # Tooltip
+        self.setToolTip(tooltip_text(cls, include_groups=False,
+                                     include_duration=False))
+
+    def mark_selected(self, selected):
+        self._selected = selected
+        self.update()
+
+    def set_ghost(self, enabled):
+        self._ghost = enabled
+        self.setOpacity(0.3 if enabled else 1.0)
+        self.update()
+
+    def paint(self, painter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        rect = self.rect()
+        bw = 3 if self._selected else 2
+        bc = QColor("#000000") if self._selected else self._bc
+        painter.setPen(QPen(bc, bw))
+        painter.setBrush(QBrush(self._bg))
+        painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6, 6)
+
+        cls = self.cls
+        m = 4
+        pad = 3
+        x, w = rect.x() + m + pad, rect.width() - 2 * m - 2 * pad
+        y = rect.y() + m
+        bottom_limit = rect.bottom() - m
+        center = Qt.AlignmentFlag.AlignHCenter
+        wrap_center = center | Qt.TextFlag.TextWordWrap
+
+        # class_code (if present)
+        code = cls.get("class_code", "")
+        if code and y < bottom_limit:
+            f = QFont("Segoe UI", 7); f.setBold(True)
+            painter.setFont(f); painter.setPen(QColor("#1D4ED8"))
+            painter.drawText(QRectF(x, y, w, 12), center, code)
+            y += 12
+
+        # name (wrapped, centered)
+        f = QFont("Segoe UI", 8); f.setBold(True)
+        painter.setFont(f); painter.setPen(QColor("#1E293B"))
+        name_avail = QRectF(x, y, w, bottom_limit - y)
+        br = painter.fontMetrics().boundingRect(
+            int(x), int(y), int(w), int(bottom_limit - y),
+            int(wrap_center), cls["name"])
+        painter.drawText(name_avail, wrap_center, cls["name"])
+        y += br.height() + 1
+
+        # lecturer
+        if y < bottom_limit:
+            f.setBold(False); painter.setFont(f)
+            painter.setPen(QColor("#475569"))
+            lec_avail = QRectF(x, y, w, bottom_limit - y)
+            br = painter.fontMetrics().boundingRect(
+                int(x), int(y), int(w), int(bottom_limit - y),
+                int(wrap_center), cls["lecturer"])
+            painter.drawText(lec_avail, wrap_center, cls["lecturer"])
+            y += br.height() + 1
+
+        # room
+        if self._room and y < bottom_limit:
+            painter.setPen(QColor("#16A34A"))
+            painter.drawText(QRectF(x, y, w, 13), center, self._room)
+            y += 13
+
+        # Protection / pinned badge
+        if y < bottom_limit:
+            emoji, label, color = get_badge(cls)
+            if emoji:
+                f.setPointSize(7); f.setBold(True); painter.setFont(f)
+                painter.setPen(QColor(color))
+                painter.drawText(QRectF(x, y, w, 11), center,
+                                 f"{emoji} {label}" if label else emoji)
+
+    # ── interaction ──────────────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.app:
+            modifiers = event.modifiers()
+            keep_multi = (
+                self._selected
+                and len(getattr(self.app, "_selected_cells", [])) > 1
+                and not (modifiers & Qt.KeyboardModifier.ControlModifier)
+                and not (modifiers & Qt.KeyboardModifier.ShiftModifier)
+            )
+            if not keep_multi:
+                self.app._select_class_gfx(self.cls, self, modifiers)
+            from scheduler_app.models import is_immovable
+            if not is_immovable(self.cls):
+                self._drag_start = event.pos()
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if self.app:
+            self.app._edit_class(self.cls)
+
+    def mouseMoveEvent(self, event):
+        from scheduler_app.models import is_immovable
+        if (self._drag_start is not None
+                and self.app
+                and not is_immovable(self.cls)
+                and (event.pos() - self._drag_start).manhattanLength() > 10):
+            self.app._start_drag_gfx(self.cls, self)
+            self._drag_start = None
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start = None
+        event.accept()
+
+    def contextMenuEvent(self, event):
+        if not self.app:
+            return
+        from scheduler_app.models import is_immovable, PROTECTION_LEVELS
+        menu = QMenu()
+        _ctx_code = self.cls.get("class_code", "")
+        _ctx_name = f"[{_ctx_code}] {self.cls['name']}" if _ctx_code else self.cls["name"]
+        title = menu.addAction("\U0001F4D6  " + _ctx_name)
+        title.setEnabled(False)
+        menu.addSeparator()
+        edit_menu = menu.addMenu("\u270E  " + tr("menus.edit"))
+        edit_class_act = edit_menu.addAction(tr("dialogs.edit_class.title"))
+        edit_class_act.triggered.connect(lambda: self.app._edit_class(self.cls))
+        edit_lecturer_act = edit_menu.addAction(f"{tr('menus.edit')} {tr('labels.lecturer')}")
+        edit_lecturer_act.triggered.connect(
+            lambda: self.app._edit_lecturer_from_class(self.cls))
+        if not is_immovable(self.cls) and self.cls["placed"]:
+            unplace_act = menu.addAction("\u25B2  " + tr("buttons.unplace"))
+            unplace_act.triggered.connect(
+                lambda: self.app._unplace_specific(self.cls))
+        if not is_immovable(self.cls):
+            move_act = menu.addAction("\u2194  " + tr("tooltips.drag_to_move"))
+            move_act.setEnabled(False)
+        if not self.cls["pinned"] and self.cls["placed"]:
+            prot_menu = menu.addMenu("\U0001F6E1  " + tr("protection.title"))
+            current = self.cls.get("protection", "none")
+            for level in PROTECTION_LEVELS:
+                label = get_protection_label(level)
+                act = prot_menu.addAction(label)
+                act.setCheckable(True)
+                act.setChecked(level == current)
+                act.triggered.connect(
+                    lambda checked, lv=level: self.app._set_protection(
+                        self.cls, lv))
+        menu.addSeparator()
+        remove_act = menu.addAction("\u2715  " + tr("buttons.remove"))
+        remove_act.triggered.connect(
+            lambda: self.app._remove_specific(self.cls))
+        menu.exec(event.screenPos())
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  SCENE
+# ═════════════════════════════════════════════════════════════════════
+
+class TimetableScene(QGraphicsScene):
+    """Assembles header + lesson + empty-slot items into a timetable grid."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.lesson_items = []
+        self.empty_items = []
+        # Grid geometry for view-level drop handling
+        self._grid_days = []       # list of day names
+        self._grid_slots = []      # list of slot names
+        self._grid_x0 = 0         # x origin of first data column
+        self._grid_y0 = 0         # y origin of first data row
+        self._grid_col_w = 0      # width of each column (+ gap)
+        self._grid_row_h = 0      # height of each row (+ gap)
+        self._grid_gap = GRID_GAP
+        self._grid_mode = "filtered"  # "filtered" or "everything"
+        self._app = None          # app ref for view-level drops
+        self._grid_day_groups = []
+
+    def cell_at(self, scene_pos):
+        """Return (day, slot) at *scene_pos*, or (None, None) if outside grid."""
+        if self._grid_mode != "filtered":
+            return None, None
+        x, y = scene_pos.x(), scene_pos.y()
+
+        # Use per-row Y offsets if available, else fall back to fixed
+        row_y = getattr(self, "_grid_row_y", None)
+        row_heights = getattr(self, "_grid_row_heights", None)
+        if row_y and row_heights:
+            row = -1
+            for ri in range(len(row_y)):
+                ry = row_y[ri]
+                rh = row_heights[ri]
+                if ry <= y <= ry + rh:
+                    row = ri
+                    break
+            if row < 0:
+                return None, None
+        else:
+            row_step = self._grid_row_h + self._grid_gap
+            if row_step <= 0:
+                return None, None
+            row = int((y - self._grid_y0) / row_step)
+
+        if not (0 <= row < len(self._grid_slots)):
+            return None, None
+
+        if row_y and row_heights:
+            cy = row_y[row]
+            rh = row_heights[row]
+        else:
+            row_step = self._grid_row_h + self._grid_gap
+            cy = self._grid_y0 + row * row_step
+            rh = self._grid_row_h
+
+        day_groups = getattr(self, "_grid_day_groups", None) or []
+        if day_groups:
+            for group in day_groups:
+                gx = group["x"]
+                gw = group["width"]
+                if gx <= x <= gx + gw and cy <= y <= cy + rh:
+                    return group["day"], self._grid_slots[row]
+            return None, None
+
+        col_step = self._grid_col_w + self._grid_gap
+        if col_step <= 0:
+            return None, None
+        col = int((x - self._grid_x0) / col_step)
+        if 0 <= col < len(self._grid_days):
+            cx = self._grid_x0 + col * col_step
+            if cx <= x <= cx + self._grid_col_w and cy <= y <= cy + rh:
+                return self._grid_days[col], self._grid_slots[row]
+        return None, None
+
+    def cell_rect(self, col, row):
+        """Return QRectF for data cell at grid (col, row)."""
+        row_y = getattr(self, "_grid_row_y", None)
+        row_heights = getattr(self, "_grid_row_heights", None)
+        if row_y and row_heights and 0 <= row < len(row_y):
+            y = row_y[row]
+            rh = row_heights[row]
+        else:
+            row_step = self._grid_row_h + self._grid_gap
+            y = self._grid_y0 + row * row_step
+            rh = self._grid_row_h
+        day_groups = getattr(self, "_grid_day_groups", None) or []
+        if day_groups and 0 <= col < len(day_groups):
+            group = day_groups[col]
+            return QRectF(group["x"], y, group["width"], rh)
+        col_step = self._grid_col_w + self._grid_gap
+        x = self._grid_x0 + col * col_step
+        return QRectF(x, y, self._grid_col_w, rh)
+
+    # ── filtered view ────────────────────────────────────────────
+
+    def _build_filtered_default(self, state, app, days, slots, blocks, occ, g):
+        nd, ns = len(days), len(slots)
+
+        row_heights = [ROW_SLOT_H] * ns
+        for b in blocks:
+            block_w = _filtered_block_width(b, FILTER_MODE_DEFAULT)
+            if b["span"] == 1:
+                needed = _needed_height_for_class(b["cls"], block_w)
+                if needed > row_heights[b["row"]]:
+                    row_heights[b["row"]] = needed
+
+        for b in blocks:
+            if b["span"] > 1:
+                block_w = _filtered_block_width(b, FILTER_MODE_DEFAULT)
+                needed = _needed_height_for_class(b["cls"], block_w)
+                existing = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
+                if needed > existing:
+                    extra = needed - existing
+                    per_row = extra / b["span"]
+                    for r in range(b["row"], b["row"] + b["span"]):
+                        row_heights[r] += per_row
+
+        row_y = []
+        y_cur = ROW_HEADER_H + g
+        for rh in row_heights:
+            row_y.append(y_cur)
+            y_cur += rh + g
+
+        self._grid_days = list(days)
+        self._grid_slots = list(slots)
+        self._grid_x0 = COL_TIME_W + g
+        self._grid_y0 = ROW_HEADER_H + g
+        self._grid_col_w = COL_DAY_W
+        self._grid_row_h = ROW_SLOT_H
+        self._grid_gap = g
+        self._grid_mode = "filtered"
+        self._grid_row_y = list(row_y)
+        self._grid_row_heights = list(row_heights)
+        self._grid_day_groups = []
+
+        total_w = COL_TIME_W + g + nd * (COL_DAY_W + g)
+        total_h = y_cur
+
+        self.addRect(0, 0, total_w, total_h,
+                     QPen(Qt.PenStyle.NoPen), QBrush(QColor("#CBD5E1")))
+        self.addItem(HeaderItem(
+            QRectF(0, 0, COL_TIME_W, ROW_HEADER_H),
+            "", CORNER_BG, "white"))
+
+        for j, day in enumerate(days):
+            x = COL_TIME_W + g + j * (COL_DAY_W + g)
+            self.addItem(HeaderItem(
+                QRectF(x, 0, COL_DAY_W, ROW_HEADER_H),
+                tr(f"weekdays.{day}"), HEADER_BG_DARK, "white", 10))
+
+        for i, slot in enumerate(slots):
+            y = row_y[i]
+            rh = row_heights[i]
+            self.addItem(HeaderItem(
+                QRectF(0, y, COL_TIME_W, rh),
+                slot, TIME_BG, "white", 9))
+            for j in range(nd):
+                if (i, j) in occ:
+                    continue
+                x = COL_TIME_W + g + j * (COL_DAY_W + g)
+                ei = EmptySlotItem(days[j], slot,
+                                   QRectF(x, y, COL_DAY_W, rh),
+                                   app)
+                self.addItem(ei)
+                self.empty_items.append(ei)
+
+        for b in blocks:
+            x = COL_TIME_W + g + b["col"] * (COL_DAY_W + g)
+            y = row_y[b["row"]]
+            h = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
+            item = LessonItem(
+                b["cls"], state, b["base_color"], b["bg_color"],
+                QRectF(x, y, COL_DAY_W, h), app, b["day"], b["slot"])
+            self.addItem(item)
+            self.lesson_items.append(item)
+
+        self.setSceneRect(0, 0, total_w, total_h)
+
+    def _build_filtered_virtual_subcolumns(self, state, app, days, slots, layout, g):
+        blocks = layout["blocks"]
+        occ = layout["occ"]
+        day_groups = [dict(group) for group in layout["day_groups"]]
+        ns = len(slots)
+
+        row_heights = [ROW_SLOT_H] * ns
+        for b in blocks:
+            if b["span"] == 1:
+                needed = _needed_height_for_class(b["cls"], COL_DAY_W)
+                if needed > row_heights[b["row"]]:
+                    row_heights[b["row"]] = needed
+
+        for b in blocks:
+            if b["span"] > 1:
+                needed = _needed_height_for_class(b["cls"], COL_DAY_W)
+                existing = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
+                if needed > existing:
+                    extra = needed - existing
+                    per_row = extra / b["span"]
+                    for r in range(b["row"], b["row"] + b["span"]):
+                        row_heights[r] += per_row
+
+        row_y = []
+        y_cur = ROW_HEADER_H + g
+        for rh in row_heights:
+            row_y.append(y_cur)
+            y_cur += rh + g
+
+        x_cur = COL_TIME_W + g
+        for group in day_groups:
+            width = group["lane_count"] * COL_DAY_W + (group["lane_count"] - 1) * g
+            group["x"] = x_cur
+            group["width"] = width
+            x_cur += width + g
+
+        total_w = x_cur
+        total_h = y_cur
+
+        self._grid_days = list(days)
+        self._grid_slots = list(slots)
+        self._grid_x0 = COL_TIME_W + g
+        self._grid_y0 = ROW_HEADER_H + g
+        self._grid_col_w = COL_DAY_W
+        self._grid_row_h = ROW_SLOT_H
+        self._grid_gap = g
+        self._grid_mode = "filtered"
+        self._grid_row_y = list(row_y)
+        self._grid_row_heights = list(row_heights)
+        self._grid_day_groups = list(day_groups)
+
+        self.addRect(0, 0, total_w, total_h,
+                     QPen(Qt.PenStyle.NoPen), QBrush(QColor("#CBD5E1")))
+        self.addItem(HeaderItem(
+            QRectF(0, 0, COL_TIME_W, ROW_HEADER_H),
+            "", CORNER_BG, "white"))
+
+        for group in day_groups:
+            self.addItem(HeaderItem(
+                QRectF(group["x"], 0, group["width"], ROW_HEADER_H),
+                tr(f"weekdays.{group['day']}"), HEADER_BG_DARK, "white", 10))
+
+        for i, slot in enumerate(slots):
+            y = row_y[i]
+            rh = row_heights[i]
+            self.addItem(HeaderItem(
+                QRectF(0, y, COL_TIME_W, rh),
+                slot, TIME_BG, "white", 9))
+            for group in day_groups:
+                for lane in range(group["lane_count"]):
+                    subcolumn = group["subcolumn_start"] + lane
+                    if (i, subcolumn) in occ:
+                        continue
+                    x = group["x"] + lane * (COL_DAY_W + g)
+                    ei = EmptySlotItem(
+                        group["day"], slot,
+                        QRectF(x, y, COL_DAY_W, rh),
+                        app,
+                    )
+                    self.addItem(ei)
+                    self.empty_items.append(ei)
+
+        group_by_day = {group["day"]: group for group in day_groups}
+        for b in blocks:
+            group = group_by_day[b["day"]]
+            x = group["x"] + b["lane"] * (COL_DAY_W + g)
+            y = row_y[b["row"]]
+            h = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
+            item = LessonItem(
+                b["cls"], state, b["base_color"], b["bg_color"],
+                QRectF(x, y, COL_DAY_W, h), app, b["day"], b["slot"])
+            self.addItem(item)
+            self.lesson_items.append(item)
+
+        self.setSceneRect(0, 0, total_w, total_h)
+
+    def build_filtered(self, state, filter_fn, app, mode=FILTER_MODE_DEFAULT):
+        self.clear()
+        self.lesson_items.clear()
+        self.empty_items.clear()
+        self._app = app
+        self._grid_day_groups = []
+
+        days = state["days"]
+        slots = state["slots"]
+        if not days or not slots:
+            return
+
+        g = GRID_GAP
+        layout = RendererAdapter.filtered_layout(state, filter_fn, mode=mode)
+        if layout["virtual_day_subcolumns"]:
+            self._build_filtered_virtual_subcolumns(
+                state, app, days, slots, layout, g)
+            return
+        self._build_filtered_default(
+            state, app, days, slots, layout["blocks"], layout["occ"], g)
+
+    # ── everything view ──────────────────────────────────────────
+
+    def build_everything(self, state, app=None):
+        """Build the full 'Show Everything' matrix for all years."""
+        self.clear()
+        self.lesson_items.clear()
+        self.empty_items.clear()
+        self._grid_mode = "everything"
+        self._app = app
+        self._grid_day_groups = []
+
+        days = state["days"]
+        slots = state["slots"]
+        years = state["years"]
+        if not days or not slots or not years:
+            return
+
+        g = GRID_GAP
+        y_offset = 0
+        max_w = 0
+        ns = len(slots)
+
+        for yr_idx, yr in enumerate(sorted(years.keys())):
+            branches = years[yr]
+            if not branches:
+                continue
+            nb = len(branches)
+
+            if yr_idx > 0:
+                y_offset += 15  # spacer
+
+            # year label
+            lbl = self.addSimpleText(yr, QFont("Segoe UI", 13, QFont.Weight.Bold))
+            lbl.setBrush(QBrush(QColor("#1E40AF")))
+            lbl.setPos(8, y_offset)
+            y_offset += 30
+
+            data_x = COL_SESSION_W + g + COL_ETIME_W + g
+            total_cols = nb * len(days)
+            grid_w = data_x + total_cols * (COL_BRANCH_W + g)
+            hdr_h = ROW_DAY_HDR_H + g + ROW_BRANCH_HDR_H + g
+            max_w = max(max_w, grid_w)
+
+            # blocks
+            eblocks = RendererAdapter.everything_blocks(state, yr)
+            e_occ = set()
+            for b in eblocks:
+                for d in range(b["span"]):
+                    e_occ.add((b["row"] + d, b["col"]))
+
+            # ── Compute adaptive row heights ──
+            row_heights = [ROW_ESLOT_H] * ns  # start with minimum
+            for b in eblocks:
+                if b["span"] == 1:
+                    needed = _needed_height_for_class(b["cls"], COL_BRANCH_W, is_matrix=True)
+                    if needed > row_heights[b["row"]]:
+                        row_heights[b["row"]] = needed
+
+            # For multi-span blocks, check if total height is enough
+            for b in eblocks:
+                if b["span"] > 1:
+                    needed = _needed_height_for_class(b["cls"], COL_BRANCH_W, is_matrix=True)
+                    existing = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
+                    if needed > existing:
+                        extra = needed - existing
+                        per_row = extra / b["span"]
+                        for r in range(b["row"], b["row"] + b["span"]):
+                            row_heights[r] += per_row
+
+            # Build cumulative Y offsets for each row
+            row_y = []
+            y_cur = hdr_h
+            for rh in row_heights:
+                row_y.append(y_cur)
+                y_cur += rh + g
+
+            grid_h = y_cur
+
+            # background
+            self.addRect(0, y_offset, grid_w, grid_h,
+                         QPen(Qt.PenStyle.NoPen), QBrush(QColor(MATRIX_BORDER)))
+
+            # corners
+            self.addItem(HeaderItem(
+                QRectF(0, y_offset, COL_SESSION_W,
+                       ROW_DAY_HDR_H + g + ROW_BRANCH_HDR_H),
+                "", MATRIX_CORNER_BG, MATRIX_DAY_FG))
+            self.addItem(HeaderItem(
+                QRectF(COL_SESSION_W + g, y_offset, COL_ETIME_W,
+                       ROW_DAY_HDR_H + g + ROW_BRANCH_HDR_H),
+                tr("labels.time"), MATRIX_CORNER_BG, MATRIX_DAY_FG, 8))
+
+            # day headers
+            for d_idx, day in enumerate(days):
+                x = data_x + d_idx * nb * (COL_BRANCH_W + g)
+                w = nb * (COL_BRANCH_W + g) - g
+                self.addItem(HeaderItem(
+                    QRectF(x, y_offset, w, ROW_DAY_HDR_H),
+                    tr(f"weekdays.{day}"), MATRIX_DAY_BG, MATRIX_DAY_FG, 9))
+
+            # branch sub-headers
+            for d_idx in range(len(days)):
+                for b_idx, br in enumerate(branches):
+                    col = d_idx * nb + b_idx
+                    x = data_x + col * (COL_BRANCH_W + g)
+                    self.addItem(HeaderItem(
+                        QRectF(x, y_offset + ROW_DAY_HDR_H + g,
+                               COL_BRANCH_W, ROW_BRANCH_HDR_H),
+                        br, MATRIX_BRANCH_BG, MATRIX_BRANCH_FG, 8))
+
+            # slot rows
+            for si, slot in enumerate(slots):
+                ry = y_offset + row_y[si]
+                rh = row_heights[si]
+                self.addItem(HeaderItem(
+                    QRectF(0, ry, COL_SESSION_W, rh),
+                    str(si + 1), MATRIX_SESSION_BG, "#333333", 9))
+                self.addItem(HeaderItem(
+                    QRectF(COL_SESSION_W + g, ry, COL_ETIME_W, rh),
+                    slot, MATRIX_TIME_BG, "white", 8))
+                for col in range(total_cols):
+                    if (si, col) not in e_occ:
+                        x = data_x + col * (COL_BRANCH_W + g)
+                        ec = QGraphicsRectItem(
+                            QRectF(x, ry, COL_BRANCH_W, rh))
+                        ec.setPen(QPen(Qt.PenStyle.NoPen))
+                        ec.setBrush(QBrush(QColor("white")))
+                        self.addItem(ec)
+
+            # lesson blocks
+            for b in eblocks:
+                x = data_x + b["col"] * (COL_BRANCH_W + g)
+                ry = y_offset + row_y[b["row"]]
+                h = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
+                item = MatrixLessonItem(
+                    QRectF(x, ry, COL_BRANCH_W, h),
+                    b["cls"], b.get("room", ""),
+                    b["base_color"], b["bg_color"], app)
+                self.addItem(item)
+                self.lesson_items.append(item)
+
+            y_offset += grid_h
+
+        if max_w > 0:
+            self.setSceneRect(0, 0, max_w, y_offset)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  VIEW
+# ═════════════════════════════════════════════════════════════════════
+
+class TimetableView(QGraphicsView):
+    """Scrollable, drop-enabled view for a TimetableScene."""
+
+    _VALID_BG = QColor(187, 247, 208, 140)   # semi-transparent green
+    _VALID_BD = QColor(22, 163, 74)
+    _INVALID_BG = QColor(254, 202, 202, 140)  # semi-transparent red
+    _INVALID_BD = QColor(220, 38, 38)
+
+    ZOOM_MIN = 25
+    ZOOM_MAX = 300
+    ZOOM_DEFAULT = 100
+    ZOOM_STEP = 10
+
+    def __init__(self, scene=None, parent=None):
+        super().__init__(scene or TimetableScene(), parent)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setAcceptDrops(True)
+        self.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setViewportUpdateMode(
+            QGraphicsView.ViewportUpdateMode.SmartViewportUpdate)
+        self.setStyleSheet("background: #CBD5E1; border: none;")
+
+        # Zoom state
+        self._zoom_pct = self.ZOOM_DEFAULT
+        self._zoom_callback = None  # optional callback(pct) for slider sync
+
+        # Overlay highlight state
+        self._drop_highlight = None   # (day, slot, valid) or None
+
+    # ── zoom ───────────────────────────────────────────────────────
+
+    def zoom_pct(self):
+        return self._zoom_pct
+
+    def set_zoom(self, pct):
+        pct = max(self.ZOOM_MIN, min(self.ZOOM_MAX, pct))
+        self._zoom_pct = pct
+        scale = pct / 100.0
+        self.setTransform(QTransform().scale(scale, scale))
+        if self._zoom_callback:
+            self._zoom_callback(pct)
+
+    def wheelEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            delta = event.angleDelta().y()
+            if delta > 0:
+                self.set_zoom(self._zoom_pct + self.ZOOM_STEP)
+            elif delta < 0:
+                self.set_zoom(self._zoom_pct - self.ZOOM_STEP)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+    # ── drag overlay ──────────────────────────────────────────────
+
+    def _scene_cell_at(self, viewport_pos):
+        """Map a viewport position to (day, slot) using scene geometry."""
+        sc = self.scene()
+        if sc is None:
+            return None, None
+        sp = self.mapToScene(viewport_pos)
+        return sc.cell_at(sp)
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasText() and md.text().startswith("class_drag:"):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        md = event.mimeData()
+        if not (md and md.hasText() and md.text().startswith("class_drag:")):
+            super().dragMoveEvent(event)
+            return
+        event.acceptProposedAction()
+        day, slot = self._scene_cell_at(event.position().toPoint())
+        sc = self.scene()
+        app = sc._app if sc else None
+        if day is not None and slot is not None and app is not None:
+            valid = app._check_drop_valid(day, slot)
+            new_hl = (day, slot, valid)
+        else:
+            new_hl = None
+        if new_hl != self._drop_highlight:
+            self._drop_highlight = new_hl
+            self.viewport().update()
+
+    def dragLeaveEvent(self, event):
+        if self._drop_highlight is not None:
+            self._drop_highlight = None
+            self.viewport().update()
+        # Don't call super — avoids Qt warning when a drag that started
+        # inside this view leaves without a preceding dragEnterEvent.
+        event.accept()
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if not (md and md.hasText() and md.text().startswith("class_drag:")):
+            super().dropEvent(event)
+            return
+        self._drop_highlight = None
+        self.viewport().update()
+        day, slot = self._scene_cell_at(event.position().toPoint())
+        sc = self.scene()
+        app = sc._app if sc else None
+        if app is None:
+            event.ignore()
+            return
+        if day is not None and slot is not None:
+            event.acceptProposedAction()
+            app._execute_drop(day, slot)
+            return
+        drag_group = list(getattr(app, "_dragging_classes", []) or [])
+        if len(drag_group) > 1 and all(not c.get("placed") for c in drag_group):
+            # Multi-drag from Unplaced panel: allow dropping anywhere on timetable
+            # to trigger batch auto-placement for the selected classes.
+            event.acceptProposedAction()
+            app._execute_drop_anywhere()
+        else:
+            event.ignore()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._drop_highlight is None:
+            return
+        day, slot, valid = self._drop_highlight
+        sc = self.scene()
+        if sc is None or not sc._grid_days or not sc._grid_slots:
+            return
+        if day not in sc._grid_days or slot not in sc._grid_slots:
+            return
+        col = sc._grid_days.index(day)
+        row = sc._grid_slots.index(slot)
+        cell_rect = sc.cell_rect(col, row)
+        # Map scene rect to viewport coordinates
+        tl = self.mapFromScene(cell_rect.topLeft())
+        br = self.mapFromScene(cell_rect.bottomRight())
+        from PyQt6.QtCore import QRect
+        vp_rect = QRect(tl, br)
+        bg = self._VALID_BG if valid else self._INVALID_BG
+        bd = self._VALID_BD if valid else self._INVALID_BD
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(bg))
+        p.setPen(QPen(bd, 2, Qt.PenStyle.DashLine))
+        p.drawRoundedRect(vp_rect, 6, 6)
+        p.end()

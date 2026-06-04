@@ -1,0 +1,4908 @@
+"""Main application window: SchedulerApp (QMainWindow subclass) — PyQt6."""
+
+import copy
+import json
+import csv
+import os
+import sys
+
+from PyQt6.QtWidgets import (
+    QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
+    QTabWidget, QComboBox, QLabel, QPushButton, QFrame, QScrollArea,
+    QGridLayout, QMenu, QMenuBar, QToolBar, QStatusBar, QFileDialog,
+    QMessageBox, QListWidget, QSplitter, QSizePolicy, QToolButton, QDialog,
+    QTreeWidget, QTreeWidgetItem, QHeaderView, QAbstractItemView,
+    QSlider, QWidgetAction, QStackedWidget,
+)
+from PyQt6.QtCore import Qt, QPoint, QMimeData, QTimer, QSize
+from PyQt6.QtGui import (
+    QAction, QKeySequence, QColor, QPainter, QDrag, QFont, QCursor,
+    QShortcut, QIcon,
+)
+
+from scheduler_app.renderer import (
+    TimetableView, TimetableScene, LessonItem,
+    FILTER_MODE_DEFAULT, FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP,
+)
+from scheduler_app.dashboard import DashboardWidget
+
+try:
+    import openpyxl
+    from openpyxl.styles import Font as XlFont, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    from openpyxl.cell.rich_text import CellRichText, TextBlock
+    from openpyxl.cell.text import InlineFont
+except ImportError:
+    openpyxl = None
+
+from scheduler_app.constants import (
+    MIN_CELL_W, MIN_CELL_H, EMPTY_BG, HEADER_BG_DARK, TIME_BG, CORNER_BG,
+    MATRIX_BORDER, MATRIX_DAY_BG, MATRIX_DAY_FG, MATRIX_BRANCH_BG,
+    MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CELL_FG,
+    MATRIX_CORNER_BG,
+)
+from scheduler_app.translations import tr, get_language, set_language, is_rtl
+from scheduler_app.ui.day_keys import (
+    normalize_state_day_keys, day_label, display_day, format_day_time,
+)
+from scheduler_app.models import (
+    new_state, split_non_joint,
+    LOCATION_FACE_TO_FACE, LOCATION_ONLINE, LOCATION_LECTURER_OFFICE,
+    get_location_label, is_virtual_location_type,
+    normalize_state_classes,
+    get_classroom_export_labels,
+    effective_day, effective_time, mark_placed, mark_unplaced,
+    cls_key,
+)
+from scheduler_app.logic import (
+    get_placed_classes,
+    occupied_slots_of, classroom_of, total_duration,
+    build_virtual_classroom_day_layout,
+    find_valid_options,
+    get_year_color, lighten_color,
+    apply_negotiation_suggestion,
+)
+from scheduler_app.feedback_logger import FeedbackLogger
+from scheduler_app.preference_learner import PreferenceLearner
+from scheduler_app import storage
+from scheduler_app.workflow import SchedulingWorkflow, snapshot_placements
+from scheduler_app.core.schedule_impact_analyzer import (
+    capture_snapshot, analyze_impact, ImpactLevel,
+)
+from scheduler_app.dialogs import (
+    SetupDialog, AddClassDialog,
+    PlaceClassDialog, SelectClassDialog, MultiSelectClassDialog,
+    WarningsDialog, OpenSlotsDialog, PostAddDialog,
+    BulkAddDialog, BulkResultsDialog, EditClassesDialog,
+)
+from scheduler_app.widgets import Toast, WarningLogPanel
+from scheduler_app.ui.bug_report import BugReportButton, BugReportDialog
+from scheduler_app.icons import (
+    icon_add_class, icon_placement, icon_reschedule, icon_setup,
+    icon_add_single, icon_bulk_add, icon_place, icon_unplace, icon_delete,
+    icon_new, icon_open, icon_save, icon_export, icon_edit,
+    get_arrow_dir,
+)
+
+
+_CLASSROOM_FILTER_ROOM_PREFIX = "room::"
+_CLASSROOM_FILTER_VIRTUAL_PREFIX = "virtual::"
+
+
+def _encode_classroom_filter_room(room):
+    return f"{_CLASSROOM_FILTER_ROOM_PREFIX}{room}"
+
+
+def _encode_classroom_filter_virtual(location_type):
+    return f"{_CLASSROOM_FILTER_VIRTUAL_PREFIX}{location_type}"
+
+
+def _decode_classroom_filter_value(value):
+    text = str(value or "")
+    if text.startswith(_CLASSROOM_FILTER_VIRTUAL_PREFIX):
+        return "virtual", text[len(_CLASSROOM_FILTER_VIRTUAL_PREFIX):]
+    if text.startswith(_CLASSROOM_FILTER_ROOM_PREFIX):
+        return "room", text[len(_CLASSROOM_FILTER_ROOM_PREFIX):]
+    return None, text
+
+
+def _make_sidebar_icon(color="#475569"):
+    """Create a sidebar-panel toggle icon (rectangle with left vertical bar)."""
+    from PyQt6.QtGui import QPixmap, QPen
+    pm = QPixmap(18, 18)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color), 1.5)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    # Outer rectangle
+    p.drawRoundedRect(3, 3, 12, 12, 2, 2)
+    # Left sidebar vertical line
+    p.drawLine(7, 3, 7, 15)
+    p.end()
+    return QIcon(pm)
+
+
+def _make_zoom_icon(kind):
+    """Create a QIcon with a painted minus or plus symbol."""
+    from PyQt6.QtGui import QPixmap, QPen
+    pm = QPixmap(16, 16)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("#475569"), 2)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(pen)
+    # Horizontal bar (minus/plus both have it)
+    p.drawLine(4, 8, 12, 8)
+    if kind == "plus":
+        p.drawLine(8, 4, 8, 12)
+    p.end()
+    return QIcon(pm)
+
+
+# ── Global Stylesheet ──────────────────────────────────────────────────────
+
+def _build_stylesheet():
+    """Build the global stylesheet with generated arrow image paths."""
+    arrows = get_arrow_dir()
+    down = os.path.join(arrows, "down.png").replace("\\", "/")
+    up = os.path.join(arrows, "up.png").replace("\\", "/")
+    left = os.path.join(arrows, "left.png").replace("\\", "/")
+    right = os.path.join(arrows, "right.png").replace("\\", "/")
+    return (_APP_STYLESHEET_TEMPLATE
+            .replace("ARROW_DOWN", down).replace("ARROW_UP", up)
+            .replace("ARROW_LEFT", left).replace("ARROW_RIGHT", right))
+
+_APP_STYLESHEET_TEMPLATE = """
+/* ── Main Window ── */
+QMainWindow {
+    background: #F1F5F9;
+}
+
+/* ── Menu Bar ── */
+QMenuBar {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #1E293B, stop:1 #334155);
+    color: #E2E8F0;
+    padding: 2px 0px;
+    font-size: 10pt;
+    font-family: "Segoe UI", sans-serif;
+}
+QMenuBar::item {
+    padding: 6px 14px;
+    border-radius: 4px;
+    margin: 1px 2px;
+}
+QMenuBar::item:selected {
+    background: #475569;
+    color: white;
+}
+QMenu {
+    background: #FFFFFF;
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    padding: 4px;
+    font-size: 9pt;
+    font-family: "Segoe UI", sans-serif;
+}
+QMenu::item {
+    padding: 6px 28px 6px 12px;
+    border-radius: 4px;
+    margin: 1px 2px;
+}
+QMenu::item:selected {
+    background: #EFF6FF;
+    color: #1E40AF;
+}
+QMenu::separator {
+    height: 1px;
+    background: #E2E8F0;
+    margin: 4px 8px;
+}
+QMenu::icon {
+    padding-left: 8px;
+}
+
+/* ── Toolbar ── */
+QToolBar {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #F8FAFC, stop:1 #E2E8F0);
+    border-bottom: 1px solid #CBD5E1;
+    spacing: 6px;
+    padding: 4px 8px;
+}
+QToolBar::separator {
+    width: 1px;
+    background: #CBD5E1;
+    margin: 4px 6px;
+}
+QToolButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 #F1F5F9);
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    padding: 5px 14px;
+    font-size: 9pt;
+    font-weight: bold;
+    color: #334155;
+    font-family: "Segoe UI", sans-serif;
+}
+QToolButton:hover {
+    background: #EFF6FF;
+    border-color: #93C5FD;
+    color: #1E40AF;
+}
+QToolButton:pressed, QToolButton::menu-button:pressed {
+    background: #DBEAFE;
+}
+QToolButton::menu-indicator {
+    image: none;
+    subcontrol-position: right center;
+    subcontrol-origin: padding;
+    width: 12px;
+}
+
+/* ── Tabs ── */
+QTabWidget::pane {
+    border: 1px solid #CBD5E1;
+    border-radius: 0px 0px 8px 8px;
+    background: white;
+    top: -1px;
+}
+QTabBar::tab {
+    background: #E2E8F0;
+    border: 1px solid #CBD5E1;
+    border-bottom: none;
+    border-radius: 6px 6px 0px 0px;
+    padding: 7px 18px;
+    margin-right: 2px;
+    font-size: 9pt;
+    font-family: "Segoe UI", sans-serif;
+    color: #64748B;
+}
+QTabBar::tab:selected {
+    background: white;
+    color: #1E40AF;
+    font-weight: bold;
+    border-bottom: 2px solid #3B82F6;
+}
+QTabBar::tab:hover:!selected {
+    background: #F1F5F9;
+    color: #334155;
+}
+
+/* ── TabBar scroll buttons ── */
+QTabBar::scroller {
+    width: 56px;
+}
+QTabBar QToolButton {
+    background: #F1F5F9;
+    border: 1px solid #CBD5E1;
+    border-radius: 4px;
+    padding: 2px;
+    margin: 2px 1px;
+    width: 22px;
+    height: 22px;
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    icon-size: 12px;
+}
+QTabBar QToolButton:hover {
+    background: #DBEAFE;
+    border-color: #93C5FD;
+}
+QTabBar QToolButton::left-arrow {
+    image: url(ARROW_LEFT);
+    width: 12px;
+    height: 12px;
+}
+QTabBar QToolButton::right-arrow {
+    image: url(ARROW_RIGHT);
+    width: 12px;
+    height: 12px;
+}
+
+/* ── ComboBox ── */
+QComboBox {
+    border: 1px solid #CBD5E1;
+    border-radius: 4px;
+    padding: 4px 8px;
+    padding-right: 28px;
+    background: white;
+    font-size: 9pt;
+    min-width: 100px;
+    min-height: 22px;
+    font-family: "Segoe UI", sans-serif;
+}
+QComboBox:hover {
+    border-color: #93C5FD;
+}
+QComboBox:focus {
+    border-color: #3B82F6;
+}
+QComboBox::drop-down {
+    subcontrol-origin: border;
+    subcontrol-position: center right;
+    width: 22px;
+    border-left: 1px solid #CBD5E1;
+    border-top-right-radius: 4px;
+    border-bottom-right-radius: 4px;
+    background: #F1F5F9;
+}
+QComboBox::down-arrow {
+    image: url(ARROW_DOWN);
+    width: 12px;
+    height: 12px;
+}
+QComboBox QAbstractItemView {
+    border: 1px solid #CBD5E1;
+    background: white;
+    selection-background-color: #EFF6FF;
+    selection-color: #1E40AF;
+}
+
+/* ── SpinBox ── */
+QSpinBox {
+    border: 1px solid #CBD5E1;
+    border-radius: 4px;
+    padding: 4px 8px;
+    padding-right: 22px;
+    background: white;
+    font-size: 9pt;
+    min-height: 22px;
+    font-family: "Segoe UI", sans-serif;
+}
+QSpinBox:hover {
+    border-color: #93C5FD;
+}
+QSpinBox:focus {
+    border-color: #3B82F6;
+}
+QSpinBox::up-button {
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 20px;
+    border-left: 1px solid #CBD5E1;
+    border-bottom: 1px solid #CBD5E1;
+    border-top-right-radius: 4px;
+    background: #F1F5F9;
+}
+QSpinBox::up-button:hover {
+    background: #E2E8F0;
+}
+QSpinBox::up-arrow {
+    image: url(ARROW_UP);
+    width: 10px;
+    height: 10px;
+}
+QSpinBox::down-button {
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 20px;
+    border-left: 1px solid #CBD5E1;
+    border-bottom-right-radius: 4px;
+    background: #F1F5F9;
+}
+QSpinBox::down-button:hover {
+    background: #E2E8F0;
+}
+QSpinBox::down-arrow {
+    image: url(ARROW_DOWN);
+    width: 10px;
+    height: 10px;
+}
+
+/* ── Push Button (general) ── */
+QPushButton {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #FFFFFF, stop:1 #F1F5F9);
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    padding: 5px 14px;
+    font-size: 9pt;
+    color: #334155;
+    font-family: "Segoe UI", sans-serif;
+}
+QPushButton:hover {
+    background: #EFF6FF;
+    border-color: #93C5FD;
+    color: #1E40AF;
+}
+QPushButton:pressed {
+    background: #DBEAFE;
+}
+
+/* ── Splitter ── */
+QSplitter::handle {
+    background: #CBD5E1;
+    width: 3px;
+    margin: 2px;
+    border-radius: 1px;
+}
+QSplitter::handle:hover {
+    background: #94A3B8;
+}
+
+/* ── ScrollBar ── */
+QScrollBar:vertical {
+    background: #F1F5F9;
+    width: 10px;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical {
+    background: #94A3B8;
+    border-radius: 4px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #64748B;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+QScrollBar:horizontal {
+    background: #F1F5F9;
+    height: 10px;
+    border-radius: 5px;
+}
+QScrollBar::handle:horizontal {
+    background: #94A3B8;
+    border-radius: 4px;
+    min-width: 30px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #64748B;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+
+/* ── Status Bar ── */
+QStatusBar {
+    background: #1E293B;
+    color: #CBD5E1;
+    font-size: 9pt;
+    font-family: "Segoe UI", sans-serif;
+    padding: 2px 8px;
+}
+QStatusBar QLabel {
+    color: #CBD5E1;
+    font-size: 9pt;
+}
+
+/* ── Tree Widget ── */
+QTreeWidget {
+    font-size: 9pt;
+    font-family: "Segoe UI", sans-serif;
+    alternate-background-color: #F0FDF4;
+}
+QTreeWidget::item:hover {
+    background: #ECFDF5;
+}
+QTreeWidget::item:selected {
+    background: #D1FAE5;
+    color: #065F46;
+}
+QHeaderView::section {
+    background: #F1F5F9;
+    border: 1px solid #E2E8F0;
+    padding: 4px;
+    font-weight: bold;
+    font-size: 8pt;
+    color: #475569;
+}
+
+/* ── List Widget ── */
+QListWidget {
+    font-size: 9pt;
+    font-family: "Segoe UI", sans-serif;
+    border-radius: 6px;
+}
+QListWidget::item {
+    padding: 4px 8px;
+    border-radius: 3px;
+    margin: 1px 2px;
+}
+QListWidget::item:hover {
+    background: #FEF9C3;
+}
+QListWidget::item:selected {
+    background: #FDE68A;
+    color: #92400E;
+}
+
+/* ── Labels ── */
+QLabel {
+    font-family: "Segoe UI", sans-serif;
+}
+"""
+
+
+# ── Drop-enabled tab button (forwards class_drag drops to unplaced list) ──
+
+class _UnplacedTabButton(QPushButton):
+    """Tab button that accepts class_drag drops to unplace classes."""
+
+    def __init__(self, text, app, parent=None):
+        super().__init__(text, parent)
+        self._app = app
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasText() and md.text().startswith("class_drag:"):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasText() and md.text().startswith("class_drag:"):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasText() and md.text().startswith("class_drag:"):
+            # Auto-switch to Unplaced tab and delegate to the list widget
+            self._app._switch_sidebar_tab(1)
+            self._app.unplaced_list.dropEvent(event)
+            return
+        super().dropEvent(event)
+
+
+# ── Draggable list for unplaced classes ────────────────────────────────────
+
+class DraggableUnplacedList(QListWidget):
+    """QListWidget that supports dragging unplaced classes onto the grid."""
+
+    def __init__(self, app, parent=None):
+        super().__init__(parent)
+        self.app = app
+        self._drag_start_pos = None
+        self._pre_drag_rows = []
+        self.setDragEnabled(False)  # We handle drag manually
+        self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+
+    def _show_context_menu(self, pos):
+        item = self.itemAt(pos)
+        if item is None:
+            return
+        if item not in self.selectedItems():
+            self.clearSelection()
+            item.setSelected(True)
+
+        selected = self.selected_classes()
+        if not selected:
+            return
+        cls = selected[0]
+
+        menu = QMenu(self)
+        _code = cls.get("class_code", "")
+        _display = f"[{_code}] {cls['name']}" if _code else cls["name"]
+        title_txt = _display if len(selected) == 1 else f"{len(selected)} {tr('status.classes')}"
+        title = menu.addAction("\U0001F4D6  " + title_txt)
+        title.setEnabled(False)
+        menu.addSeparator()
+
+        edit_menu = menu.addMenu("\u270E  " + tr("menus.edit"))
+        edit_class_act = edit_menu.addAction(tr("dialogs.edit_class.title"))
+        edit_class_act.setEnabled(len(selected) == 1)
+        edit_class_act.triggered.connect(lambda: self.app._edit_class(cls))
+        edit_lecturer_act = edit_menu.addAction(f"{tr('menus.edit')} {tr('labels.lecturer')}")
+        edit_lecturer_act.setEnabled(len(selected) == 1)
+        edit_lecturer_act.triggered.connect(
+            lambda: self.app._edit_lecturer_from_class(cls))
+
+        remove_act = menu.addAction("\u2715  " + tr("buttons.remove"))
+        remove_act.triggered.connect(lambda: self.app._remove_classes(selected))
+        menu.exec(self.viewport().mapToGlobal(pos))
+
+    # ── drop support (receive placed classes from timetable) ────────
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasText() and md.text().startswith("class_drag:"):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasText() and md.text().startswith("class_drag:"):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if not (md and md.hasText() and md.text().startswith("class_drag:")):
+            super().dropEvent(event)
+            return
+        event.acceptProposedAction()
+        dragging_cls = self.app._dragging_cls
+        drag_list = list(getattr(self.app, "_dragging_classes", []) or [])
+        if not drag_list and dragging_cls is not None:
+            drag_list = [dragging_cls]
+        # The drag originator (_start_drag_gfx) pre-emptively calls
+        # mark_unplaced on the primary class before drag.exec(), so
+        # cls.get("placed") is already False for that class.  Use the
+        # backup to detect that the drag originated from a placed slot.
+        backup = getattr(self.app, "_drag_backup", None)
+        from_placed = backup is not None and backup.get("placed")
+        unique = []
+        seen = set()
+        for cls in drag_list:
+            if cls is None:
+                continue
+            cid = cls_key(cls)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            if cls.get("pinned"):
+                continue
+            if cls.get("placed") or from_placed:
+                unique.append(cls)
+        if not unique:
+            return
+        # Undo snapshot was already pushed by _start_drag_gfx before the
+        # pre-emptive mark_unplaced, so it captures the correct placed state.
+        for cls in unique:
+            mark_unplaced(cls)
+        self.app._drag_success = True
+        if len(unique) == 1:
+            self.app._show_toast(tr("status.class_unplaced_drag"), "success")
+        else:
+            self.app._show_toast(
+                tr("status.classes_unplaced_count").format(n=len(unique)),
+                "success",
+            )
+
+    # ── outgoing drag (drag unplaced classes onto the grid) ───────
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.pos()
+            self._pre_drag_rows = [self.row(it) for it in self.selectedItems()]
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._drag_start_pos is not None
+                and (event.pos() - self._drag_start_pos).manhattanLength()
+                > QApplication.startDragDistance()):
+            row = self.row(self.itemAt(self._drag_start_pos))
+            self._drag_start_pos = None
+            if row < 0 or row >= len(self.app._unplaced_indices):
+                return
+            idx = self.app._unplaced_indices[row]
+            cls = self.app.state_data["classes"][idx]
+            selected = self._classes_from_rows(
+                self.row(sel_item) for sel_item in self.selectedItems()
+            )
+            # Qt may collapse selection on press. If drag began from a row that
+            # was part of a larger selection, preserve that pre-press selection.
+            if (len(selected) <= 1 and self._pre_drag_rows
+                    and row in self._pre_drag_rows):
+                pre_selected = self._classes_from_rows(self._pre_drag_rows)
+                if len(pre_selected) > 1:
+                    selected = pre_selected
+            if cls in selected and len(selected) > 1:
+                self.app._start_drag_unplaced(selected, self)
+            else:
+                self.app._start_drag_unplaced([cls], self)
+            self._pre_drag_rows = []
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start_pos = None
+        self._pre_drag_rows = []
+        super().mouseReleaseEvent(event)
+
+    def _classes_from_rows(self, rows):
+        classes = []
+        for sel_row in rows:
+            if 0 <= sel_row < len(self.app._unplaced_indices):
+                sel_idx = self.app._unplaced_indices[sel_row]
+                sel_cls = self.app.state_data["classes"][sel_idx]
+                if sel_cls not in classes:
+                    classes.append(sel_cls)
+        return classes
+
+    def selected_classes(self):
+        return self._classes_from_rows(
+            self.row(sel_item) for sel_item in self.selectedItems()
+        )
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.SelectAll):
+            self.selectAll()
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Delete):
+            selected = self.selected_classes()
+            if selected:
+                self.app._remove_classes(selected)
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+
+# ── Main Application Window ─────────────────────────────────────────────────
+
+class SchedulerApp(QMainWindow):
+    def __init__(self, session=None, server_url=''):
+        super().__init__()
+        self._session = session or {}
+        self._server_url = server_url
+        self.setWindowTitle(tr("app.title"))
+        _icon_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "docs", "dersis.png")
+        if os.path.exists(_icon_path):
+            self.setWindowIcon(QIcon(_icon_path))
+        self.resize(1150, 720)
+        self.setMinimumSize(850, 550)
+
+        # Apply global stylesheet
+        QApplication.instance().setStyleSheet(_build_stylesheet())
+
+        # Ensure Dersis directory tree exists and migrate legacy files
+        storage.ensure_dirs()
+        storage.migrate_legacy_files()
+
+        self.state_data = new_state()
+        self.current_file = None
+        self._config_path = storage.settings_path()
+        self._active_tutorial = None
+
+        # Selection state
+        self._selected_class = None
+        self._selected_cell = None       # LessonItem (graphics) reference
+        self._selected_classes = []      # selected class objects (possibly multiple)
+        self._selected_cells = []        # selected graphics items
+        self._selection_anchor = None    # anchor graphics item for Shift+Click
+        self._selected_empty_slot = None
+
+        # Drag-and-drop state
+        self._dragging_cls = None
+        self._dragging_classes = []
+        self._drag_backup = None
+        self._drag_success = False
+
+        # Undo / Redo stacks (snapshot-based)
+        self._undo_stack = []   # list of (label, classes_snapshot)
+        self._redo_stack = []   # list of (label, classes_snapshot)
+        self._max_undo = 50
+
+        # AI-assisted optimization: feedback & learning
+        self._feedback_logger = FeedbackLogger()
+        self._preference_learner = PreferenceLearner()
+        # Run a learning pass on startup to pick up any pending feedback
+        self._preference_learner.learn()
+
+        # Schedule impact analysis state (observer layer)
+        self._has_baseline = False  # True once initial setup is done
+        self._reschedule_required_flag = False
+        self._reschedule_recommended_flag = False
+        self._structural_change_count = 0
+        self._impact_reasons = []  # human-readable trigger descriptions
+
+        # Business-logic workflow (UI-free orchestration layer)
+        self._workflow = SchedulingWorkflow(
+            self.state_data, self._get_learned_weights,
+            feedback_logger=self._feedback_logger,
+            preference_learner=self._preference_learner)
+
+        # Widget-scoped shortcuts (e.g., Ctrl+A inside specific views)
+        self._ui_shortcuts = []
+        # Keep refs so old translated menu actions can be disposed safely.
+        self._menu_actions = []
+
+        loaded = self._auto_load()
+        if loaded:
+            self._has_baseline = True
+        self._workflow.state = self.state_data
+
+        self._build_menu()
+        self._build_toolbar()
+        self._build_main()
+        self._build_status()
+
+        # Shortcuts — only register here for keys that have NO menu QAction.
+        # Keys that ARE on menu actions (Ctrl+Shift+A/B/P, Ctrl+P, Ctrl+R,
+        # Ctrl+N/O/S) are handled via QAction.setShortcutContext(WindowShortcut)
+        # in _add_action, so they fire regardless of focus without conflict.
+        self._shortcuts = []
+        for seq, slot in [
+            (QKeySequence.StandardKey.Delete, self._delete_selected),
+            (QKeySequence("Ctrl+C"),  self._copy_to_clipboard),
+            (QKeySequence("Ctrl+E"),  self._edit_selected_class),
+            (QKeySequence("F5"),      self.refresh_grid),
+            (QKeySequence("Ctrl+1"),  lambda: self._switch_tab(0)),
+            (QKeySequence("Ctrl+2"),  lambda: self._switch_tab(1)),
+            (QKeySequence("Ctrl+3"),  lambda: self._switch_tab(2)),
+            (QKeySequence("Ctrl+4"),  lambda: self._switch_tab(3)),
+            (QKeySequence("Ctrl+5"),  lambda: self._switch_tab(4)),
+        ]:
+            sc = QShortcut(seq, self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(slot)
+            self._shortcuts.append(sc)  # prevent garbage collection
+
+        if loaded:
+            QTimer.singleShot(100, self.refresh_grid)
+
+        # First-run onboarding (tutorial → setup).
+        # Language gate runs before window.show() in scheduler_gui.main().
+        from scheduler_app.first_run import FirstRunController
+        self._first_run = FirstRunController(self)
+        QTimer.singleShot(400 if not loaded else 500, self._first_run.start)
+
+    # ── Menu ──────────────────────────────────────────────────────────────
+
+    def _build_menu(self):
+        menubar = self.menuBar()
+        for action in self._menu_actions:
+            try:
+                action.setShortcut(QKeySequence())
+            except Exception:
+                pass
+            action.deleteLater()
+        self._menu_actions = []
+        menubar.clear()
+
+        # File
+        file_menu = menubar.addMenu(tr("menubar.file"))
+        self._add_action(file_menu, tr("menus.file_new"), self.new_schedule, "Ctrl+N", icon_new())
+        self._add_action(file_menu, tr("menus.file_open"), self.open_file, "Ctrl+O", icon_open())
+        file_menu.addSeparator()
+        self._add_action(file_menu, tr("buttons.save"), self.save_file, "Ctrl+S", icon_save())
+        self._add_action(file_menu, tr("menus.file_save_as"), self.save_as, None, icon_save())
+        file_menu.addSeparator()
+        from scheduler_app.ui.tier_enforcement import gate_menu_action, gate_export_submenu
+        from scheduler_app.plans import (
+            FEATURE_EXPORT_EXCEL, FEATURE_EXPORT_PDF, FEATURE_EXPORT_CSV,
+            FEATURE_BULK_SCHEDULING,
+        )
+        self._export_submenu = file_menu.addMenu(icon_export(), tr("buttons.export"))
+        _act_excel = self._add_action(self._export_submenu, tr("menus.export_excel"), self._export_to_excel)
+        gate_menu_action(_act_excel, FEATURE_EXPORT_EXCEL)
+        _act_pdf = self._add_action(self._export_submenu, tr("menus.export_pdf"), self._export_to_pdf)
+        gate_menu_action(_act_pdf, FEATURE_EXPORT_PDF)
+        _act_csv = self._add_action(self._export_submenu, tr("menus.file_export_csv"), self.export_csv)
+        gate_menu_action(_act_csv, FEATURE_EXPORT_CSV)
+        # Disable entire Export submenu when ALL export features are locked
+        gate_export_submenu(self._export_submenu)
+        file_menu.addSeparator()
+        self._add_action(file_menu, tr("menus.import_excel"), self._import_from_excel)
+        self._add_action(file_menu, tr("menus.generate_template"), self._generate_excel_template)
+        file_menu.addSeparator()
+        self._add_action(file_menu, tr("menus.file_exit"), self._on_quit)
+
+        # Edit
+        edit_menu = menubar.addMenu(tr("menubar.edit"))
+        self._add_action(edit_menu, tr("actions.undo"), self.undo, "Ctrl+Z")
+        self._add_action(edit_menu, tr("actions.redo"), self.redo, "Ctrl+Y")
+        edit_menu.addSeparator()
+        classes_sub = edit_menu.addMenu(icon_add_class(), tr("menus.classes"))
+        self._add_action(classes_sub, tr("toolbar.add_single"), self.add_class, "Ctrl+Shift+A", icon_add_single())
+        _act_bulk = self._add_action(classes_sub, tr("toolbar.bulk_add"), self.bulk_add_classes, "Ctrl+Shift+B", icon_bulk_add())
+        gate_menu_action(_act_bulk, FEATURE_BULK_SCHEDULING)
+        classes_sub.addSeparator()
+        self._add_action(classes_sub, tr("menus.edit_classes"), self.edit_classes, "Ctrl+Shift+E", icon_edit())
+        place_sub = edit_menu.addMenu(icon_placement(), tr("toolbar.class_placement"))
+        self._add_action(
+            place_sub, tr("toolbar.place_all_unplaced"),
+            self.place_class, "Ctrl+P", icon_place(),
+        )
+        self._add_action(
+            place_sub, tr("dialogs.place.title"),
+            self.place_single_class, "Ctrl+Shift+P", icon_place(),
+        )
+        self._add_action(place_sub, tr("buttons.unplace"), self.unplace_class, "Ctrl+U", icon_unplace())
+        self._add_action(place_sub, tr("buttons.delete"), self.remove_class, None, icon_delete())
+        place_sub.addSeparator()
+        self._add_action(place_sub, tr("buttons.reschedule"), self.reschedule, "Ctrl+R", icon_reschedule())
+        edit_menu.addSeparator()
+        self._add_action(edit_menu, tr("menus.edit_setup"), self.edit_setup, None, icon_setup())
+
+        # View
+        view_menu = menubar.addMenu(tr("menubar.view"))
+        self._add_action(view_menu, tr("menus.view_by_classroom"), lambda: self._switch_tab(0))
+        self._add_action(view_menu, tr("menus.view_by_group"), lambda: self._switch_tab(1))
+        self._add_action(view_menu, tr("menus.view_by_lecturer"), lambda: self._switch_tab(2))
+        self._add_action(view_menu, tr("tabs.show_everything"), lambda: self._switch_tab(3))
+        view_menu.addSeparator()
+        self._add_action(view_menu, tr("tabs.dashboard"), lambda: self._switch_tab(4))
+        view_menu.addSeparator()
+        self._toggle_sidebar_action = QAction(tr("menus.toggle_sidebar"), view_menu)
+        self._toggle_sidebar_action.setCheckable(True)
+        self._toggle_sidebar_action.setChecked(True)
+        self._toggle_sidebar_action.triggered.connect(self._toggle_sidebar_panel)
+        view_menu.addAction(self._toggle_sidebar_action)
+        self._menu_actions.append(self._toggle_sidebar_action)
+
+        # Language — opens the shared LanguageDialog, with current flag icon
+        from scheduler_app.first_run import LANGUAGE_LIST
+        current_lang = get_language()
+        lang_icon = None
+        for code, _name_key, icon_fn in LANGUAGE_LIST:
+            if code == current_lang:
+                lang_icon = icon_fn()
+                break
+        lang_menu = menubar.addMenu(tr("menubar.language"))
+        if lang_icon:
+            lang_menu.setIcon(lang_icon)
+        self._add_action(lang_menu, tr("dialogs.language.title"),
+                         self._open_language_dialog)
+
+        # Help
+        help_menu = menubar.addMenu(tr("menubar.help"))
+        self._add_action(help_menu, tr("tutorial.title"), self._show_tutorial)
+        self._add_action(help_menu, tr("dialogs.about.features_title"), self._show_features)
+        help_menu.addSeparator()
+        self._add_action(help_menu, tr("menus.help_about"), self._show_about)
+
+    def _add_action(self, menu, text, callback, shortcut=None, icon=None):
+        action = QAction(text, menu)
+        if icon:
+            action.setIcon(icon)
+        action.triggered.connect(callback)
+        if shortcut:
+            action.setShortcut(QKeySequence(shortcut))
+            action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        menu.addAction(action)
+        self._menu_actions.append(action)
+        return action
+
+    # ── Toolbar ───────────────────────────────────────────────────────────
+
+    def _build_toolbar(self):
+        tb = self.addToolBar("main")
+        tb.setObjectName("main_toolbar")
+        self._toolbar = tb
+        tb.setMovable(False)
+        tb.setIconSize(QSize(24, 24))
+
+        # "Classes" dropdown menu button
+        add_btn = QToolButton()
+        add_btn.setIcon(icon_add_class())
+        add_btn.setText(tr("toolbar.classes"))
+        add_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        add_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        add_menu = QMenu(add_btn)
+        add_menu.addAction(icon_add_single(), tr("toolbar.add_single") + "\tCtrl+Shift+A", self.add_class)
+        _tb_bulk_act = add_menu.addAction(icon_bulk_add(), tr("toolbar.bulk_add") + "\tCtrl+Shift+B", self.bulk_add_classes)
+        from scheduler_app.ui.tier_enforcement import gate_menu_action
+        from scheduler_app.plans import FEATURE_BULK_SCHEDULING, FEATURE_EXPORT_PDF, FEATURE_EXPORT_EXCEL, FEATURE_EXPORT_CSV
+        gate_menu_action(_tb_bulk_act, FEATURE_BULK_SCHEDULING)
+        add_menu.addSeparator()
+        add_menu.addAction(icon_edit(), tr("toolbar.edit_classes") + "\tCtrl+Shift+E", self.edit_classes)
+        add_btn.setMenu(add_menu)
+        add_btn.setToolTip(tr("menus.classes") + " (Ctrl+Shift+A)")
+        tb.addWidget(add_btn)
+        self._tb_add_btn = add_btn
+
+        # "Class Placement" dropdown menu button
+        place_btn = QToolButton()
+        place_btn.setIcon(icon_placement())
+        place_btn.setText(tr("toolbar.placement"))
+        place_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        place_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        place_menu = QMenu(place_btn)
+        place_menu.addAction(
+            icon_place(),
+            tr("toolbar.place_all_unplaced") + "\tCtrl+P",
+            self.place_class,
+        )
+        place_menu.addAction(
+            icon_place(),
+            tr("dialogs.place.title") + "\tCtrl+Shift+P",
+            self.place_single_class,
+        )
+        place_menu.addAction(icon_unplace(), tr("buttons.unplace") + "\tCtrl+U", self.unplace_class)
+        place_menu.addAction(icon_delete(), tr("buttons.delete"), self.remove_class)
+        place_menu.addSeparator()
+        place_menu.addAction(icon_reschedule(), tr("buttons.reschedule") + "\tCtrl+R", self.reschedule)
+        place_btn.setMenu(place_menu)
+        place_btn.setToolTip(tr("toolbar.place_all_unplaced") + " (Ctrl+P)")
+        tb.addWidget(place_btn)
+        self._tb_place_btn = place_btn
+
+        tb.addSeparator()
+        setup_btn = QToolButton()
+        setup_btn.setIcon(icon_setup())
+        setup_btn.setText(tr("toolbar.setup"))
+        setup_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        setup_btn.clicked.connect(self.edit_setup)
+        tb.addWidget(setup_btn)
+        self._tb_setup_btn = setup_btn
+
+        # ── Reschedule impact badge (observer layer) ──
+        tb.addSeparator()
+        badge_container = QWidget()
+        badge_layout = QHBoxLayout(badge_container)
+        badge_layout.setContentsMargins(0, 0, 0, 0)
+        badge_layout.setSpacing(2)
+
+        self._impact_badge = QToolButton()
+        self._impact_badge.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._impact_badge.clicked.connect(self.reschedule)
+        self._impact_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        badge_layout.addWidget(self._impact_badge)
+
+        self._impact_info_btn = QToolButton()
+        self._impact_info_btn.setText("\u24D8")  # ⓘ
+        self._impact_info_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
+        self._impact_info_btn.setStyleSheet(
+            "QToolButton { border: none; font-size: 11pt;"
+            " color: #6B7280; padding: 2px; }"
+            "QToolButton:hover { color: #374151; }")
+        badge_layout.addWidget(self._impact_info_btn)
+
+        self._impact_dismiss_btn = QToolButton()
+        self._impact_dismiss_btn.setText("\u2715")  # ✕
+        self._impact_dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._impact_dismiss_btn.setStyleSheet(
+            "QToolButton { border: none; font-size: 9pt;"
+            " color: #9CA3AF; padding: 2px; }"
+            "QToolButton:hover { color: #EF4444; }")
+        self._impact_dismiss_btn.clicked.connect(self._dismiss_impact_badge)
+        badge_layout.addWidget(self._impact_dismiss_btn)
+
+        badge_container.setVisible(False)
+        self._impact_badge_container = badge_container
+        badge_action = QWidgetAction(tb)
+        badge_action.setDefaultWidget(badge_container)
+        self._impact_badge_action = badge_action
+        tb.addAction(badge_action)
+
+        # ── Spacer + upgrade CTA + user avatar (right-aligned) ──
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+
+        # Upgrade CTA button — starts hidden; shown only for free-plan users
+        # once the tier has been confirmed by the server.
+        self._upgrade_btn = QPushButton(tr('upgrade.cta.button'))
+        self._upgrade_btn.setObjectName('upgradeBtn')
+        self._upgrade_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._upgrade_btn.setStyleSheet(
+            'QPushButton#upgradeBtn {'
+            '  background: #3B82F6; color: white; font-size: 9pt;'
+            '  font-weight: 600; border: none; border-radius: 6px;'
+            '  padding: 5px 14px;'
+            '}'
+            'QPushButton#upgradeBtn:hover { background: #2563EB; }'
+        )
+        self._upgrade_btn.clicked.connect(self._open_upgrade_page)
+        self._upgrade_btn.setVisible(False)
+        tb.addWidget(self._upgrade_btn)
+
+        # Auto-update visibility whenever the tier changes (from any source:
+        # startup init, heartbeat, account dialog, avatar fetch, etc.)
+        # Register only once (toolbar may be rebuilt on language change).
+        from scheduler_app.ui.tier_enforcement import TierEnforcement
+        if not getattr(self, '_tier_cb_registered', False):
+            TierEnforcement.instance().on_tier_changed(
+                self._update_upgrade_btn_visibility)
+            self._tier_cb_registered = True
+        # Apply current state in case set_tier was already called before
+        # this window was constructed.
+        self._update_upgrade_btn_visibility()
+
+    def _open_upgrade_page(self):
+        """Open the pricing page in the user's browser (offline build: no-op)."""
+        import webbrowser
+        from scheduler_app.ui.tier_enforcement import PRICING_PAGE_URL
+        if PRICING_PAGE_URL:
+            webbrowser.open(PRICING_PAGE_URL)
+
+    def _update_upgrade_btn_visibility(self):
+        """Show the toolbar upgrade button only for free-plan users."""
+        from scheduler_app.ui.tier_enforcement import TierEnforcement
+        enforcer = TierEnforcement.instance()
+        is_free = enforcer.tier_slug == 'free'
+        self._upgrade_btn.setVisible(is_free and enforcer.tier_confirmed)
+        if hasattr(self, '_upgrade_banner'):
+            self._upgrade_banner.setVisible(is_free and enforcer.tier_confirmed)
+
+    # (Account avatar / profile fetch removed — fully offline build.)
+
+    # ── Main area ─────────────────────────────────────────────────────────
+
+    def _build_main(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        outer_layout = QVBoxLayout(central)
+        outer_layout.setContentsMargins(5, 0, 5, 0)
+        outer_layout.setSpacing(0)
+
+        # Offline warning banner (hidden by default, text set dynamically)
+        self._offline_banner = QLabel('')
+        self._offline_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._offline_banner.setStyleSheet(
+            'background: #FEF3C7; color: #92400E; font-size: 9pt; '
+            'font-weight: bold; padding: 6px; border-bottom: 1px solid #F59E0B;')
+        self._offline_banner.setVisible(False)
+        outer_layout.addWidget(self._offline_banner)
+
+        # Upgrade banner — shown for Free users, conversion-focused
+        self._upgrade_banner = QWidget()
+        self._upgrade_banner.setStyleSheet(
+            'QWidget { background: qlineargradient('
+            'x1:0,y1:0,x2:1,y2:0,stop:0 #EFF6FF,stop:1 #DBEAFE);'
+            'border-bottom: 1px solid #BFDBFE; }')
+        ub_layout = QHBoxLayout(self._upgrade_banner)
+        ub_layout.setContentsMargins(16, 6, 16, 6)
+        ub_layout.setSpacing(12)
+        ub_text = QLabel(tr('upgrade.cta.banner'))
+        ub_text.setStyleSheet(
+            'font-size: 9pt; color: #1E40AF; font-weight: 500; background: transparent;')
+        ub_layout.addWidget(ub_text, 1)
+        ub_btn = QPushButton(tr('upgrade.cta.button'))
+        ub_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ub_btn.setStyleSheet(
+            'QPushButton { background: #3B82F6; color: white; font-size: 8pt;'
+            ' font-weight: 600; border: none; border-radius: 4px;'
+            ' padding: 4px 12px; }'
+            'QPushButton:hover { background: #2563EB; }')
+        ub_btn.clicked.connect(self._open_upgrade_page)
+        ub_layout.addWidget(ub_btn)
+        ub_dismiss = QPushButton('\u2715')
+        ub_dismiss.setCursor(Qt.CursorShape.PointingHandCursor)
+        ub_dismiss.setStyleSheet(
+            'QPushButton { background: transparent; color: #64748B;'
+            ' border: none; font-size: 11pt; padding: 2px 4px; }'
+            'QPushButton:hover { color: #1E293B; }')
+        ub_dismiss.clicked.connect(lambda: self._upgrade_banner.setVisible(False))
+        ub_layout.addWidget(ub_dismiss)
+        self._upgrade_banner.setVisible(False)  # starts hidden; callback updates it
+        outer_layout.addWidget(self._upgrade_banner)
+
+        # Horizontal splitter: notebook + open-slots panel + unplaced panel
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        outer_layout.addWidget(self.splitter, 1)
+
+        # Notebook
+        self.notebook = QTabWidget()
+        self.splitter.addWidget(self.notebook)
+
+        # Tab 1 — By Classroom
+        self.tab_classroom = QWidget()
+        tcl = QVBoxLayout(self.tab_classroom)
+        tcl.setContentsMargins(5, 5, 5, 5)
+        fb1 = QHBoxLayout()
+        self._classroom_label = QLabel("\U0001F3E0  " + tr("filters.classroom"))
+        fb1.addWidget(self._classroom_label)
+        self.classroom_filter = QComboBox()
+        self.classroom_filter.setMinimumWidth(150)
+        self.classroom_filter.currentIndexChanged.connect(lambda: self._render_current_tab())
+        fb1.addWidget(self.classroom_filter)
+        fb1.addStretch()
+        self._export_btn1 = QToolButton()
+        self._export_btn1.setText("\u21D7  " + tr("buttons.export"))
+        self._export_btn1.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._export_menu1 = QMenu()
+        self._export_menu1.addAction(tr("menus.export_excel"), self._export_to_excel)
+        self._export_menu1.addAction(tr("menus.export_pdf"), self._export_to_pdf)
+        self._export_btn1.setMenu(self._export_menu1)
+        fb1.addWidget(self._export_btn1)
+        tcl.addLayout(fb1)
+        self.grid_view1 = TimetableView()
+        tcl.addWidget(self.grid_view1)
+        self.notebook.addTab(self.tab_classroom, "\U0001F3E0  " + tr("menus.view_by_classroom"))
+
+        # Tab 2 — By Student Group
+        self.tab_group = QWidget()
+        tgl = QVBoxLayout(self.tab_group)
+        tgl.setContentsMargins(5, 5, 5, 5)
+        fb2 = QHBoxLayout()
+        self._group_label = QLabel("\U0001F393  " + tr("filters.group"))
+        fb2.addWidget(self._group_label)
+        self.group_filter = QComboBox()
+        self.group_filter.setMinimumWidth(150)
+        self.group_filter.currentIndexChanged.connect(lambda: self._render_current_tab())
+        fb2.addWidget(self.group_filter)
+        fb2.addStretch()
+        self._export_btn2 = QToolButton()
+        self._export_btn2.setText("\u21D7  " + tr("buttons.export"))
+        self._export_btn2.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._export_menu2 = QMenu()
+        self._export_menu2.addAction(tr("menus.export_excel"), self._export_to_excel)
+        self._export_menu2.addAction(tr("menus.export_pdf"), self._export_to_pdf)
+        self._export_btn2.setMenu(self._export_menu2)
+        fb2.addWidget(self._export_btn2)
+        tgl.addLayout(fb2)
+        self.grid_view2 = TimetableView()
+        tgl.addWidget(self.grid_view2)
+        self.notebook.addTab(self.tab_group, "\U0001F393  " + tr("menus.view_by_group"))
+
+        # Tab 3 — By Lecturer
+        self.tab_lecturer = QWidget()
+        tll = QVBoxLayout(self.tab_lecturer)
+        tll.setContentsMargins(5, 5, 5, 5)
+        fb3 = QHBoxLayout()
+        self._lecturer_label = QLabel("\U0001F468\u200D\U0001F3EB  " + tr("filters.lecturer"))
+        fb3.addWidget(self._lecturer_label)
+        self.lecturer_filter = QComboBox()
+        self.lecturer_filter.setMinimumWidth(150)
+        self.lecturer_filter.currentIndexChanged.connect(lambda: self._render_current_tab())
+        fb3.addWidget(self.lecturer_filter)
+        fb3.addStretch()
+        self._export_btn3 = QToolButton()
+        self._export_btn3.setText("\u21D7  " + tr("buttons.export"))
+        self._export_btn3.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._export_menu3 = QMenu()
+        self._export_menu3.addAction(tr("menus.export_excel"), self._export_to_excel)
+        self._export_menu3.addAction(tr("menus.export_pdf"), self._export_to_pdf)
+        self._export_btn3.setMenu(self._export_menu3)
+        fb3.addWidget(self._export_btn3)
+        tll.addLayout(fb3)
+        self.grid_view3 = TimetableView()
+        tll.addWidget(self.grid_view3)
+        self.notebook.addTab(self.tab_lecturer, "\U0001F468\u200D\U0001F3EB  " + tr("menus.view_by_lecturer"))
+
+        # Tab 4 — Show Everything
+        self.tab_everything = QWidget()
+        tel = QVBoxLayout(self.tab_everything)
+        tel.setContentsMargins(5, 5, 5, 5)
+        fb4 = QHBoxLayout()
+        self._export_btn4 = QToolButton()
+        self._export_btn4.setText("\u21D7  " + tr("buttons.export"))
+        self._export_btn4.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._export_menu4 = QMenu()
+        self._export_menu4.addAction(tr("menus.export_excel"), self._export_to_excel)
+        self._export_menu4.addAction(tr("menus.export_pdf"), self._export_to_pdf)
+        self._export_btn4.setMenu(self._export_menu4)
+        fb4.addWidget(self._export_btn4)
+        fb4.addStretch()
+        tel.addLayout(fb4)
+        self.grid_view4 = TimetableView()
+        tel.addWidget(self.grid_view4)
+        self.notebook.addTab(self.tab_everything, "\U0001F4CB  " + tr("tabs.show_everything"))
+
+        # Tab 5 — Dashboard
+        self.dashboard_widget = DashboardWidget()
+        self.notebook.addTab(self.dashboard_widget, "\U0001F4CA  " + tr("tabs.dashboard"))
+
+        # Ctrl+A in timetable views: select all visible classes in that view.
+        # This avoids relying on a global window-level Ctrl+A that can
+        # interfere with side-panel list shortcuts.
+        for gv in [self.grid_view1, self.grid_view2,
+                    self.grid_view3, self.grid_view4]:
+            sc_view = QShortcut(QKeySequence.StandardKey.SelectAll, gv)
+            sc_view.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc_view.activated.connect(lambda v=gv: self._select_all_in_view(v))
+            self._ui_shortcuts.append(sc_view)
+
+        # Wire zoom callbacks for Ctrl+Wheel sync
+        for gv in [self.grid_view1, self.grid_view2,
+                    self.grid_view3, self.grid_view4]:
+            gv._zoom_callback = self._on_view_zoom_changed
+
+        # Connect tab-change signal AFTER all tabs and filters are created
+        self.notebook.currentChanged.connect(lambda: self._render_current_tab())
+
+        # ── Collapsible Right Sidebar (tabbed: Open Slots + Unplaced) ──
+        self._sidebar_panel = QWidget()
+        self._sidebar_panel.setObjectName("sidebar")
+        self._sidebar_panel.setStyleSheet(
+            "QWidget#sidebar { background: #F8FAFC; border-radius: 8px; }")
+        sidebar_layout = QVBoxLayout(self._sidebar_panel)
+        sidebar_layout.setContentsMargins(6, 6, 6, 6)
+        sidebar_layout.setSpacing(4)
+
+        # Header row: title + collapse button
+        sidebar_header_row = QHBoxLayout()
+        sidebar_header_row.setContentsMargins(0, 0, 0, 0)
+        sidebar_header_row.setSpacing(2)
+        self._sidebar_title = QLabel(tr("panels.sidebar"))
+        self._sidebar_title.setStyleSheet(
+            "QLabel { font-weight: bold; font-size: 10pt; color: #334155;"
+            "  padding: 4px 6px; }")
+        sidebar_header_row.addWidget(self._sidebar_title, 1)
+        self._sidebar_collapse_btn = QPushButton()
+        self._sidebar_collapse_btn.setIcon(_make_sidebar_icon("#475569"))
+        self._sidebar_collapse_btn.setFixedSize(26, 26)
+        self._sidebar_collapse_btn.setToolTip(tr("panels.collapse_sidebar"))
+        self._sidebar_collapse_btn.setStyleSheet(
+            "QPushButton { background: transparent; border: 1px solid #CBD5E1;"
+            "  border-radius: 5px; padding: 2px; }"
+            "QPushButton:hover { background: #E2E8F0; }")
+        self._sidebar_collapse_btn.clicked.connect(
+            lambda: self._collapse_panel("sidebar"))
+        sidebar_header_row.addWidget(self._sidebar_collapse_btn)
+        sidebar_layout.addLayout(sidebar_header_row)
+
+        # Tab buttons row
+        tab_row = QHBoxLayout()
+        tab_row.setContentsMargins(0, 0, 0, 0)
+        tab_row.setSpacing(4)
+        self._sidebar_tab_open_slots = QPushButton(
+            "\u2B50  " + tr("panels.open_slots"))
+        self._sidebar_tab_unplaced = _UnplacedTabButton(
+            "\u26A0  " + tr("panels.unplaced_classes"), self)
+        _tab_active_ss = (
+            "QPushButton { font-weight: bold; font-size: 9pt; color: #1E40AF;"
+            "  background: #DBEAFE; border: 1px solid #93C5FD;"
+            "  border-radius: 6px; padding: 5px 10px; }"
+            "QPushButton:hover { background: #BFDBFE; }")
+        _tab_inactive_ss = (
+            "QPushButton { font-weight: bold; font-size: 9pt; color: #64748B;"
+            "  background: #F1F5F9; border: 1px solid #E2E8F0;"
+            "  border-radius: 6px; padding: 5px 10px; }"
+            "QPushButton:hover { background: #E2E8F0; }")
+        self._sidebar_tab_active_ss = _tab_active_ss
+        self._sidebar_tab_inactive_ss = _tab_inactive_ss
+        self._sidebar_tab_open_slots.setStyleSheet(_tab_active_ss)
+        self._sidebar_tab_unplaced.setStyleSheet(_tab_inactive_ss)
+        self._sidebar_tab_open_slots.clicked.connect(
+            lambda: self._switch_sidebar_tab(0))
+        self._sidebar_tab_unplaced.clicked.connect(
+            lambda: self._switch_sidebar_tab(1))
+        tab_row.addWidget(self._sidebar_tab_open_slots, 1)
+        tab_row.addWidget(self._sidebar_tab_unplaced, 1)
+        sidebar_layout.addLayout(tab_row)
+
+        # Stacked content: page 0 = open slots, page 1 = unplaced
+        self._sidebar_stack = QStackedWidget()
+
+        # -- Open Slots page --
+        osp_page = QWidget()
+        osp_page.setObjectName("osp")
+        osp_page.setStyleSheet(
+            "QWidget#osp { background: #F0FDF4; border-radius: 6px; }")
+        osp_lay = QVBoxLayout(osp_page)
+        osp_lay.setContentsMargins(4, 4, 4, 4)
+        osp_lay.setSpacing(4)
+        self._open_slots_filter_hint = QLabel("")
+        self._open_slots_filter_hint.setStyleSheet(
+            "QLabel { font-size: 7pt; color: #4B5563; background: #E0F2FE;"
+            "  border: 1px solid #BAE6FD; border-radius: 4px;"
+            "  padding: 3px 6px; }")
+        self._open_slots_filter_hint.setWordWrap(True)
+        self._open_slots_filter_hint.hide()
+        osp_lay.addWidget(self._open_slots_filter_hint)
+        self._open_slots_scroll = QScrollArea()
+        self._open_slots_scroll.setWidgetResizable(True)
+        self._open_slots_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._open_slots_scroll.setStyleSheet(
+            "QScrollArea { background: #F0FFF0;"
+            "  border: 1px solid #A7F3D0; border-radius: 6px; }"
+            "QScrollBar:vertical { width: 6px; background: transparent; }"
+            "QScrollBar::handle:vertical { background: #A7F3D0;"
+            "  border-radius: 3px; min-height: 20px; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical"
+            "  { height: 0; }")
+        self._open_slots_container = QWidget()
+        self._open_slots_container.setStyleSheet("background: transparent;")
+        self._open_slots_layout = QVBoxLayout(self._open_slots_container)
+        self._open_slots_layout.setContentsMargins(6, 6, 6, 6)
+        self._open_slots_layout.setSpacing(2)
+        self._open_slots_scroll.setWidget(self._open_slots_container)
+        osp_lay.addWidget(self._open_slots_scroll)
+        # Keep attribute for backward compat checks (hasattr guards)
+        self.open_slots_tree = self._open_slots_scroll
+        self._sidebar_stack.addWidget(osp_page)
+
+        # -- Unplaced Classes page --
+        upl_page = QWidget()
+        upl_page.setObjectName("upl")
+        upl_page.setStyleSheet(
+            "QWidget#upl { background: #FFFBEB; border-radius: 6px; }")
+        upl_lay = QVBoxLayout(upl_page)
+        upl_lay.setContentsMargins(4, 4, 4, 4)
+        upl_lay.setSpacing(4)
+        self.unplaced_list = DraggableUnplacedList(self)
+        self.unplaced_list.setStyleSheet(
+            "QListWidget { background: #FEFCE8; border: 1px solid #FCD34D;"
+            "  border-radius: 6px; }"
+            "QListWidget::item { padding: 4px 8px; border-radius: 3px;"
+            "  margin: 1px 2px; }"
+            "QListWidget::item:hover { background: #FEF3C7; }"
+            "QListWidget::item:selected { background: #FDE68A; color: #92400E; }")
+        self.unplaced_list.itemDoubleClicked.connect(self._on_unplaced_dblclick)
+        self.unplaced_list.itemSelectionChanged.connect(self._refresh_open_slots)
+        sc_unplaced = QShortcut(
+            QKeySequence.StandardKey.SelectAll, self.unplaced_list)
+        sc_unplaced.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_unplaced.activated.connect(self.unplaced_list.selectAll)
+        self._ui_shortcuts.append(sc_unplaced)
+        upl_lay.addWidget(self.unplaced_list)
+        self._sidebar_stack.addWidget(upl_page)
+
+        sidebar_layout.addWidget(self._sidebar_stack, 1)
+
+        self._sidebar_panel.setMinimumWidth(0)
+        self.splitter.addWidget(self._sidebar_panel)
+
+        self.splitter.setStretchFactor(0, 1)  # notebook
+        self.splitter.setStretchFactor(1, 0)  # sidebar
+
+        # ── Sidebar expand button — overlay child of the sidebar panel ──
+        self._sidebar_expand_btn = QPushButton(self._sidebar_panel)
+        self._sidebar_expand_btn.setIcon(_make_sidebar_icon("#475569"))
+        self._sidebar_expand_btn.setFixedSize(28, 28)
+        self._sidebar_expand_btn.setToolTip(tr("panels.sidebar"))
+        self._sidebar_expand_btn.setStyleSheet(
+            "QPushButton { background: #E2E8F0; border: 1px solid #CBD5E1;"
+            "  border-radius: 6px; padding: 2px; }"
+            "QPushButton:hover { background: #CBD5E1; }")
+        self._sidebar_expand_btn.clicked.connect(
+            lambda: self._expand_panel("sidebar"))
+        self._sidebar_expand_btn.setVisible(False)
+
+        # Sidebar collapse state tracking
+        self._sidebar_is_collapsed = False
+        self._sidebar_saved_width = 350
+        self._sidebar_current_tab = 0
+        self._collapsed_width = 36
+        self._collapse_threshold = 60
+        self._in_collapse_sync = False
+
+        # Detect splitter-drag collapse
+        self.splitter.splitterMoved.connect(self._on_splitter_moved)
+
+        # Set initial splitter sizes: give notebook the bulk, sidebar ~350
+        QTimer.singleShot(0, self._init_splitter_sizes)
+
+        # ── Zoom bar (Office-style) ──
+        zoom_bar = QFrame()
+        zoom_bar.setFixedHeight(26)
+        zoom_bar.setStyleSheet(
+            "QFrame { background: #F1F5F9; border-top: 1px solid #E2E8F0; }")
+        zl = QHBoxLayout(zoom_bar)
+        zl.setContentsMargins(8, 0, 8, 0)
+        zl.setSpacing(6)
+        zl.addStretch()
+        self._zoom_out_btn = QPushButton()
+        self._zoom_out_btn.setFixedSize(22, 20)
+        self._zoom_out_btn.setIcon(_make_zoom_icon("minus"))
+        self._zoom_out_btn.setStyleSheet(
+            "QPushButton { background: transparent;"
+            " border: 1px solid #CBD5E1; border-radius: 3px; padding: 0; }"
+            "QPushButton:hover { background: #E2E8F0; }")
+        self._zoom_out_btn.clicked.connect(lambda: self._set_zoom(
+            self._zoom_slider.value() - 10))
+        zl.addWidget(self._zoom_out_btn)
+        self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self._zoom_slider.setRange(25, 300)
+        self._zoom_slider.setValue(100)
+        self._zoom_slider.setSingleStep(10)
+        self._zoom_slider.setPageStep(25)
+        self._zoom_slider.setFixedWidth(180)
+        self._zoom_slider.setToolTip(tr("tooltips.zoom"))
+        self._zoom_slider.setStyleSheet(
+            "QSlider::groove:horizontal {"
+            "  height: 4px; background: #CBD5E1; border-radius: 2px; }"
+            "QSlider::handle:horizontal {"
+            "  width: 14px; height: 14px; margin: -5px 0;"
+            "  background: white; border: 1px solid #94A3B8; border-radius: 7px; }"
+            "QSlider::handle:horizontal:hover {"
+            "  border-color: #3B82F6; }"
+            "QSlider::sub-page:horizontal {"
+            "  background: #3B82F6; border-radius: 2px; }")
+        self._zoom_slider.valueChanged.connect(self._set_zoom)
+        zl.addWidget(self._zoom_slider)
+        self._zoom_in_btn = QPushButton()
+        self._zoom_in_btn.setFixedSize(22, 20)
+        self._zoom_in_btn.setIcon(_make_zoom_icon("plus"))
+        self._zoom_in_btn.setStyleSheet(
+            "QPushButton { background: transparent;"
+            " border: 1px solid #CBD5E1; border-radius: 3px; padding: 0; }"
+            "QPushButton:hover { background: #E2E8F0; }")
+        self._zoom_in_btn.clicked.connect(lambda: self._set_zoom(
+            self._zoom_slider.value() + 10))
+        zl.addWidget(self._zoom_in_btn)
+        self._zoom_label = QLabel(tr("labels.percent_value", value=100))
+        self._zoom_label.setFixedWidth(40)
+        self._zoom_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._zoom_label.setStyleSheet(
+            "font-size: 8pt; color: #475569; border: none;")
+        zl.addWidget(self._zoom_label)
+        outer_layout.addWidget(zoom_bar)
+
+        # Warning log panel at bottom
+        self.warning_log = WarningLogPanel()
+        outer_layout.addWidget(self.warning_log)
+
+    # ── Status bar ────────────────────────────────────────────────────────
+
+    def _build_status(self):
+        self.status_label = QLabel(tr("status.ready"))
+        self.statusBar().addWidget(self.status_label, 1)
+
+        # Bug report button (right side of status bar)
+        self._bug_report_btn = BugReportButton()
+        self._bug_report_btn.clicked.connect(self._open_bug_report)
+        self.statusBar().addPermanentWidget(self._bug_report_btn)
+
+    # ── Bug report ──────────────────────────────────────────────────────
+
+    def _open_bug_report(self):
+        """Open the bug report dialog with current context auto-filled."""
+        current_module = ''
+        if hasattr(self, 'notebook'):
+            idx = self.notebook.currentIndex()
+            if idx >= 0:
+                current_module = self.notebook.tabText(idx)
+
+        dlg = BugReportDialog(
+            self,
+            current_module=current_module,
+        )
+        dlg.exec()
+
+    # ── Schedule Impact Analysis (observer layer) ────────────────────────
+
+    def _update_impact_badge(self):
+        """Update the reschedule badge visibility and style."""
+        badge = getattr(self, "_impact_badge", None)
+        if badge is None:
+            return
+        container = getattr(self, "_impact_badge_container", None)
+        action = getattr(self, "_impact_badge_action", None)
+        info_btn = getattr(self, "_impact_info_btn", None)
+
+        # Build tooltip from stored reasons
+        tooltip = "\n".join(self._impact_reasons) if self._impact_reasons else ""
+        if info_btn:
+            info_btn.setToolTip(tooltip)
+
+        if self._reschedule_required_flag:
+            badge.setText(tr("impact.reschedule_required"))
+            badge.setStyleSheet(
+                "QToolButton { background: #FEE2E2; border: 1px solid #EF4444;"
+                " border-radius: 6px; padding: 5px 14px; font-size: 9pt;"
+                " font-weight: bold; color: #DC2626; }"
+                "QToolButton:hover { background: #FECACA; }")
+            if container:
+                container.setVisible(True)
+            if action:
+                action.setVisible(True)
+        elif self._reschedule_recommended_flag or self._structural_change_count > 0:
+            badge.setText(tr("impact.reschedule_recommended"))
+            badge.setStyleSheet(
+                "QToolButton { background: #FEF3C7; border: 1px solid #F59E0B;"
+                " border-radius: 6px; padding: 5px 14px; font-size: 9pt;"
+                " font-weight: bold; color: #D97706; }"
+                "QToolButton:hover { background: #FDE68A; }")
+            if container:
+                container.setVisible(True)
+            if action:
+                action.setVisible(True)
+        else:
+            if container:
+                container.setVisible(False)
+            if action:
+                action.setVisible(False)
+
+    def _clear_impact_flags(self):
+        """Clear reschedule flags and hide badge (e.g. after reschedule)."""
+        self._reschedule_required_flag = False
+        self._reschedule_recommended_flag = False
+        self._structural_change_count = 0
+        self._impact_reasons = []
+        self._update_impact_badge()
+
+    def mark_current_state_as_baseline(self):
+        """Mark the current state as the baseline for impact analysis.
+
+        After this call, only *subsequent* changes will trigger the
+        reschedule recommender.  Called after initial setup, file load,
+        and reschedule to prevent false positives.
+        """
+        self._has_baseline = True
+        self._clear_impact_flags()
+
+    def _note_structural_change(self, before_snapshot, *, description=""):
+        """Analyze the impact of adding/deleting classes and show badge if warranted.
+
+        Unlike constraint-change analysis, this does NOT show a modal dialog.
+        The badge is only shown when the analyzer determines reschedule is
+        needed (violations or optimization opportunities).
+
+        Args:
+            before_snapshot: Snapshot captured before the change.
+            description: Human-readable description of what triggered the change.
+        """
+        # No baseline yet (initial setup) → skip analysis
+        if not self._has_baseline:
+            return
+
+        # No classes left → nothing to reschedule
+        if not self.state_data.get("classes"):
+            self._clear_impact_flags()
+            return
+
+        after_snapshot = capture_snapshot(self.state_data)
+        result = analyze_impact(before_snapshot, after_snapshot, self.state_data)
+
+        if result.level == ImpactLevel.NO_RESCHEDULE_NEEDED:
+            return
+
+        # Build trigger description for tooltip
+        reasons = []
+        if description:
+            reasons.append(description)
+        if result.hard_violations:
+            reasons.append(tr("impact.trigger.hard_violations"))
+            for v in result.hard_violations[:5]:
+                reasons.append(f"  \u2022 {v}")
+        if result.soft_impact_reasons:
+            reasons.append(tr("impact.trigger.soft_changes"))
+            for r in result.soft_impact_reasons[:5]:
+                reasons.append(f"  \u2022 {r}")
+        self._impact_reasons.extend(reasons)
+
+        self._structural_change_count += 1
+        if result.level == ImpactLevel.RESCHEDULE_REQUIRED:
+            self._reschedule_required_flag = True
+        elif result.level == ImpactLevel.RESCHEDULE_RECOMMENDED:
+            if not self._reschedule_required_flag:
+                self._reschedule_recommended_flag = True
+        self._update_impact_badge()
+
+    def _dismiss_impact_badge(self):
+        """Dismiss the impact badge. Warn if level is 'required'."""
+        if self._reschedule_required_flag:
+            resp = QMessageBox.warning(
+                self,
+                tr("impact.dismiss_required_title"),
+                tr("impact.dismiss_required_warning"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if resp != QMessageBox.StandardButton.Yes:
+                return
+        self._clear_impact_flags()
+
+    def _run_impact_analysis(self, before_snapshot):
+        """Run impact analysis after a save and show prompt if needed.
+
+        Args:
+            before_snapshot: Snapshot captured before the change via
+                             capture_snapshot().
+        """
+        # No baseline yet (initial setup) → skip analysis
+        if not self._has_baseline:
+            return
+
+        after_snapshot = capture_snapshot(self.state_data)
+        result = analyze_impact(before_snapshot, after_snapshot, self.state_data)
+
+        if result.level == ImpactLevel.NO_RESCHEDULE_NEEDED:
+            return
+
+        # Update global flags (required > recommended)
+        if result.level == ImpactLevel.RESCHEDULE_REQUIRED:
+            self._reschedule_required_flag = True
+        elif result.level == ImpactLevel.RESCHEDULE_RECOMMENDED:
+            if not self._reschedule_required_flag:
+                self._reschedule_recommended_flag = True
+
+        self._update_impact_badge()
+
+        # Prompt user
+        if result.level == ImpactLevel.RESCHEDULE_REQUIRED:
+            msg = tr("impact.prompt_required")
+        else:
+            msg = tr("impact.prompt_recommended")
+
+        resp = QMessageBox.question(
+            self, tr("impact.prompt_title"), msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+        if resp == QMessageBox.StandardButton.Yes:
+            self.reschedule()
+
+    # ── Undo / Redo ──────────────────────────────────────────────────────
+
+    def _push_undo(self, label=""):
+        """Snapshot current classes state before a change."""
+        snapshot = copy.deepcopy(self.state_data["classes"])
+        self._undo_stack.append((label, snapshot))
+        if len(self._undo_stack) > self._max_undo:
+            self._undo_stack.pop(0)
+        # Any new action clears the redo stack
+        self._redo_stack.clear()
+
+    def undo(self):
+        """Restore the previous classes state."""
+        if not self._undo_stack:
+            return
+        label, snapshot = self._undo_stack.pop()
+        # Save current state to redo stack
+        current = copy.deepcopy(self.state_data["classes"])
+        self._redo_stack.append((label, current))
+        # Restore
+        self.state_data["classes"] = snapshot
+        self._clear_class_selection()
+        self._clear_empty_slot_selection()
+        self.refresh_grid()
+        desc = tr("actions.undo_action").format(action=label) if label else tr("actions.undo")
+        self._show_toast(desc, "info")
+
+    def redo(self):
+        """Re-apply an undone action."""
+        if not self._redo_stack:
+            return
+        label, snapshot = self._redo_stack.pop()
+        # Save current state to undo stack (without clearing redo)
+        current = copy.deepcopy(self.state_data["classes"])
+        self._undo_stack.append((label, current))
+        # Restore
+        self.state_data["classes"] = snapshot
+        self._clear_class_selection()
+        self._clear_empty_slot_selection()
+        self.refresh_grid()
+        desc = tr("actions.redo_action").format(action=label) if label else tr("actions.redo")
+        self._show_toast(desc, "info")
+
+    # ── Auto-save / Auto-load ─────────────────────────────────────────────
+
+    @staticmethod
+    def _get_config_path():
+        return storage.settings_path()
+
+    def _auto_load(self):
+        if not os.path.exists(self._config_path):
+            return False
+        try:
+            data = storage.load_encrypted(self._config_path)
+            self.state_data = data.get("state", new_state())
+            normalize_state_day_keys(self.state_data)
+            normalize_state_classes(self.state_data)
+            if "lecturers" not in self.state_data:
+                self.state_data["lecturers"] = []
+            if "classroom_capacities" not in self.state_data:
+                self.state_data["classroom_capacities"] = {}
+            self.current_file = data.get("last_file", None)
+            lang = data.get("language", "en")
+            set_language(lang)
+            if is_rtl(lang):
+                QApplication.instance().setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+            return bool(self.state_data.get("days"))
+        except Exception:
+            return False
+
+    def _auto_save(self):
+        try:
+            # Read-modify-write to preserve first-run flags and other keys
+            data = {}
+            if os.path.exists(self._config_path):
+                try:
+                    data = storage.load_encrypted(self._config_path)
+                except Exception:
+                    data = {}
+            normalize_state_day_keys(self.state_data)
+            normalize_state_classes(self.state_data)
+            data["state"] = self.state_data
+            data["last_file"] = self.current_file
+            data["language"] = get_language()
+            storage.save_encrypted(data, self._config_path)
+        except Exception:
+            pass
+
+    def _update_status(self):
+        s = self.state_data
+        n_total = len(s["classes"])
+        n_pinned = sum(1 for c in s["classes"] if c["pinned"])
+        n_placed = sum(1 for c in s["classes"] if c["placed"])
+        n_protected = sum(1 for c in s["classes"]
+                          if c.get("protection", "none") != "none"
+                          and not c["pinned"])
+        n_unplaced = n_total - n_pinned - n_placed
+        fname = os.path.basename(self.current_file) if self.current_file else tr("app.untitled")
+        status = (
+            f"\U0001F4C4 {fname}   \u2502   "
+            f"\U0001F4DA {n_total} {tr('status.classes')}   \u2502   "
+            f"\U0001F4CC {n_pinned} {tr('status.pinned')}   \u2502   "
+            f"\u2705 {n_placed} {tr('status.placed')}   \u2502   "
+            f"\u23F3 {n_unplaced} {tr('status.unplaced')}")
+        if n_protected > 0:
+            status += f"   \u2502   \U0001F6E1 {n_protected} {tr('labels.protected')}"
+        self.status_label.setText(status)
+
+    # ── Filter updates ────────────────────────────────────────────────────
+
+    def _update_filters(self):
+        s = self.state_data
+
+        self.classroom_filter.blockSignals(True)
+        cur = self.classroom_filter.currentData()
+        if cur is None:
+            cur = self.classroom_filter.currentText().strip() or None
+        self.classroom_filter.clear()
+        for room in s["classrooms"]:
+            self.classroom_filter.addItem(room, _encode_classroom_filter_room(room))
+        for location_type in (LOCATION_ONLINE, LOCATION_LECTURER_OFFICE):
+            self.classroom_filter.addItem(
+                get_location_label(location_type),
+                _encode_classroom_filter_virtual(location_type),
+            )
+        idx = self.classroom_filter.findData(cur)
+        if idx < 0 and isinstance(cur, str):
+            idx = self.classroom_filter.findText(cur)
+        self.classroom_filter.setCurrentIndex(idx if idx >= 0 else 0)
+        self.classroom_filter.blockSignals(False)
+
+        groups = []
+        for yr in sorted(s["years"].keys()):
+            for br in s["years"][yr]:
+                groups.append(f"{yr} / {br}")
+        self.group_filter.blockSignals(True)
+        cur = self.group_filter.currentText()
+        self.group_filter.clear()
+        self.group_filter.addItems(groups)
+        idx = self.group_filter.findText(cur)
+        self.group_filter.setCurrentIndex(idx if idx >= 0 else 0)
+        self.group_filter.blockSignals(False)
+
+        # Build lecturer filter: use defined list + any from classes
+        lec_set = set(s.get("lecturers", []))
+        if s["classes"]:
+            lec_set.update(c["lecturer"] for c in s["classes"] if c["lecturer"])
+        all_lecs = sorted(lec_set)
+        self.lecturer_filter.blockSignals(True)
+        cur = self.lecturer_filter.currentText()
+        self.lecturer_filter.clear()
+        self.lecturer_filter.addItems(all_lecs)
+        idx = self.lecturer_filter.findText(cur)
+        self.lecturer_filter.setCurrentIndex(idx if idx >= 0 else 0)
+        self.lecturer_filter.blockSignals(False)
+
+    def _check_setup(self):
+        """Prompt for setup when schedule has no basic config (e.g. after New)."""
+        s = self.state_data
+        if not s["days"] or not s["slots"] or not s["classrooms"] or not s["years"]:
+            if QMessageBox.question(
+                    self, tr("dialogs.welcome.title"),
+                    tr("dialogs.welcome.setup_prompt")
+            ) == QMessageBox.StandardButton.Yes:
+                self.edit_setup()
+
+    def _switch_tab(self, idx):
+        self.notebook.setCurrentIndex(idx)
+
+    # ── Zoom ──────────────────────────────────────────────────────────
+
+    def _set_zoom(self, pct):
+        """Apply zoom level to all timetable views and sync the slider."""
+        pct = max(25, min(300, pct))
+        self._zoom_slider.blockSignals(True)
+        self._zoom_slider.setValue(pct)
+        self._zoom_slider.blockSignals(False)
+        self._zoom_label.setText(tr("labels.percent_value", value=pct))
+        for view in [self.grid_view1, self.grid_view2,
+                     self.grid_view3, self.grid_view4]:
+            view.set_zoom(pct)
+
+    def _on_view_zoom_changed(self, pct):
+        """Callback from TimetableView Ctrl+Wheel zoom — sync slider."""
+        self._zoom_slider.blockSignals(True)
+        self._zoom_slider.setValue(pct)
+        self._zoom_slider.blockSignals(False)
+        self._zoom_label.setText(tr("labels.percent_value", value=pct))
+        # Sync other views to same zoom
+        for view in [self.grid_view1, self.grid_view2,
+                     self.grid_view3, self.grid_view4]:
+            if view.zoom_pct() != pct:
+                view.set_zoom(pct)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  GRID RENDERING  (QGraphicsView-based)
+    # ══════════════════════════════════════════════════════════════════════
+
+    def refresh_grid(self):
+        """Full refresh: render + update all panels + auto-save."""
+        self._render_current_tab()
+        self._update_side_panels()
+        self._auto_save()
+
+    def _render_current_tab(self):
+        """Render only the visible timetable tab (no side effects)."""
+        if not hasattr(self, 'lecturer_filter'):
+            return  # Still building UI
+        # Scene items are rebuilt every refresh; clear stale graphics selections.
+        self._clear_class_selection()
+        self._clear_empty_slot_selection()
+        self._update_filters()
+        self._update_status()
+
+        tab_idx = self.notebook.currentIndex()
+        if tab_idx == 0:
+            self._render_grid(
+                self.grid_view1,
+                self._filter_classroom,
+                mode=self._filtered_render_mode(tab_idx),
+            )
+        elif tab_idx == 1:
+            self._render_grid(
+                self.grid_view2,
+                self._filter_group,
+                mode=self._filtered_render_mode(tab_idx),
+            )
+        elif tab_idx == 2:
+            self._render_grid(
+                self.grid_view3,
+                self._filter_lecturer,
+                mode=self._filtered_render_mode(tab_idx),
+            )
+        elif tab_idx == 3:
+            self._render_everything(self.grid_view4)
+        elif tab_idx == 4:
+            self.dashboard_widget.refresh(self.state_data)
+
+    def _update_side_panels(self):
+        """Update unplaced panel, open slots, and warnings."""
+        if not hasattr(self, 'lecturer_filter'):
+            return
+        self._refresh_unplaced_panel()
+        self._refresh_open_slots()
+        self._refresh_warnings()
+
+    def _filter_classroom(self, cls):
+        selected = self.classroom_filter.currentData()
+        kind, value = _decode_classroom_filter_value(selected)
+        if kind == "virtual":
+            return cls.get("location_type", LOCATION_FACE_TO_FACE) == value
+        if kind == "room":
+            return classroom_of(cls) == value
+        return classroom_of(cls) == self.classroom_filter.currentText()
+
+    def _filter_group(self, cls):
+        group = self.group_filter.currentText()
+        if " / " not in group:
+            return False
+        yr, br = group.split(" / ", 1)
+        return any(t["year"] == yr and t["branch"] == br for t in cls["targets"])
+
+    def _filter_lecturer(self, cls):
+        return cls["lecturer"] == self.lecturer_filter.currentText()
+
+    def _filtered_render_mode(self, tab_idx):
+        """Return the renderer mode for the active filtered timetable tab."""
+        selected = self.classroom_filter.currentData()
+        kind, value = _decode_classroom_filter_value(selected)
+        if tab_idx == 0 and kind == "virtual" and is_virtual_location_type(value):
+            return FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP
+        return FILTER_MODE_DEFAULT
+
+    def _render_grid(self, view, filter_fn, mode=FILTER_MODE_DEFAULT):
+        """Build a filtered timetable in the given TimetableView."""
+        scene = TimetableScene()
+        scene.build_filtered(self.state_data, filter_fn, self, mode=mode)
+        view.setScene(scene)
+
+    def _render_everything(self, view):
+        """Build the 'Show Everything' matrix in the given TimetableView."""
+        scene = TimetableScene()
+        scene.build_everything(self.state_data, self)
+        view.setScene(scene)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  UNPLACED PANEL
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _refresh_unplaced_panel(self):
+        self.unplaced_list.clear()
+        self._unplaced_indices = []
+        for i, c in enumerate(self.state_data["classes"]):
+            if not c["pinned"] and not c["placed"]:
+                code = c.get("class_code", "")
+                label = f"[{code}] {c['name']}" if code else c["name"]
+                self.unplaced_list.addItem(f"{label}  ({c['lecturer']})")
+                self._unplaced_indices.append(i)
+
+    def _switch_sidebar_tab(self, index):
+        """Switch sidebar tab (0 = Open Slots, 1 = Unplaced Classes)."""
+        self._sidebar_current_tab = index
+        self._sidebar_stack.setCurrentIndex(index)
+        # Update tab button styles
+        if index == 0:
+            self._sidebar_tab_open_slots.setStyleSheet(
+                self._sidebar_tab_active_ss)
+            self._sidebar_tab_unplaced.setStyleSheet(
+                self._sidebar_tab_inactive_ss)
+            self._sidebar_title.setText(tr("panels.open_slots"))
+        else:
+            self._sidebar_tab_open_slots.setStyleSheet(
+                self._sidebar_tab_inactive_ss)
+            self._sidebar_tab_unplaced.setStyleSheet(
+                self._sidebar_tab_active_ss)
+            self._sidebar_title.setText(tr("panels.unplaced_classes"))
+
+    def _toggle_sidebar_panel(self, checked):
+        """Toggle entire sidebar visibility from View menu."""
+        if checked:
+            self._expand_panel("sidebar")
+        else:
+            self._collapse_panel("sidebar")
+
+    def _init_splitter_sizes(self):
+        """Set initial splitter sizes once the window is laid out."""
+        total = self.splitter.width()
+        sw = 350
+        nb = total - sw
+        if nb < 400:
+            nb = 400
+        self.splitter.setSizes([nb, sw])
+
+    def _on_splitter_moved(self):
+        """Detect when a splitter drag shrinks the sidebar below threshold."""
+        if self._in_collapse_sync:
+            return
+        sizes = self.splitter.sizes()
+        thresh = self._collapse_threshold
+        if not self._sidebar_is_collapsed and sizes[1] <= thresh:
+            self._sidebar_saved_width = max(self._sidebar_saved_width, 150)
+            self._in_collapse_sync = True
+            self._collapse_panel("sidebar")
+            self._in_collapse_sync = False
+        elif not self._sidebar_is_collapsed and sizes[1] > thresh:
+            self._sidebar_saved_width = sizes[1]
+
+    def _collapse_panel(self, which):
+        """Collapse the sidebar by shrinking it in the splitter."""
+        if which != "sidebar" or self._sidebar_is_collapsed:
+            return
+        cw = self._collapsed_width
+        sizes = self.splitter.sizes()
+        if sizes[1] > self._collapse_threshold:
+            self._sidebar_saved_width = max(sizes[1], 150)
+        self._sidebar_is_collapsed = True
+        # Hide sidebar contents
+        self._sidebar_title.setVisible(False)
+        self._sidebar_collapse_btn.setVisible(False)
+        self._sidebar_tab_open_slots.setVisible(False)
+        self._sidebar_tab_unplaced.setVisible(False)
+        self._sidebar_stack.setVisible(False)
+        self._sidebar_panel.setStyleSheet(
+            "QWidget#sidebar { background: transparent; }")
+        # Show overlay expand button
+        self._sidebar_expand_btn.setVisible(True)
+        self._sidebar_panel.setFixedWidth(cw)
+        reclaimed = sizes[1] - cw
+        sizes[0] += reclaimed
+        sizes[1] = cw
+        self.splitter.setSizes(sizes)
+        self._toggle_sidebar_action.setChecked(False)
+        self._update_collapsed_handles()
+        self._position_expand_buttons()
+
+    def _expand_panel(self, which):
+        """Expand the collapsed sidebar back to its previous width."""
+        if which != "sidebar" or not self._sidebar_is_collapsed:
+            return
+        sizes = self.splitter.sizes()
+        self._sidebar_is_collapsed = False
+        self._sidebar_expand_btn.setVisible(False)
+        # Restore sidebar contents
+        self._sidebar_title.setVisible(True)
+        self._sidebar_collapse_btn.setVisible(True)
+        self._sidebar_tab_open_slots.setVisible(True)
+        self._sidebar_tab_unplaced.setVisible(True)
+        self._sidebar_stack.setVisible(True)
+        self._sidebar_panel.setStyleSheet(
+            "QWidget#sidebar { background: #F8FAFC; border-radius: 8px; }")
+        # Remove fixed-width constraint
+        self._sidebar_panel.setMinimumWidth(0)
+        self._sidebar_panel.setMaximumWidth(16777215)
+        w = self._sidebar_saved_width
+        sizes[0] = max(sizes[0] - w + sizes[1], 100)
+        sizes[1] = w
+        self.splitter.setSizes(sizes)
+        self._toggle_sidebar_action.setChecked(True)
+        self._update_collapsed_handles()
+
+    def _position_expand_buttons(self):
+        """Position overlay expand button at the top of the sidebar."""
+        if not self._sidebar_is_collapsed:
+            return
+        top_y = 6
+        btn_w = 28
+        x = (self._sidebar_panel.width() - btn_w) // 2
+        self._sidebar_expand_btn.move(max(x, 0), top_y)
+        self._sidebar_expand_btn.raise_()
+
+    def _update_collapsed_handles(self):
+        """Hide splitter handle when sidebar is collapsed."""
+        for i in range(1, self.splitter.count()):
+            handle = self.splitter.handle(i)
+            if not handle:
+                continue
+            if self._sidebar_is_collapsed:
+                handle.setFixedWidth(0)
+            else:
+                handle.setMinimumWidth(0)
+                handle.setMaximumWidth(16777215)
+                handle.resize(self.splitter.handleWidth(), handle.height())
+
+    def _on_unplaced_dblclick(self, item):
+        row = self.unplaced_list.row(item)
+        if row < 0 or row >= len(self._unplaced_indices):
+            return
+        idx = self._unplaced_indices[row]
+        cls = self.state_data["classes"][idx]
+        dlg = PostAddDialog(self, self.state_data, cls)
+        if dlg.exec() == PostAddDialog.DialogCode.Accepted:
+            if dlg.result and dlg.result != "skip":
+                day, slot, room = dlg.result
+                mark_placed(cls, day, slot, room)
+                self._show_toast(tr("status.class_placed"), "success")
+                self.refresh_grid()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  FILE OPERATIONS
+    # ══════════════════════════════════════════════════════════════════════
+
+    def new_schedule(self):
+        if QMessageBox.question(
+                self, tr("menus.file_new"),
+                tr("dialogs.new_schedule.confirm")
+        ) == QMessageBox.StandardButton.Yes:
+            self.state_data = new_state()
+            self._workflow.state = self.state_data
+            self.current_file = None
+            self._has_baseline = False
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self._clear_impact_flags()
+            self.refresh_grid()
+            self._check_setup()
+
+    def open_file(self):
+        fname, _ = QFileDialog.getOpenFileName(
+            self, tr("dialogs.file.open_title"), storage.sub_dir(storage.SAVES_DIR),
+            f"{tr('labels.dersis_files')} (*.egu);;{tr('labels.legacy_schedule_files')} (*.uva);;{tr('labels.all_files')} (*)")
+        if not fname:
+            return
+        is_legacy = fname.lower().endswith(".uva")
+        try:
+            self.state_data = storage.load_encrypted(fname)
+            self._workflow.state = self.state_data
+            normalize_state_day_keys(self.state_data)
+            normalize_state_classes(self.state_data)
+            # Ensure backward compat for older files missing keys
+            if "lecturers" not in self.state_data:
+                self.state_data["lecturers"] = []
+            if "classroom_capacities" not in self.state_data:
+                self.state_data["classroom_capacities"] = {}
+            self.current_file = fname
+            self._undo_stack.clear()
+            self._redo_stack.clear()
+            self.mark_current_state_as_baseline()
+            self.refresh_grid()
+            if is_legacy:
+                QMessageBox.information(
+                    self, tr("dialogs.file.legacy_title"),
+                    tr("dialogs.file.legacy_migration_note"))
+        except storage.EguFileError as e:
+            QMessageBox.warning(self, tr("dialogs.error.title"), str(e))
+        except Exception as e:
+            QMessageBox.critical(self, tr("dialogs.error.title"), f"{tr('errors.failed_to_load')}\n{e}")
+
+    def save_file(self):
+        if self.current_file:
+            # Auto-migrate legacy .uva → .egu on save
+            if self.current_file.lower().endswith(".uva"):
+                self.current_file = self.current_file[:-4] + ".egu"
+            self._do_save(self.current_file)
+        else:
+            self.save_as()
+
+    def save_as(self):
+        # Tier enforcement: check schedule limit when saving as a new file
+        if not self.current_file:
+            from scheduler_app.ui.tier_enforcement import TierEnforcement
+            from scheduler_app.plans import ENTITY_SCHEDULES
+            enforcer = TierEnforcement.instance()
+            saves_dir = storage.sub_dir(storage.SAVES_DIR)
+            import glob as _glob
+            existing = len(_glob.glob(os.path.join(saves_dir, "*.egu")))
+            if not enforcer.require_entity_limit(ENTITY_SCHEDULES, existing, self):
+                return
+
+        default_name = storage.new_save_path()
+        fname, _ = QFileDialog.getSaveFileName(
+            self, tr("dialogs.file.save_title"), default_name,
+            f"{tr('labels.dersis_files')} (*.egu);;{tr('labels.all_files')} (*)")
+        if fname:
+            self._do_save(fname)
+
+    def _do_save(self, fname):
+        normalize_state_day_keys(self.state_data)
+        normalize_state_classes(self.state_data)
+        try:
+            storage.save_encrypted(self.state_data, fname)
+            self.current_file = fname
+            self._update_status()
+        except Exception as e:
+            QMessageBox.critical(self, tr("dialogs.error.title"), f"{tr('errors.failed_to_save')}\n{e}")
+
+    def export_csv(self):
+        # Tier enforcement: CSV export requires feature
+        from scheduler_app.ui.tier_enforcement import TierEnforcement
+        from scheduler_app.plans import FEATURE_EXPORT_CSV
+        if not TierEnforcement.instance().require_feature(FEATURE_EXPORT_CSV, self):
+            return
+        placed = get_placed_classes(self.state_data)
+        if not placed:
+            QMessageBox.information(self, tr("buttons.export"), tr("warnings.no_placed_to_export"))
+            return
+        fname, _ = QFileDialog.getSaveFileName(
+            self, tr("dialogs.export.csv_title"), storage.sub_dir(storage.EXPORTS_DIR),
+            f"{tr('labels.csv_files')} (*.csv);;{tr('labels.all_files')} (*)")
+        if not fname:
+            return
+        try:
+            with open(fname, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([tr("labels.class_item"), tr("labels.lecturer"), tr("labels.year"), tr("labels.branch"),
+                                 tr("labels.day"), tr("labels.start_time"), tr("labels.duration"), tr("labels.classroom")])
+                for c in placed:
+                    day = effective_day(c)
+                    start = effective_time(c)
+                    room = classroom_of(c)
+                    for t in c["targets"]:
+                        writer.writerow([c["name"], c["lecturer"],
+                                         t["year"], t["branch"],
+                                         day, start, c["duration"], room])
+            QMessageBox.information(self, tr("status.exported"),
+                                   f"{tr('status.exported_to')} {os.path.basename(fname)}")
+        except Exception as e:
+            QMessageBox.critical(self, tr("dialogs.error.title"), f"{tr('errors.failed_to_export')}\n{e}")
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  EDIT OPERATIONS
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _get_learned_weights(self):
+        """Return the current learned scoring weights."""
+        return self._preference_learner.get_weights()
+
+    def _auto_place_and_apply(self, cls):
+        """Automatically place a class using AI-assisted optimization.
+
+        Delegates to SchedulingWorkflow.auto_place() for business logic.
+        Returns True if the class was placed.
+        """
+        result = self._workflow.auto_place(cls)
+
+        if not result.success:
+            return False
+
+        if result.relocated:
+            lines = []
+            for r in result.relocated:
+                lines.append(
+                    f"  {r['name']}: "
+                    f"{format_day_time(r['old_day'], r['old_time'])} ({r['old_room']}) "
+                    f"-> {format_day_time(r['new_day'], r['new_time'])} ({r['new_room']})")
+            msg = tr("status.class_placed_relocated") + "\n\n" + "\n".join(lines)
+            if result.explanation:
+                msg += "\n\n" + tr("labels.placement_quality") + " " + result.explanation["summary"]
+            QMessageBox.information(
+                self, tr("dialogs.reorganized.title"), msg)
+        elif result.explanation:
+            self._show_toast(
+                tr("status.class_placed") + " — " +
+                result.explanation["summary"], "success")
+
+        return True
+
+    def add_class(self):
+        if not self.state_data["years"]:
+            QMessageBox.information(self, tr("menus.classes"),
+                                   tr("errors.setup_years_first"))
+            return
+        # Tier enforcement: check class limit
+        from scheduler_app.ui.tier_enforcement import TierEnforcement
+        from scheduler_app.plans import ENTITY_CLASSES
+        enforcer = TierEnforcement.instance()
+        current_count = len(self.state_data.get("classes", []))
+        if not enforcer.require_entity_limit(ENTITY_CLASSES, current_count, self):
+            return
+        dlg = AddClassDialog(self, self.state_data)
+        if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
+            return
+        cls = dlg.result
+        snap_before = capture_snapshot(self.state_data)
+        self._push_undo(tr("actions.add").format(name=cls["name"]))
+        split_classes = split_non_joint(cls)
+        if self._schedule_new_classes(split_classes):
+            desc = tr("impact.trigger.classes_added").format(n=len(split_classes))
+            self._note_structural_change(snap_before, description=desc)
+        self.refresh_grid()
+
+    def bulk_add_classes(self):
+        # Tier enforcement: bulk scheduling requires feature
+        from scheduler_app.ui.tier_enforcement import TierEnforcement
+        from scheduler_app.plans import ENTITY_CLASSES, FEATURE_BULK_SCHEDULING
+        enforcer = TierEnforcement.instance()
+        if not enforcer.require_feature(FEATURE_BULK_SCHEDULING, self):
+            return
+        if not self.state_data["years"]:
+            QMessageBox.information(self, tr("dialogs.bulk_add.title"),
+                                   tr("errors.setup_years_first"))
+            return
+        # Tier enforcement: check class limit before bulk add
+        current_count = len(self.state_data.get("classes", []))
+        if not enforcer.require_entity_limit(ENTITY_CLASSES, current_count, self):
+            return
+        dlg = BulkAddDialog(self, self.state_data)
+        if dlg.exec() != BulkAddDialog.DialogCode.Accepted or not dlg.result:
+            return
+
+        raw_classes = dlg.result
+        new_classes = []
+        for rc in raw_classes:
+            new_classes.extend(split_non_joint(rc))
+
+        snap_before = capture_snapshot(self.state_data)
+        self._push_undo(tr("actions.bulk_schedule"))
+        if self._schedule_new_classes(new_classes):
+            desc = tr("impact.trigger.classes_added").format(n=len(new_classes))
+            self._note_structural_change(snap_before, description=desc)
+        self.refresh_grid()
+
+    def _schedule_new_classes(self, new_classes):
+        """Unified scheduling for both single and bulk class addition.
+
+        Delegates to SchedulingWorkflow for business logic.
+        Shows BulkResultsDialog for user confirmation.
+        On rejection, rolls back all changes.
+        """
+        if not new_classes:
+            return False
+
+        existing_snapshots = snapshot_placements(self.state_data)
+        result = self._workflow.schedule_new_classes(new_classes)
+
+        # All new classes placed successfully — no dialog needed
+        if result.single_success:
+            self._show_toast(tr("status.class_placed"), "success")
+            return True
+
+        # Single-class failed — show negotiation hints
+        if result.single_failed:
+            cls = new_classes[0]
+            report = result.negotiation_report or {}
+            suggestions = report.get("suggestions", [])
+            if cls["pinned"]:
+                detail = ""
+                if suggestions:
+                    detail = "\n\n" + report.get("summary", "")
+                    for s in suggestions[:3]:
+                        detail += f"\n  → {s['description']}"
+                QMessageBox.warning(
+                    self, tr("dialogs.error.title"),
+                    tr("errors.no_valid_arrangement") + detail)
+                return False
+            else:
+                msg = tr("status.class_added_no_slot")
+                if suggestions:
+                    msg += f"\n{suggestions[0]['description']}"
+                self._show_toast(msg, "info")
+                if hasattr(self, 'warning_log') and suggestions:
+                    for sug in suggestions[:3]:
+                        self.warning_log.log(
+                            f"{cls['name']}: {sug['description']}", "info")
+                return True  # class stays in state (unplaced)
+
+        # Multi-class or rescheduled — show results dialog
+        results_dlg = BulkResultsDialog(
+            self, result.placed, result.unplaced, result.rescheduled)
+        accepted = (results_dlg.exec() == BulkResultsDialog.DialogCode.Accepted
+                    and results_dlg.result)
+
+        if accepted:
+            self._workflow.apply_schedule_result(result)
+            msg = f"{len(result.placed)} {tr('status.classes_placed_count')}"
+            if result.rescheduled:
+                msg += f" ({tr('status.schedule_reorganized')})"
+            self._show_toast(msg, "success")
+            return True
+        else:
+            self._workflow.rollback_schedule(new_classes, existing_snapshots)
+            self._feedback_logger.log_batch_result(
+                len(result.placed), len(result.unplaced),
+                result.rescheduled, False)
+            self._show_toast(tr("status.bulk_cancelled"), "info")
+            return False
+
+    def edit_classes(self):
+        """Open the Edit Class(es) dialog."""
+        if not self.state_data.get("classes"):
+            QMessageBox.information(self, tr("dialogs.edit_classes.title"),
+                                   tr("dialogs.edit_classes.no_classes"))
+            return
+        snap_before = capture_snapshot(self.state_data)
+        self._push_undo(tr("actions.edit").format(name="classes"))
+        dlg = EditClassesDialog(self, self.state_data,
+                                edit_callback=self._edit_class)
+        dlg.exec()
+        # Validate placements via workflow
+        invalidated = SchedulingWorkflow.validate_placements_after_edit(
+            self.state_data)
+        if invalidated:
+            self._show_toast(
+                f"{len(invalidated)} placement(s) cleared (constraints changed)",
+                "warning")
+        self.refresh_grid()
+        self._run_impact_analysis(snap_before)
+
+    def place_class(self):
+        """Default placement workflow: place all currently unplaced classes."""
+        self.place_all_unplaced_classes()
+
+    def _place_classes_batch(self, candidates):
+        """Auto-place a batch of candidate classes via workflow."""
+        if not candidates:
+            return 0, 0, False
+
+        self._push_undo(tr("actions.bulk_schedule"))
+        result = self._workflow.place_batch(candidates)
+
+        if result.placed_count == 0 and result.unresolved_count == 0:
+            return 0, 0, False
+
+        msg = f"{result.placed_count} {tr('status.classes_placed_count')}"
+        if result.unresolved_count:
+            msg += f" {result.unresolved_count} {tr('status.could_not_place')}"
+        if result.rescheduled:
+            msg += f" ({tr('status.schedule_reorganized')})"
+        kind = "success" if result.unresolved_count == 0 else (
+            "warning" if result.placed_count > 0 else "error"
+        )
+        self._show_toast(msg, kind)
+
+        self._clear_class_selection()
+        self._clear_empty_slot_selection()
+        self.refresh_grid()
+        if not self._has_baseline and result.placed_count > 0:
+            self.mark_current_state_as_baseline()
+        return result.placed_count, result.unresolved_count, result.rescheduled
+
+    def place_all_unplaced_classes(self):
+        candidates = [
+            c for c in self.state_data["classes"]
+            if not c["pinned"] and not c["placed"]
+        ]
+        if not candidates:
+            QMessageBox.information(
+                self,
+                tr("toolbar.place_all_unplaced"),
+                tr("warnings.no_unplaced_classes"),
+            )
+            return
+        self._place_classes_batch(candidates)
+
+    def place_single_class(self):
+        dlg = PlaceClassDialog(self, self.state_data)
+        if not getattr(dlg, "unplaced", None):
+            return
+        if dlg.exec() == PlaceClassDialog.DialogCode.Accepted and dlg.result:
+            idx, day, slot, room = dlg.result
+            cls = self.state_data["classes"][idx]
+            self._push_undo(tr("actions.place").format(name=cls["name"]))
+            mark_placed(cls, day, slot, room)
+            self.refresh_grid()
+
+    def unplace_class(self):
+        selected = [
+            c for c in self._selected_classes
+            if c.get("placed") and not c.get("pinned")
+        ]
+        if selected:
+            self._push_undo(tr("actions.unplace").format(name=selected[0]["name"]))
+            for cls in selected:
+                mark_unplaced(cls)
+            self._clear_class_selection()
+            self._show_toast(
+                tr("status.classes_unplaced_count").format(n=len(selected)), "success")
+            self.refresh_grid()
+            return
+
+        placed = [(i, c) for i, c in enumerate(self.state_data["classes"])
+                  if c["placed"] and not c["pinned"]]
+        if not placed:
+            QMessageBox.information(self, tr("buttons.unplace"), tr("warnings.no_flexible_classes"))
+            return
+        dlg = MultiSelectClassDialog(
+            self, tr("dialogs.unplace_classes.title"), placed,
+            show_placement=True, action_label=tr("buttons.unplace_selected"))
+        if dlg.exec() == MultiSelectClassDialog.DialogCode.Accepted and dlg.result:
+            self._push_undo(tr("actions.unplace").format(
+                name=self.state_data["classes"][dlg.result[0]]["name"]))
+            for idx in dlg.result:
+                cls = self.state_data["classes"][idx]
+                mark_unplaced(cls)
+            self._show_toast(
+                tr("status.classes_unplaced_count").format(n=len(dlg.result)), "success")
+            self.refresh_grid()
+
+    def remove_class(self):
+        if not self.state_data["classes"]:
+            QMessageBox.information(self, tr("buttons.remove"), tr("warnings.no_classes_to_remove"))
+            return
+        all_cls = [(i, c) for i, c in enumerate(self.state_data["classes"])]
+        dlg = MultiSelectClassDialog(
+            self, tr("dialogs.delete_classes.title"), all_cls,
+            show_placement=True, action_label=tr("buttons.delete_selected"))
+        if dlg.exec() == MultiSelectClassDialog.DialogCode.Accepted and dlg.result:
+            snap_before = capture_snapshot(self.state_data)
+            self._push_undo(tr("actions.delete").format(
+                name=self.state_data["classes"][dlg.result[0]]["name"]))
+            had_placed = any(self.state_data["classes"][i].get("placed")
+                            for i in dlg.result)
+            n_deleted = len(dlg.result)
+            # Remove in reverse index order to avoid shifting
+            for idx in sorted(dlg.result, reverse=True):
+                self.state_data["classes"].pop(idx)
+            self._show_toast(
+                tr("status.classes_deleted_count").format(n=n_deleted), "success")
+            self._clear_class_selection()
+            self._clear_empty_slot_selection()
+            if had_placed:
+                desc = tr("impact.trigger.classes_deleted").format(n=n_deleted)
+                self._note_structural_change(snap_before, description=desc)
+            self.refresh_grid()
+
+    def reschedule(self):
+        """Hybrid re-optimization using multi-start LNS + optional CP-SAT."""
+        placed_cls = [c for c in self.state_data["classes"]
+                      if c["placed"] and not c["pinned"]]
+        if not placed_cls:
+            QMessageBox.information(
+                self, tr("buttons.reschedule"),
+                tr("warnings.no_flexible_to_reschedule"))
+            return
+
+        # Check if OR-Tools is available for deep optimization option
+        try:
+            from scheduler_app.cpsat_scheduler import HAS_ORTOOLS
+        except ImportError:
+            HAS_ORTOOLS = False
+
+        # Show reschedule dialog with optional optimization goals
+        from scheduler_app.dialogs import RescheduleDialog
+        from scheduler_app.optimization_goals import goals_to_weights
+
+        resched_dlg = RescheduleDialog(self, has_ortools=HAS_ORTOOLS)
+        if resched_dlg.exec() != RescheduleDialog.DialogCode.Accepted:
+            return
+        use_cpsat = (resched_dlg.result_mode == "deep")
+
+        try:
+            self._do_reschedule(resched_dlg, use_cpsat, weights=self._get_learned_weights())
+        except Exception:
+            import traceback
+            tb = traceback.format_exc()
+            # Write to crash log
+            try:
+                from datetime import datetime
+                log_path = storage.crash_log_path()
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"RESCHEDULE CRASH at {datetime.now()}\n")
+                    f.write(f"{'='*60}\n")
+                    f.write(tb + "\n")
+            except Exception:
+                pass
+            self.statusBar().clearMessage()
+            # Show crash dialog with bug report option
+            from scheduler_app.ui.bug_report import CrashReportDialog
+            dlg = CrashReportDialog(
+                exc_type_name='RescheduleError',
+                exc_message=tr('errors.optimization_error'),
+                traceback_text=tb,
+                log_path=storage.crash_log_path(),
+                parent=self,
+            )
+            dlg.exec()
+
+    def _do_reschedule(self, resched_dlg, use_cpsat, weights):
+        """Inner reschedule logic, separated for error handling."""
+        from scheduler_app.optimization_goals import goals_to_weights
+
+        snapshots = snapshot_placements(self.state_data)
+
+        # Merge learned weights with user goal overrides
+        if resched_dlg.result_goals is not None:
+            goal_weights = goals_to_weights(resched_dlg.result_goals)
+            weights.update(goal_weights)
+
+        # Show progress during multi-start LNS optimization
+        self.statusBar().showMessage(tr("status.optimizing"))
+        QApplication.processEvents()
+
+        def _progress(iteration, best_score, current_score,
+                      run_number=0, total_runs=1):
+            msg = tr("status.optimizing_run").format(
+                r=run_number + 1, t=total_runs,
+                i=iteration, q=best_score)
+            self.statusBar().showMessage(msg)
+            from PyQt6.QtCore import QEventLoop
+            QApplication.processEvents(
+                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
+        result = self._workflow.reschedule(
+            weights, use_cpsat=use_cpsat, progress_callback=_progress)
+
+        self.statusBar().clearMessage()
+
+        # Show results with analytics
+        results_dlg = BulkResultsDialog(
+            self, result.placed, result.unplaced, bool(result.changes),
+            analytics=result.analytics,
+            reschedule_explanation=result.explanation,
+            negotiation_result=result.negotiation_result)
+        accepted = (results_dlg.exec() == BulkResultsDialog.DialogCode.Accepted
+                    and results_dlg.result)
+
+        if accepted:
+            self._push_undo(tr("actions.reschedule"))
+            self._workflow.apply_reschedule(result)
+            self._clear_impact_flags()
+
+            moved = len(result.changes)
+            msg = tr("status.reschedule_complete").format(n=moved)
+            if result.unplaced:
+                msg += f" {len(result.unplaced)} {tr('status.could_not_place')}"
+
+            # Add optimization summary
+            if result.summary:
+                imp = result.summary.get("improvement", {})
+                parts = []
+                if imp.get("lecturer_gaps", 0) > 0.1:
+                    parts.append(tr("labels.lecturer_gaps") + f" -{imp['lecturer_gaps']:.1f}")
+                if imp.get("student_gaps", 0) > 0.1:
+                    parts.append(tr("labels.student_gaps") + f" -{imp['student_gaps']:.1f}")
+                if imp.get("fragmentation", 0) > 0.1:
+                    parts.append(tr("labels.fragmentation") + f" -{imp['fragmentation']:.1f}")
+                if parts:
+                    msg += "\n" + tr("labels.improvements") + " " + ", ".join(parts)
+                runs = result.summary.get("runs_completed", 1)
+                elapsed = result.summary.get("total_time", 0)
+                engine_info = f"{runs} " + tr("labels.runs")
+                if result.summary.get("cpsat_used"):
+                    cpsat_st = result.summary.get("cpsat_status_label") or result.summary.get("cpsat_status", "")
+                    engine_info += f" + CP-SAT ({cpsat_st})"
+                msg += f"\n({engine_info}, {elapsed:.1f}s)"
+
+            if result.analytics:
+                msg += f"\n{tr('analytics.schedule_quality')}: {result.analytics['global_score']:.0f}/100 ({tr('labels.grade')}: {result.analytics['grade']})"
+
+            self._show_toast(msg, "success" if not result.unplaced else "warning")
+            # Log negotiation diagnostics
+            if result.negotiation_result and hasattr(self, 'warning_log'):
+                for report in result.negotiation_result.get("class_reports", []):
+                    self.warning_log.log(
+                        f"{report['class_name']}: {report['summary']}",
+                        "warning")
+                    for sug in report.get("suggestions", [])[:2]:
+                        self.warning_log.log(
+                            f"  {report['class_name']}: "
+                            f"{tr('labels.suggestion')}: {sug['description']}",
+                            "info")
+        else:
+            self._workflow.reject_reschedule(snapshots, result.changes)
+            self._show_toast(tr("status.reschedule_cancelled"), "info")
+        self.refresh_grid()
+
+    def _edit_class(self, cls):
+        snap_before = capture_snapshot(self.state_data)
+        dlg = AddClassDialog(self, self.state_data, edit_cls=cls)
+        if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
+            return
+        self._push_undo(tr("actions.edit").format(name=cls["name"]))
+        edit_result = SchedulingWorkflow.apply_class_edit(
+            self.state_data, cls, dlg.result)
+        if edit_result.placement_cleared:
+            self._show_toast(tr("status.class_unplaced_after_edit"), "warning")
+        self._show_toast(tr("status.class_updated"), "success")
+        self.refresh_grid()
+        self._run_impact_analysis(snap_before)
+
+    def _unplace_specific(self, cls):
+        self._push_undo(tr("actions.unplace").format(name=cls["name"]))
+        mark_unplaced(cls)
+        self.refresh_grid()
+
+    def _remove_specific(self, cls):
+        self._remove_classes([cls])
+
+    def _remove_classes(self, classes):
+        # Deduplicate candidates
+        uniq = []
+        seen = set()
+        for cls in classes:
+            if cls is None:
+                continue
+            cid = cls_key(cls)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            if cls in self.state_data["classes"]:
+                uniq.append(cls)
+        if not uniq:
+            return
+        title = uniq[0]["name"] if len(uniq) == 1 else f"{len(uniq)} {tr('status.classes')}"
+        if QMessageBox.question(
+                self, tr("dialogs.confirm.title"),
+                f"{tr('buttons.delete')}: '{title}'?") != QMessageBox.StandardButton.Yes:
+            return
+        snap_before = capture_snapshot(self.state_data)
+        self._push_undo(tr("actions.delete").format(name=uniq[0]["name"]))
+        had_placed = any(c.get("placed") for c in uniq)
+        removed = SchedulingWorkflow.remove_classes(self.state_data, uniq)
+        if removed == 1:
+            self._show_toast(tr("status.class_removed"), "success")
+        elif removed > 1:
+            self._show_toast(
+                tr("status.classes_deleted_count").format(n=removed), "success")
+        if removed and had_placed:
+            desc = tr("impact.trigger.classes_deleted").format(n=removed)
+            self._note_structural_change(snap_before, description=desc)
+        self._clear_class_selection()
+        self._clear_empty_slot_selection()
+        self.refresh_grid()
+
+    def _edit_lecturer_from_class(self, cls):
+        snap_before = capture_snapshot(self.state_data)
+        lecturer_name = (cls.get("lecturer") or "").strip()
+        dlg = SetupDialog(self, self.state_data, focus_lecturer=lecturer_name)
+        dlg.exec()
+        self.refresh_grid()
+        if dlg.result:
+            self._run_impact_analysis(snap_before)
+
+    def edit_setup(self):
+        snap_before = capture_snapshot(self.state_data)
+        is_initial = not self._has_baseline
+        dlg = SetupDialog(self, self.state_data)
+        dlg.exec()
+        self.refresh_grid()
+        if dlg.result:
+            if is_initial:
+                self.mark_current_state_as_baseline()
+            else:
+                self._run_impact_analysis(snap_before)
+
+    def _refresh_open_slots(self):
+        """Update the live open-slots panel (grouped by day).
+
+        When a single class is selected, filters to show only slots
+        where that class can be validly placed.
+        """
+        if not hasattr(self, '_open_slots_layout'):
+            return
+        layout = self._open_slots_layout
+        # Clear existing widgets
+        while layout.count():
+            item = layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        s = self.state_data
+        if not s["days"] or not s["slots"] or not s["classrooms"]:
+            self._open_slots_filter_hint.hide()
+            return
+
+        # Determine if contextual filtering applies
+        selected_cls = getattr(self, '_selected_class', None)
+        # Also check unplaced list single selection
+        if selected_cls is None and hasattr(self, 'unplaced_list'):
+            upl_sel = self.unplaced_list.selected_classes()
+            if len(upl_sel) == 1:
+                selected_cls = upl_sel[0]
+
+        if selected_cls is not None:
+            # Contextual mode: use find_valid_options for the selected class
+            valid_options = find_valid_options(s, selected_cls)
+            valid_set = set()
+            for day, slot, room in valid_options:
+                valid_set.add((day, slot, room if room else ""))
+
+            # Group valid slots by day
+            free_by_day = {}
+            for day in s["days"]:
+                for slot in s["slots"]:
+                    for room in s["classrooms"]:
+                        if (day, slot, room) in valid_set:
+                            free_by_day.setdefault(day, []).append(
+                                (slot, room))
+
+            self._open_slots_filter_hint.setText(
+                f"\u25C9 {tr('panels.filtered_for')}: {selected_cls['name']}")
+            self._open_slots_filter_hint.show()
+        else:
+            # Default mode: show all open slots
+            placed = get_placed_classes(s)
+            occupied_set = set()
+            for c in placed:
+                room = classroom_of(c)
+                for day, slot in occupied_slots_of(s, c):
+                    occupied_set.add((day, slot, room))
+
+            free_by_day = {}
+            for day in s["days"]:
+                for slot in s["slots"]:
+                    for room in s["classrooms"]:
+                        if (day, slot, room) not in occupied_set:
+                            free_by_day.setdefault(day, []).append(
+                                (slot, room))
+
+            self._open_slots_filter_hint.hide()
+
+        if not free_by_day:
+            if selected_cls is not None:
+                no_slots = QLabel(tr("warnings.no_valid_placements"))
+                no_slots.setStyleSheet(
+                    "QLabel { font-size: 7.5pt; color: #9CA3AF;"
+                    "  padding: 12px; background: transparent; }")
+                no_slots.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                layout.addWidget(no_slots)
+            layout.addStretch()
+            return
+
+        for day in s["days"]:
+            entries = free_by_day.get(day, [])
+            if not entries:
+                continue
+
+            # Day header
+            header = QLabel(display_day(day).upper())
+            header.setStyleSheet(
+                "QLabel { font-size: 7pt; font-weight: 600;"
+                "  color: #6B7280; letter-spacing: 1px;"
+                "  padding: 6px 4px 2px 4px; background: transparent; }")
+            layout.addWidget(header)
+
+            # Slot rows
+            for slot_time, room in entries:
+                row = QWidget()
+                row.setObjectName("slotRow")
+                row.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+                row.setStyleSheet(
+                    "QWidget#slotRow {"
+                    "  background: #FFFFFF; border-radius: 6px;"
+                    "  padding: 8px 10px; margin: 1px 0px; }"
+                    "QWidget#slotRow:hover {"
+                    "  background: #ECFDF5; }")
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(10, 6, 10, 6)
+                row_layout.setSpacing(0)
+
+                time_label = QLabel(slot_time)
+                time_label.setStyleSheet(
+                    "QLabel { font-size: 8pt; font-weight: 700;"
+                    "  color: #111827; background: transparent; }")
+                row_layout.addWidget(time_label)
+
+                row_layout.addStretch()
+
+                room_label = QLabel(room)
+                room_label.setStyleSheet(
+                    "QLabel { font-size: 7.5pt; color: #9CA3AF;"
+                    "  background: transparent; }")
+                row_layout.addWidget(room_label)
+
+                layout.addWidget(row)
+
+        layout.addStretch()
+
+    def _refresh_warnings(self):
+        """Compute workload warnings and auto-negotiation diagnostics."""
+        if not hasattr(self, 'warning_log'):
+            return
+        s = self.state_data
+        placed = get_placed_classes(s)
+        if not s["days"] or not s["slots"]:
+            return
+
+        if placed:
+            for yr in sorted(s["years"].keys()):
+                for br in s["years"][yr]:
+                    day_counts = {}
+                    for day in s["days"]:
+                        count = 0
+                        for c in placed:
+                            if not any(t["year"] == yr and t["branch"] == br
+                                       for t in c["targets"]):
+                                continue
+                            occ = occupied_slots_of(s, c)
+                            count += sum(1 for d, sl in occ if d == day)
+                        day_counts[day] = count
+
+                    heavy = [d for d, n in day_counts.items()
+                             if n >= len(s["slots"]) * 0.75]
+                    light = [d for d, n in day_counts.items()
+                             if n == 0 and sum(day_counts.values()) > 0]
+                    if heavy:
+                        self.warning_log.log(
+                            f"{yr}/{br}: {tr('warnings.heavy_days_short')} {', '.join(day_label(d) for d in heavy)}",
+                            "warning")
+                    if light:
+                        self.warning_log.log(
+                            f"{yr}/{br}: {tr('warnings.empty_days_short')} {', '.join(day_label(d) for d in light)}",
+                            "warning")
+
+        # Auto-negotiation: analyze unplaced classes and log suggestions
+        self._run_auto_negotiation()
+
+    def _run_auto_negotiation(self):
+        """Automatically analyze unplaced/constrained classes and log suggestions.
+
+        This is the event-driven negotiation layer: it runs as part of every
+        refresh cycle whenever unplaced classes or severe bottlenecks exist,
+        pushing structured diagnostics and relaxation suggestions into the
+        warning log panel without requiring any manual trigger.
+        """
+        if not hasattr(self, 'warning_log'):
+            return
+        s = self.state_data
+        unplaced = [c for c in s.get("classes", [])
+                    if not c.get("placed") and not c.get("pinned")]
+        if not unplaced:
+            return
+
+        from scheduler_app.constraint_negotiator import ConstraintNegotiator
+        neg = ConstraintNegotiator(s)
+
+        auto_apply_enabled = self._get_negotiation_auto_apply()
+        applied_any = False
+
+        for cls in unplaced:
+            report = neg.negotiate_class(cls)
+            if not report["suggestions"]:
+                self.warning_log.log(
+                    f"{cls['name']}: {report['summary']}", "warning")
+                continue
+
+            # Log the top suggestions into the warning panel
+            top = report["suggestions"][0]
+            self.warning_log.log(
+                f"{cls['name']}: {report['summary']} "
+                f"— {tr('labels.suggestion')}: {top['description']}",
+                "warning")
+            for sug in report["suggestions"][1:3]:
+                self.warning_log.log(
+                    f"  {cls['name']}: {tr('labels.also')}: {sug['description']}",
+                    "info")
+
+            # Auto-apply low-risk suggestions if enabled
+            if auto_apply_enabled:
+                for sug in report["suggestions"]:
+                    if sug.get("disruption", 1.0) <= 0.3:
+                        if not applied_any:
+                            self._push_undo(tr("actions.auto_negotiate"))
+                        if apply_negotiation_suggestion(cls, sug):
+                            self.warning_log.log(
+                                f"{cls['name']}: {tr('status.auto_applied')}: "
+                                f"{sug['description']}", "success")
+                            applied_any = True
+                            break
+
+        if applied_any:
+            # Re-trigger placement attempts for classes whose constraints
+            # were just relaxed, without recursing into _refresh_warnings
+            for cls in unplaced:
+                if not cls.get("placed"):
+                    self._auto_place_and_apply(cls)
+
+    def _get_negotiation_auto_apply(self):
+        """Check if auto-apply of low-risk negotiation suggestions is enabled.
+
+        Reads from settings/negotiation_settings.egu.
+        Default is False (suggest only, never auto-modify constraints).
+        """
+        neg_path = storage.negotiation_settings_path()
+        try:
+            data = storage.load_encrypted(neg_path)
+            return bool(data.get("auto_apply_low_risk", False))
+        except Exception:
+            return False
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  SELECTION & DRAG-DROP
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _clear_class_selection(self):
+        for it in self._selected_cells:
+            try:
+                it.mark_selected(False)
+            except (RuntimeError, AttributeError):
+                pass
+        self._selected_cells = []
+        self._selected_classes = []
+        self._selected_class = None
+        self._selected_cell = None
+        self._selection_anchor = None
+        self._refresh_open_slots()
+
+    def _clear_empty_slot_selection(self):
+        if self._selected_empty_slot is None:
+            return
+        try:
+            self._selected_empty_slot.mark_selected(False)
+        except (RuntimeError, AttributeError):
+            pass
+        self._selected_empty_slot = None
+
+    def _iter_scene_lesson_items(self, item):
+        scene = item.scene() if item is not None else None
+        if scene is None or not hasattr(scene, "lesson_items"):
+            return []
+        items = [it for it in scene.lesson_items if it is not None]
+        # Keep Shift+Click range selection predictable by visual order.
+        items.sort(
+            key=lambda it: (
+                round(it.sceneBoundingRect().top(), 3),
+                round(it.sceneBoundingRect().left(), 3),
+            )
+        )
+        return items
+
+    def _apply_class_selection(self, items, anchor=None):
+        deduped = []
+        seen_item_ids = set()
+        for it in items:
+            if it is None:
+                continue
+            iid = id(it)
+            if iid in seen_item_ids:
+                continue
+            seen_item_ids.add(iid)
+            deduped.append(it)
+
+        new_set = set(deduped)
+        for old in self._selected_cells:
+            if old not in new_set:
+                try:
+                    old.mark_selected(False)
+                except (RuntimeError, AttributeError):
+                    pass
+        for it in deduped:
+            try:
+                it.mark_selected(True)
+            except (RuntimeError, AttributeError):
+                pass
+
+        self._selected_cells = deduped
+        seen_cls_ids = set()
+        selected_classes = []
+        for it in deduped:
+            cls_obj = getattr(it, "cls", None)
+            if cls_obj is None:
+                continue
+            cid = id(cls_obj)
+            if cid in seen_cls_ids:
+                continue
+            seen_cls_ids.add(cid)
+            selected_classes.append(cls_obj)
+
+        self._selected_classes = selected_classes
+        self._selected_class = selected_classes[0] if len(selected_classes) == 1 else None
+        self._selected_cell = deduped[0] if len(deduped) == 1 else None
+        self._selection_anchor = anchor if deduped else None
+
+        if len(selected_classes) == 1:
+            self.status_label.setText(
+                f"{tr('status.selected')}: {selected_classes[0]['name']} — "
+                f"{tr('status.press_delete')}")
+        elif len(selected_classes) > 1:
+            self.status_label.setText(
+                f"{tr('status.selected')}: {len(selected_classes)} {tr('status.classes')} — "
+                f"{tr('status.press_delete')}")
+        else:
+            self.status_label.setText(tr("status.ready"))
+        self._refresh_open_slots()
+
+    def _select_class_gfx(self, cls, item, modifiers=None):
+        """Select one or multiple lessons via graphics items."""
+        if modifiers is None:
+            modifiers = QApplication.keyboardModifiers()
+
+        self._clear_empty_slot_selection()
+
+        ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+        current_items = list(self._selected_cells)
+
+        if shift:
+            ordered = self._iter_scene_lesson_items(item)
+            anchor = (self._selection_anchor
+                      if self._selection_anchor in ordered
+                      else (current_items[-1] if current_items and current_items[-1] in ordered else item))
+            if anchor in ordered and item in ordered:
+                a_idx = ordered.index(anchor)
+                b_idx = ordered.index(item)
+                lo, hi = sorted((a_idx, b_idx))
+                ranged = ordered[lo:hi + 1]
+                if ctrl:
+                    merged = list(current_items)
+                    for it in ranged:
+                        if it not in merged:
+                            merged.append(it)
+                    self._apply_class_selection(merged, anchor=anchor)
+                else:
+                    self._apply_class_selection(ranged, anchor=anchor)
+                return
+
+        if ctrl:
+            if item in current_items:
+                current_items.remove(item)
+                anchor = self._selection_anchor if current_items else None
+                self._apply_class_selection(current_items, anchor=anchor)
+            else:
+                current_items.append(item)
+                self._apply_class_selection(current_items, anchor=item)
+            return
+
+        self._apply_class_selection([item], anchor=item)
+
+    def _select_empty_slot(self, item):
+        """Highlight an empty timetable slot on left click."""
+        self._clear_class_selection()
+        if self._selected_empty_slot is item:
+            return
+        self._clear_empty_slot_selection()
+        self._selected_empty_slot = item
+        try:
+            item.mark_selected(True)
+        except (RuntimeError, AttributeError):
+            pass
+        self.status_label.setText(
+            f"{tr('status.selected')}: {format_day_time(item.day, item.slot)}")
+
+    def _show_empty_slot_context_menu(self, day, slot, global_pos):
+        """Context menu for empty timetable slots."""
+        menu = QMenu(self)
+        title = menu.addAction(f"\U0001F4C5  {format_day_time(day, slot)}")
+        title.setEnabled(False)
+        menu.addSeparator()
+        add_act = menu.addAction("\u2795  " + tr("menus.classes"))
+        add_act.triggered.connect(lambda: self._add_class_at(day, slot))
+        place_act = menu.addAction("\u25BC  " + tr("dialogs.place.title"))
+        place_act.triggered.connect(lambda: self._place_unplaced_class_at_slot(day, slot))
+        menu.exec(global_pos)
+
+    def _place_unplaced_class_at_slot(self, day, slot):
+        """Pick an unplaced class and place it directly into the chosen slot."""
+        unplaced = [
+            (i, c) for i, c in enumerate(self.state_data["classes"])
+            if not c["pinned"] and not c["placed"]
+        ]
+        if not unplaced:
+            QMessageBox.information(self, tr("dialogs.place.title"),
+                                   tr("warnings.no_unplaced_classes"))
+            return
+
+        valid = []
+        for idx, cls in unplaced:
+            options = [
+                opt for opt in find_valid_options(self.state_data, cls)
+                if opt[0] == day and opt[1] == slot
+            ]
+            if options:
+                valid.append((idx, cls, options))
+
+        if not valid:
+            QMessageBox.information(
+                self, tr("dialogs.place.title"),
+                tr("warnings.no_valid_placements"))
+            return
+
+        chooser_items = [(idx, cls) for idx, cls, _opts in valid]
+        dlg = SelectClassDialog(self, tr("dialogs.place.title"), chooser_items, show_placement=False)
+        if dlg.exec() != SelectClassDialog.DialogCode.Accepted or dlg.result is None:
+            return
+
+        selected_idx = dlg.result
+        picked = next((v for v in valid if v[0] == selected_idx), None)
+        if not picked:
+            return
+        _idx, cls, options = picked
+
+        preferred_room = None
+        if self.notebook.currentIndex() == 0:
+            selected = self.classroom_filter.currentData()
+            kind, value = _decode_classroom_filter_value(selected)
+            if kind == "room":
+                preferred_room = value
+        chosen = options[0]
+        if preferred_room:
+            for opt in options:
+                if opt[2] == preferred_room:
+                    chosen = opt
+                    break
+
+        self._push_undo(tr("actions.place").format(name=cls["name"]))
+        mark_placed(cls, chosen[0], chosen[1], chosen[2])
+        self.refresh_grid()
+
+    def _set_protection(self, cls, level):
+        """Set the protection level of a class."""
+        from scheduler_app.models import get_protection_label
+        cls["protection"] = level
+        self._show_toast(
+            tr("protection.set_to").format(
+                level=get_protection_label(level)),
+            "success")
+        self.refresh_grid()
+
+    def _start_drag_gfx(self, cls, item):
+        """Start a drag from a LessonItem (graphics-based)."""
+        from scheduler_app.models import is_immovable
+        if is_immovable(cls):
+            if cls["pinned"]:
+                self._show_toast(tr("warnings.pinned_cannot_move"), "warning")
+            else:
+                self._show_toast(
+                    tr("warnings.locked_cannot_move"),
+                    "warning")
+            return
+
+        selected_drag_group = [
+            c for c in self._selected_classes
+            if c.get("placed") and not c.get("pinned")
+        ]
+        if cls in selected_drag_group and len(selected_drag_group) > 1:
+            self._dragging_classes = list(selected_drag_group)
+        else:
+            self._dragging_classes = [cls]
+
+        self._drag_backup = {
+            "placed": cls["placed"],
+            "placed_day": cls["placed_day"],
+            "placed_time": cls["placed_time"],
+            "placed_classroom": cls["placed_classroom"],
+        }
+        # Push undo BEFORE the pre-emptive mark_unplaced so the snapshot
+        # captures the original placed state.  Popped later if drag fails.
+        self._push_undo(tr("actions.unplace").format(name=cls["name"]))
+        mark_unplaced(cls)
+
+        self._dragging_cls = cls
+        self._drag_success = False
+
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setText(f"class_drag:{cls_key(cls)}")
+        drag.setMimeData(mime)
+
+        # Render drag pixmap BEFORE unplacing (item still valid)
+        try:
+            scene = item.scene()
+            if scene:
+                rect = item.boundingRect()
+                from PyQt6.QtGui import QPixmap
+                from PyQt6.QtCore import QRectF
+                w, h = max(1, int(rect.width())), max(1, int(rect.height()))
+                pm = QPixmap(w, h)
+                pm.fill(QColor(0, 0, 0, 0))
+                p = QPainter(pm)
+                src = QRectF(item.mapToScene(rect).boundingRect())
+                p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                scene.render(p, QRectF(pm.rect()), src)
+                p.end()
+                scaled = pm.scaled(
+                    int(pm.width() * 0.85), int(pm.height() * 0.85),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation)
+                drag.setPixmap(scaled)
+                drag.setHotSpot(QPoint(scaled.width() // 2, 20))
+        except Exception:
+            pass  # proceed without drag pixmap
+
+        # Ghost effect on the source item
+        if hasattr(item, 'set_ghost'):
+            try:
+                item.set_ghost(True)
+            except RuntimeError:
+                pass
+
+        drag.exec(Qt.DropAction.MoveAction)
+
+        # Remove ghost effect
+        if hasattr(item, 'set_ghost'):
+            try:
+                item.set_ghost(False)
+            except RuntimeError:
+                pass
+
+        if not self._drag_success:
+            for k, v in self._drag_backup.items():
+                cls[k] = v
+            # Drag was cancelled — discard the pre-emptive undo snapshot
+            if self._undo_stack:
+                self._undo_stack.pop()
+
+        self._dragging_cls = None
+        self._dragging_classes = []
+        self._drag_backup = None
+        self.refresh_grid()
+
+    def _start_drag_unplaced(self, classes, widget):
+        """Initiate a drag for one or many unplaced classes."""
+        drag_classes = []
+        seen = set()
+        for cls in classes or []:
+            if cls is None:
+                continue
+            cid = cls_key(cls)
+            if cid in seen:
+                continue
+            seen.add(cid)
+            drag_classes.append(cls)
+        if not drag_classes:
+            return
+
+        self._drag_backup = {
+            "placed": False,
+            "placed_day": None,
+            "placed_time": None,
+            "placed_classroom": None,
+        }
+        self._dragging_cls = drag_classes[0]
+        self._dragging_classes = drag_classes
+        self._drag_success = False
+
+        drag = QDrag(widget)
+        mime = QMimeData()
+        mime.setText(f"class_drag:{cls_key(drag_classes[0])}")
+        drag.setMimeData(mime)
+
+        if len(drag_classes) > 1:
+            label = QLabel(f"{len(drag_classes)} {tr('status.classes')}")
+            label.setStyleSheet(
+                "background: #FEF3C7; border: 1px solid #F59E0B; "
+                "padding: 4px 8px; border-radius: 3px; font-weight: bold;")
+            label.adjustSize()
+            drag.setPixmap(label.grab())
+            drag.setHotSpot(QPoint(drag.pixmap().width() // 2, 12))
+        else:
+            item = widget.currentItem()
+            if item:
+                label = QLabel(item.text())
+                label.setStyleSheet(
+                    "background: #FEF3C7; border: 1px solid #F59E0B; "
+                    "padding: 4px 8px; border-radius: 3px; font-weight: bold;")
+                label.adjustSize()
+                drag.setPixmap(label.grab())
+                drag.setHotSpot(QPoint(drag.pixmap().width() // 2, 12))
+
+        drag.exec(Qt.DropAction.MoveAction)
+
+        if self._drag_success:
+            if len(drag_classes) == 1:
+                self._show_toast(
+                    tr("status.class_placed_drag"), "success")
+
+        self._dragging_cls = None
+        self._dragging_classes = []
+        self._drag_backup = None
+        self.refresh_grid()
+
+    def _get_preferred_rooms(self, cls):
+        """Build an ordered preference list of rooms from UI context."""
+        preferred = []
+        if self._drag_backup and self._drag_backup.get("placed_classroom"):
+            preferred.append(self._drag_backup["placed_classroom"])
+        tab_idx = self.notebook.currentIndex()
+        if tab_idx == 0:
+            selected = self.classroom_filter.currentData()
+            kind, value = _decode_classroom_filter_value(selected)
+            if kind == "room":
+                preferred.append(value)
+        return preferred
+
+    def _get_drop_classroom(self, cls, day, slot):
+        """Determine the classroom for a drop via workflow."""
+        preferred = self._get_preferred_rooms(cls)
+        room, conflicts = SchedulingWorkflow.find_drop_classroom(
+            self.state_data, cls, day, slot, preferred_rooms=preferred)
+        if room is None:
+            return None, [tr("errors.no_compatible_classrooms")]
+        return room, conflicts
+
+    def _check_drop_valid(self, day, slot):
+        """Quick check if dragging class can be placed at (day, slot)."""
+        drag_group = list(getattr(self, "_dragging_classes", []) or [])
+        if len(drag_group) > 1 and all(not c.get("placed") for c in drag_group):
+            return True
+
+        cls = self._dragging_cls
+        if cls is None:
+            return False
+        preferred = self._get_preferred_rooms(cls)
+        return SchedulingWorkflow.check_drop_valid(
+            self.state_data, cls, day, slot,
+            drag_backup=self._drag_backup,
+            preferred_rooms=preferred)
+
+    def _execute_drop_anywhere(self):
+        """Handle drops that are not over a specific timetable cell."""
+        drag_group = list(getattr(self, "_dragging_classes", []) or [])
+        if len(drag_group) > 1 and all(not c.get("placed") for c in drag_group):
+            self._place_classes_batch(drag_group)
+            self._drag_success = True
+
+    def _execute_drop(self, day, slot):
+        """Finalize the drop: validate fully and either commit or reject."""
+        drag_group = list(getattr(self, "_dragging_classes", []) or [])
+        if len(drag_group) > 1 and all(not c.get("placed") for c in drag_group):
+            self._execute_drop_anywhere()
+            return
+
+        cls = self._dragging_cls
+        if cls is None:
+            return
+
+        # Phase 1: basic constraint validation
+        validation = SchedulingWorkflow.validate_drop(
+            self.state_data, cls, day, slot, drag_backup=self._drag_backup)
+        if not validation.valid:
+            reasons = self._format_drop_reasons(validation.reasons, cls)
+            QMessageBox.warning(
+                self, tr("dialogs.move_rejected.title"),
+                tr("errors.cannot_move_to").format(
+                    name=cls["name"], day=display_day(day), slot=slot)
+                + "\n\n" + "\n".join(f"  - {r}" for r in reasons))
+            return
+
+        # Phase 2: find classroom
+        room, conflicts = self._get_drop_classroom(cls, day, slot)
+        if room is None:
+            QMessageBox.warning(
+                self, tr("dialogs.move_rejected.title"),
+                tr("errors.cannot_move_to").format(
+                    name=cls["name"], day=display_day(day), slot=slot)
+                + "\n\n  - " + tr("errors.no_compatible_classrooms"))
+            return
+
+        # Phase 3: classroom-level constraints
+        constraint_check = SchedulingWorkflow.validate_drop_constraints(
+            self.state_data, cls, day, slot, room)
+        if not constraint_check.valid:
+            reasons = self._format_drop_reasons(constraint_check.reasons, cls)
+            QMessageBox.warning(
+                self, tr("dialogs.move_rejected.title"),
+                tr("errors.cannot_move_to").format(
+                    name=cls["name"], day=display_day(day), slot=slot)
+                + "\n\n" + "\n".join(f"  - {r}" for r in reasons))
+            return
+
+        if conflicts:
+            self._feedback_logger.log_rejected_placement(
+                cls, day, slot, room,
+                reason="; ".join(conflicts))
+            QMessageBox.warning(
+                self, tr("dialogs.move_rejected.title"),
+                tr("errors.cannot_move_to_room").format(
+                    name=cls["name"], day=display_day(day), slot=slot, room=room)
+                + "\n\n" + "\n".join(f"  - {c}" for c in conflicts))
+            return
+
+        # Log and commit
+        old_day = self._drag_backup.get("placed_day")
+        old_slot = self._drag_backup.get("placed_time")
+        old_room = self._drag_backup.get("placed_classroom")
+        self._workflow.log_manual_move(
+            cls, old_day, old_slot, old_room, day, slot, room)
+
+        # Replace the pre-emptive undo snapshot (pushed by _start_drag_gfx
+        # with an "unplace" label) with a proper "move" snapshot.  The
+        # snapshot data is identical — only the label differs.
+        if self._undo_stack:
+            self._undo_stack.pop()
+        self._push_undo(tr("actions.move").format(name=cls["name"]))
+        mark_placed(cls, day, slot, room)
+        self._drag_success = True
+        self._show_toast(
+            tr("status.moved_to").format(
+                name=cls["name"], day=display_day(day), slot=slot, room=room),
+            "success")
+
+    def _format_drop_reasons(self, reasons, cls):
+        """Convert workflow reason tuples to translated strings."""
+        formatted = []
+        for r in reasons:
+            kind = r[0]
+            if kind == "restricted_to_day":
+                formatted.append(tr("warnings.restricted_to_day").format(
+                    d=display_day(r[1])))
+            elif kind == "not_enough_slots":
+                formatted.append(tr("errors.not_enough_slots").format(
+                    n=r[1], a=r[2], t=r[3]))
+            elif kind == "day_not_allowed":
+                formatted.append(tr("errors.day_not_allowed").format(
+                    d=day_label(r[1]),
+                    ds=", ".join(day_label(d) for d in r[2])))
+            elif kind == "day_excluded":
+                formatted.append(tr("errors.day_excluded").format(
+                    d=day_label(r[1]),
+                    ds=", ".join(day_label(d) for d in r[2])))
+            elif kind == "time_not_allowed":
+                formatted.append(tr("errors.time_not_allowed").format(
+                    t=r[1], ts=", ".join(r[2])))
+            elif kind == "time_excluded":
+                formatted.append(tr("errors.time_excluded").format(
+                    t=r[1], ts=", ".join(r[2])))
+            elif kind == "classroom_not_required":
+                formatted.append(tr("errors.classroom_not_required").format(
+                    r=r[1], rs=", ".join(r[2])))
+            elif kind == "classroom_excluded":
+                formatted.append(tr("errors.classroom_excluded").format(r=r[1]))
+            elif kind == "classroom_capacity":
+                formatted.append(tr("errors.classroom_capacity").format(
+                    r=r[1], c=r[2], p=r[3]))
+            else:
+                formatted.append(str(r))
+        return formatted
+
+    def _edit_selected_class(self):
+        if self._selected_classes:
+            self._edit_class(self._selected_classes[0])
+            return
+        if self._selected_class:
+            self._edit_class(self._selected_class)
+
+    def _delete_selected(self):
+        ul = getattr(self, "unplaced_list", None)
+        if ul is not None:
+            focus = QApplication.focusWidget()
+            ul_focused = (
+                focus is ul
+                or (focus is not None and ul.isAncestorOf(focus))
+                or ul.hasFocus()
+                or ul.viewport().hasFocus()
+            )
+            if ul_focused:
+                selected = ul.selected_classes()
+                if selected:
+                    self._remove_classes(selected)
+                return
+
+        if self._selected_classes:
+            self._remove_classes(self._selected_classes)
+            return
+        if self._selected_class:
+            self._remove_classes([self._selected_class])
+
+    def _add_class_at(self, day, slot):
+        """Add a class via double-click on empty slot — uses automatic placement."""
+        if not self.state_data["years"]:
+            QMessageBox.information(self, tr("menus.classes"),
+                                   tr("errors.setup_years_first"))
+            return
+        # Tier enforcement: check class limit
+        from scheduler_app.ui.tier_enforcement import TierEnforcement
+        from scheduler_app.plans import ENTITY_CLASSES
+        enforcer = TierEnforcement.instance()
+        current_count = len(self.state_data.get("classes", []))
+        if not enforcer.require_entity_limit(ENTITY_CLASSES, current_count, self):
+            return
+        dlg = AddClassDialog(self, self.state_data)
+        if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
+            return
+        cls = dlg.result
+        snap_before = capture_snapshot(self.state_data)
+        self._push_undo(tr("actions.add").format(name=cls["name"]))
+        split_classes = split_non_joint(cls)
+        added_any = False
+        for sc in split_classes:
+            self.state_data["classes"].append(sc)
+
+            if self._auto_place_and_apply(sc):
+                self._show_toast(tr("status.class_placed"), "success")
+                added_any = True
+            else:
+                if sc["pinned"]:
+                    self.state_data["classes"].remove(sc)
+                    from scheduler_app.constraint_negotiator import ConstraintNegotiator
+                    neg = ConstraintNegotiator(self.state_data)
+                    report = neg.negotiate_class(sc)
+                    detail = ""
+                    if report["suggestions"]:
+                        detail = "\n\n" + report["summary"]
+                        for s in report["suggestions"][:3]:
+                            detail += f"\n  → {s['description']}"
+                    QMessageBox.warning(
+                        self, tr("dialogs.error.title"),
+                        tr("errors.no_valid_arrangement") + detail)
+                else:
+                    # Auto-negotiation on placement failure
+                    added_any = True
+                    from scheduler_app.constraint_negotiator import ConstraintNegotiator
+                    neg = ConstraintNegotiator(self.state_data)
+                    report = neg.negotiate_class(sc)
+                    msg = tr("status.class_added_no_slot")
+                    if report["suggestions"]:
+                        msg += f"\n{report['suggestions'][0]['description']}"
+                    self._show_toast(msg, "info")
+                    if hasattr(self, 'warning_log') and report["suggestions"]:
+                        for sug in report["suggestions"][:3]:
+                            self.warning_log.log(
+                                f"{sc['name']}: {sug['description']}", "info")
+        if added_any:
+            desc = tr("impact.trigger.classes_added").format(n=len(split_classes))
+            self._note_structural_change(snap_before, description=desc)
+        self.refresh_grid()
+
+    def _select_all_in_view(self, view):
+        """Select all lesson items rendered in the given timetable view."""
+        scene = view.scene() if view else None
+        items = list(getattr(scene, "lesson_items", [])) if scene else []
+        if not items:
+            self._selected_class = None
+            return
+        self._clear_empty_slot_selection()
+        self._apply_class_selection(items, anchor=items[0])
+
+    def _select_all(self):
+        focus = QApplication.focusWidget()
+        if hasattr(self, "unplaced_list"):
+            ul = self.unplaced_list
+            ul_focused = (
+                focus is ul
+                or (focus is not None and ul.isAncestorOf(focus))
+                or ul.hasFocus()
+                or ul.viewport().hasFocus()
+                or ul.underMouse()
+                or ul.viewport().underMouse()
+            )
+            if ul_focused:
+                ul.selectAll()
+                return
+
+        if hasattr(self, "_open_slots_scroll"):
+            ost = self._open_slots_scroll
+            ost_focused = (
+                focus is ost
+                or (focus is not None and ost.isAncestorOf(focus))
+                or ost.hasFocus()
+                or ost.underMouse()
+            )
+            if ost_focused:
+                return
+
+        tab_idx = self.notebook.currentIndex() if hasattr(self, "notebook") else -1
+        if tab_idx in (0, 1, 2, 3):
+            view = [self.grid_view1, self.grid_view2, self.grid_view3, self.grid_view4][tab_idx]
+            self._select_all_in_view(view)
+            return
+        self._selected_class = None
+
+
+    def _copy_to_clipboard(self):
+        s = self.state_data
+        if not s["days"] or not s["slots"]:
+            return
+        placed = get_placed_classes(s)
+        if not placed:
+            return
+
+        lines = []
+        tab_idx = self.notebook.currentIndex()
+
+        if tab_idx == 3:
+            days = s["days"]
+            slots = s["slots"]
+            for yr in sorted(s["years"].keys()):
+                branches = s["years"][yr]
+                if not branches:
+                    continue
+                lines.append(f"=== {yr} ===")
+                hdr1 = ["", ""]
+                for day in days:
+                    hdr1.append(tr(f"weekdays.{day}"))
+                    hdr1.extend([""] * (len(branches) - 1))
+                lines.append("\t".join(hdr1))
+                hdr2 = [tr("labels.session"), tr("labels.time")]
+                for day in days:
+                    for br in branches:
+                        hdr2.append(br)
+                lines.append("\t".join(hdr2))
+                for si, slot in enumerate(slots):
+                    row_data = [str(si + 1), slot]
+                    for d_idx, day in enumerate(days):
+                        for b_idx, br in enumerate(branches):
+                            cell_text = ""
+                            for c in placed:
+                                c_day = effective_day(c)
+                                c_start = effective_time(c)
+                                if c_day != day or c_start not in slots:
+                                    continue
+                                if not any(t["year"] == yr and t["branch"] == br
+                                           for t in c["targets"]):
+                                    continue
+                                occ = occupied_slots_of(s, c)
+                                if (day, slot) in occ:
+                                    room = classroom_of(c)
+                                    cell_text = f"{c['name']} / {c['lecturer']} / {room}"
+                                    break
+                            row_data.append(cell_text)
+                    lines.append("\t".join(row_data))
+                lines.append("")
+        else:
+            header = [""] + [tr(f"weekdays.{day}") for day in s["days"]]
+            lines.append("\t".join(header))
+            filter_fn = [self._filter_classroom, self._filter_group,
+                         self._filter_lecturer][tab_idx]
+            filtered = [c for c in placed if filter_fn(c)]
+            for slot in s["slots"]:
+                row_data = [slot]
+                for day in s["days"]:
+                    cell_text = ""
+                    for c in filtered:
+                        occ = occupied_slots_of(s, c)
+                        if (day, slot) in occ:
+                            cell_text = f"{c['name']} ({c['lecturer']})"
+                            break
+                    row_data.append(cell_text)
+                lines.append("\t".join(row_data))
+
+        text = "\n".join(lines)
+        QApplication.clipboard().setText(text)
+        self._show_toast(tr("status.copied_to_clipboard"), "success")
+
+    def _show_toast(self, message, kind="info"):
+        Toast(self, message, duration=3000, kind=kind)
+        if hasattr(self, 'warning_log'):
+            self.warning_log.log(message, kind)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  EXCEL EXPORT
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _sheet_name_for_export(self, base, used):
+        invalid = set("[]:*?/\\")
+        default_sheet = tr("labels.sheet")
+        cleaned = "".join(ch for ch in str(base or default_sheet) if ch not in invalid).strip()
+        if not cleaned:
+            cleaned = default_sheet
+        name = cleaned[:31]
+        if name not in used:
+            used.add(name)
+            return name
+        counter = 2
+        while True:
+            suffix = f" ({counter})"
+            candidate = f"{cleaned[:31 - len(suffix)]}{suffix}"
+            if candidate not in used:
+                used.add(candidate)
+                return candidate
+            counter += 1
+
+    def _export_to_excel(self):
+        # Tier enforcement: Excel export requires feature
+        from scheduler_app.ui.tier_enforcement import TierEnforcement
+        from scheduler_app.plans import FEATURE_EXPORT_EXCEL
+        if not TierEnforcement.instance().require_feature(FEATURE_EXPORT_EXCEL, self):
+            return
+        if openpyxl is None:
+            QMessageBox.critical(
+                self, tr("dialogs.error.title"),
+                tr("errors.openpyxl_required"))
+            return
+
+        s = self.state_data
+        if not s["days"] or not s["slots"] or not s["years"]:
+            QMessageBox.information(self, tr("buttons.export"), tr("warnings.no_schedule_data"))
+            return
+
+        tab_idx = self.notebook.currentIndex() if hasattr(self, "notebook") else 3
+        mode = {0: "classroom", 1: "group", 2: "lecturer", 3: "everything", 4: "everything"}.get(tab_idx, "everything")
+        default_name = {
+            "classroom": "classrooms_schedule.xlsx",
+            "group": "groups_schedule.xlsx",
+            "lecturer": "lecturers_schedule.xlsx",
+            "everything": "schedule.xlsx",
+        }.get(mode, "schedule.xlsx")
+
+        fname, _ = QFileDialog.getSaveFileName(
+            self, tr("dialogs.export.excel_title"),
+            os.path.join(storage.sub_dir(storage.EXPORTS_DIR), default_name),
+            f"{tr('labels.excel_files')} (*.xlsx);;{tr('labels.all_files')} (*)")
+        if not fname:
+            return
+
+        try:
+            self._write_excel(fname, mode=mode)
+            QMessageBox.information(self, tr("status.exported"),
+                                   f"{tr('status.exported_to')} {os.path.basename(fname)}")
+        except Exception as e:
+            QMessageBox.critical(self, tr("dialogs.error.title"), f"{tr('errors.failed_to_export')}\n{e}")
+
+    def _export_to_pdf(self):
+        # Tier enforcement: PDF export requires feature
+        from scheduler_app.ui.tier_enforcement import TierEnforcement
+        from scheduler_app.plans import FEATURE_EXPORT_PDF
+        if not TierEnforcement.instance().require_feature(FEATURE_EXPORT_PDF, self):
+            return
+        # Check reportlab availability, offer to install if missing
+        try:
+            import reportlab  # noqa: F401
+        except ImportError:
+            reply = QMessageBox.question(
+                self, tr("dialogs.export.pdf_title"),
+                tr("errors.reportlab_required")
+                + "\n\n" + tr("dialogs.install.prompt"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            import subprocess, sys
+            try:
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "reportlab"],
+                    timeout=120,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, tr("dialogs.error.title"),
+                                    tr("errors.reportlab_install_failed") + f"\n{exc}")
+                return
+
+        s = self.state_data
+        if not s["days"] or not s["slots"] or not s["years"]:
+            QMessageBox.information(self, tr("buttons.export"), tr("warnings.no_schedule_data"))
+            return
+
+        tab_idx = self.notebook.currentIndex() if hasattr(self, "notebook") else 3
+        mode = {0: "classroom", 1: "group", 2: "lecturer",
+                3: "everything", 4: "everything"}.get(tab_idx, "everything")
+        default_name = {
+            "classroom": "classrooms_schedule.pdf",
+            "group": "groups_schedule.pdf",
+            "lecturer": "lecturers_schedule.pdf",
+            "everything": "schedule.pdf",
+        }.get(mode, "schedule.pdf")
+
+        fname, _ = QFileDialog.getSaveFileName(
+            self, tr("dialogs.export.pdf_title"),
+            os.path.join(storage.sub_dir(storage.EXPORTS_DIR), default_name),
+            f"{tr('labels.pdf_files')} (*.pdf);;{tr('labels.all_files')} (*)")
+        if not fname:
+            return
+
+        try:
+            from scheduler_app.data_io.exporter import export_schedule
+            export_schedule(s, "pdf", fname, mode=mode)
+            QMessageBox.information(self, tr("status.exported"),
+                                   f"{tr('status.exported_to')} {os.path.basename(fname)}")
+        except Exception as e:
+            QMessageBox.critical(self, tr("dialogs.error.title"), f"{tr('errors.failed_to_export')}\n{e}")
+
+    def _write_excel(self, fname, mode="everything"):
+        s = self.state_data
+        placed = get_placed_classes(s)
+        days = s["days"]
+        slots = s["slots"]
+
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+        used_sheet_names = set()
+
+        # ── Theme matching the app's blue/slate UI ──
+        grid_side = Side(style="thin", color="CBD5E1")
+        cell_border = Border(left=grid_side, right=grid_side,
+                             top=grid_side, bottom=grid_side)
+        # Day header: dark slate (#334155) with white text
+        day_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+        day_font = XlFont(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+        # Branch sub-header: slate (#475569) with white text
+        branch_fill = PatternFill(start_color="475569", end_color="475569", fill_type="solid")
+        branch_font = XlFont(name="Segoe UI", size=9, bold=True, color="FFFFFF")
+        # Corner: gray-blue (#94A3B8) with white text
+        corner_fill = PatternFill(start_color="94A3B8", end_color="94A3B8", fill_type="solid")
+        corner_font = XlFont(name="Segoe UI", size=9, bold=True, color="FFFFFF")
+        # Session number: light gray (#F1F5F9) with dark text
+        session_fill = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
+        session_font = XlFont(name="Segoe UI", size=10, bold=True, color="333333")
+        # Time column: slate (#475569) with white text
+        time_fill = PatternFill(start_color="475569", end_color="475569", fill_type="solid")
+        time_font = XlFont(name="Segoe UI", size=9, bold=True, color="FFFFFF")
+        # Empty cell: near-white (#F8FAFC)
+        empty_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+        center_wrap = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        center_nowrap = Alignment(horizontal="center", vertical="center")
+
+        def _append_rich_cell_blocks(blocks, cls, include_room=False, include_targets=False):
+            """Append rich text fragments for one class into *blocks*."""
+            code = cls.get("class_code", "")
+            if code:
+                blocks.append(TextBlock(
+                    InlineFont(b=True, sz=9, color="1D4ED8"), code + "\n"))
+            blocks.append(TextBlock(
+                InlineFont(b=True, sz=10, color="1E293B"), cls["name"] + "\n"))
+            if cls.get("lecturer"):
+                blocks.append(TextBlock(
+                    InlineFont(sz=9, color="475569"), cls["lecturer"]))
+            if include_room:
+                room = classroom_of(cls)
+                if room:
+                    blocks.append(TextBlock(
+                        InlineFont(sz=9, color="16A34A"), "\n" + room))
+            if include_targets:
+                groups = ", ".join(f"{t['year']}/{t['branch']}" for t in cls.get("targets", []))
+                if groups:
+                    blocks.append(TextBlock(
+                        InlineFont(sz=8, color="6D28D9"), "\n" + groups))
+            # Protection badge
+            badge_text, badge_color = "", ""
+            if cls.get("pinned"):
+                badge_text, badge_color = "\U0001F4CC " + tr("badges.pinned"), "DC2626"
+            else:
+                prot = cls.get("protection", "none")
+                if prot == "locked":
+                    badge_text, badge_color = "\U0001F512 " + tr("badges.locked"), "DC2626"
+                elif prot == "soft":
+                    badge_text, badge_color = "\U0001F6E1 " + tr("badges.protected"), "D97706"
+                elif prot == "same_day":
+                    badge_text, badge_color = "\u2194 " + tr("badges.same_day"), "2563EB"
+                elif prot == "improve_only":
+                    badge_text, badge_color = "\u2191 " + tr("badges.improve_only"), "7C3AED"
+            if badge_text:
+                blocks.append(TextBlock(
+                    InlineFont(b=True, sz=8, color=badge_color), "\n" + badge_text))
+            return blocks
+
+        def _build_rich_cell(cls, include_room=False, include_targets=False):
+            """Build rich text cell with color-coded content matching app view."""
+            blocks = []
+            _append_rich_cell_blocks(
+                blocks, cls, include_room=include_room,
+                include_targets=include_targets,
+            )
+            return CellRichText(*blocks)
+
+        def _build_stacked_rich_cell(classes, include_room=False, include_targets=False):
+            """Build a stacked rich-text cell for multiple overlapping classes."""
+            blocks = []
+            for idx, cls in enumerate(classes):
+                if idx > 0:
+                    blocks.append(TextBlock(
+                        InlineFont(sz=8, color="94A3B8"), "\n---\n"))
+                _append_rich_cell_blocks(
+                    blocks, cls, include_room=include_room,
+                    include_targets=include_targets,
+                )
+            return CellRichText(*blocks)
+
+        def _apply_page_setup(ws):
+            ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(
+                fitToPage=True)
+            ws.page_setup.fitToWidth = 1
+            ws.page_setup.fitToHeight = 0
+            ws.page_setup.orientation = "landscape"
+            ws.page_setup.paperSize = ws.PAPERSIZE_A3
+
+        def _lesson_fill_for_class(cls):
+            year_key = cls["targets"][0]["year"] if cls.get("targets") else None
+            if year_key:
+                yr_hex = get_year_color(s, year_key).lstrip("#")
+                light_hex = lighten_color(f"#{yr_hex}", 0.45).lstrip("#")
+            else:
+                light_hex = "F3F4F6"
+            return PatternFill(
+                start_color=light_hex.upper(),
+                end_color=light_hex.upper(),
+                fill_type="solid",
+            )
+
+        def _apply_lesson_cell(cell, cls, rich):
+            cell.value = rich
+            cell.fill = _lesson_fill_for_class(cls)
+            cell.alignment = center_wrap
+            cell.border = cell_border
+
+        def _write_filtered_sheet(ws, filter_fn, include_room=False, include_targets=False):
+            c = ws.cell(row=1, column=1, value=tr("labels.time"))
+            c.fill = corner_fill
+            c.font = corner_font
+            c.border = cell_border
+            c.alignment = center_nowrap
+
+            for d_idx, day in enumerate(days):
+                col = d_idx + 2
+                dc = ws.cell(row=1, column=col, value=tr(f"weekdays.{day}"))
+                dc.fill = day_fill
+                dc.font = day_font
+                dc.border = cell_border
+                dc.alignment = center_nowrap
+
+            filtered_entries = []
+            slot_claims = {}
+            for order, cls in enumerate(placed):
+                if not filter_fn(cls):
+                    continue
+                c_day = effective_day(cls)
+                c_start = effective_time(cls)
+                if c_day not in days or c_start not in slots:
+                    continue
+                start_si = slots.index(c_start)
+                span = min(total_duration(cls), len(slots) - start_si)
+                if span <= 0:
+                    continue
+                entry = {
+                    "cls": cls,
+                    "day": c_day,
+                    "start_si": start_si,
+                    "span": span,
+                    "order": order,
+                }
+                filtered_entries.append(entry)
+                for off in range(span):
+                    slot_claims.setdefault((start_si + off, c_day), []).append(entry)
+
+            overlapping_ids = set()
+            for entries in slot_claims.values():
+                if len(entries) > 1:
+                    overlapping_ids.update(cls_key(entry["cls"]) for entry in entries)
+
+            occupied_start = {}
+            covered = set()
+            overlap_cells = {}
+            for entry in filtered_entries:
+                cls = entry["cls"]
+                c_day = entry["day"]
+                start_si = entry["start_si"]
+                span = entry["span"]
+                if cls_key(cls) in overlapping_ids:
+                    for off in range(span):
+                        overlap_cells.setdefault((start_si + off, c_day), []).append(entry)
+                    continue
+                key = (start_si, c_day)
+                occupied_start[key] = (cls, span)
+                for off in range(span):
+                    covered.add((start_si + off, c_day))
+
+            for si, slot in enumerate(slots):
+                row = si + 2
+                t_cell = ws.cell(row=row, column=1, value=slot)
+                t_cell.fill = time_fill
+                t_cell.font = time_font
+                t_cell.border = cell_border
+                t_cell.alignment = center_nowrap
+
+                for d_idx, day in enumerate(days):
+                    col = d_idx + 2
+                    key = (si, day)
+                    if key in occupied_start:
+                        cls, span = occupied_start[key]
+                        rich = _build_rich_cell(cls, include_room=include_room,
+                                               include_targets=include_targets)
+                        if span > 1:
+                            ws.merge_cells(start_row=row, start_column=col,
+                                           end_row=row + span - 1, end_column=col)
+                        data_cell = ws.cell(row=row, column=col)
+                        _apply_lesson_cell(data_cell, cls, rich)
+                        for rr in range(row, row + span):
+                            ws.cell(row=rr, column=col).border = cell_border
+                    elif key in overlap_cells:
+                        entries = sorted(overlap_cells[key], key=lambda item: item["order"])
+                        classes = [item["cls"] for item in entries]
+                        rich = _build_stacked_rich_cell(
+                            classes,
+                            include_room=include_room,
+                            include_targets=include_targets,
+                        )
+                        data_cell = ws.cell(row=row, column=col)
+                        _apply_lesson_cell(data_cell, classes[0], rich)
+                    elif key in covered:
+                        ws.cell(row=row, column=col).border = cell_border
+                    else:
+                        blank = ws.cell(row=row, column=col, value="")
+                        blank.fill = empty_fill
+                        blank.border = cell_border
+                        blank.alignment = center_wrap
+
+            ws.column_dimensions["A"].width = 12
+            for c_idx in range(2, len(days) + 2):
+                ws.column_dimensions[get_column_letter(c_idx)].width = 24
+            ws.row_dimensions[1].height = 30
+            for si in range(len(slots)):
+                ws.row_dimensions[si + 2].height = 70
+            _apply_page_setup(ws)
+
+        def _write_virtual_classroom_sheet(ws, filter_fn, include_room=False, include_targets=False):
+            c = ws.cell(row=1, column=1, value=tr("labels.time"))
+            c.fill = corner_fill
+            c.font = corner_font
+            c.border = cell_border
+            c.alignment = center_nowrap
+
+            layout = build_virtual_classroom_day_layout(s, filter_fn)
+            day_groups = layout["day_groups"]
+            blocks = layout["blocks"]
+            occupied_subcolumns = layout["occupied_subcolumns"]
+            starts = {
+                (block["row"], block["subcolumn"]): block
+                for block in blocks
+            }
+            covered = set(occupied_subcolumns)
+
+            for group in day_groups:
+                col_start = 2 + group["subcolumn_start"]
+                col_end = col_start + group["lane_count"] - 1
+                if group["lane_count"] > 1:
+                    ws.merge_cells(
+                        start_row=1, start_column=col_start,
+                        end_row=1, end_column=col_end,
+                    )
+                for col in range(col_start, col_end + 1):
+                    cell = ws.cell(row=1, column=col)
+                    cell.fill = day_fill
+                    cell.font = day_font
+                    cell.border = cell_border
+                    cell.alignment = center_nowrap
+                ws.cell(row=1, column=col_start, value=tr(f"weekdays.{group['day']}"))
+
+            total_subcolumns = layout["total_subcolumns"]
+            for si, slot in enumerate(slots):
+                row = si + 2
+                t_cell = ws.cell(row=row, column=1, value=slot)
+                t_cell.fill = time_fill
+                t_cell.font = time_font
+                t_cell.border = cell_border
+                t_cell.alignment = center_nowrap
+
+                for subcolumn in range(total_subcolumns):
+                    col = 2 + subcolumn
+                    key = (si, subcolumn)
+                    if key in starts:
+                        block = starts[key]
+                        rich = _build_rich_cell(
+                            block["cls"],
+                            include_room=include_room,
+                            include_targets=include_targets,
+                        )
+                        span = block["span"]
+                        if span > 1:
+                            ws.merge_cells(
+                                start_row=row, start_column=col,
+                                end_row=row + span - 1, end_column=col,
+                            )
+                        data_cell = ws.cell(row=row, column=col)
+                        _apply_lesson_cell(data_cell, block["cls"], rich)
+                        for rr in range(row, row + span):
+                            ws.cell(row=rr, column=col).border = cell_border
+                    elif key in covered:
+                        ws.cell(row=row, column=col).border = cell_border
+                    else:
+                        blank = ws.cell(row=row, column=col, value="")
+                        blank.fill = empty_fill
+                        blank.border = cell_border
+                        blank.alignment = center_wrap
+
+            ws.column_dimensions["A"].width = 12
+            for c_idx in range(2, total_subcolumns + 2):
+                ws.column_dimensions[get_column_letter(c_idx)].width = 24
+            ws.row_dimensions[1].height = 30
+            for si in range(len(slots)):
+                ws.row_dimensions[si + 2].height = 70
+            _apply_page_setup(ws)
+
+        if mode == "classroom":
+            physical_rooms = set(s.get("classrooms", []))
+            for room in get_classroom_export_labels(s.get("classrooms", []), placed):
+                ws = wb.create_sheet(title=self._sheet_name_for_export(room, used_sheet_names))
+                writer = _write_virtual_classroom_sheet if room not in physical_rooms else _write_filtered_sheet
+                writer(
+                    ws,
+                    filter_fn=lambda c, r=room: classroom_of(c) == r,
+                    include_room=False,
+                    include_targets=True,
+                )
+
+        elif mode == "group":
+            for yr in sorted(s.get("years", {}).keys()):
+                for br in s["years"][yr]:
+                    ws = wb.create_sheet(
+                        title=self._sheet_name_for_export(f"{yr} {br}", used_sheet_names))
+                    _write_filtered_sheet(
+                        ws,
+                        filter_fn=lambda c, y=yr, b=br: any(
+                            t["year"] == y and t["branch"] == b
+                            for t in c.get("targets", [])
+                        ),
+                        include_room=True,
+                        include_targets=False,
+                    )
+
+        elif mode == "lecturer":
+            lecturers = list(s.get("lecturers", []))
+            if not lecturers:
+                lecturers = sorted({c.get("lecturer", "") for c in placed if c.get("lecturer", "")})
+            for lecturer in lecturers:
+                if not lecturer:
+                    continue
+                ws = wb.create_sheet(
+                    title=self._sheet_name_for_export(lecturer, used_sheet_names))
+                _write_filtered_sheet(
+                    ws,
+                    filter_fn=lambda c, l=lecturer: c.get("lecturer", "") == l,
+                    include_room=True,
+                    include_targets=True,
+                )
+
+        else:
+            # Show Everything matrix export (per year), preserving the current matrix layout.
+            for yr in sorted(s["years"].keys()):
+                branches = s["years"][yr]
+                if not branches:
+                    continue
+                n_branches = len(branches)
+                ws = wb.create_sheet(title=self._sheet_name_for_export(yr, used_sheet_names))
+
+                ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+                c_sn = ws.cell(row=1, column=1, value="")
+                c_sn.fill = corner_fill
+                c_sn.border = cell_border
+
+                ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+                c_time = ws.cell(row=1, column=2, value=tr("labels.time"))
+                c_time.fill = corner_fill
+                c_time.font = corner_font
+                c_time.border = cell_border
+                c_time.alignment = center_nowrap
+
+                for d_idx, day in enumerate(days):
+                    col_start = 3 + d_idx * n_branches
+                    col_end = col_start + n_branches - 1
+                    if n_branches > 1:
+                        ws.merge_cells(start_row=1, start_column=col_start,
+                                       end_row=1, end_column=col_end)
+                    dc = ws.cell(row=1, column=col_start, value=tr(f"weekdays.{day}"))
+                    dc.fill = day_fill
+                    dc.font = day_font
+                    dc.border = cell_border
+                    dc.alignment = center_nowrap
+                    for mc in range(col_start, col_end + 1):
+                        ws.cell(row=1, column=mc).fill = day_fill
+                        ws.cell(row=1, column=mc).border = cell_border
+
+                ws.cell(row=2, column=1).fill = corner_fill
+                ws.cell(row=2, column=1).border = cell_border
+                ws.cell(row=2, column=2).fill = corner_fill
+                ws.cell(row=2, column=2).border = cell_border
+
+                for d_idx in range(len(days)):
+                    for b_idx, br in enumerate(branches):
+                        col = 3 + d_idx * n_branches + b_idx
+                        bc = ws.cell(row=2, column=col, value=br)
+                        bc.fill = branch_fill
+                        bc.font = branch_font
+                        bc.border = cell_border
+                        bc.alignment = center_nowrap
+
+                occupied = {}
+                for c in placed:
+                    c_day = effective_day(c)
+                    c_start = effective_time(c)
+                    if c_day not in days or c_start not in slots:
+                        continue
+                    d_idx = days.index(c_day)
+                    start_si = slots.index(c_start)
+                    is_joint = c.get("joint_session", True)
+                    n_targets = len(c.get("targets", []))
+                    dur = c["duration"]
+                    for t in c["targets"]:
+                        if t["year"] != yr or t["branch"] not in branches:
+                            continue
+                        b_idx = branches.index(t["branch"])
+                        if not is_joint and n_targets > 1:
+                            t_idx = c["targets"].index(t)
+                            slot_off = t_idx * dur
+                        else:
+                            slot_off = 0
+                        actual_start = start_si + slot_off
+                        for d_off in range(dur):
+                            si = actual_start + d_off
+                            if si >= len(slots):
+                                break
+                            okey = (si, d_idx, b_idx)
+                            if d_off == 0:
+                                span = min(dur, len(slots) - actual_start)
+                                occupied[okey] = ("start", c, span)
+                            else:
+                                occupied[okey] = ("span", None, 0)
+
+                for si, slot in enumerate(slots):
+                    erow = si + 3
+                    sn_cell = ws.cell(row=erow, column=1, value=si + 1)
+                    sn_cell.fill = session_fill
+                    sn_cell.font = session_font
+                    sn_cell.border = cell_border
+                    sn_cell.alignment = center_nowrap
+
+                    t_cell = ws.cell(row=erow, column=2, value=slot)
+                    t_cell.fill = time_fill
+                    t_cell.font = time_font
+                    t_cell.border = cell_border
+                    t_cell.alignment = center_nowrap
+
+                    for d_idx in range(len(days)):
+                        for b_idx in range(n_branches):
+                            col = 3 + d_idx * n_branches + b_idx
+                            okey = (si, d_idx, b_idx)
+                            if okey in occupied:
+                                kind, cls, span = occupied[okey]
+                                if kind == "span":
+                                    ws.cell(row=erow, column=col).border = cell_border
+                                    continue
+                                rich = _build_rich_cell(cls, include_room=True,
+                                                       include_targets=False)
+                                if span > 1:
+                                    ws.merge_cells(start_row=erow, start_column=col,
+                                                   end_row=erow + span - 1, end_column=col)
+                                    for mr in range(erow, erow + span):
+                                        ws.cell(row=mr, column=col).border = cell_border
+                                yr_hex = get_year_color(s, yr).lstrip("#")
+                                light_hex = lighten_color(f"#{yr_hex}", 0.45).lstrip("#")
+                                cf = PatternFill(start_color=light_hex.upper(),
+                                                 end_color=light_hex.upper(), fill_type="solid")
+                                data_cell = ws.cell(row=erow, column=col, value=rich)
+                                data_cell.fill = cf
+                                data_cell.border = cell_border
+                                data_cell.alignment = center_wrap
+                            else:
+                                ec = ws.cell(row=erow, column=col, value="")
+                                ec.fill = empty_fill
+                                ec.border = cell_border
+
+                ws.column_dimensions["A"].width = 5
+                ws.column_dimensions["B"].width = 12
+                total_cols = 2 + n_branches * len(days)
+                for c_idx in range(3, total_cols + 1):
+                    ws.column_dimensions[get_column_letter(c_idx)].width = 22
+                ws.row_dimensions[1].height = 30
+                ws.row_dimensions[2].height = 22
+                for si in range(len(slots)):
+                    ws.row_dimensions[si + 3].height = 80
+                _apply_page_setup(ws)
+
+        if not wb.worksheets:
+            ws = wb.create_sheet(
+                title=self._sheet_name_for_export(tr("labels.schedule"), used_sheet_names)
+            )
+            ws.cell(row=1, column=1, value=tr("warnings.no_schedule_data"))
+
+        wb.save(fname)
+
+    def _ensure_excel_deps(self):
+        """Return True if pandas+openpyxl are available, auto-installing if needed."""
+        try:
+            import pandas  # noqa: F401
+            import openpyxl  # noqa: F401
+            return True
+        except ImportError:
+            pass
+        reply = QMessageBox.question(
+            self, tr("dialogs.import.excel_title"),
+            tr("errors.pandas_openpyxl_required")
+            + "\n\n" + tr("dialogs.install.prompt"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return False
+        import subprocess, sys
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "pandas", "openpyxl"],
+                timeout=120,
+            )
+            return True
+        except Exception as exc:
+            QMessageBox.warning(self, tr("status.import_failed"), str(exc))
+            return False
+
+    def _import_from_excel(self):
+        if not self._ensure_excel_deps():
+            return
+
+        fname, _ = QFileDialog.getOpenFileName(
+            self, tr("dialogs.import.excel_title"),
+            storage.sub_dir(storage.EXPORTS_DIR),
+            f"{tr('labels.excel_files')} (*.xlsx);;{tr('labels.all_files')} (*)")
+        if not fname:
+            return
+
+        from scheduler_app.data_io.importer import load_scheduler_data_from_excel
+
+        dataset = load_scheduler_data_from_excel(fname)
+        report = dataset.report
+
+        if not report.is_valid:
+            QMessageBox.warning(
+                self, tr("status.import_failed"),
+                report.summary())
+            return
+
+        # Tier enforcement: check limits before importing
+        from scheduler_app.ui.tier_enforcement import TierEnforcement
+        from scheduler_app.plans import (
+            ENTITY_LECTURERS, ENTITY_CLASSROOMS, ENTITY_CLASSES,
+        )
+        enforcer = TierEnforcement.instance()
+        imported = dataset.state
+        if imported["lecturers"] and not enforcer.require_entity_limit(
+                ENTITY_LECTURERS, len(imported["lecturers"]) - 1, self):
+            return
+        if imported["classrooms"] and not enforcer.require_entity_limit(
+                ENTITY_CLASSROOMS, len(imported["classrooms"]) - 1, self):
+            return
+        if imported["classes"]:
+            total_classes = len(self.state_data.get("classes", [])) + len(imported["classes"])
+            if not enforcer.require_entity_limit(
+                    ENTITY_CLASSES, total_classes - 1, self):
+                return
+
+        # Merge imported data into current state
+        s = self.state_data
+        if dataset.state["lecturers"]:
+            s["lecturers"] = dataset.state["lecturers"]
+            s["lecturer_availability"] = dataset.state.get("lecturer_availability", {})
+        if dataset.state["classrooms"]:
+            s["classrooms"] = dataset.state["classrooms"]
+            s["classroom_capacities"] = dataset.state.get("classroom_capacities", {})
+        if dataset.state["years"]:
+            s["years"] = dataset.state["years"]
+        if dataset.state["classes"]:
+            s["classes"].extend(dataset.state["classes"])
+
+        self._on_state_changed()
+        self.refresh()
+
+        msg = tr("status.import_successful")
+        if report.warnings:
+            msg += "\n\n" + report.summary()
+        QMessageBox.information(self, tr("dialogs.import.excel_title"), msg)
+
+    def _generate_excel_template(self):
+        if not self._ensure_excel_deps():
+            return
+
+        fname, _ = QFileDialog.getSaveFileName(
+            self, tr("menus.generate_template"),
+            os.path.join(storage.sub_dir(storage.EXPORTS_DIR), "scheduler_template.xlsx"),
+            f"{tr('labels.excel_files')} (*.xlsx);;{tr('labels.all_files')} (*)")
+        if not fname:
+            return
+
+        from scheduler_app.data_io.template import generate_excel_template
+
+        try:
+            generate_excel_template(fname)
+            QMessageBox.information(
+                self, tr("status.template_generated"),
+                f"{tr('status.excel_template_saved')} {os.path.basename(fname)}")
+        except Exception as e:
+            QMessageBox.critical(self, tr("dialogs.error.title"), str(e))
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  MISC
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _show_tutorial(self):
+        """Launch the tutorial (from Help menu — replay case)."""
+        self._show_tutorial_controlled(None)
+
+    def _show_tutorial_controlled(self, on_done_callback):
+        """Launch the tutorial overlay, optionally calling back when done."""
+        from scheduler_app.tutorial import TutorialOverlay
+        steps = self._tutorial_steps()
+        section_names = [
+            "tutorial.sec_welcome", "tutorial.sec_interface", "tutorial.sec_setup",
+            "tutorial.sec_classes", "tutorial.sec_placement", "tutorial.sec_views",
+            "tutorial.sec_panels", "tutorial.sec_optimization", "tutorial.sec_dashboard",
+            "tutorial.sec_data", "tutorial.sec_shortcuts",
+        ]
+        overlay = TutorialOverlay(self, steps, section_names)
+        self._active_tutorial = overlay
+
+        def _on_finished():
+            self._active_tutorial = None
+            if on_done_callback:
+                on_done_callback()
+
+        overlay.finished.connect(_on_finished)
+        if not on_done_callback:
+            from scheduler_app.first_run import _write_flag
+            overlay.finished.connect(
+                lambda: _write_flag(self._config_path,
+                                    "tutorial_seen_or_skipped", True))
+        overlay.show()
+
+    def _find_toolbar_btn(self, *names):
+        """Find a toolbar QToolButton whose text matches any of *names*."""
+        for tb in self.findChildren(QToolBar):
+            for btn in tb.findChildren(QToolButton):
+                txt = btn.text().strip()
+                for name in names:
+                    if name in txt:
+                        return btn
+        return None
+
+    def _get_toolbar(self):
+        """Return the main toolbar widget."""
+        for tb in self.findChildren(QToolBar):
+            if tb.objectName() == "main_toolbar":
+                return tb
+        return None
+
+    def _tutorial_steps(self):
+        """Build the full hierarchical tutorial step list."""
+        # Direct widget references (stored during _build_toolbar)
+        setup_btn = getattr(self, "_tb_setup_btn", None)
+        add_btn = getattr(self, "_tb_add_btn", None)
+        place_btn = getattr(self, "_tb_place_btn", None)
+
+        # Section indices (matching section_names order)
+        S_WELCOME, S_INTERFACE, S_SETUP = 0, 1, 2
+        S_ADDING, S_PLACEMENT, S_VIEWS = 3, 4, 5
+        S_PANELS, S_OPTIMIZATION, S_DASHBOARD = 6, 7, 8
+        S_DATA, S_SHORTCUTS = 9, 10
+
+        return [
+            # ── 0. Welcome ──
+            {"widget": None, "title": "tutorial.welcome_title",
+             "body": "tutorial.welcome_body", "section": S_WELCOME},
+
+            # ── 1. Interface Overview ──
+            {"widget": self.menuBar(), "title": "tutorial.menubar_title",
+             "body": "tutorial.menubar_body", "section": S_INTERFACE},
+            {"widget": self.notebook.tabBar(), "title": "tutorial.toolbar_title",
+             "body": "tutorial.toolbar_body", "section": S_INTERFACE},
+            {"widget": self.notebook, "title": "tutorial.tabs_title",
+             "body": "tutorial.tabs_body", "section": S_INTERFACE,
+             "action": lambda: self.notebook.setCurrentIndex(0)},
+
+            # ── 2. Setup ──
+            {"widget": setup_btn, "title": "tutorial.setup_title",
+             "body": "tutorial.setup_body", "section": S_SETUP},
+            {"widget": setup_btn, "title": "tutorial.setup_tabs_title",
+             "body": "tutorial.setup_tabs_body", "section": S_SETUP},
+
+            # ── 3. Classes ──
+            {"widget": add_btn, "title": "tutorial.classes_title",
+             "body": "tutorial.classes_body", "section": S_ADDING},
+            {"widget": add_btn, "title": "tutorial.add_single_title",
+             "body": "tutorial.add_single_body", "section": S_ADDING},
+            {"widget": add_btn, "title": "tutorial.add_bulk_title",
+             "body": "tutorial.add_bulk_body", "section": S_ADDING},
+            {"widget": add_btn, "title": "tutorial.edit_classes_title",
+             "body": "tutorial.edit_classes_body", "section": S_ADDING},
+            {"widget": add_btn, "title": "tutorial.template_title",
+             "body": "tutorial.template_body", "section": S_ADDING},
+
+            # ── 4. Placement & Drag-and-Drop ──
+            {"widget": place_btn, "title": "tutorial.place_title",
+             "body": "tutorial.place_body", "section": S_PLACEMENT},
+            {"widget": place_btn, "title": "tutorial.place_actions_title",
+             "body": "tutorial.place_actions_body", "section": S_PLACEMENT},
+            {"widget": self.grid_view1, "title": "tutorial.dragdrop_title",
+             "body": "tutorial.dragdrop_body", "section": S_PLACEMENT,
+             "action": lambda: self.notebook.setCurrentIndex(0)},
+
+            # ── 5. Timetable View Modes ──
+            {"widget": self.notebook, "title": "tutorial.views_title",
+             "body": "tutorial.views_body", "section": S_VIEWS,
+             "action": lambda: self.notebook.setCurrentIndex(0)},
+            {"widget": self.tab_classroom, "title": "tutorial.view_classroom_title",
+             "body": "tutorial.view_classroom_body", "section": S_VIEWS,
+             "action": lambda: self.notebook.setCurrentIndex(0)},
+            {"widget": self.tab_group, "title": "tutorial.view_group_title",
+             "body": "tutorial.view_group_body", "section": S_VIEWS,
+             "action": lambda: self.notebook.setCurrentIndex(1)},
+            {"widget": self.tab_lecturer, "title": "tutorial.view_lecturer_title",
+             "body": "tutorial.view_lecturer_body", "section": S_VIEWS,
+             "action": lambda: self.notebook.setCurrentIndex(2)},
+            {"widget": self.tab_everything, "title": "tutorial.view_everything_title",
+             "body": "tutorial.view_everything_body", "section": S_VIEWS,
+             "action": lambda: self.notebook.setCurrentIndex(3)},
+
+            # ── 6. Side Panels ──
+            {"widget": self._sidebar_panel, "title": "tutorial.unplaced_title",
+             "body": "tutorial.unplaced_body", "section": S_PANELS,
+             "action": lambda: (self.notebook.setCurrentIndex(0),
+                                self._switch_sidebar_tab(1))},
+            {"widget": self._sidebar_panel, "title": "tutorial.openslots_title",
+             "body": "tutorial.openslots_body", "section": S_PANELS,
+             "action": lambda: self._switch_sidebar_tab(0)},
+            {"widget": self.warning_log, "title": "tutorial.warnings_title",
+             "body": "tutorial.warnings_body", "section": S_PANELS},
+            {"widget": self._zoom_slider, "title": "tutorial.zoom_title",
+             "body": "tutorial.zoom_body", "section": S_PANELS},
+
+            # ── 7. Optimization & Rescheduling ──
+            {"widget": place_btn, "title": "tutorial.reschedule_title",
+             "body": "tutorial.reschedule_body", "section": S_OPTIMIZATION},
+            {"widget": None, "title": "tutorial.optimization_modes_title",
+             "body": "tutorial.optimization_modes_body", "section": S_OPTIMIZATION},
+
+            # ── 8. Quality Dashboard ──
+            {"widget": self.dashboard_widget, "title": "tutorial.dashboard_title",
+             "body": "tutorial.dashboard_body", "section": S_DASHBOARD,
+             "action": lambda: self.notebook.setCurrentIndex(4)},
+            {"widget": self.dashboard_widget, "title": "tutorial.dashboard_metrics_title",
+             "body": "tutorial.dashboard_metrics_body", "section": S_DASHBOARD},
+
+            # ── 9. Data Management ──
+            {"widget": self.menuBar(), "title": "tutorial.file_menu_title",
+             "body": "tutorial.file_menu_body", "section": S_DATA},
+            {"widget": self.menuBar(), "title": "tutorial.import_export_title",
+             "body": "tutorial.import_export_body", "section": S_DATA},
+            {"widget": self._export_btn1, "title": "tutorial.export_btn_title",
+             "body": "tutorial.export_btn_body", "section": S_DATA,
+             "action": lambda: self.notebook.setCurrentIndex(0)},
+
+            # ── 10. Keyboard Shortcuts ──
+            {"widget": None, "title": "tutorial.shortcuts_title",
+             "body": "tutorial.shortcuts_body", "section": S_SHORTCUTS},
+            {"widget": None, "title": "tutorial.shortcuts_editing_title",
+             "body": "tutorial.shortcuts_editing_body", "section": S_SHORTCUTS},
+
+            # ── Done ──
+            {"widget": None, "title": "tutorial.done_title",
+             "body": "tutorial.done_body", "section": S_WELCOME},
+        ]
+
+    def _show_about(self):
+        from PyQt6.QtGui import QPixmap
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("dialogs.about.title"))
+        dlg.setFixedSize(460, 440)
+        logo_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            'docs', 'dersis.png')
+        if os.path.exists(logo_path):
+            dlg.setWindowIcon(QIcon(logo_path))
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Header — white background so logo blends in
+        header = QFrame()
+        header.setStyleSheet(
+            'background: white; border: none; border-bottom: 1px solid #E2E8F0;')
+        header.setFixedHeight(110)
+        hl = QVBoxLayout(header)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo_label = QLabel()
+        logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo_label.setStyleSheet('background: transparent; border: none;')
+        if os.path.exists(logo_path):
+            pixmap = QPixmap(logo_path)
+            scaled = pixmap.scaled(
+                QSize(220, 100),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            logo_label.setPixmap(scaled)
+        else:
+            logo_label.setText('DERSIS')
+            logo_label.setStyleSheet(
+                'font-size: 24pt; font-weight: 800; color: #1E293B; '
+                'background: transparent;')
+        hl.addWidget(logo_label)
+        layout.addWidget(header)
+
+        # Body
+        body = QFrame()
+        body.setStyleSheet('background: #F8FAFC; border: none;')
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(32, 20, 32, 16)
+        bl.setSpacing(0)
+
+        from scheduler_app._version import __version__ as current_ver
+        version_lbl = QLabel(
+            tr("dialogs.about.version").replace("{version}", current_ver))
+        version_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        version_lbl.setStyleSheet(
+            'font-size: 10pt; font-weight: 600; color: #1E293B; '
+            'background: transparent; margin-bottom: 6px;')
+        bl.addWidget(version_lbl)
+
+        desc_lbl = QLabel(tr("dialogs.about.description"))
+        desc_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        desc_lbl.setWordWrap(True)
+        desc_lbl.setStyleSheet(
+            'font-size: 9pt; color: #64748B; background: transparent; '
+            'margin-bottom: 14px;')
+        bl.addWidget(desc_lbl)
+
+        rights_lbl = QLabel(tr("dialogs.about.rights"))
+        rights_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        rights_lbl.setStyleSheet(
+            'font-size: 8pt; color: #94A3B8; background: transparent; '
+            'margin-bottom: 16px;')
+        bl.addWidget(rights_lbl)
+
+        # Separator
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet('background: #E2E8F0; max-height: 1px; border: none;')
+        bl.addWidget(sep)
+        bl.addSpacing(14)
+
+        # Dedication
+        ded_lbl = QLabel(tr("dialogs.about.dedication"))
+        ded_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        ded_lbl.setWordWrap(True)
+        ded_lbl.setStyleSheet(
+            'font-size: 8.5pt; font-style: italic; color: #64748B; '
+            'background: transparent;')
+        bl.addWidget(ded_lbl)
+
+        bl.addStretch()
+        layout.addWidget(body, 1)
+
+        # Footer
+        footer = QFrame()
+        footer.setStyleSheet('background: #F8FAFC; border-top: 1px solid #E2E8F0;')
+        fl = QHBoxLayout(footer)
+        fl.setContentsMargins(24, 10, 24, 10)
+        fl.addStretch()
+        close_btn = QPushButton(tr('buttons.close'))
+        close_btn.setFixedWidth(90)
+        close_btn.setStyleSheet(
+            'QPushButton { background: #1E293B; color: white; border: none;'
+            '  border-radius: 8px; font-size: 9pt; font-weight: 600;'
+            '  padding: 7px 16px; }'
+            'QPushButton:hover { background: #334155; }')
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.clicked.connect(dlg.accept)
+        fl.addWidget(close_btn)
+        layout.addWidget(footer)
+
+        dlg.exec()
+
+    def _show_features(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("dialogs.about.features_title"))
+        dlg.setMinimumSize(520, 480)
+        dlg.setMaximumSize(640, 720)
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+        content = QLabel(tr("dialogs.about.features_html"))
+        content.setWordWrap(True)
+        content.setTextFormat(Qt.TextFormat.RichText)
+        content.setAlignment(Qt.AlignmentFlag.AlignTop)
+        content.setContentsMargins(24, 20, 24, 20)
+        content.setStyleSheet(
+            "QLabel { background: white; color: #1E293B; font-size: 10pt; }")
+        scroll.setWidget(content)
+        lay.addWidget(scroll)
+
+        close_btn = QPushButton(tr("buttons.close"))
+        close_btn.setFixedWidth(100)
+        close_btn.setStyleSheet(
+            "QPushButton { background: #3B82F6; color: white; border: none;"
+            "  border-radius: 6px; font-size: 9pt; font-weight: bold;"
+            "  padding: 8px 16px; }"
+            "QPushButton:hover { background: #2563EB; }")
+        close_btn.clicked.connect(dlg.accept)
+        btn_lay = QHBoxLayout()
+        btn_lay.addStretch()
+        btn_lay.addWidget(close_btn)
+        btn_lay.setContentsMargins(16, 8, 16, 12)
+        lay.addLayout(btn_lay)
+
+        dlg.exec()
+
+    def _open_language_dialog(self):
+        """Open the shared LanguageDialog from the top menu."""
+        from scheduler_app.first_run import LanguageDialog
+        dlg = LanguageDialog(parent=self, current_language=get_language())
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            lang = dlg.chosen_language
+            if lang != get_language():
+                self._set_language(lang)
+
+    def _set_language(self, lang):
+        if lang == get_language():
+            return
+        set_language(lang)
+        # Apply layout direction for RTL languages
+        app = QApplication.instance()
+        if is_rtl(lang):
+            app.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        else:
+            app.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        # Mark language as explicitly chosen so the dialog never reappears
+        from scheduler_app.first_run import _write_flag
+        _write_flag(self._config_path, "language_chosen", True)
+        self.setWindowTitle(tr("app.title"))
+        self._build_menu()
+        for tb in self.findChildren(QToolBar):
+            self.removeToolBar(tb)
+        self._build_toolbar()
+        self.notebook.setTabText(0, "\U0001F3E0  " + tr("menus.view_by_classroom"))
+        self.notebook.setTabText(1, "\U0001F393  " + tr("menus.view_by_group"))
+        self.notebook.setTabText(2, "\U0001F468\u200D\U0001F3EB  " + tr("menus.view_by_lecturer"))
+        self.notebook.setTabText(3, "\U0001F4CB  " + tr("tabs.show_everything"))
+        self.notebook.setTabText(4, "\U0001F4CA  " + tr("tabs.dashboard"))
+        self.dashboard_widget.retranslate()
+        # Refresh sidebar
+        self._sidebar_tab_open_slots.setText(
+            "\u2B50  " + tr("panels.open_slots"))
+        self._sidebar_tab_unplaced.setText(
+            "\u26A0  " + tr("panels.unplaced_classes"))
+        # Update header title based on active tab
+        if self._sidebar_current_tab == 0:
+            self._sidebar_title.setText(tr("panels.open_slots"))
+        else:
+            self._sidebar_title.setText(tr("panels.unplaced_classes"))
+        # Refresh filter labels and export buttons
+        self._classroom_label.setText("\U0001F3E0  " + tr("filters.classroom"))
+        self._group_label.setText("\U0001F393  " + tr("filters.group"))
+        self._lecturer_label.setText("\U0001F468\u200D\U0001F3EB  " + tr("filters.lecturer"))
+        self._export_btn1.setText("\u21D7  " + tr("buttons.export"))
+        self._export_btn2.setText("\u21D7  " + tr("buttons.export"))
+        self._export_btn3.setText("\u21D7  " + tr("buttons.export"))
+        self._export_btn4.setText("\u21D7  " + tr("buttons.export"))
+        for menu in (self._export_menu1, self._export_menu2,
+                     self._export_menu3, self._export_menu4):
+            actions = menu.actions()
+            if len(actions) >= 2:
+                actions[0].setText(tr("menus.export_excel"))
+                actions[1].setText(tr("menus.export_pdf"))
+        # Refresh open slots panel
+        self._refresh_open_slots()
+        # Refresh sidebar collapse/expand tooltips
+        self._sidebar_collapse_btn.setToolTip(tr("panels.collapse_sidebar"))
+        self._sidebar_expand_btn.setToolTip(tr("panels.sidebar"))
+        # Refresh zoom bar tooltip
+        self._zoom_slider.setToolTip(tr("tooltips.zoom"))
+        # Refresh warning log panel
+        self.warning_log.retranslate()
+        # Retranslate active tutorial overlay if one is showing
+        if getattr(self, "_active_tutorial", None) is not None:
+            self._active_tutorial.retranslate()
+        # Retranslate impact badge
+        self._update_impact_badge()
+        self.refresh_grid()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, '_sidebar_is_collapsed'):
+            self._position_expand_buttons()
+
+    def _on_quit(self):
+        if self.state_data["classes"]:
+            resp = QMessageBox.question(
+                self, tr("dialogs.quit.title"), tr("dialogs.quit.save_prompt"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel)
+            if resp == QMessageBox.StandardButton.Cancel:
+                return
+            if resp == QMessageBox.StandardButton.Yes:
+                self.save_file()
+        self.close()
+
+    def closeEvent(self, event):
+        self._auto_save()
+        event.accept()
