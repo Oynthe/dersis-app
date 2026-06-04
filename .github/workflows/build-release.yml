@@ -1,0 +1,188 @@
+# ============================================================================
+# DERSİS — Build & Release
+#
+# Builds the DERSİS desktop app on a Windows runner using the embeddable
+# Python bundle, compiles the Inno Setup installer, uploads it as a workflow
+# artifact, and publishes a GitHub Release with the installer attached.
+#
+# Paths (verified against the repository):
+#   - build_embed.bat ............ repo root  (produces build\Dersis.dist\)
+#   - installer.iss .............. repo root  (reads build\version.iss)
+#   - app launcher (built) ....... build\Dersis.dist\Dersis.exe
+#   - installer (built) .......... Output\Dersis_Setup_v<VERSION>.exe
+#
+# Versioning:
+#   The base version comes from the VERSION file (currently semver X.Y.Z).
+#   Because pushes to main reuse the same VERSION, the release tag is made
+#   unique per run by appending the workflow run number:
+#       v<VERSION>-build.<run_number>   e.g.  v1.0.0-build.42
+#
+# Triggers:
+#   - Manual dispatch (workflow_dispatch)
+#   - Pushes to the main branch
+# ============================================================================
+
+name: Build & Release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+# Required so the workflow can create a GitHub Release.
+permissions:
+  contents: write
+
+# Avoid overlapping release runs for the same ref.
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: Build DERSİS & Publish Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Determine version / release tag ───────────────────────────────
+      - name: Read version and compute release tag
+        id: version
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "VERSION")) {
+            Write-Error "VERSION file not found"
+            exit 1
+          }
+
+          $version = (Get-Content "VERSION" -Raw).Trim()
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "VERSION '$version' is not valid semver (expected X.Y.Z)"
+            exit 1
+          }
+
+          # Unique, clear tag per run: v<version>-build.<run_number>
+          $tag = "v$version-build.${{ github.run_number }}"
+          $installerName = "Dersis_Setup_v$version.exe"
+
+          echo "version=$version"              >> $env:GITHUB_OUTPUT
+          echo "tag=$tag"                       >> $env:GITHUB_OUTPUT
+          echo "installer_name=$installerName"  >> $env:GITHUB_OUTPUT
+
+          Write-Host "Version:        $version"
+          Write-Host "Release tag:    $tag"
+          Write-Host "Installer name: $installerName"
+
+      # ── Python setup (build_embed.bat needs Python on PATH) ───────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      # ── Build the app ─────────────────────────────────────────────────
+      # build_embed.bat downloads the embeddable Python, installs runtime
+      # dependencies, copies the app, and writes build\version.iss.
+      # "< NUL" feeds EOF to the script's `pause` statements so it does not
+      # hang on a headless runner.
+      - name: Build app (build_embed.bat)
+        shell: cmd
+        run: build_embed.bat < NUL
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $dist = "build\Dersis.dist"
+          $required = @(
+            "$dist\python\pythonw.exe",
+            "$dist\scheduler_gui.py",
+            "$dist\VERSION",
+            "$dist\scheduler_app",
+            "$dist\Dersis.exe",
+            "build\version.iss"
+          )
+          foreach ($f in $required) {
+            if (-not (Test-Path $f)) {
+              Write-Error "Missing build output: $f"
+              exit 1
+            }
+            Write-Host "OK: $f"
+          }
+
+      # ── Compile the installer ─────────────────────────────────────────
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $installer = "$env:TEMP\innosetup.exe"
+          Write-Host "Downloading Inno Setup..."
+          Invoke-WebRequest -Uri "https://jrsoftware.org/download.php/is.exe" -OutFile $installer -UseBasicParsing
+          Write-Host "Installing Inno Setup silently..."
+          Start-Process -FilePath $installer -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\InnoSetup" -Wait -NoNewWindow
+          echo "C:\InnoSetup" >> $env:GITHUB_PATH
+          Write-Host "Inno Setup installed to C:\InnoSetup"
+
+      - name: Build installer (installer.iss)
+        shell: cmd
+        run: '"C:\InnoSetup\iscc.exe" installer.iss'
+
+      - name: Verify installer output
+        shell: pwsh
+        run: |
+          $installer = "Output\${{ steps.version.outputs.installer_name }}"
+          if (-not (Test-Path $installer)) {
+            Write-Error "Installer not found: $installer"
+            Get-ChildItem "Output\" -ErrorAction SilentlyContinue | Format-Table Name, Length
+            exit 1
+          }
+          $sizeMB = [math]::Round((Get-Item $installer).Length / 1MB, 2)
+          Write-Host "Installer: $installer ($sizeMB MB)"
+          if ((Get-Item $installer).Length -lt 1MB) {
+            Write-Error "Installer is suspiciously small ($sizeMB MB). Build may be incomplete."
+            exit 1
+          }
+
+      # ── Upload the installer as a workflow artifact ───────────────────
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.installer_name }}
+          path: Output/${{ steps.version.outputs.installer_name }}
+          if-no-files-found: error
+          retention-days: 90
+
+      # ── Publish a GitHub Release with the installer attached ──────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "DERSİS ${{ steps.version.outputs.tag }}"
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: Output/${{ steps.version.outputs.installer_name }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Summary ───────────────────────────────────────────────────────
+      - name: Summary
+        shell: pwsh
+        run: |
+          $installer = "Output\${{ steps.version.outputs.installer_name }}"
+          $sizeMB = [math]::Round((Get-Item $installer).Length / 1MB, 2)
+          @"
+          ## DERSİS Build & Release
+
+          | Property | Value |
+          |----------|-------|
+          | **Version** | ``${{ steps.version.outputs.version }}`` |
+          | **Release tag** | ``${{ steps.version.outputs.tag }}`` |
+          | **Installer** | ``${{ steps.version.outputs.installer_name }}`` |
+          | **Size** | $sizeMB MB |
+          | **Runner** | ``$($env:RUNNER_OS)`` |
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
