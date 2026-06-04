@@ -1,0 +1,8 @@
+# DERSİS — Development Dependencies
+# Tools for testing and development.
+#
+# Install:  pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest>=7.0

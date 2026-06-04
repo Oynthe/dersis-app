@@ -1,0 +1,240 @@
+# ============================================================================
+# DERSİS — Release Publisher
+#
+# Creates a GitHub Release with the installer and checksum attached.
+#
+# Triggers:
+#   - Version tags (v*) — automatic release on tag push
+#   - Manual dispatch — for re-releasing or testing
+#
+# This workflow calls build-installer.yml, then publishes the artifacts
+# to a GitHub Release.
+# ============================================================================
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v1.2.0). Must already exist."
+        required: true
+        type: string
+      prerelease:
+        description: "Mark as pre-release"
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Build the installer via the reusable build workflow ────────────
+  build:
+    name: Build DERSİS Installer
+    runs-on: windows-latest
+
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      installer_name: ${{ steps.version.outputs.installer_name }}
+      checksum_name: ${{ steps.version.outputs.checksum_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # ── Version validation ──────────────────────────────────────────
+      - name: Read and validate version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Get-Content "VERSION" -Raw).Trim()
+
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Error "VERSION '$version' is not valid semver"
+            exit 1
+          }
+
+          # Determine the tag being released
+          $tag = ""
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ github.event.inputs.tag }}" -replace '^v', ''
+          } elseif ("${{ github.ref }}".StartsWith("refs/tags/v")) {
+            $tag = "${{ github.ref_name }}" -replace '^v', ''
+          }
+
+          if ($tag -ne "" -and $tag -ne $version) {
+            Write-Error "Tag 'v$tag' does not match VERSION '$version'"
+            exit 1
+          }
+
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "installer_name=Dersis_Setup_v$version.exe" >> $env:GITHUB_OUTPUT
+          echo "checksum_name=Dersis_Setup_v$version.exe.sha256" >> $env:GITHUB_OUTPUT
+          echo "APP_VERSION=$version" >> $env:GITHUB_ENV
+
+          Write-Host "Release version: $version"
+
+      # ── Python setup ────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── Build ───────────────────────────────────────────────────────
+      - name: Run build_embed.bat
+        shell: cmd
+        run: build_embed.bat < NUL
+
+      - name: Verify ortools is importable in build
+        shell: pwsh
+        run: |
+          $dist = "build\Dersis.dist"
+          & "$dist\python\python.exe" -c "from ortools.sat.python import cp_model; print('ortools OK:', cp_model.__name__)"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "FATAL: ortools is not importable in the embeddable Python build."
+            exit 1
+          }
+          Write-Host "ortools import verified"
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $dist = "build\Dersis.dist"
+          $checks = @(
+            "$dist\python\pythonw.exe",
+            "$dist\scheduler_gui.py",
+            "$dist\VERSION",
+            "$dist\scheduler_app",
+            "build\version.iss"
+          )
+          foreach ($f in $checks) {
+            if (-not (Test-Path $f)) {
+              Write-Error "Missing: $f"
+              exit 1
+            }
+          }
+          Write-Host "Build output verified"
+
+      # ── Installer ──────────────────────────────────────────────────
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $installer = "$env:TEMP\innosetup.exe"
+          Invoke-WebRequest -Uri "https://jrsoftware.org/download.php/is.exe" -OutFile $installer -UseBasicParsing
+          Start-Process -FilePath $installer -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\InnoSetup" -Wait -NoNewWindow
+          echo "C:\InnoSetup" >> $env:GITHUB_PATH
+
+      - name: Build installer
+        shell: cmd
+        run: "C:\InnoSetup\iscc.exe" installer.iss
+
+      - name: Verify installer and generate checksum
+        shell: pwsh
+        run: |
+          $version = $env:APP_VERSION
+          $installer = "Output\Dersis_Setup_v$version.exe"
+
+          if (-not (Test-Path $installer)) {
+            Write-Error "Installer not found: $installer"
+            exit 1
+          }
+
+          $size = (Get-Item $installer).Length
+          if ($size -lt 1MB) {
+            Write-Error "Installer too small ($([math]::Round($size/1MB,2)) MB)"
+            exit 1
+          }
+
+          # Generate checksum
+          $hash = (Get-FileHash -Path $installer -Algorithm SHA256).Hash.ToLower()
+          $filename = Split-Path $installer -Leaf
+          "$hash  $filename" | Out-File -FilePath "$installer.sha256" -Encoding ascii -NoNewline
+
+          Write-Host "Installer: $filename ($([math]::Round($size/1MB,2)) MB)"
+          Write-Host "SHA-256: $hash"
+
+      # ── Upload artifacts for the release job ────────────────────────
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-installer
+          path: Output/Dersis_Setup_v${{ steps.version.outputs.version }}.exe
+          if-no-files-found: error
+
+      - name: Upload checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-checksum
+          path: Output/Dersis_Setup_v${{ steps.version.outputs.version }}.exe.sha256
+          if-no-files-found: error
+
+  # ── Publish GitHub Release ────────────────────────────────────────
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download installer artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-installer
+          path: release-assets/
+
+      - name: Download checksum artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: release-checksum
+          path: release-assets/
+
+      - name: Verify downloaded assets
+        run: |
+          INSTALLER="release-assets/${{ needs.build.outputs.installer_name }}"
+          CHECKSUM="release-assets/${{ needs.build.outputs.checksum_name }}"
+
+          if [ ! -f "$INSTALLER" ]; then
+            echo "::error::Installer not found: $INSTALLER"
+            ls -la release-assets/
+            exit 1
+          fi
+
+          if [ ! -f "$CHECKSUM" ]; then
+            echo "::error::Checksum not found: $CHECKSUM"
+            exit 1
+          fi
+
+          echo "Assets ready for release:"
+          ls -lh release-assets/
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=${{ github.event.inputs.prerelease }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: "DERSİS v${{ needs.build.outputs.version }}"
+          draft: false
+          prerelease: ${{ steps.tag.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: |
+            release-assets/${{ needs.build.outputs.installer_name }}
+            release-assets/${{ needs.build.outputs.checksum_name }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

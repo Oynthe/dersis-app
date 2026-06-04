@@ -1,0 +1,40 @@
+# DERSİS — Pinned Dependencies (lock file)
+# Generated from a clean virtual environment on 2026-04-03.
+# Use this for reproducible CI/CD and build installations.
+#
+# Regenerate:
+#   python -m venv .venv-lock
+#   .venv-lock/Scripts/pip install -r requirements.txt   (Windows)
+#   .venv-lock/bin/pip install -r requirements.txt       (Linux)
+#   pip freeze > requirements-lock.txt
+#   # Then re-add this header.
+
+# ── Direct dependencies ────────────────────────────────────────────────
+PyQt6==6.11.0
+cryptography==46.0.6
+openpyxl==3.1.5
+pandas==3.0.2
+reportlab==4.4.10
+ortools==9.15.6755
+packaging==26.0
+deepdiff==9.0.0
+
+# ── Transitive dependencies ────────────────────────────────────────────
+PyQt6-Qt6==6.11.0
+PyQt6-sip==13.11.1
+absl-py==2.4.0
+certifi==2026.2.25
+cffi==2.0.0
+charset-normalizer==3.4.7
+et-xmlfile==2.0.0
+idna==3.11
+immutabledict==4.3.1
+numpy==2.4.4
+orderly-set==5.5.0
+pillow==12.2.0
+protobuf==6.33.6
+pycparser==3.0
+python-dateutil==2.9.0.post0
+six==1.17.0
+typing-extensions==4.15.0
+urllib3==2.6.3

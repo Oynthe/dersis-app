@@ -1,0 +1,148 @@
+# ============================================================================
+# DERSİS — Continuous Integration
+#
+# Lightweight validation on every push and pull request.
+# Fails fast on version/build inconsistencies and import errors.
+# ============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Python setup ──────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip check
+
+      # ── Version checks ────────────────────────────────────────────────
+      - name: Verify VERSION file exists and is valid semver
+        run: |
+          if [ ! -f VERSION ]; then
+            echo "::error::VERSION file not found"
+            exit 1
+          fi
+
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::VERSION '$VERSION' is not valid semver (expected X.Y.Z)"
+            exit 1
+          fi
+
+          echo "Version: $VERSION"
+
+      - name: Verify _version.py reads VERSION correctly
+        run: |
+          RUNTIME_VERSION=$(python -c "from scheduler_app._version import __version__; print(__version__)")
+          echo "Runtime version: $RUNTIME_VERSION"
+
+          if [ "$RUNTIME_VERSION" != "$VERSION" ]; then
+            echo "::error::_version.py reports '$RUNTIME_VERSION' but VERSION file says '$VERSION'"
+            exit 1
+          fi
+
+      - name: Verify tag matches VERSION (on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          if [ "$TAG_VERSION" != "$VERSION" ]; then
+            echo "::error::Tag 'v$TAG_VERSION' does not match VERSION file '$VERSION'"
+            exit 1
+          fi
+
+      # ── Build file checks ─────────────────────────────────────────────
+      - name: Verify required build files exist
+        run: |
+          MISSING=0
+          for f in build_embed.bat installer.iss verify_deps.py scheduler_gui.py; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Required build file missing: $f"
+              MISSING=1
+            else
+              echo "OK: $f"
+            fi
+          done
+
+          for f in scheduler_app/assets/app_icon.ico installer/LICENSE.txt; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Required asset missing: $f"
+              MISSING=1
+            else
+              echo "OK: $f"
+            fi
+          done
+
+          if [ "$MISSING" -eq 1 ]; then exit 1; fi
+
+      # ── Import / smoke checks ─────────────────────────────────────────
+      - name: Smoke-test core imports
+        run: |
+          python -c "
+          import sys
+          failures = []
+
+          # Only test modules that can load on headless Linux.
+          # UI modules (PyQt6 widgets) are tested implicitly via the
+          # Windows build workflow.
+          modules = [
+              'scheduler_app._version',
+              'scheduler_app.core.models',
+              'scheduler_app.core.workflow',
+              'scheduler_app.plans',
+              'scheduler_app.storage',
+          ]
+
+          for mod in modules:
+              try:
+                  __import__(mod)
+                  print(f'  [OK] {mod}')
+              except Exception as e:
+                  print(f'  [FAIL] {mod}: {e}')
+                  failures.append(mod)
+
+          if failures:
+              print(f'\n{len(failures)} import(s) failed')
+              sys.exit(1)
+          else:
+              print(f'\nAll {len(modules)} imports OK')
+          "
+
+      # ── Installer script syntax check ─────────────────────────────────
+      - name: Validate installer.iss references
+        run: |
+          # Verify installer.iss references the correct source directory
+          if ! grep -q 'build\\Dersis.dist' installer.iss; then
+            echo "::error::installer.iss does not reference build\Dersis.dist"
+            exit 1
+          fi
+
+          # Verify output naming convention
+          if ! grep -q 'Dersis_Setup_v{#AppVersion}' installer.iss; then
+            echo "::error::installer.iss output naming does not follow convention"
+            exit 1
+          fi
+
+          echo "installer.iss references OK"

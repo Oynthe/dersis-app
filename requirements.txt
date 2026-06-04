@@ -1,0 +1,17 @@
+# DERSİS — Runtime Dependencies
+# Direct dependencies only. Transitive deps are resolved by pip automatically.
+#
+# Install:  pip install -r requirements.txt
+# Lock:     pip install -r requirements.txt && pip freeze > requirements-lock.txt
+
+# ── Core (always imported) ──────────────────────────────────────────────
+PyQt6>=6.5
+cryptography>=41.0
+
+# ── Features (conditional imports with graceful fallback) ───────────────
+openpyxl>=3.1          # Excel import/export
+pandas>=2.0            # Data processing for Excel import
+reportlab>=4.0         # PDF export
+ortools>=9.7           # CP-SAT constraint solver
+packaging>=21.0        # Version comparison
+deepdiff>=6.0          # Schedule impact analysis

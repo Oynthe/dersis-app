@@ -1,0 +1,6 @@
+# DERSIS line-ending policy
+#
+# Keep the VERSION file LF-only so the Windows build scripts always read a
+# clean semver value. A CRLF here can leave a trailing carriage return in the
+# batch variable and break version validation.
+VERSION text eol=lf
