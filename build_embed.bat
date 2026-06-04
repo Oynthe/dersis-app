@@ -134,11 +134,19 @@ echo [6/8] Copying application files...
 :: Main entry point
 copy /y scheduler_gui.py "%DIST_DIR%\" >nul
 
-:: Application package (exclude __pycache__ and .pyc files)
-echo __pycache__> "%TEMP%\dersis_exclude.tmp"
-echo .pyc>> "%TEMP%\dersis_exclude.tmp"
-xcopy /s /e /i /q /y scheduler_app "%DIST_DIR%\scheduler_app" /exclude:"%TEMP%\dersis_exclude.tmp"
-del "%TEMP%\dersis_exclude.tmp"
+:: Application package (exclude __pycache__ and .pyc files).
+:: Use robocopy instead of "xcopy /exclude" — xcopy's /exclude with a quoted
+:: list file fails with "Can't read file" on some hosts (e.g. CI runners),
+:: silently copying nothing. Robocopy returns exit codes 0-7 on success and
+:: >=8 only on real errors.
+robocopy scheduler_app "%DIST_DIR%\scheduler_app" /E /XD __pycache__ /XF *.pyc /NFL /NDL /NJH /NJS /NP /R:2 /W:2
+if errorlevel 8 (
+    echo ERROR: Failed to copy scheduler_app.
+    pause
+    exit /b 1
+)
+:: Normalize errorlevel — robocopy uses 1-7 for non-error states.
+ver >nul
 
 :: Flag icons
 xcopy /s /e /i /q /y flags "%DIST_DIR%\flags" >nul
@@ -241,7 +249,7 @@ if exist "%DIST_DIR%\docs\dersis.png" (
 if exist "%DIST_DIR%\flags" (
     set /a FC=0
     for %%f in ("%DIST_DIR%\flags\*.png") do set /a FC+=1
-    echo   [OK] flags\ (!FC! flags)
+    echo   [OK] flags\ ^(!FC! flags^)
 ) else (
     echo   [MISSING] flags\
     set /a ERRORS+=1
@@ -257,7 +265,7 @@ if exist "%DIST_DIR%\VERSION" (
 if exist "%DIST_DIR%\scheduler_app\ui\app.pyc" (
     echo   [OK] scheduler_app compiled to .pyc
 ) else if exist "%DIST_DIR%\scheduler_app\ui\app.py" (
-    echo   [OK] scheduler_app (source)
+    echo   [OK] scheduler_app ^(source^)
 ) else (
     echo   [MISSING] scheduler_app
     set /a ERRORS+=1
@@ -269,7 +277,7 @@ echo   Total files: %TOTAL%
 
 echo.
 if %ERRORS% GTR 0 (
-    echo WARNING: %ERRORS% critical file(s) missing!
+    echo WARNING: %ERRORS% critical file^(s^) missing!
     pause
 ) else (
     echo ============================================
