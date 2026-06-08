@@ -83,10 +83,15 @@ echo.
 :: ── Step 3: Enable pip in embeddable Python ─────────────────────────────
 echo [3/8] Setting up pip in embeddable Python...
 
-:: Uncomment "import site" in python*._pth to enable site-packages
+:: Configure the embeddable Python search path (python*._pth):
+::   - Uncomment "import site" so pip-installed site-packages are importable.
+::   - Add ".." so the app package (one level up, in the dist root) is found.
+:: When a ._pth file is present the interpreter runs in "safe path" mode and
+:: does NOT add the launched script's own directory to sys.path. Without "..",
+:: "import scheduler_app" fails and the app closes silently under pythonw.exe.
 for %%f in ("%PY_DIR%\python*._pth") do (
-    powershell -Command "(Get-Content '%%f') -replace '^#import site','import site' | Set-Content '%%f'"
-    echo   Updated %%~nxf
+    powershell -NoProfile -Command "$f='%%f'; $c = Get-Content $f; $c = $c -replace '^#\s*import site','import site'; if ($c -notcontains '..') { $c += '..' }; Set-Content -Path $f -Value $c"
+    echo   Updated %%~nxf - added app dir to sys.path, enabled site
 )
 
 :: Download and run get-pip.py
@@ -211,10 +216,12 @@ echo cd /d "%%~dp0"
 echo start "" "python\pythonw.exe" "scheduler_gui.py"
 ) > "%DIST_DIR%\Dersis.bat"
 
-:: .exe launcher — compile a tiny C# wrapper
+:: .exe launcher — compile a tiny C# wrapper. Build it as a GUI-subsystem app
+:: (WindowsApplication) so it does not flash a console window before handing
+:: off to pythonw.exe.
 echo   Creating Dersis.exe...
 powershell -NoProfile -Command ^
-  "$src = 'using System; using System.Diagnostics; using System.IO; using System.Reflection; class P { static void Main() { string d = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location); Process.Start(new ProcessStartInfo { FileName = Path.Combine(d, \"python\", \"pythonw.exe\"), Arguments = \"\\\"\" + Path.Combine(d, \"scheduler_gui.py\") + \"\\\"\", WorkingDirectory = d, UseShellExecute = false, CreateNoWindow = true }); } }'; Add-Type -TypeDefinition $src -OutputAssembly '%DIST_DIR%\Dersis.exe' -OutputType ConsoleApplication 2>$null; if (Test-Path '%DIST_DIR%\Dersis.exe') { Write-Host '  [OK] Dersis.exe' } else { Write-Host '  [WARN] exe failed, using .vbs' }"
+  "$src = 'using System; using System.Diagnostics; using System.IO; using System.Reflection; class P { static void Main() { string d = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location); Process.Start(new ProcessStartInfo { FileName = Path.Combine(d, \"python\", \"pythonw.exe\"), Arguments = \"\\\"\" + Path.Combine(d, \"scheduler_gui.py\") + \"\\\"\", WorkingDirectory = d, UseShellExecute = false, CreateNoWindow = true }); } }'; Add-Type -TypeDefinition $src -OutputAssembly '%DIST_DIR%\Dersis.exe' -OutputType WindowsApplication 2>$null; if (Test-Path '%DIST_DIR%\Dersis.exe') { Write-Host '  [OK] Dersis.exe' } else { Write-Host '  [WARN] exe failed, using .vbs' }"
 
 :: Copy icon into dist for shortcuts
 copy /y scheduler_app\assets\app_icon.ico "%DIST_DIR%\scheduler_app\assets\" >nul 2>nul
@@ -269,6 +276,19 @@ if exist "%DIST_DIR%\scheduler_app\ui\app.pyc" (
 ) else (
     echo   [MISSING] scheduler_app
     set /a ERRORS+=1
+)
+
+:: Import smoke test: run the bundled interpreter exactly as the launcher will
+:: and confirm it can import the app package. Catches python*._pth / sys.path
+:: regressions that otherwise surface only as a silent crash on the user's PC.
+echo   Running import smoke test...
+"%PY_DIR%\python.exe" -c "from scheduler_app.app import SchedulerApp"
+if errorlevel 1 (
+    echo   [FAIL] embedded Python cannot import scheduler_app.app
+    echo          ^(check that python*._pth contains the ".." app-dir line^)
+    set /a ERRORS+=1
+) else (
+    echo   [OK] embedded Python imports scheduler_app.app
 )
 
 set /a TOTAL=0

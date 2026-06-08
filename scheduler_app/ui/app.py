@@ -183,6 +183,7 @@ QMenuBar::item:selected {
 }
 QMenu {
     background: #FFFFFF;
+    color: #1E293B;
     border: 1px solid #CBD5E1;
     border-radius: 6px;
     padding: 4px;
@@ -343,6 +344,7 @@ QComboBox::down-arrow {
 QComboBox QAbstractItemView {
     border: 1px solid #CBD5E1;
     background: white;
+    color: #1E293B;
     selection-background-color: #EFF6FF;
     selection-color: #1E40AF;
 }
@@ -500,6 +502,8 @@ QHeaderView::section {
 
 /* ── List Widget ── */
 QListWidget {
+    background: white;
+    color: #1E293B;
     font-size: 9pt;
     font-family: "Segoe UI", sans-serif;
     border-radius: 6px;
@@ -522,6 +526,55 @@ QLabel {
     font-family: "Segoe UI", sans-serif;
 }
 """
+
+
+# ── Light palette ───────────────────────────────────────────────────────────
+
+def apply_light_palette(app):
+    """Pin a deterministic light palette on the QApplication.
+
+    Dersis ships a light-only stylesheet but sets no palette. Qt 6.5+ adopts
+    the OS colour scheme by default, so on Windows running in *dark mode* the
+    default palette supplies light text. Every stylesheet rule that sets a
+    light background without also setting a text colour (drop-down menus,
+    list/table rows, line edits, ...) then renders light-on-light and is
+    unreadable — legible only once a row is selected and the highlight colour
+    kicks in. Forcing a light palette makes the UI render correctly regardless
+    of the operating system's light/dark setting.
+    """
+    from PyQt6.QtGui import QPalette, QColor
+
+    text      = QColor("#1E293B")   # slate-800 — primary text
+    disabled  = QColor("#94A3B8")   # slate-400
+    base      = QColor("#FFFFFF")   # input / list / table background
+    alt_base  = QColor("#F1F5F9")   # slate-100 — alternating rows
+    window    = QColor("#F1F5F9")   # slate-100 — window background
+    button    = QColor("#FFFFFF")
+    highlight = QColor("#3B82F6")   # blue-500
+    hl_text   = QColor("#FFFFFF")
+
+    pal = QPalette()
+    pal.setColor(QPalette.ColorRole.Window, window)
+    pal.setColor(QPalette.ColorRole.WindowText, text)
+    pal.setColor(QPalette.ColorRole.Base, base)
+    pal.setColor(QPalette.ColorRole.AlternateBase, alt_base)
+    pal.setColor(QPalette.ColorRole.Text, text)
+    pal.setColor(QPalette.ColorRole.Button, button)
+    pal.setColor(QPalette.ColorRole.ButtonText, text)
+    pal.setColor(QPalette.ColorRole.BrightText, QColor("#DC2626"))
+    pal.setColor(QPalette.ColorRole.PlaceholderText, disabled)
+    pal.setColor(QPalette.ColorRole.ToolTipBase, QColor("#1E293B"))
+    pal.setColor(QPalette.ColorRole.ToolTipText, QColor("#F8FAFC"))
+    pal.setColor(QPalette.ColorRole.Link, highlight)
+    pal.setColor(QPalette.ColorRole.LinkVisited, QColor("#7C3AED"))
+    pal.setColor(QPalette.ColorRole.Highlight, highlight)
+    pal.setColor(QPalette.ColorRole.HighlightedText, hl_text)
+
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text,
+                 QPalette.ColorRole.ButtonText):
+        pal.setColor(QPalette.ColorGroup.Disabled, role, disabled)
+
+    app.setPalette(pal)
 
 
 # ── Drop-enabled tab button (forwards class_drag drops to unplaced list) ──
