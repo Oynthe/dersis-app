@@ -10,6 +10,7 @@ Format: `symbol` — file:line-range — short description — related symbols.
 - `analyze_conflict_graph(state)` — `core/logic.py` — Returns conflict-graph metrics. Wraps `ConflictGraphBuilder` + `ConflictAnalyzer`.
 - `analyze_constraint_propagation(state)` — `core/logic.py` — Per-class valid-placement counts.
 - `apply_lecturer_availability_filters(state, lec, days, times)` — `core/models.py` — Restricts days/times based on availability.
+- `apply_light_palette(app)` — `ui/app.py` (module-level) — Pins a complete light `QPalette` on the `QApplication` so the light-only stylesheet stays readable under OS dark mode (Qt 6.5+ otherwise supplies light text). Called by `scheduler_gui.main()` right after `app.setStyle("Fusion")`.
 - `apply_negotiation_suggestion(cls, suggestion)` — `core/logic.py` — Applies a single relaxation suggestion to a class. Wraps `ConstraintNegotiator.apply_suggestion`.
 - `APP_VERSION` — `scheduler_app/_version.py::__version__` — Authoritative app version, read from the `VERSION` file. Imported by `ui/bug_report.py` and shown in the About dialog.
 - `AutoPlaceResult` — `core/workflow.py` — Dataclass: `success`, `relocated`, `placed_info`, `explanation`, `score`.
@@ -90,6 +91,7 @@ Format: `symbol` — file:line-range — short description — related symbols.
 - `get_plan(tier_slug)`, `get_required_tier_for_limit(...)`, `get_upgrade_tier(tier_slug, feature_name)` — `plans.py`.
 - `get_protection_label(level)`, `get_room_candidates(state, cls)`, `get_room_capacity(state, room)` — `core/models.py`.
 - `get_year_color(state, year_name)` — `core/logic.py`.
+- `_global_exception_handler(exc_type, exc_value, exc_tb)` — `scheduler_gui.py` — Top-level `sys.excepthook` (installed in the `__main__` guard before `main()`). Two paths: **no `QApplication`** → `_report_startup_failure` (writes `startup_error.log` + native `MessageBox`); **`QApplication` running** → writes `crash_log.txt` and shows `CrashReportDialog` (`QMessageBox.critical` fallback). Skips `KeyboardInterrupt`; ends at `sys.__excepthook__`. Heavy imports are lazy.
 
 ## H
 
@@ -112,7 +114,7 @@ Format: `symbol` — file:line-range — short description — related symbols.
 
 ## M
 
-- `main()` — `scheduler_gui.py` — Offline application entry point: `freeze_support` → crash excepthook → `QApplication`(Fusion) → `run_language_gate()` → `TierEnforcement.set_tier(TIER_INSTITUTIONAL)` → `SchedulerApp()` → `exec()`. No auth/version/heartbeat/updater.
+- `main()` — `scheduler_gui.py` — Offline application entry point. Lazily imports the heavy deps, then `freeze_support` → `QApplication`(Fusion) → `apply_light_palette` → `run_language_gate()` → `TierEnforcement.set_tier(TIER_INSTITUTIONAL)` → `SchedulerApp()` → `exec()`. The crash excepthook (`_global_exception_handler`) is installed in the `__main__` guard *before* `main()`. No auth/version/heartbeat/updater.
 - `mark_placed(cls, day, slot, room)`, `mark_unplaced(cls)` — `core/models.py`.
 - `migrate_legacy_files()` — `storage/storage.py` — Idempotent legacy migration.
 - `MultiSelectButton` — `ui/widgets.py`.
@@ -148,6 +150,7 @@ Format: `symbol` — file:line-range — short description — related symbols.
 
 - `RendererAdapter` — `ui/renderer.py`.
 - `RepairStrategy`, `DestroyStrategy`, `AdaptiveStrategySelector`, `get_destroy_strategy(name, state, weights=None)` — `core/lns_strategies.py`.
+- `_report_startup_failure(tb_text)` — `scheduler_gui.py` — Persists + surfaces a fatal **startup** error before the Qt app exists: appends to `startup_error.log`, shows a native Windows `MessageBox` (via `ctypes`), echoes to stderr. stdlib-only, so it works even when PyQt6/`scheduler_app` fail to import. Called by `_global_exception_handler` on the no-`QApplication` path.
 - `reschedule_all(state)` — `core/logic.py` — Legacy global re-optimization.
 - `respects_constraints(...)` — `core/logic.py` — **Deprecated** alias.
 - `room_fits_class(state, room, cls)` — `core/models.py`.
@@ -168,6 +171,7 @@ Format: `symbol` — file:line-range — short description — related symbols.
 - `slot_index(state, slot_name)`, `slots_fit(state, start, duration)` — `core/logic.py`.
 - `slot_offset_for_target(cls, target_idx)` — `core/models.py`.
 - `split_non_joint(cls)` — `core/models.py`.
+- `_startup_log_path()` — `scheduler_gui.py` — Returns the first writable of `~/Documents/Dersis/logs`, the app dir, then the temp dir, as `.../startup_error.log` (or `None`). stdlib-only; used by `_report_startup_failure` (and as the crash-log fallback when `storage` can't be imported).
 
 ## T
 

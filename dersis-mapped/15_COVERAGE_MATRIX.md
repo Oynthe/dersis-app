@@ -14,7 +14,7 @@ For every included file in the repository (excluding items recorded in `00_EXCLU
 | `requirements-build.txt` | yes | file-maps/_config_files.md | yes | high | |
 | `requirements-dev.txt` | yes | file-maps/_config_files.md | yes | high | |
 | `requirements-lock.txt` | yes | file-maps/_config_files.md | yes | high | |
-| `scheduler_gui.py` | yes | file-maps/scheduler_gui.py.md | yes | high | Offline entry point; detailed map. |
+| `scheduler_gui.py` | yes | file-maps/scheduler_gui.py.md | yes | high | Offline entry point; detailed map. Re-verified 2026-06-08 against the startup-crash rewrite (~190 lines, stdlib-only top level + lazy heavy imports). |
 | `verify_deps.py` | yes | file-maps/verify_deps.py.md | yes | high | |
 | `build_embed.bat` | yes | file-maps/_config_files.md | partial | medium | Mapped at description level, not script-by-script. |
 | `build_nuitka.bat` | yes | file-maps/_config_files.md | partial | medium | Same. |

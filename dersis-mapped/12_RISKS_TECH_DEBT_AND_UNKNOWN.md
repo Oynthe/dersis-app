@@ -4,6 +4,13 @@ This document lists observations from reading the code. **Confirmed issues** are
 
 > **Offline-first:** DERSİS is now a fully offline desktop app. The former licensing/auth gate, heartbeat thread, auto-updater, device fingerprinting, and all remote network endpoints were removed, so the risks that used to attach to them no longer apply and have been dropped from this list.
 
+## Resolved since capture (2026-06-08)
+
+Two latent packaging/UI risks present in the 2026-06-04 snapshot have since been fixed (branch `claude/eloquent-rubin-7hwes6`, commits `65de83a`/`de15d22`). Recorded here for traceability:
+
+- **Silent startup crash in the embeddable-Python build (RESOLVED).** With a `python*._pth` file the interpreter runs in safe-path mode and did not add the launched script's dir to `sys.path`, so `import scheduler_app` failed and the app closed with **no message** under `pythonw.exe`. Fixed on three fronts: `build_embed.bat` now appends `..` to `python*._pth` (and adds a bundled-interpreter import smoke test); `scheduler_gui.py` now imports the heavy deps lazily and installs `_global_exception_handler` in `__main__` *before* `main()`, so a bootstrap/import failure is written to `startup_error.log` and shown in a native `MessageBox` instead of vanishing. See `04_ENTRYPOINTS_AND_RUNTIME_FLOW.md` and `10_BUILD_PACKAGING_RELEASE_MAP.md`.
+- **Dark-mode white-on-white contrast (RESOLVED).** The app shipped a light-only stylesheet but set no palette; Qt 6.5+ follows the OS scheme, so under Windows dark mode menus/lists/inputs rendered light-on-light. Fixed by `apply_light_palette(app)` in `ui/app.py` (pinned light `QPalette`, called from `scheduler_gui.main()` after `setStyle("Fusion")`) plus explicit `color: #1E293B` on the `QMenu`/`QComboBox`/`QListWidget` stylesheet rules. See `06_UI_MAP.md` §1.0.
+
 ## Confirmed issues
 
 ### 1. `scheduler_app/__init__.py` — `_ShimFinder.find_module` and `find_spec`
@@ -90,5 +97,5 @@ These should never be casually refactored:
 2. **`scheduler_app/__init__.py`** — the `_ShimFinder` shim. External scripts and old flat imports (e.g. `scheduler_app.models`) rely on it.
 3. **`models.py::new_class()` schema** — any field added must also be handled by `normalize_class_data` and `copy_editable_class_fields`.
 4. **`ui/translations.py`** — see #2 in *Confirmed issues* above. Use a script when refactoring keys.
-5. **`scheduler_gui.py::main` startup order** — `freeze_support` → excepthook → `QApplication` (Fusion) → `run_language_gate()` → `TierEnforcement.set_tier(TIER_INSTITUTIONAL)` → `SchedulerApp()`. The language gate must run before any widget is built; the excepthook must be installed first.
-6. **`scheduler_gui.py::_global_exception_handler`** — it is wired before everything else and must remain robust against partial initialisation.
+5. **`scheduler_gui.py::main` startup order** — the excepthook is installed in the `__main__` guard *before* `main()`; then (after lazy heavy imports) `freeze_support` → `QApplication` (Fusion) → `apply_light_palette` → `run_language_gate()` → `TierEnforcement.set_tier(TIER_INSTITUTIONAL)` → `SchedulerApp()`. The language gate must run before any widget is built; the excepthook must be installed first; `apply_light_palette` must run right after `setStyle`. Keep the heavy imports **lazy** — re-adding an eager `import PyQt6`/`from scheduler_app …` at module top would defeat the bootstrap-failure reporting.
+6. **`scheduler_gui.py::_global_exception_handler`** — wired before everything else; must remain robust against partial initialisation and **stdlib-only on the bootstrap path** (it may run before PyQt6/`scheduler_app` are importable). Its two paths — native `MessageBox` (no `QApplication`) vs `CrashReportDialog` (Qt running) — hinge on whether a `QApplication` exists.

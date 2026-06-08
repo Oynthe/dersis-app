@@ -87,7 +87,7 @@ You almost certainly don't. If you really must:
 1. Both dialogs live in `ui/bug_report.py` (`BugReportDialog`, `CrashReportDialog`); the status-bar trigger is `BugReportButton`.
 2. The report is composed locally and handed to the user's email client via `_open_mailto()` (`QDesktopServices.openUrl` on a `mailto:dersis.app@gmail.com` link, subject "DERSİS Bug Report"). Nothing is transmitted by the app.
 3. If no mail client is available, `_open_mailto` copies the body to the clipboard and shows an info dialog with the address.
-4. The crash hook is `_global_exception_handler` in `scheduler_gui.py`, which also writes `~/Documents/Dersis/logs/crash_log.txt`.
+4. The crash hook is `_global_exception_handler` in `scheduler_gui.py` (installed in the `__main__` guard *before* `main()`, as of 2026-06-08). It has two paths: if a `QApplication` exists it writes `~/Documents/Dersis/logs/crash_log.txt` and shows `CrashReportDialog`; if not — a bootstrap/import failure before Qt is up — it writes `startup_error.log` and shows a native Windows `MessageBox` via `_report_startup_failure`. The latter is what stops the embeddable build from closing silently under `pythonw.exe`.
 
 ## Likely future development workflows
 

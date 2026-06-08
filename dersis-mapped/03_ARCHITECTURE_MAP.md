@@ -156,13 +156,19 @@ scheduler_app.core.cpsat_scheduler
 
 ## Runtime flow at a glance (full detail in `04_ENTRYPOINTS_AND_RUNTIME_FLOW.md`)
 
+> _Updated 2026-06-08: `scheduler_gui.py` rewritten (~95 → ~190 lines) — stdlib-only top-level imports, lazy heavy imports, excepthook installed in `__main__` before `main()`, `apply_light_palette` after `setStyle`._
+
 ```
-main()                                              (~95 lines; fully offline, no network)
-  ├── multiprocessing.freeze_support()
-  ├── sys.excepthook = _global_exception_handler   (writes ~/Documents/Dersis/logs/crash_log.txt + shows CrashReportDialog)
-  ├── QApplication(sys.argv); setStyle("Fusion")
-  ├── run_language_gate()                          (first-time language picker, local only)
-  ├── TierEnforcement.instance().set_tier(TIER_INSTITUTIONAL)  (unlock every feature locally)
-  ├── SchedulerApp().show()                        (opens directly into the main window)
-  └── sys.exit(app.exec())                         (Qt event loop)
+__main__:
+  sys.excepthook = _global_exception_handler          (installed BEFORE main(); two paths, see below)
+  main()                                               (~190 lines; stdlib-only top level + lazy heavy imports; fully offline, no network)
+    ├── multiprocessing.freeze_support()
+    ├── QApplication(sys.argv); setStyle("Fusion"); apply_light_palette(app)   (light palette → readable under OS dark mode)
+    ├── run_language_gate()                            (first-time language picker, local only)
+    ├── TierEnforcement.instance().set_tier(TIER_INSTITUTIONAL)  (unlock every feature locally)
+    ├── SchedulerApp().show()                          (opens directly into the main window)
+    └── sys.exit(app.exec())                           (Qt event loop)
+
+  _global_exception_handler:  no QApplication  → startup_error.log + native MessageBox (bootstrap failure)
+                              QApplication up   → ~/Documents/Dersis/logs/crash_log.txt + CrashReportDialog
 ```
