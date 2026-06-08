@@ -1,17 +1,25 @@
 <p align="center">
-  <img src="docs/dersis.png" alt="DERSİS logo" width="260">
+  <img src="docs/dersis.png" alt="DERSİS logosu" width="260">
 </p>
 
 <h1 align="center">DERSİS</h1>
 
 <p align="center">
-  <b>Intelligent, fully offline class-timetable software for schools and universities.</b><br>
+  <b>Okullar ve üniversiteler için akıllı, tamamen çevrimdışı ders programı yazılımı.</b><br>
   <i>Ders Programı Hazırlama Sistemi · Class Schedule Preparation System</i>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Oynthe/dersis-app/releases/latest"><img src="https://img.shields.io/badge/%E2%AC%87%20%C4%B0ndir-Son%20S%C3%BCr%C3%BCm-2ea44f?style=for-the-badge" alt="İndir — Son Sürüm"></a>
+</p>
+
+<p align="center">
+  <sub>Windows yükleyicisini indirin · komut satırı için <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
 </p>
 
 ---
 
-<p align="center"><b>📖 Choose your language · Dilinizi seçin · Sprache wählen · Elija su idioma</b></p>
+<p align="center"><b>📖 Dilinizi seçin · Choose your language · Sprache wählen · Elija su idioma</b></p>
 
 <p align="center">
   <a href="README-en.md"><img src="https://img.shields.io/badge/English-6e4f9e?style=for-the-badge" alt="English"></a>
@@ -22,36 +30,50 @@
 
 ---
 
-DERSİS builds, optimizes, and manages **weekly class timetables** for educational
-institutions. It runs entirely on your own computer — **no login, no account, and no internet
-connection are ever required** — and combines automatic conflict prevention, AI-assisted
-optimization (heuristic search + Large Neighborhood Search + Google OR-Tools CP-SAT),
-explainable decisions, drag-and-drop editing, analytics, and Excel/CSV/PDF export.
+DERSİS, eğitim kurumları için **haftalık ders programları** oluşturur, eniyiler ve yönetir.
+Tamamen kendi bilgisayarınızda çalışır — **hiçbir zaman giriş, hesap veya internet bağlantısı
+gerektirmez** — ve otomatik çakışma önlemeyi, yapay zekâ destekli eniyilemeyi (sezgisel arama +
+Büyük Komşuluk Araması + Google OR-Tools CP-SAT), açıklanabilir kararları, sürükle-bırak
+düzenlemeyi, analizleri ve Excel/CSV/PDF dışa aktarmayı bir araya getirir.
 
-The full documentation — features, installation, building from source, usage guide, and bug
-reporting — is available in each language above:
+Tüm belgeler — özellikler, kurulum, kaynaktan derleme, kullanım kılavuzu ve hata bildirimi —
+yukarıdaki her dilde mevcuttur:
 
 - 🇬🇧 **English** → [`README-en.md`](README-en.md)
 - 🇹🇷 **Türkçe** → [`README-tr.md`](README-tr.md)
 - 🇩🇪 **Deutsch** → [`README-de.md`](README-de.md)
 - 🇪🇸 **Español** → [`README-es.md`](README-es.md)
 
-## License at a glance
+## İndirme
 
-DERSİS is **free for all individual users**. **Institutions** (universities, faculties,
-schools, departments, research centers, administrative units, or any university sub-body)
-**need a paid license** to embed, integrate, deploy, customize, or officially incorporate
-DERSİS into their institutional systems. For institutional licensing, contact
-**[dersis.app@gmail.com](mailto:dersis.app@gmail.com)**. Full terms:
-[`LICENSE.md`](LICENSE.md).
+En güncel Windows yükleyicisini her zaman
+**[en son sürüm sayfasından](https://github.com/Oynthe/dersis-app/releases/latest)**
+edinebilirsiniz.
 
-## Reporting bugs
+Komut satırını tercih edenler için, depodaki bağımlılık gerektirmeyen indirici en son sürümü
+çözümler, indirir ve SHA-256 sağlamasını doğrular:
 
-Use the in-app **Report Bug** button (it prepares an email for you; the app sends nothing on
-its own) or email **[dersis.app@gmail.com](mailto:dersis.app@gmail.com)** directly.
+```bash
+python scripts/download_release.py
+```
 
-## For developers
+## Lisansa genel bakış
 
-- Build & packaging guide: [`BUILD.md`](BUILD.md)
-- Repository structure: [`docs/STRUCTURE.md`](docs/STRUCTURE.md)
-- Feature inventory (with source locations): [`docs/FEATURES.md`](docs/FEATURES.md)
+DERSİS **tüm bireysel kullanıcılar için ücretsizdir**. **Kurumların** (üniversiteler,
+fakülteler, okullar, bölümler, araştırma merkezleri, idari birimler veya herhangi bir
+üniversite alt birimi) DERSİS'i kurumsal sistemlerine gömmek, entegre etmek, dağıtmak,
+özelleştirmek veya resmî olarak dahil etmek için **ücretli bir lisansa ihtiyacı vardır**.
+Kurumsal lisanslama için **[dersis.app@gmail.com](mailto:dersis.app@gmail.com)** ile iletişime
+geçin. Tüm koşullar: [`LICENSE.md`](LICENSE.md).
+
+## Hata bildirimi
+
+Uygulama içindeki **Hata Bildir** düğmesini kullanın (sizin için bir e-posta hazırlar; uygulama
+kendiliğinden hiçbir şey göndermez) veya doğrudan
+**[dersis.app@gmail.com](mailto:dersis.app@gmail.com)** adresine e-posta gönderin.
+
+## Geliştiriciler için
+
+- Derleme ve paketleme kılavuzu: [`BUILD.md`](BUILD.md)
+- Depo yapısı: [`docs/STRUCTURE.md`](docs/STRUCTURE.md)
+- Özellik envanteri (kaynak konumlarıyla): [`docs/FEATURES.md`](docs/FEATURES.md)

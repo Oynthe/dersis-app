@@ -12,6 +12,14 @@
 
 <p align="center"><b>Software de horarios de clase inteligente y totalmente sin conexión para colegios y universidades.</b></p>
 
+<p align="center">
+  <a href="https://github.com/Oynthe/dersis-app/releases/latest"><img src="https://img.shields.io/badge/%E2%AC%87%20Descargar-%C3%9Altima%20versi%C3%B3n-2ea44f?style=for-the-badge" alt="Descargar — Última versión"></a>
+</p>
+
+<p align="center">
+  <sub>Descarga el instalador de Windows · para la línea de comandos, consulta <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
+</p>
+
 ---
 
 ## Índice

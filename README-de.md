@@ -12,6 +12,14 @@
 
 <p align="center"><b>Intelligente, vollständig offline arbeitende Stundenplan-Software für Schulen und Hochschulen.</b></p>
 
+<p align="center">
+  <a href="https://github.com/Oynthe/dersis-app/releases/latest"><img src="https://img.shields.io/badge/%E2%AC%87%20Herunterladen-Neueste%20Version-2ea44f?style=for-the-badge" alt="Herunterladen — Neueste Version"></a>
+</p>
+
+<p align="center">
+  <sub>Windows-Installer herunterladen · für die Befehlszeile siehe <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
+</p>
+
 ---
 
 ## Inhaltsverzeichnis

@@ -12,6 +12,14 @@
 
 <p align="center"><b>Okullar ve üniversiteler için akıllı, tamamen çevrimdışı ders programı yazılımı.</b></p>
 
+<p align="center">
+  <a href="https://github.com/Oynthe/dersis-app/releases/latest"><img src="https://img.shields.io/badge/%E2%AC%87%20%C4%B0ndir-Son%20S%C3%BCr%C3%BCm-2ea44f?style=for-the-badge" alt="İndir — Son Sürüm"></a>
+</p>
+
+<p align="center">
+  <sub>Windows yükleyicisini indirin · komut satırı için <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
+</p>
+
 ---
 
 ## İçindekiler
