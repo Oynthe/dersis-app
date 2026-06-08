@@ -216,10 +216,12 @@ echo cd /d "%%~dp0"
 echo start "" "python\pythonw.exe" "scheduler_gui.py"
 ) > "%DIST_DIR%\Dersis.bat"
 
-:: .exe launcher — compile a tiny C# wrapper
+:: .exe launcher — compile a tiny C# wrapper. Build it as a GUI-subsystem app
+:: (WindowsApplication) so it does not flash a console window before handing
+:: off to pythonw.exe.
 echo   Creating Dersis.exe...
 powershell -NoProfile -Command ^
-  "$src = 'using System; using System.Diagnostics; using System.IO; using System.Reflection; class P { static void Main() { string d = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location); Process.Start(new ProcessStartInfo { FileName = Path.Combine(d, \"python\", \"pythonw.exe\"), Arguments = \"\\\"\" + Path.Combine(d, \"scheduler_gui.py\") + \"\\\"\", WorkingDirectory = d, UseShellExecute = false, CreateNoWindow = true }); } }'; Add-Type -TypeDefinition $src -OutputAssembly '%DIST_DIR%\Dersis.exe' -OutputType ConsoleApplication 2>$null; if (Test-Path '%DIST_DIR%\Dersis.exe') { Write-Host '  [OK] Dersis.exe' } else { Write-Host '  [WARN] exe failed, using .vbs' }"
+  "$src = 'using System; using System.Diagnostics; using System.IO; using System.Reflection; class P { static void Main() { string d = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location); Process.Start(new ProcessStartInfo { FileName = Path.Combine(d, \"python\", \"pythonw.exe\"), Arguments = \"\\\"\" + Path.Combine(d, \"scheduler_gui.py\") + \"\\\"\", WorkingDirectory = d, UseShellExecute = false, CreateNoWindow = true }); } }'; Add-Type -TypeDefinition $src -OutputAssembly '%DIST_DIR%\Dersis.exe' -OutputType WindowsApplication 2>$null; if (Test-Path '%DIST_DIR%\Dersis.exe') { Write-Host '  [OK] Dersis.exe' } else { Write-Host '  [WARN] exe failed, using .vbs' }"
 
 :: Copy icon into dist for shortcuts
 copy /y scheduler_app\assets\app_icon.ico "%DIST_DIR%\scheduler_app\assets\" >nul 2>nul
