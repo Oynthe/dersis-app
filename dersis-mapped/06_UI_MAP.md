@@ -1,10 +1,24 @@
 # 06 — UI Map
 
+> **Captured 2026-06-04.** _Updated 2026-06-08: reflects the dark-mode-theme fix — documents `apply_light_palette()` (§1.0) and the `QMenu`/`QComboBox`/`QListWidget` stylesheet text-colour additions._
+
 The PyQt6 UI is concentrated under `scheduler_app/ui/`. It is built on top of a UI-free workflow layer (`core/workflow.py`); the UI files mostly assemble widgets, wire signals to workflow methods, and translate result objects into Qt updates.
 
 ## 1. Main window — `ui/app.py`
 
-Class: `SchedulerApp(QMainWindow)`. ~5,130 lines. The single source of truth for everything that lives on screen at runtime.
+Class: `SchedulerApp(QMainWindow)`. ~4,960 lines. The single source of truth for everything that lives on screen at runtime. The module also defines the light-only stylesheet template and the module-level `apply_light_palette()` helper (see §1.0).
+
+### 1.0 Theming — light-only, made dark-mode-safe
+
+DERSİS renders **light-only**, by two complementary mechanisms:
+
+1. **The application stylesheet** (`_APP_STYLESHEET_TEMPLATE` / `_build_stylesheet()` at the top of `ui/app.py`), applied in the constructor. It styles every widget for the light theme. As of **2026-06-08** three rules that set a light background without a text colour now also set an explicit `color: #1E293B` (slate-800):
+   - `QMenu` — `color: #1E293B` (menus and their items).
+   - `QComboBox QAbstractItemView` — `color: #1E293B` (the drop-down popup list).
+   - `QListWidget` — `background: white; color: #1E293B` (e.g. the unplaced-classes list).
+2. **A pinned light palette** — `apply_light_palette(app)`, a module-level function in `ui/app.py` called by `scheduler_gui.main()` immediately after `app.setStyle("Fusion")`. It builds a complete light `QPalette` (Window, WindowText, Base, AlternateBase, Text, Button, ButtonText, BrightText, PlaceholderText, ToolTipBase, ToolTipText, Link, LinkVisited, Highlight, HighlightedText, plus the Disabled colour group) and calls `app.setPalette(pal)`.
+
+**Why the palette is needed (dark-mode readability fix):** the app sets a light-only stylesheet but previously set **no palette**. Qt 6.5+ (the build ships Qt 6.11) adopts the OS colour scheme by default, so on Windows running in *dark mode* the default palette supplies light text. Every widget whose stylesheet rule set a light background without an explicit text colour (drop-down menus, list/table rows, line edits, …) then rendered light-on-light — unreadable, legible only once a row was selected and the highlight colour kicked in. Forcing a deterministic light palette makes the UI render correctly regardless of the OS light/dark setting; the three stylesheet `color` additions above belt-and-brace the most-affected widgets.
 
 ### 1.1 Constructor responsibilities (high-level order)
 1. Apply style sheet from `_DIALOG_STYLESHEET_TEMPLATE` etc.

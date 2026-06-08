@@ -32,6 +32,7 @@ No Qt display is needed — CI never launches `QApplication`.
 ## 3. Validation scripts (not a test framework)
 
 - `verify_deps.py` — production dependency import-check (returns 0/1). Used by `build_nuitka.bat` and as a manual pre-build gate. It checks direct **and** transitive deps so Nuitka can statically discover everything.
+- **Build-time import smoke test** (added 2026-06-08, inside `build_embed.bat` step 8) — runs the **bundled** interpreter exactly as the launcher will: `"%PY_DIR%\python.exe" -c "from scheduler_app.app import SchedulerApp"`. It fails the build if the embeddable Python cannot import the app package, catching `python*._pth`/`sys.path` regressions that would otherwise surface only as a silent crash on the user's PC. (This runs against the packaged dist, so it is distinct from the CI import smoke test in §2, which runs against the dev environment.)
 
 ## 4. What is NOT automatically verified
 
@@ -86,6 +87,7 @@ CI uses the structural checks in `.github/workflows/ci.yml`. Tests build no in-m
 
 `docs/RELEASE_CHECKLIST.md` lists the manual checks performed before each release. Highlights (paraphrased, adjusted for the offline app):
 - Launch a fresh install on Windows; the app opens directly into the main window after the first-run **language gate** (no login, no account, no update prompt).
+- **Launch with Windows set to dark mode** and confirm menus, drop-downs, and list/table rows are readable (the `apply_light_palette` + stylesheet fix; regressions show as white-on-white text). The packaged `Dersis.exe` should start with **no console-window flash** (GUI-subsystem wrapper).
 - Restore an existing autosave.
 - Place a class manually; auto-place; reschedule; verify the analytics dashboard.
 - Import an Excel template and export to all three formats (Excel/CSV/PDF).

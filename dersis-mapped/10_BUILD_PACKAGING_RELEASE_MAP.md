@@ -1,5 +1,7 @@
 # 10 — Build, Packaging, and Release Map
 
+> **Captured 2026-06-04.** _Updated 2026-06-08: reflects the packaging fixes in `build_embed.bat` and `installer.iss` — the `python*._pth` now also appends `..` (app dir) for safe-path mode, a bundled-interpreter import smoke test was added, the `Dersis.exe` wrapper is now a GUI-subsystem app, and `installer.iss` requires Inno Setup ≥ 6.3.0._
+
 ## 1. Version source of truth
 
 The file `VERSION` at the repo root holds a single line such as `1.0.0`. This is the **only** authoritative version string. It is read by:
@@ -22,16 +24,17 @@ Speed: ~2 min. Complexity: low.
 
 1. Validate `VERSION` format.
 2. Clean `build\` directory.
-3. Download the embeddable-Python zip for the chosen Python version.
+3. Download the embeddable-Python zip for the chosen Python version (3.11.9).
 4. Extract into `build\Dersis.dist\python\`.
-5. Enable `import site` by editing `python<ver>._pth`.
+5. **Configure the embeddable Python search path** by editing `python<ver>._pth`: uncomment `import site` (so pip-installed site-packages are importable) **and append `..`** — the dist root, one level up — so the bundled `scheduler_app` package is importable. **Why `..` is required:** when a `._pth` file is present the interpreter runs in *safe-path* mode and does **not** add the launched script's own directory to `sys.path`; without the `..` line, `import scheduler_app` fails and the app closes silently under `pythonw.exe` (`ModuleNotFoundError: No module named 'scheduler_app'`).
 6. Vendored `get-pip.py` bootstraps pip inside the embeddable runtime.
-7. `pip install -r requirements-lock.txt -t build\Dersis.dist\python\Lib\site-packages`.
+7. `pip install -r requirements-lock.txt` into the embeddable runtime.
 8. Copy the application source into `build\Dersis.dist\`:
    - `scheduler_gui.py`, `VERSION`, `scheduler_app/` package, `flags/`, `docs/dersis.png`, license, etc.
-9. Generate `build\Dersis.dist\Dersis.bat` (and optionally a stub `.exe`) that launches `python\python.exe scheduler_gui.py`.
-10. Write `build\version.iss` containing `#define AppVersion "X.Y.Z"`.
-11. Print a summary and exit 0 on success.
+9. Compile the package to `.pyc` (and remove the `.py` sources from `scheduler_app`, keeping `scheduler_gui.py`).
+10. Generate the launchers in `build\Dersis.dist\`: `Dersis.vbs`, `Dersis.bat`, and `Dersis.exe`. `Dersis.exe` is a tiny C# wrapper compiled with `Add-Type … -OutputType WindowsApplication` (a **GUI-subsystem** app, previously `ConsoleApplication`) so launching it does **not** flash a console window before handing off to `pythonw.exe`.
+11. **Verify the build**, including an **import smoke test**: run the bundled interpreter exactly as the launcher will (`"%PY_DIR%\python.exe" -c "from scheduler_app.app import SchedulerApp"`) and fail the build if it cannot import the app package. This catches `python*._pth`/`sys.path` regressions at build time instead of as a silent crash on the user's PC.
+12. Write `build\version.iss` containing `#define AppVersion "X.Y.Z"` and print a summary.
 
 The result is a self-contained directory: drop it anywhere, run the launcher.
 
@@ -53,6 +56,7 @@ Nuitka produces a smaller distribution and hides the source code as compiled bin
 
 Run with `iscc installer.iss` after either build path. Highlights:
 
+- **Minimum-version guard** (near the top of the script): `#if VER < EncodeVer(6,3,0)` → `#error ...` → `#endif`, requiring **Inno Setup 6.3.0+**. The script uses the `x64compatible` architecture identifier, which was introduced in 6.3.0; the guard fails the compile early with a clear message instead of a confusing "invalid [Setup] value" error on older compilers.
 - Defines: `AppName`, `AppFullName`, `AppVersion` (from `build\version.iss`), `AppPublisher`, `AppCopyright`, `AppURL`. Offline build: `AppURL` is now an empty string (`""`) — the former remote URL was removed.
 - `Source: "build\Dersis.dist\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs`.
 - Generates Start Menu and (optionally) Desktop shortcuts to the launcher.
@@ -119,7 +123,7 @@ The offline build has **no in-app update mechanism**. The former auto-updater (`
 | Wizard BMPs are binary | `wizard_image.bmp` / `wizard_small_image.bmp`. | Regenerate via `installer/create_wizard_images.py` if the logo changes. |
 | GitHub Release secrets | `release.yml` needs `secrets.GITHUB_TOKEN` (default) plus possibly a code-signing secret. | Verify before re-running. |
 | Crash log is **plain text** | `storage.crash_log_path` | This is intentional (recoverability) — do not encrypt it. |
-| Embeddable-Python `python<ver>._pth` edit | `build_embed.bat` | Required for `import site` to work; if Python release notes change the format, the regex/edit must be updated. |
+| Embeddable-Python `python<ver>._pth` edit | `build_embed.bat` | Must both uncomment `import site` **and** append `..` (the app dir) — safe-path mode otherwise drops the script dir from `sys.path` and `import scheduler_app` fails silently under `pythonw.exe`. The build's import smoke test (`python.exe -c "from scheduler_app.app import SchedulerApp"`) now guards this regression; if Python release notes change the `._pth` format, the PowerShell edit and the smoke test must be kept in sync. |
 
 ## 7. Files mapped in this section
 

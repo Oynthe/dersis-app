@@ -140,11 +140,14 @@ Because the same day can appear in user data as "Monday", "monday", "Lundi", "Pa
 
 ## 3. Theme / style handling
 
-There is no dynamic theming system. Styles come from three places:
+> _Updated 2026-06-08: added the pinned light `QPalette` (point 4) and the dark-mode-readability note; see `06_UI_MAP.md` §1.0._
+
+There is no dynamic theming system; the app renders **light-only**. Styles come from four places:
 
 1. **Constants** in `core/constants.py` — used by the renderer.
-2. **Per-dialog QSS** embedded as Python f-strings at the top of each dialog file (see `_DIALOG_STYLESHEET_TEMPLATE` in `ui/dialogs.py`; `_BUG_DIALOG_STYLE` in `ui/bug_report.py`).
+2. **Per-dialog QSS** embedded as Python f-strings at the top of each dialog file (see `_DIALOG_STYLESHEET_TEMPLATE` in `ui/dialogs.py`; `_BUG_DIALOG_STYLE` in `ui/bug_report.py`). The main window's light QSS is `_APP_STYLESHEET_TEMPLATE` in `ui/app.py` (as of 2026-06-08 its `QMenu`/`QComboBox`/`QListWidget` rules set an explicit `color: #1E293B`).
 3. **Application-wide Fusion style** set in `scheduler_gui.py::main` via `app.setStyle("Fusion")`.
+4. **A pinned light `QPalette`** — `apply_light_palette(app)` (in `ui/app.py`) is called from `scheduler_gui.main()` immediately after `setStyle("Fusion")`. Because the stylesheet sets no palette and Qt 6.5+ follows the OS colour scheme, this is required to keep the UI readable under Windows dark mode (otherwise menus/lists render white-on-white). See `06_UI_MAP.md` §1.0.
 
 The brand colour is purple `#6e4f9e` (defined in `installer/create_wizard_images.py`).
 
