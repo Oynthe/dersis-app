@@ -1,0 +1,12 @@
+# DERSİS — macOS Build Dependencies
+# Only needed for creating the macOS .app / .dmg on a Mac.
+#
+# Install:  pip install -r requirements-build-mac.txt
+#
+# This pulls in every runtime dependency plus PyInstaller, which packages the
+# PyQt6 app into a native `Dersis.app` bundle. PyInstaller is free and
+# open-source and does NOT require Apple Developer Program membership.
+
+-r requirements.txt
+
+pyinstaller>=6.3        # Builds the native macOS .app bundle

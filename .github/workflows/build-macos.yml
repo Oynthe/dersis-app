@@ -1,0 +1,97 @@
+# ============================================================================
+# DERSİS — macOS Build
+#
+# Builds the native macOS app and packages it as .dmg (+ .zip) for both
+# Apple Silicon (arm64) and Intel (x64). Each architecture is built natively
+# on its matching runner because not all runtime wheels (notably ortools)
+# ship universal2 binaries.
+#
+# Triggers:
+#   - Manual dispatch — build on demand and download from the run's artifacts
+#   - Version tags (v*) — produce the macOS distributables alongside a release
+#
+# This is the macOS counterpart to build-installer.yml (Windows). It does not
+# touch the Windows build.
+# ============================================================================
+
+name: Build macOS
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    name: Build macOS (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 runners are Apple Silicon (arm64).
+          - arch: arm64
+            runner: macos-14
+          # macos-13 runners are Intel (x86_64).
+          - arch: x64
+            runner: macos-13
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read and validate version
+        id: version
+        run: |
+          version="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::VERSION '$version' is not valid semver"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building DERSİS $version for ${{ matrix.arch }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build macOS app + dmg + zip
+        run: ./build_mac.sh ${{ matrix.arch }}
+
+      - name: Verify outputs
+        run: |
+          dmg="dist/Dersis-${{ steps.version.outputs.version }}-mac-${{ matrix.arch }}.dmg"
+          zip="dist/Dersis-${{ steps.version.outputs.version }}-mac-${{ matrix.arch }}.zip"
+          for f in "$dmg" "$zip"; do
+            if [[ ! -f "$f" ]]; then
+              echo "::error::Missing expected output: $f"
+              ls -la dist/ || true
+              exit 1
+            fi
+          done
+          echo "macOS artifacts:"
+          ls -lh dist/*.dmg dist/*.zip
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          for f in *.dmg *.zip; do
+            shasum -a 256 "$f" > "$f.sha256"
+          done
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dersis-macos-${{ matrix.arch }}
+          path: |
+            dist/Dersis-*-mac-${{ matrix.arch }}.dmg
+            dist/Dersis-*-mac-${{ matrix.arch }}.zip
+            dist/Dersis-*-mac-${{ matrix.arch }}.dmg.sha256
+            dist/Dersis-*-mac-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error

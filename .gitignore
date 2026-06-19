@@ -7,6 +7,8 @@ dist/
 *.egg-info/
 .eggs/
 *.spec
+# Exception: the macOS PyInstaller spec is a maintained, committed build file.
+!Dersis-mac.spec
 *.tmp
 .tools/
 .venv/
