@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <sub>Get the Windows installer · for the command line, see <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
+  <sub>Windows installer · macOS <code>.dmg</code> · for the command line, see <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
 </p>
 
 ---
@@ -174,11 +174,28 @@ This section is for users who just want to **use** DERSİS, with no programming 
 > folder, at `Documents\Dersis\` (schedules, settings, logs, and exports). Your data never
 > leaves your computer.
 
+### On macOS
+
+1. From the [latest release](https://github.com/Oynthe/dersis-app/releases/latest), download
+   the `.dmg` for your Mac:
+   - **Apple Silicon** (M1/M2/M3/M4): `Dersis-<version>-mac-arm64.dmg`
+   - **Intel**: `Dersis-<version>-mac-x64.dmg`
+
+   Not sure? Apple menu →  **About This Mac**: "Apple silicon" → arm64, "Intel" → x64.
+2. Open the `.dmg` and drag **DERSİS** onto the **Applications** folder.
+3. Launch it from Applications or Launchpad.
+
+> **First launch — security warning:** Because DERSİS is currently distributed outside the
+> Mac App Store and may not yet be notarized by Apple, macOS may show a security warning on
+> first launch. Users can open it via **System Settings → Privacy & Security**, or by
+> **right-clicking the app and selecting Open**. Full guidance (including the
+> `xattr -dr com.apple.quarantine` fix) is in [`docs/MACOS.md`](docs/MACOS.md).
+
 ### On other systems
 
 The application itself is built with Python and the Qt toolkit and can also run on Linux
-(see [Running From Source](#running-from-source)). The **ready-made installer is currently
-Windows-only**. macOS support is *to be confirmed*.
+(see [Running From Source](#running-from-source)). A ready-made Linux package is not yet
+provided.
 
 ---
 
@@ -226,6 +243,21 @@ app and its assets, and creates the launchers. A second method using **Nuitka**
 (`build_nuitka.bat`) compiles to native code. Full details, required tools (Inno Setup), and
 options are in [`BUILD.md`](BUILD.md).
 
+### 4. (Optional) Build a macOS app (.dmg) — on a Mac
+
+On macOS, PyInstaller builds a native `Dersis.app` which is then packaged into a `.dmg`
+(plus an optional `.zip`). No Apple Developer Program membership is needed for a local build:
+
+```bash
+./build_mac.sh           # build for your Mac's architecture
+./build_mac.sh arm64     # Apple Silicon
+./build_mac.sh x64       # Intel
+```
+
+Outputs land in `dist/` as `Dersis-<version>-mac-<arch>.dmg` (and `.zip`). Builds are
+ad-hoc signed by default; signing with a Developer ID and notarization are optional. See the
+full [macOS guide](docs/MACOS.md).
+
 ---
 
 ## Project Structure
@@ -271,6 +303,7 @@ this exact setup — here is what DERSİS is made of and how the pieces fit toge
 | PDF output | reportlab | WeasyPrint, fpdf2 |
 | Encryption at rest | `cryptography` (AES-256-GCM) | SQLCipher, OS keychain integration |
 | Windows packaging | Embeddable Python + Inno Setup | PyInstaller, Nuitka, MSIX |
+| macOS packaging | PyInstaller `.app` → `.dmg` | py2app, Briefcase |
 
 **Architectural approach to reproduce**
 
@@ -296,8 +329,12 @@ You are welcome to study the structure for your own learning. Note the
 These are **realistic, not-yet-committed** directions, listed so you can judge feasibility.
 Items here are possibilities (*to be confirmed*), not promises.
 
-- **Native installers for macOS and Linux.** The build scripts are currently Windows
-  `.bat` files; the app code is cross-platform, so platform-native packaging is feasible.
+- **Native Linux package.** Windows (Inno Setup) and macOS (PyInstaller `.dmg`) are now
+  supported; a native Linux package (AppImage / .deb) is a feasible next step since the app
+  code is cross-platform.
+- **macOS notarization.** macOS builds are currently unsigned/ad-hoc; signing with an Apple
+  Developer ID and notarizing (to remove the Gatekeeper prompt) is wired for credentials but
+  not yet automated in CI.
 - **An automated test suite.** The repository currently ships **without test files**;
   continuous integration runs only version, build-file, and import-smoke checks. Adding unit
   tests around the `core/` engine would be a high-value, low-risk improvement.

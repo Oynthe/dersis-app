@@ -1,8 +1,13 @@
 # Dersis — Build & Packaging Guide
 
+> **Platforms:** Windows is packaged as an Inno Setup installer
+> (`Dersis_Setup.exe`). macOS is packaged as a `.dmg` (+ optional `.zip`) via
+> PyInstaller — see [**macOS Build & Install Guide**](docs/MACOS.md). The two
+> are independent and can be released side by side.
+
 ## Overview
 
-Dersis can be packaged two ways. Both produce the same `build\Dersis.dist\` folder, and both use the same Inno Setup installer.
+On **Windows**, Dersis can be packaged two ways. Both produce the same `build\Dersis.dist\` folder, and both use the same Inno Setup installer.
 
 | Method | Script | Speed | Complexity |
 |--------|--------|-------|------------|
@@ -156,6 +161,42 @@ Only needed if `docs/dersis.png` changes.
 | `installer/vc_redist.x64.exe` | VC++ runtime (optional) |
 | `scheduler_app/assets/app_icon.ico` | Setup icon and shortcuts |
 
+## macOS Build (.dmg / .zip)
+
+macOS uses a separate, native toolchain — **PyInstaller** builds a
+self-contained `Dersis.app`, which is then packaged into a `.dmg` (and an
+optional `.zip`) using macOS built-ins (`sips`, `iconutil`, `hdiutil`,
+`ditto`). No Apple Developer Program membership is required for a local build.
+
+```bash
+# On a Mac:
+./build_mac.sh            # build for the host architecture
+./build_mac.sh arm64      # Apple Silicon
+./build_mac.sh x64        # Intel
+```
+
+Outputs land in `dist/`:
+
+- `Dersis-<version>-mac-<arch>.dmg` — drag-to-Applications installer
+- `Dersis-<version>-mac-<arch>.zip` — secondary download (`DERSIS_SKIP_ZIP=1` to skip)
+
+Architectures are built **natively per-arch** (arm64 on Apple Silicon, x64 on
+Intel) rather than as a single universal2 binary, because not all dependency
+wheels (notably `ortools`) ship universal2 builds reliably.
+
+Relevant files:
+
+| File | Purpose |
+|------|---------|
+| `build_mac.sh` | macOS build/package orchestrator |
+| `Dersis-mac.spec` | PyInstaller spec (`.app` bundle config, identity, icon) |
+| `requirements-build-mac.txt` | Runtime deps + PyInstaller |
+| `docs/MACOS.md` | Full user + developer macOS guide (incl. Gatekeeper) |
+
+Signing/notarization is **optional**: builds are ad-hoc signed by default
+(so Apple Silicon will run them) and can be signed with a real Developer ID via
+the `DERSIS_CODESIGN_IDENTITY` environment variable. See [`docs/MACOS.md`](docs/MACOS.md).
+
 ## Installer Languages
 
 13 languages via Inno Setup built-in `.isl` files:
@@ -193,7 +234,8 @@ GitHub Actions automate validation, building, and releases. See `.github/workflo
 |----------|------|---------|---------|
 | **CI** | `ci.yml` | Push / PR to `master` | Version checks, build-file checks, import-smoke checks (no test files) |
 | **Build Installer** | `build-installer.yml` | Manual / `v*` tags | Full Windows build + installer + checksum |
-| **Release** | `release.yml` | Manual / `v*` tags | Build + publish GitHub Release |
+| **Build macOS** | `build-macos.yml` | Manual / `v*` tags | macOS `.dmg` + `.zip` for arm64 and x64 (uploaded as run artifacts) |
+| **Release** | `release.yml` | Manual / `v*` tags | Builds Windows installer **and** macOS `.dmg`/`.zip`, then publishes one GitHub Release with all artifacts |
 
 **Quick release:**
 ```bash
@@ -202,7 +244,10 @@ git add VERSION && git commit -m "Bump version to 1.2.0"
 git tag -a v1.2.0 -m "Release 1.2.0"
 git push origin master --tags
 ```
-The Release workflow builds the installer on Windows and creates a GitHub Release with `Dersis_Setup_v1.2.0.exe` and its `.sha256` checksum.
+The Release workflow builds the installer on Windows **and** the macOS
+distributables on macOS runners, then creates a single GitHub Release
+containing `Dersis_Setup_v1.2.0.exe`, `Dersis-1.2.0-mac-arm64.dmg`,
+`Dersis-1.2.0-mac-x64.dmg`, the `.zip` variants, and their `.sha256` checksums.
 
 **Manual build:** Go to Actions → "Build Installer" → "Run workflow".
 
@@ -210,7 +255,12 @@ The Release workflow builds the installer on Windows and creates a GitHub Releas
 
 1. **Installer languages**: 13 of 20 app languages have installer UI translations. The 7 missing only affect the installer wizard — the installed app has all 20.
 
-2. **Windows only**: Both build scripts are `.bat` files for Windows x64.
+2. **Per-platform build hosts**: The Windows installer (`.bat` + Inno Setup)
+   must be built on Windows; the macOS `.dmg` (`build_mac.sh` + PyInstaller)
+   must be built on macOS. Each macOS architecture builds natively on its own
+   hardware/runner — no cross-compilation, and no clean universal2 build
+   (ortools lacks reliable universal2 wheels). macOS builds are **unsigned/
+   ad-hoc** by default; notarization is optional and not automated.
 
 3. **Embed method ships source**: The embeddable Python method includes `.py` source files. Use Nuitka if source code protection is required.
 

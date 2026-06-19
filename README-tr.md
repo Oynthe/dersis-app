@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <sub>Windows yükleyicisini indirin · komut satırı için <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
+  <sub>Windows yükleyicisi · macOS <code>.dmg</code> · komut satırı için <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
 </p>
 
 ---
@@ -176,11 +176,29 @@ isteyenler içindir.
 > içinde, `Documents\Dersis\` konumunda saklar (programlar, ayarlar, günlükler ve dışa
 > aktarmalar). Verileriniz asla bilgisayarınızdan çıkmaz.
 
+### macOS'ta
+
+1. [En son sürümden](https://github.com/Oynthe/dersis-app/releases/latest) Mac'inize uygun
+   `.dmg` dosyasını indirin:
+   - **Apple Silicon** (M1/M2/M3/M4): `Dersis-<sürüm>-mac-arm64.dmg`
+   - **Intel**: `Dersis-<sürüm>-mac-x64.dmg`
+
+   Emin değil misiniz? Apple menüsü →  **Bu Mac Hakkında**: "Apple silicon" → arm64,
+   "Intel" → x64.
+2. `.dmg` dosyasını açın ve **DERSİS**'i **Uygulamalar** klasörüne sürükleyin.
+3. Uygulamalar veya Launchpad üzerinden başlatın.
+
+> **İlk açılış — güvenlik uyarısı:** DERSİS şu anda Mac App Store dışında dağıtıldığı ve
+> henüz Apple tarafından noter onaylı (notarized) olmadığı için, macOS ilk açılışta bir
+> güvenlik uyarısı gösterebilir. Uygulamayı **Sistem Ayarları → Gizlilik ve Güvenlik**
+> üzerinden ya da uygulamaya **sağ tıklayıp “Aç”** diyerek açabilirsiniz. Ayrıntılı kılavuz
+> (`xattr -dr com.apple.quarantine` çözümü dahil): [`docs/MACOS.md`](docs/MACOS.md).
+
 ### Diğer sistemlerde
 
 Uygulama Python ve Qt araç takımıyla geliştirilmiştir ve Linux'ta da çalışabilir
-(bkz. [Kaynak Koddan Çalıştırma](#kaynak-koddan-çalıştırma)). **Hazır kurulum dosyası şu an
-yalnızca Windows içindir.** macOS desteği *teyit edilecek*.
+(bkz. [Kaynak Koddan Çalıştırma](#kaynak-koddan-çalıştırma)). Linux için hazır bir paket
+henüz sağlanmamaktadır.
 
 ---
 
@@ -228,6 +246,22 @@ iscc installer.iss       :: Output\Dersis_Setup_v<sürüm>.exe dosyasını üret
 oluşturur. **Nuitka** kullanan ikinci bir yöntem (`build_nuitka.bat`) yerel koda derler. Tüm
 ayrıntılar, gerekli araçlar (Inno Setup) ve seçenekler [`BUILD.md`](BUILD.md) içindedir.
 
+### 4. (İsteğe bağlı) macOS uygulaması (.dmg) oluşturma — bir Mac'te
+
+macOS'ta PyInstaller, yerel bir `Dersis.app` paketi oluşturur ve bu paket bir `.dmg`
+(ve isteğe bağlı bir `.zip`) içine konur. Yerel derleme için Apple Developer Program üyeliği
+gerekmez:
+
+```bash
+./build_mac.sh           # Mac'inizin mimarisi için derler
+./build_mac.sh arm64     # Apple Silicon
+./build_mac.sh x64       # Intel
+```
+
+Çıktılar `dist/` içine `Dersis-<sürüm>-mac-<mimari>.dmg` (ve `.zip`) olarak gelir.
+Derlemeler varsayılan olarak ad-hoc imzalanır; Developer ID ile imzalama ve noter onayı
+(notarization) isteğe bağlıdır. Ayrıntılar: [macOS kılavuzu](docs/MACOS.md).
+
 ---
 
 ## Proje Yapısı
@@ -274,6 +308,7 @@ geldiği aşağıdadır.
 | PDF çıktısı | reportlab | WeasyPrint, fpdf2 |
 | Diskte şifreleme | `cryptography` (AES-256-GCM) | SQLCipher, işletim sistemi anahtarlığı |
 | Windows paketleme | Gömülebilir Python + Inno Setup | PyInstaller, Nuitka, MSIX |
+| macOS paketleme | PyInstaller `.app` → `.dmg` | py2app, Briefcase |
 
 **Yeniden üretmek için mimari yaklaşım**
 
@@ -301,9 +336,12 @@ Bunlar **gerçekçi, henüz taahhüt edilmemiş** yönlerdir; fizibiliteyi
 değerlendirebilmeniz için listelenmiştir. Buradaki maddeler birer olasılıktır
 (*teyit edilecek*), vaat değildir.
 
-- **macOS ve Linux için yerel kurulum dosyaları.** Derleme betikleri şu an Windows `.bat`
-  dosyalarıdır; uygulama kodu çapraz platformdur, dolayısıyla platforma özgü paketleme
-  yapılabilir.
+- **Linux için yerel paket.** Windows (Inno Setup) ve macOS (PyInstaller `.dmg`) artık
+  desteklenmektedir; uygulama kodu çapraz platform olduğundan, Linux için yerel bir paket
+  (AppImage / .deb) uygulanabilir bir sonraki adımdır.
+- **macOS noter onayı.** macOS derlemeleri şu an imzasız/ad-hoc'tur; Apple Developer ID ile
+  imzalama ve noter onayı (Gatekeeper uyarısını kaldırmak için) kimlik bilgileri sağlandığında
+  çalışacak şekilde hazırdır ancak henüz CI'da otomatikleştirilmemiştir.
 - **Otomatik test paketi.** Depo şu an **test dosyası içermez**; sürekli entegrasyon yalnızca
   sürüm, derleme dosyası ve içe aktarma denetimleri çalıştırır. `core/` motoru çevresine
   birim testleri eklemek, yüksek değerli ve düşük riskli bir iyileştirme olur.
