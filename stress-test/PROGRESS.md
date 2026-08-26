@@ -69,9 +69,25 @@ rather than statistical. It is a prerequisite, not a nice-to-have.
 
 ### Known gaps in this phase
 
-- **CI has not been observed green on a real runner.** It is green locally on
-  Windows; the Ubuntu job (offscreen Qt, apt Qt libs, reportlab fonts) is
-  unverified until the first push.
+- **GitHub Actions is not executing anything in this repository**, so the CI fix
+  is unverified end to end. Diagnosed on PR #7: the push and the PR created **no
+  workflow run at all** — not even `Claude Code Review`, which subscribes to
+  `pull_request: [opened, synchronize, ready_for_review, reopened]` with no branch
+  filter and ran fine on PR #6. Closing and reopening the PR to re-fire the event
+  also produced nothing. `GET /actions/permissions` reports
+  `enabled: true, allowed_actions: all`; the repo is public, not archived, not
+  disabled. The last workflow run of any kind was **2026-06-19, 68 days before
+  this branch** — consistent with GitHub's inactivity shutoff, which is cleared by
+  the repo owner from the Actions tab ("I understand my workflows, go ahead and
+  enable them"). **Action required from the maintainer**: re-enable Actions, then
+  confirm the Ubuntu path (offscreen Qt, apt Qt libs, reportlab fonts), which has
+  only ever been observed green locally on Windows.
+
+  Side effect worth knowing: `ci.yml` and `claude.yml` are absent from
+  `GET /actions/workflows` even though both have been on `main` since the initial
+  commit. That index appears to list only workflows that have run at least once —
+  `ci.yml` never could (it triggered on `master`, a branch this repo has never
+  had) and `claude.yml` needs an `@claude` mention. It is a symptom, not a cause.
 - The three new user-facing strings (`errors.invalid_number`,
   `warnings.blank_number_defaulted`, `warnings.invalid_number_defaulted`) exist
   in **en** and **tr** only. The other 20 locales fall back to English via
