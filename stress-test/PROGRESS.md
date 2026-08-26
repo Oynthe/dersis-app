@@ -69,25 +69,31 @@ rather than statistical. It is a prerequisite, not a nice-to-have.
 
 ### Known gaps in this phase
 
-- **GitHub Actions is not executing anything in this repository**, so the CI fix
-  is unverified end to end. Diagnosed on PR #7: the push and the PR created **no
-  workflow run at all** — not even `Claude Code Review`, which subscribes to
-  `pull_request: [opened, synchronize, ready_for_review, reopened]` with no branch
-  filter and ran fine on PR #6. Closing and reopening the PR to re-fire the event
-  also produced nothing. `GET /actions/permissions` reports
-  `enabled: true, allowed_actions: all`; the repo is public, not archived, not
-  disabled. The last workflow run of any kind was **2026-06-19, 68 days before
-  this branch** — consistent with GitHub's inactivity shutoff, which is cleared by
-  the repo owner from the Actions tab ("I understand my workflows, go ahead and
-  enable them"). **Action required from the maintainer**: re-enable Actions, then
-  confirm the Ubuntu path (offscreen Qt, apt Qt libs, reportlab fonts), which has
-  only ever been observed green locally on Windows.
+- **CI is green on Ubuntu.** Both jobs pass on PR #7: **Validate** (1 m 01 s,
+  including `pytest -m "not slow"` under `QT_QPA_PLATFORM=offscreen` with the apt
+  Qt libraries) and **Scheduling invariants** (4 m 10 s, the full oracle
+  including the slow presets). ST-ARCH-002 is therefore verified end to end, and
+  Phase 0's "CI runs and is green" completion criterion is met.
 
-  Side effect worth knowing: `ci.yml` and `claude.yml` are absent from
-  `GET /actions/workflows` even though both have been on `main` since the initial
-  commit. That index appears to list only workflows that have run at least once —
-  `ci.yml` never could (it triggered on `master`, a branch this repo has never
-  had) and `claude.yml` needs an `@claude` mention. It is a symptom, not a cause.
+  *Correction to an earlier entry here.* This file previously recorded that
+  "GitHub Actions is not executing anything in this repository", diagnosed from
+  PR #7 showing no runs — not even `Claude Code Review`, which subscribes to
+  `pull_request` with no branch filter — and from the last run of any kind being
+  68 days earlier. That conclusion was **wrong**. The runs were simply late:
+  they were created about fifteen minutes after the PR, well after the checks
+  that concluded otherwise, and nothing needed to be re-enabled. The lesson is
+  narrow and worth keeping: an empty `GET /actions/runs` shortly after a push is
+  evidence of queueing, not of a disabled repository, and the two look identical
+  for as long as the queue lasts.
+
+  Still true, and still only a symptom: `ci.yml` and `claude.yml` are absent from
+  `GET /actions/workflows` until their first run, because that index lists only
+  workflows that have executed at least once. `ci.yml` never could — it triggered
+  on `master`, a branch this repo has never had.
+
+- **`Claude Code Review` fails**, on this branch and on PR #6 back in June. It is
+  unrelated to the roadmap and predates this work; it needs whoever owns that
+  workflow's configuration.
 - The three new user-facing strings (`errors.invalid_number`,
   `warnings.blank_number_defaulted`, `warnings.invalid_number_defaulted`) exist
   in **en** and **tr** only. The other 20 locales fall back to English via
