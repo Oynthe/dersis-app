@@ -1,0 +1,69 @@
+{
+  "preset": "tiny",
+  "n_classes": 5,
+  "reschedule_sec": 1.655,
+  "error": null,
+  "raw_placed": 5,
+  "raw_unplaced": 0,
+  "raw_violations": {},
+  "apply_sec": 0.0,
+  "apply_rejected": 0,
+  "applied_violations": {},
+  "applied_n_placed": 5,
+  "applied_samples": [],
+  "raw_samples": []
+}
+{
+  "preset": "small",
+  "n_classes": 25,
+  "reschedule_sec": 47.106,
+  "error": null,
+  "raw_placed": 21,
+  "raw_unplaced": 4,
+  "raw_violations": {
+    "room_double_book": 6,
+    "lecturer_double_book": 6,
+    "group_clash": 6
+  },
+  "apply_sec": 0.0,
+  "apply_rejected": 1,
+  "applied_violations": {},
+  "applied_n_placed": 20,
+  "applied_samples": [],
+  "raw_samples": [
+    "[room_double_book] Ders 11: room 'R001' shared at friday/12:00 by: Ders 11, Ders 23",
+    "[room_double_book] Ders 23: room 'R001' shared at friday/12:00 by: Ders 11, Ders 23",
+    "[room_double_book] Ders 11: room 'R001' shared at friday/13:00 by: Ders 11, Ders 23",
+    "[room_double_book] Ders 23: room 'R001' shared at friday/13:00 by: Ders 11, Ders 23",
+    "[room_double_book] Ders 11: room 'R001' shared at friday/14:00 by: Ders 11, Ders 23",
+    "[room_double_book] Ders 23: room 'R001' shared at friday/14:00 by: Ders 11, Ders 23"
+  ]
+}
+{
+  "preset": "normal",
+  "n_classes": 80,
+  "reschedule_sec": 121.665,
+  "error": null,
+  "raw_placed": 76,
+  "raw_unplaced": 4,
+  "raw_violations": {
+    "room_double_book": 24,
+    "lecturer_double_book": 12,
+    "group_clash": 24
+  },
+  "apply_sec": 0.0,
+  "apply_rejected": 9,
+  "applied_violations": {},
+  "applied_n_placed": 67,
+  "applied_samples": [],
+  "raw_samples": [
+    "[room_double_book] Ders 53: room 'R008' shared at wednesday/11:00 by: Ders 53, Ders 79",
+    "[room_double_book] Ders 79: room 'R008' shared at wednesday/11:00 by: Ders 53, Ders 79",
+    "[room_double_book] Ders 18: room 'R001' shared at wednesday/13:00 by: Ders 18, Ders 57",
+    "[room_double_book] Ders 57: room 'R001' shared at wednesday/13:00 by: Ders 18, Ders 57",
+    "[room_double_book] Ders 36: room 'R001' shared at friday/10:00 by: Ders 36, Ders 37",
+    "[room_double_book] Ders 37: room 'R001' shared at friday/10:00 by: Ders 36, Ders 37"
+  ]
+}
+
+[exited with code 0]

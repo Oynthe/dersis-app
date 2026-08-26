@@ -1,0 +1,36 @@
+preset=large rejected=51
+committed violations by category: {'availability': 3, 'capacity': 7, 'room_double_book': 2, 'group_clash': 4}
+total placed blocks: 180
+
+[availability] Ders 22 uid=aed4cbee pinned=True prot=none loc=face_to_face
+     committed day=monday slot=12:00 room=R008 participants=55 dur=3
+     production check_placement(excl self) = False | room_fits=True avail_at_start=True
+[capacity] Ders 52 uid=9603fdb6 pinned=True prot=none loc=face_to_face
+     committed day=wednesday slot=16:00 room=R005 participants=25 dur=1
+     production check_placement(excl self) = False | room_fits=False avail_at_start=True
+[availability] Ders 181 uid=8dafeb78 pinned=True prot=none loc=face_to_face
+     committed day=tuesday slot=12:00 room=R009 participants=35 dur=1
+     production check_placement(excl self) = False | room_fits=True avail_at_start=False
+[availability] Ders 194 uid=642677ff pinned=True prot=none loc=face_to_face
+     committed day=thursday slot=09:00 room=R004 participants=55 dur=3
+     production check_placement(excl self) = False | room_fits=False avail_at_start=False
+[capacity] Ders 194 uid=642677ff pinned=True prot=none loc=face_to_face
+     committed day=thursday slot=09:00 room=R004 participants=55 dur=3
+     production check_placement(excl self) = False | room_fits=False avail_at_start=False
+[capacity] Ders 237 uid=eca08a76 pinned=True prot=none loc=face_to_face
+     committed day=friday slot=13:00 room=R005 participants=35 dur=3
+     production check_placement(excl self) = False | room_fits=False avail_at_start=True
+[room_double_book] Ders 237 uid=eca08a76 pinned=True prot=none loc=face_to_face
+     committed day=friday slot=13:00 room=R005 participants=35 dur=3
+     production check_placement(excl self) = False | room_fits=False avail_at_start=True
+[room_double_book] Ders 246 uid=4840e5e0 pinned=True prot=none loc=face_to_face
+     committed day=friday slot=12:00 room=R005 participants=0 dur=2
+     production check_placement(excl self) = False | room_fits=True avail_at_start=True
+[group_clash] Ders 159 uid=8a7c12f0 pinned=True prot=none loc=face_to_face
+     committed day=friday slot=12:00 room=R012 participants=0 dur=3
+     production check_placement(excl self) = False | room_fits=True avail_at_start=True
+[group_clash] Ders 246 uid=4840e5e0 pinned=True prot=none loc=face_to_face
+     committed day=friday slot=12:00 room=R005 participants=0 dur=2
+     production check_placement(excl self) = False | room_fits=True avail_at_start=True
+
+Distinct violating classes: 7; of which pinned: 7

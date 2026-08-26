@@ -12,6 +12,7 @@ dist/
 *.tmp
 .tools/
 .venv/
+.venv-audit/
 .pytest_cache/
 Output/
 *.exe
