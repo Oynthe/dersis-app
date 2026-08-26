@@ -387,7 +387,8 @@ class SchedulingWorkflow:
 
     def reschedule(self, weights, use_cpsat=False,
                    progress_callback=None,
-                   seed=DEFAULT_OPTIMIZER_SEED) -> RescheduleResult:
+                   seed=DEFAULT_OPTIMIZER_SEED,
+                   cancel_token=None, **optimizer_kwargs) -> RescheduleResult:
         """Run full reschedule optimization. Returns proposed changes.
 
         `seed` defaults to a fixed value so the same timetable regenerates the
@@ -397,16 +398,25 @@ class SchedulingWorkflow:
         self._optimizing = True
         try:
             return self._reschedule_impl(weights, use_cpsat,
-                                         progress_callback, seed)
+                                         progress_callback, seed,
+                                         cancel_token, **optimizer_kwargs)
         finally:
             self._optimizing = False
 
     def _reschedule_impl(self, weights, use_cpsat, progress_callback,
-                         seed=DEFAULT_OPTIMIZER_SEED):
+                         seed=DEFAULT_OPTIMIZER_SEED, cancel_token=None,
+                         **optimizer_kwargs):
         placed, unplaced, changes, summary = optimized_reschedule_all(
             self.state, weights=weights,
             progress_callback=progress_callback,
-            use_cpsat=use_cpsat, seed=seed)
+            use_cpsat=use_cpsat, seed=seed,
+            cancel_token=cancel_token, **optimizer_kwargs)
+
+        # ST-PERF-001: stop before the expensive analysis passes below. A user
+        # who cancelled does not want to wait out a negotiation run for a
+        # result that is about to be discarded.
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled()
 
         # Build analytics
         from scheduler_app.explanation_engine import ExplanationEngine

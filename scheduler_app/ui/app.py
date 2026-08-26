@@ -1845,8 +1845,23 @@ class SchedulerApp(QMainWindow):
             self._show_toast(pending, "error")
         except Exception:
             pass
-        QTimer.singleShot(0, lambda: QMessageBox.warning(
-            self, tr("status.settings_problem_title"), pending))
+        self._deferred_warning(tr("status.settings_problem_title"), pending)
+
+    def _deferred_warning(self, title, text):
+        """Show a modal warning on the next event-loop turn, owned by this window.
+
+        Deliberately NOT QTimer.singleShot(0, lambda: ...): a context-less
+        single shot outlives the window and then fires against a destroyed
+        widget, which corrupts the heap. Measured as 6/6 interpreter aborts
+        once the off-thread solve started pumping the event loop hard.
+        Qt's (msec, context, slot) overload is not exposed by PyQt6, so the
+        equivalent is a real QTimer parented to self — destroyed with the
+        window, and so never delivered to a dead one.
+        """
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: QMessageBox.warning(self, title, text))
+        timer.start(0)
 
     def _report_settings_problem(self, kind, message):
         """Tell the user their settings could not be read or written.
@@ -1881,8 +1896,7 @@ class SchedulerApp(QMainWindow):
             self._show_toast(message, "error")
         except Exception:
             pass
-        QTimer.singleShot(0, lambda: QMessageBox.warning(
-            self, tr("status.settings_problem_title"), message))
+        self._deferred_warning(tr("status.settings_problem_title"), message)
 
     def _read_settings_container(self):
         """Read the settings container, distinguishing the three outcomes.
@@ -2776,33 +2790,87 @@ class SchedulerApp(QMainWindow):
             return
         use_cpsat = (resched_dlg.result_mode == "deep")
 
+        # The solve now runs on a worker thread, so a failure inside it arrives
+        # on the `failed` signal rather than as an exception here
+        # (see _on_solve_failed).
+        self._do_reschedule(resched_dlg, use_cpsat,
+                            weights=self._get_learned_weights())
+
+    def _on_solve_failed(self, exc):
+        """The worker raised. Log it and offer a bug report, as before."""
+        tb = getattr(self._solver_task, "failure_traceback", "") or repr(exc)
         try:
-            self._do_reschedule(resched_dlg, use_cpsat, weights=self._get_learned_weights())
+            from datetime import datetime
+            log_path = storage.crash_log_path()
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"RESCHEDULE CRASH at {datetime.now()}\n")
+                f.write(f"{'='*60}\n")
+                f.write(tb + "\n")
         except Exception:
-            import traceback
-            tb = traceback.format_exc()
-            # Write to crash log
-            try:
-                from datetime import datetime
-                log_path = storage.crash_log_path()
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"\n{'='*60}\n")
-                    f.write(f"RESCHEDULE CRASH at {datetime.now()}\n")
-                    f.write(f"{'='*60}\n")
-                    f.write(tb + "\n")
-            except Exception:
-                pass
-            self.statusBar().clearMessage()
-            # Show crash dialog with bug report option
-            from scheduler_app.ui.bug_report import CrashReportDialog
-            dlg = CrashReportDialog(
-                exc_type_name='RescheduleError',
-                exc_message=tr('errors.optimization_error'),
-                traceback_text=tb,
-                log_path=storage.crash_log_path(),
-                parent=self,
-            )
-            dlg.exec()
+            pass
+        self._end_solve_ui()
+        from scheduler_app.ui.bug_report import CrashReportDialog
+        dlg = CrashReportDialog(
+            exc_type_name='RescheduleError',
+            exc_message=tr('errors.optimization_error'),
+            traceback_text=tb,
+            log_path=storage.crash_log_path(),
+            parent=self,
+        )
+        dlg.exec()
+
+    # ── Solve lifecycle (ST-PERF-001) ────────────────────────────────────
+
+    def _begin_solve_ui(self):
+        """Put the window into "solving" mode: progress visible, actions off.
+
+        Disabling the actions is not cosmetic. The whole point of the worker is
+        that the window stays clickable, so a user WILL press Generate again —
+        and two solves sharing one state dict and one apply_reschedule is how
+        this change would corrupt a timetable.
+        """
+        from PyQt6.QtWidgets import QProgressDialog
+        from PyQt6.QtCore import Qt as _Qt
+
+        self.statusBar().showMessage(tr("status.optimizing"))
+        dlg = QProgressDialog(tr("status.optimizing"), tr("buttons.cancel"),
+                              0, 1000, self)
+        dlg.setWindowModality(_Qt.WindowModality.WindowModal)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setMinimumDuration(0)
+        dlg.canceled.connect(self._on_solve_cancel_requested)
+        dlg.setValue(0)
+        self._solve_progress_dialog = dlg
+
+    def _end_solve_ui(self):
+        """Leave "solving" mode, whatever the outcome."""
+        dlg = getattr(self, "_solve_progress_dialog", None)
+        if dlg is not None:
+            self._solve_progress_dialog = None
+            dlg.close()
+            dlg.deleteLater()
+        self.statusBar().clearMessage()
+
+    def _on_solve_cancel_requested(self):
+        task = getattr(self, "_solver_task", None)
+        if task is not None:
+            task.cancel()
+        self.statusBar().showMessage(tr("status.reschedule_cancelled"))
+
+    def _on_solve_progress(self, progress):
+        """Update the bar. Runs on the GUI thread — no event pumping needed."""
+        dlg = getattr(self, "_solve_progress_dialog", None)
+        if dlg is not None:
+            dlg.setValue(int(progress.fraction * 1000))
+        self.statusBar().showMessage(tr("status.optimizing_run").format(
+            r=progress.run + 1, t=progress.total_runs,
+            i=progress.iteration, q=progress.best_score))
+
+    def _on_solve_cancelled(self):
+        self._end_solve_ui()
+        self._show_toast(tr("status.reschedule_cancelled"), "info")
 
     def _do_reschedule(self, resched_dlg, use_cpsat, weights):
         """Inner reschedule logic, separated for error handling."""
@@ -2815,24 +2883,34 @@ class SchedulerApp(QMainWindow):
             goal_weights = goals_to_weights(resched_dlg.result_goals)
             weights.update(goal_weights)
 
-        # Show progress during multi-start LNS optimization
-        self.statusBar().showMessage(tr("status.optimizing"))
-        QApplication.processEvents()
+        # ST-PERF-001. The solve used to run inline on the GUI thread, via a
+        # synchronous call into the workflow whose progress callback pumped the
+        # Qt event loop by hand. That callback WAS the freeze: the window only
+        # repainted because the solver reached back into Qt about three times a
+        # second, and between two pumps the app answered nothing — 25-120 s of
+        # "Not Responding" at a realistic department size, escapable only by
+        # killing the process and losing the schedule.
+        from scheduler_app.ui.solver_task import SolverTask
 
-        def _progress(iteration, best_score, current_score,
-                      run_number=0, total_runs=1):
-            msg = tr("status.optimizing_run").format(
-                r=run_number + 1, t=total_runs,
-                i=iteration, q=best_score)
-            self.statusBar().showMessage(msg)
-            from PyQt6.QtCore import QEventLoop
-            QApplication.processEvents(
-                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        existing = getattr(self, "_solver_task", None)
+        if existing is not None and existing.is_running:
+            return  # a solve is already running; the UI is disabled anyway
 
-        result = self._workflow.reschedule(
-            weights, use_cpsat=use_cpsat, progress_callback=_progress)
+        self._solve_snapshots = snapshots
+        task = SolverTask(self._workflow, weights, use_cpsat=use_cpsat,
+                          parent=self)
+        self._solver_task = task
+        task.progress.connect(self._on_solve_progress)
+        task.finished.connect(self._on_solve_finished)
+        task.failed.connect(self._on_solve_failed)
+        task.cancelled.connect(self._on_solve_cancelled)
+        self._begin_solve_ui()
+        task.start()
 
-        self.statusBar().clearMessage()
+    def _on_solve_finished(self, result):
+        """The worker produced a schedule. Everything from here is GUI-thread."""
+        snapshots = getattr(self, "_solve_snapshots", None)
+        self._end_solve_ui()
 
         # Show results with analytics
         results_dlg = BulkResultsDialog(

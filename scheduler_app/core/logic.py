@@ -1179,7 +1179,8 @@ def optimized_reschedule_all(state, weights=None, protected_ids=None,
                              multi_start_time_limit=120.0,
                              use_cpsat=False, cpsat_time_limit=15.0,
                              parallel_workers=0,
-                             seed=DEFAULT_OPTIMIZER_SEED):
+                             seed=DEFAULT_OPTIMIZER_SEED,
+                             cancel_token=None, **optimizer_kwargs):
     """Hybrid timetable-wide reschedule with multi-start LNS + optional CP-SAT.
 
     Preserves pinned and protected placements. Uses greedy construction
@@ -1206,7 +1207,8 @@ def optimized_reschedule_all(state, weights=None, protected_ids=None,
         multi_start_runs=multi_start_runs,
         multi_start_time_limit=multi_start_time_limit,
         use_cpsat=use_cpsat, cpsat_time_limit=cpsat_time_limit,
-        parallel_workers=parallel_workers, seed=seed)
+        parallel_workers=parallel_workers, seed=seed,
+        cancel_token=cancel_token, **optimizer_kwargs)
     return optimizer.optimize()
 
 
