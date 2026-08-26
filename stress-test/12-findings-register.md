@@ -6,8 +6,10 @@ reflects **user consequence**, not discovery difficulty
 ([definitions](00-README.md#severity-system)). Confidence and OBSERVED/INFERRED
 follow [the methodology](03-test-methodology.md#6-evidence-discipline).
 
-Status is `Open` for all — this audit is diagnosis, not remediation
-([§23 of the brief](14-implementation-roadmap.md)).
+Statuses were `Open` for all at audit time — the audit was diagnosis, not
+remediation ([§23 of the brief](14-implementation-roadmap.md)). They are now
+updated as roadmap phases land; see [PROGRESS.md](PROGRESS.md) for the
+phase-by-phase state.
 
 **Counts:** 6 Critical · 27 High · 43 Medium · 17 Low = 93 findings.
 
@@ -189,7 +191,7 @@ accordingly.
 - **User impact** The flagship "import from Excel" workflow is 100% broken; worse, it half-applies the import (state changed, screen not refreshed, exception dialog shown), so the user cannot tell what state they are in.
 - **Technical impact** Combined with the global excepthook, the app survives but is left in an inconsistent, unrendered state; a subsequent action auto-saves the half-merged data.
 - **Recommendation** Replace with `self.refresh_grid(); self._update_status()`; wrap the whole import in `try/except` that rolls back the merge on failure. Add a regression test that drives `_import_from_excel` end-to-end.
-- **Effort** S · **Dependencies** none · **Related** ST-FUNC-002, ST-ARCH-001 · **Status** Open
+- **Effort** S · **Dependencies** none · **Related** ST-FUNC-002, ST-ARCH-001 · **Status** **Fixed** (Phase 0, branch `fix/phase-0-test-scaffold`)
 
 <a id="st-func-002"></a>
 ### ST-FUNC-002 — Blank joint-group cells merge/delete unrelated classes
@@ -200,14 +202,14 @@ accordingly.
 - **Root cause** `jcg = str(row.get('joint_class_group','')).strip()` — pandas reads blank/empty cells as float `NaN`, and `str(NaN) == 'nan'` (truthy), so every blank-group class shares the joint key `'nan'` and is merged; duplicates are removed from `state['classes']`.
 - **User impact** Silent, invisible data loss on the primary bulk-entry path. A real institution importing a roster with mostly-independent courses would lose most of them and never be told.
 - **Recommendation** `jcg = '' if pd.isna(v) else str(v).strip()`, treat `''`/`'nan'` as "no group". Round-trip test of the generated template asserting class count preserved.
-- **Effort** S · **Related** ST-FUNC-001, ST-ARCH-001 · **Status** Open
+- **Effort** S · **Related** ST-FUNC-001, ST-ARCH-001 · **Status** **Fixed** (Phase 0, branch `fix/phase-0-test-scaffold`)
 
 <a id="st-func-003"></a>
 ### ST-FUNC-003 — Malformed numeric cell aborts the entire import
 - **Severity** High · **OBSERVED** · `importer.py:258-259`
 - **Evidence** Blank `duration` → `ValueError: cannot convert float NaN to integer`; `duration='two'` / `student_count='many'` → `invalid literal for int()`. The exception escapes `load_scheduler_data_from_excel` and the caller `_import_from_excel` has **no** `try/except`. Probe: `probe_02_import_edge_cases.py`.
 - **Root cause** `int(row.get('duration',1) or 1)` — a present-but-NaN cell returns `NaN` (not the default), `NaN` is truthy so `or 1` doesn't apply, `int(NaN)` raises. No per-row error handling in `_process_classes`.
-- **Recommendation** `pd.isna` guard + per-row `try/except → report.add_error(...)`; skip the bad row, keep the import. **Effort** S · **Related** ST-FUNC-001 · **Status** Open
+- **Recommendation** `pd.isna` guard + per-row `try/except → report.add_error(...)`; skip the bad row, keep the import. **Effort** S · **Related** ST-FUNC-001 · **Status** **Fixed** (Phase 0, branch `fix/phase-0-test-scaffold`)
 
 <a id="st-func-004"></a>
 ### ST-FUNC-004 — PDF export cannot render Turkish letters
@@ -372,7 +374,7 @@ accordingly.
 - **Category** Architecture · **Severity** Critical · **Confidence** High · **OBSERVED**
 - **Evidence** No test files, no `tests/` dir, no pytest/tox/pyproject config anywhere outside `.venv-audit`. `requirements-dev.txt` pins `pytest>=7.0` that nothing consumes. CI (`ci.yml`) runs no test runner and its trigger (`branches: [master]`) never fires (ST-ARCH-002). Conceptual coverage: **0%**.
 - **User/technical impact** Every Critical/High finding in this register (import crash, `'nan'` merge, optimizer hard-violations, key orphaning) is exactly the class of regression a minimal test suite would have caught. There is no safety net for any change.
-- **Recommendation** Stand up pytest; first targets are the headless core (oracle-based scheduler invariants, storage roundtrip/corruption, import round-trip of the generated template, export smoke on all three formats). See [14-implementation-roadmap.md](14-implementation-roadmap.md) Phase 7. **Effort** L · **Related** every finding · **Status** Open
+- **Recommendation** Stand up pytest; first targets are the headless core (oracle-based scheduler invariants, storage roundtrip/corruption, import round-trip of the generated template, export smoke on all three formats). See [14-implementation-roadmap.md](14-implementation-roadmap.md) Phase 7. **Effort** L · **Related** every finding · **Status** **Partially fixed** (Phase 0 stood up `pytest.ini` + `tests/` with 138 tests — the first regression wave and the oracle in CI; depth is Phase 7)
 
 <a id="st-sec-001"></a>
 ### ST-SEC-001 — CI auto-publishes a public `latest` release on every push to main

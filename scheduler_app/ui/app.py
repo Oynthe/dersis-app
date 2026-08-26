@@ -4468,6 +4468,14 @@ class SchedulerApp(QMainWindow):
             QMessageBox.warning(self, tr("status.import_failed"), str(exc))
             return False
 
+    # Every state key `_import_from_excel` may overwrite. The import rolls all
+    # of them back together, so a failure cannot leave lecturers from the
+    # workbook sitting next to classes from the old schedule (ST-FUNC-001).
+    _IMPORT_MERGED_KEYS = (
+        "lecturers", "lecturer_availability", "classrooms",
+        "classroom_capacities", "years", "classes",
+    )
+
     def _import_from_excel(self):
         if not self._ensure_excel_deps():
             return
@@ -4509,21 +4517,39 @@ class SchedulerApp(QMainWindow):
                     ENTITY_CLASSES, total_classes - 1, self):
                 return
 
-        # Merge imported data into current state
+        # Merge imported data into current state.
+        #
+        # ST-FUNC-001: this used to merge first and only then call
+        # `self._on_state_changed()` / `self.refresh()` -- two methods that do
+        # not exist anywhere in the MRO -- so every *successful* import ended in
+        # an AttributeError with the state already mutated and the screen never
+        # repainted. The merge is now a transaction: anything that raises below,
+        # including the repaint, restores the state the user had before.
         s = self.state_data
-        if dataset.state["lecturers"]:
-            s["lecturers"] = dataset.state["lecturers"]
-            s["lecturer_availability"] = dataset.state.get("lecturer_availability", {})
-        if dataset.state["classrooms"]:
-            s["classrooms"] = dataset.state["classrooms"]
-            s["classroom_capacities"] = dataset.state.get("classroom_capacities", {})
-        if dataset.state["years"]:
-            s["years"] = dataset.state["years"]
-        if dataset.state["classes"]:
-            s["classes"].extend(dataset.state["classes"])
+        rollback = {k: copy.deepcopy(s.get(k)) for k in self._IMPORT_MERGED_KEYS}
+        try:
+            if dataset.state["lecturers"]:
+                s["lecturers"] = dataset.state["lecturers"]
+                s["lecturer_availability"] = dataset.state.get("lecturer_availability", {})
+            if dataset.state["classrooms"]:
+                s["classrooms"] = dataset.state["classrooms"]
+                s["classroom_capacities"] = dataset.state.get("classroom_capacities", {})
+            if dataset.state["years"]:
+                s["years"] = dataset.state["years"]
+            if dataset.state["classes"]:
+                s["classes"].extend(dataset.state["classes"])
 
-        self._on_state_changed()
-        self.refresh()
+            self.refresh_grid()
+            self._update_status()
+        except Exception as exc:
+            for key, value in rollback.items():
+                s[key] = value
+            try:
+                self.refresh_grid()
+            except Exception:
+                pass  # the repaint is what failed; do not mask the real error
+            QMessageBox.critical(self, tr("status.import_failed"), str(exc))
+            return
 
         msg = tr("status.import_successful")
         if report.warnings:

@@ -20,6 +20,7 @@ from scheduler_app.models import (
 from scheduler_app.translations import tr
 from scheduler_app.data_io.schema import (
     canonicalize_workbook_columns,
+    get_workbook_sheet_header_map,
     lookup_workbook_sheet_id,
 )
 
@@ -99,9 +100,59 @@ class SchedulerDataset:
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
+def _is_blank(value) -> bool:
+    """True when a spreadsheet cell holds nothing the user actually typed.
+
+    pandas represents an empty cell as float ``NaN``, and ``str(NaN)`` is the
+    *truthy* string ``'nan'``. Reading cells with a bare ``str(...)`` is what
+    made blank ``joint_class_group`` cells collapse unrelated classes into a
+    single joint session (ST-FUNC-002), and reading them with ``int(...)`` is
+    what aborted entire imports (ST-FUNC-003). Every cell read goes through
+    here or one of the two helpers below.
+    """
+    if value is None:
+        return True
+    if HAS_PANDAS:
+        try:
+            if pd.isna(value):
+                return True
+        except (TypeError, ValueError):
+            pass  # not a scalar (list/array) — fall through to the text test
+    return str(value).strip() == ""
+
+
+def _cell_text(value) -> str:
+    """Return a cell as a stripped string; every spelling of blank gives ''."""
+    return "" if _is_blank(value) else str(value).strip()
+
+
+def _cell_int(value, default):
+    """Parse a numeric cell without ever aborting the import.
+
+    Returns *default* for a blank cell — the fallback the original
+    ``int(row.get(col, default) or default)`` always intended, which pandas'
+    ``NaN`` silently defeated — and ``None`` for text that is not a number, so
+    the caller can report that one row and carry on (ST-FUNC-003).
+    """
+    if _is_blank(value):
+        return default
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _column_label(sheet_id: str, field: str) -> str:
+    """The column header as the user sees it in their own workbook."""
+    try:
+        return get_workbook_sheet_header_map(sheet_id).get(field, field)
+    except Exception:
+        return field
+
+
 def _parse_comma_list(value) -> list:
     """Parse a comma-separated string into a list of stripped strings."""
-    if pd.isna(value) or value is None:
+    if _is_blank(value):
         return []
     return [x.strip() for x in str(value).split(",") if x.strip()]
 
@@ -149,8 +200,8 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
     availability = {}
     for idx, row in df.iterrows():
         row_num = idx + 2  # Excel row (1-indexed header + 1-indexed data)
-        tid = str(row["teacher_id"]).strip()
-        name = str(row["name"]).strip()
+        tid = _cell_text(row["teacher_id"])
+        name = _cell_text(row["name"])
         if not tid or not name:
             report.add_error(tr("labels.teachers"), row_num, tr("errors.teacher_id_required"))
             continue
@@ -181,19 +232,28 @@ def _process_rooms(df, report: DataValidationReport, dataset: SchedulerDataset):
     capacities = {}
     for idx, row in df.iterrows():
         row_num = idx + 2
-        rid = str(row["room_id"]).strip()
-        name = str(row["name"]).strip()
+        rid = _cell_text(row["room_id"])
+        name = _cell_text(row["name"])
         if not rid or not name:
             report.add_error(tr("tabs.rooms"), row_num, tr("errors.room_id_required"))
             continue
 
+        cap = _cell_int(row.get("capacity"), 0)
+        if cap is None:
+            report.add_warning(
+                tr("tabs.rooms"), row_num,
+                tr("warnings.invalid_number_defaulted").format(
+                    value=_cell_text(row.get("capacity")),
+                    field=_column_label("rooms", "capacity"),
+                    default=0))
+            cap = 0
+
         classrooms.append(name)
         dataset.raw_rooms.append({
             "room_id": rid, "name": name,
-            "capacity": int(row.get("capacity", 0) or 0),
-            "room_type": str(row.get("room_type", "")).strip(),
+            "capacity": cap,
+            "room_type": _cell_text(row.get("room_type")),
         })
-        cap = int(row.get("capacity", 0) or 0)
         if cap > 0:
             capacities[name] = cap
 
@@ -210,8 +270,8 @@ def _process_branches(df, report: DataValidationReport, dataset: SchedulerDatase
 
     for idx, row in df.iterrows():
         row_num = idx + 2
-        bid = str(row["branch_id"]).strip()
-        name = str(row["name"]).strip()
+        bid = _cell_text(row["branch_id"])
+        name = _cell_text(row["name"])
         if not bid or not name:
             report.add_error(tr("setup.branches"), row_num, tr("errors.branch_id_required"))
             continue
@@ -236,10 +296,10 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
 
     for idx, row in df.iterrows():
         row_num = idx + 2
-        cid = str(row["class_id"]).strip()
-        course = str(row["course_name"]).strip()
-        tid = str(row["teacher_id"]).strip()
-        bid = str(row["branch_id"]).strip()
+        cid = _cell_text(row["class_id"])
+        course = _cell_text(row["course_name"])
+        tid = _cell_text(row["teacher_id"])
+        bid = _cell_text(row["branch_id"])
 
         if not cid or not course:
             report.add_error(tr("labels.classes"), row_num, tr("errors.class_id_required"))
@@ -255,18 +315,44 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
                              tr("errors.branch_not_found").format(bid=bid))
             continue
 
-        duration = int(row.get("duration", 1) or 1)
-        student_count = int(row.get("student_count", 0) or 0)
+        # ST-FUNC-003: one malformed number must cost the user one row, not the
+        # whole import. `duration` is required, so unreadable text skips the row;
+        # `student_count` is optional, so it degrades to 0 with a warning. A
+        # blank cell in either is not malformed — it takes the documented default.
+        duration = _cell_int(row.get("duration"), None)
+        if duration is None and not _is_blank(row.get("duration")):
+            report.add_error(
+                tr("labels.classes"), row_num,
+                tr("errors.invalid_number").format(
+                    value=_cell_text(row.get("duration")),
+                    field=_column_label("classes", "duration")))
+            continue
+        if duration is None:
+            duration = 1
+            report.add_warning(
+                tr("labels.classes"), row_num,
+                tr("warnings.blank_number_defaulted").format(
+                    field=_column_label("classes", "duration"), default=1))
+
+        student_count = _cell_int(row.get("student_count"), 0)
+        if student_count is None:
+            report.add_warning(
+                tr("labels.classes"), row_num,
+                tr("warnings.invalid_number_defaulted").format(
+                    value=_cell_text(row.get("student_count")),
+                    field=_column_label("classes", "student_count"),
+                    default=0))
+            student_count = 0
 
         cls = new_class()
-        cls["class_code"] = str(row.get("class_code", "")).strip() if not pd.isna(row.get("class_code")) else ""
+        cls["class_code"] = _cell_text(row.get("class_code"))
         cls["name"] = course
         cls["lecturer"] = teacher_map[tid]
         cls["duration"] = max(1, duration)
         cls["participants"] = student_count
 
         # Location type (optional column)
-        lt_raw = str(row.get("location_type", "")).strip().lower()
+        lt_raw = _cell_text(row.get("location_type")).lower()
         if lt_raw:
             cls["location_type"] = parse_location_type_label(lt_raw)
 
@@ -293,8 +379,10 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
         if excluded_rooms:
             cls["excluded_classrooms"] = excluded_rooms
 
-        # Joint class group
-        jcg = str(row.get("joint_class_group", "")).strip()
+        # Joint class group. ST-FUNC-002: a blank cell arrives as NaN, and
+        # `str(NaN)` is the truthy string 'nan', so every blank-group class used
+        # to share one joint key and all but the first were deleted from state.
+        jcg = _cell_text(row.get("joint_class_group"))
         if jcg:
             cls["_joint_group"] = jcg  # Used for post-processing grouping
 
