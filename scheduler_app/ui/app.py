@@ -3582,6 +3582,11 @@ class SchedulerApp(QMainWindow):
             if kind == "restricted_to_day":
                 formatted.append(tr("warnings.restricted_to_day").format(
                     d=display_day(r[1])))
+            elif kind == "slot_not_in_grid":
+                formatted.append(tr("validation.slot_not_in_grid").format(r[1]))
+            elif kind == "day_not_in_grid":
+                formatted.append(tr("validation.day_not_in_grid").format(
+                    day_label(r[1])))
             elif kind == "not_enough_slots":
                 formatted.append(tr("errors.not_enough_slots").format(
                     n=r[1], a=r[2], t=r[3]))

@@ -14,7 +14,7 @@ Scoring priorities:
   7. Time-of-day quality
 """
 
-from scheduler_app.logic import slot_index, total_duration, _active_targets
+from scheduler_app.logic import slot_index, total_duration, _active_targets, find_slot_index
 from scheduler_app.models import get_effective_room_resource_for_class
 from scheduler_app.placement_scorer import DEFAULT_WEIGHTS
 
@@ -56,7 +56,9 @@ class TimetableScorer:
         day_loads = {}      # day -> total slot count
 
         for cls, day, slot, room in placements:
-            si = slot_index(self.state, slot)
+            si = find_slot_index(self.state, slot)
+            if si is None or day not in self.state["days"]:
+                continue  # off-grid placement scores nothing (ST-DATA-003)
             td = total_duration(cls)
             lect = cls["lecturer"]
             slots_used = list(range(si, si + td))
@@ -123,7 +125,9 @@ class TimetableScorer:
 
         # ── 6. Time-of-day quality ──
         for cls, day, slot, room in placements:
-            si = slot_index(self.state, slot)
+            si = find_slot_index(self.state, slot)
+            if si is None or day not in self.state["days"]:
+                continue  # off-grid placement scores nothing (ST-DATA-003)
             td = total_duration(cls)
             # Penalize end-of-day
             if si + td >= self._total_slots:
@@ -149,7 +153,9 @@ class TimetableScorer:
         day_loads = {}
 
         for cls, day, slot, room in placements:
-            si = slot_index(self.state, slot)
+            si = find_slot_index(self.state, slot)
+            if si is None or day not in self.state["days"]:
+                continue  # off-grid placement scores nothing (ST-DATA-003)
             td = total_duration(cls)
             lect = cls["lecturer"]
             slots_used = list(range(si, si + td))
@@ -205,7 +211,9 @@ class TimetableScorer:
                     (len(rooms) - 1) * w["room_switch_penalty"])
 
         for cls, day, slot, room in placements:
-            si = slot_index(self.state, slot)
+            si = find_slot_index(self.state, slot)
+            if si is None or day not in self.state["days"]:
+                continue  # off-grid placement scores nothing (ST-DATA-003)
             td = total_duration(cls)
             if si + td >= self._total_slots:
                 breakdown["time_quality"] += w["end_of_day_penalty"] * 0.3

@@ -12,12 +12,14 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from scheduler_app.models import (
+    DEFAULT_OPTIMIZER_SEED,
     split_non_joint, needs_physical_room, room_fits_class,
     copy_editable_class_fields,
     mark_placed, mark_unplaced,
     cls_key,
 )
 from scheduler_app.logic import (
+    find_slot_index,
     slots_fit, total_duration, find_conflicts,
     respects_constraints, find_valid_options,
     optimized_auto_place, optimized_batch_schedule,
@@ -366,20 +368,27 @@ class SchedulingWorkflow:
     # ── Reschedule ───────────────────────────────────────────────────────
 
     def reschedule(self, weights, use_cpsat=False,
-                   progress_callback=None) -> RescheduleResult:
-        """Run full reschedule optimization. Returns proposed changes."""
+                   progress_callback=None,
+                   seed=DEFAULT_OPTIMIZER_SEED) -> RescheduleResult:
+        """Run full reschedule optimization. Returns proposed changes.
+
+        `seed` defaults to a fixed value so the same timetable regenerates the
+        same way (ST-SCHED-013); pass None to randomize deliberately. The seed
+        actually used comes back as `result.summary['seed']`.
+        """
         self._optimizing = True
         try:
             return self._reschedule_impl(weights, use_cpsat,
-                                         progress_callback)
+                                         progress_callback, seed)
         finally:
             self._optimizing = False
 
-    def _reschedule_impl(self, weights, use_cpsat, progress_callback):
+    def _reschedule_impl(self, weights, use_cpsat, progress_callback,
+                         seed=DEFAULT_OPTIMIZER_SEED):
         placed, unplaced, changes, summary = optimized_reschedule_all(
             self.state, weights=weights,
             progress_callback=progress_callback,
-            use_cpsat=use_cpsat)
+            use_cpsat=use_cpsat, seed=seed)
 
         # Build analytics
         from scheduler_app.explanation_engine import ExplanationEngine
@@ -472,8 +481,17 @@ class SchedulingWorkflow:
             if original_day and day != original_day:
                 reasons.append(("restricted_to_day", original_day))
 
-        if not slots_fit(state, slot, td):
-            slots_available = len(state["slots"]) - state["slots"].index(slot)
+        # ST-DATA-003: `slots_fit` now returns False for a slot that is not on
+        # the grid at all, which would otherwise expose the bare `.index(slot)`
+        # below. Distinguish the two: "this hour does not exist" and "this hour
+        # exists but the class does not fit after it" need different wording.
+        slot_idx = find_slot_index(state, slot)
+        if slot_idx is None:
+            reasons.append(("slot_not_in_grid", slot))
+        elif day not in state["days"]:
+            reasons.append(("day_not_in_grid", day))
+        elif not slots_fit(state, slot, td):
+            slots_available = len(state["slots"]) - slot_idx
             reasons.append(("not_enough_slots", td, slots_available, slot))
 
         if cls["allowed_days"] and day not in cls["allowed_days"]:

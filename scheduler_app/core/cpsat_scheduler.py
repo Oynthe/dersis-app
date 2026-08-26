@@ -27,6 +27,7 @@ except ImportError:
 
 from scheduler_app.logic import slot_index, total_duration, _active_targets
 from scheduler_app.models import (
+    DEFAULT_OPTIMIZER_SEED,
     cls_key,
     room_fits_class, needs_physical_room,
     get_physical_room_candidates,
@@ -52,7 +53,8 @@ class CPSATScheduler:
     """
 
     def __init__(self, state, weights=None, time_limit=15.0,
-                 protected_ids=None, progress_callback=None):
+                 protected_ids=None, progress_callback=None,
+                 seed=DEFAULT_OPTIMIZER_SEED):
         """
         Args:
             state: Schedule state dict.
@@ -60,6 +62,13 @@ class CPSATScheduler:
             time_limit: Solver time limit in seconds.
             protected_ids: Set of class ids that must not move.
             progress_callback: Optional callable(status_string) for UI.
+            seed: CP-SAT random seed (ST-SCHED-013). Note this makes the
+                  *search* reproducible, not the whole solve: the budget is
+                  still `max_time_in_seconds`, so a slower machine can still
+                  return a different answer. Callers report that honestly via
+                  summary['deterministic'], which is False whenever CP-SAT ran.
+                  A deterministic budget (max_deterministic_time) needs
+                  per-scale calibration and belongs with Phase 3.
         """
         if not HAS_ORTOOLS:
             raise RuntimeError(
@@ -72,6 +81,7 @@ class CPSATScheduler:
         self.time_limit = time_limit
         self.protected_ids = protected_ids or set()
         self.progress_callback = progress_callback
+        self.seed = int(seed)
 
         self._days = state["days"]
         self._slots = state["slots"]
@@ -518,6 +528,7 @@ class CPSATScheduler:
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = self.time_limit
         solver.parameters.num_workers = 1
+        solver.parameters.random_seed = self.seed % (2 ** 31)
         solver.parameters.log_search_progress = False
 
         status = solver.Solve(model)
