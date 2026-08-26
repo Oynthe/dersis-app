@@ -30,22 +30,57 @@ from scheduler_app import storage
 
 # ── Persistent flags ──────────────────────────────────────────────────────
 
+# Set when a corrupt settings container is quarantined during the language
+# gate, which runs before any main window exists (scheduler_gui.py calls
+# run_language_gate() at 172 and SchedulerApp() at 180). SchedulerApp reads this
+# once it has a window and tells the user (ST-DATA-014).
+LAST_QUARANTINE = None
+
+
 def _read_config(path):
+    """Read the settings container. Never raises for an absent file.
+
+    ST-DATA-014: this used to swallow every exception and return ``{}``, after
+    which ``_write_flag`` wrote that ``{}`` straight back over the user's
+    settings — so a container that failed to decrypt for ANY reason took the
+    saved schedule with it. The three outcomes are now distinguished:
+
+    absent            -> ``{}``; this is first run.
+    EguFileError      -> genuinely unreadable: quarantine the bytes, then ``{}``.
+    anything else     -> a transient failure (a locked file, an I/O error).
+                         Propagate. Quarantining a perfectly good file because
+                         the disk hiccuped is data loss dressed up as recovery.
+    """
+    global LAST_QUARANTINE
+    if not os.path.exists(path):
+        return {}
     try:
-        if os.path.exists(path):
-            return storage.load_encrypted(path)
-    except Exception:
-        pass
-    return {}
+        data = storage.load_encrypted(path)
+    except storage.EguFileError:
+        try:
+            LAST_QUARANTINE = storage.quarantine_corrupt(path)
+        except Exception:
+            raise  # could not even preserve it — do not report a recovery
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _write_flag(path, key, value):
-    data = _read_config(path)
+    """Persist one flag. Returns True on success.
+
+    Must never raise: every caller is a Qt slot or a QTimer callback, where an
+    exception aborts the process under a real platform plugin.
+    """
+    try:
+        data = _read_config(path)
+    except Exception:
+        return False  # never overwrite a container we could not read
     data[key] = value
     try:
         storage.save_encrypted(data, path)
+        return True
     except Exception:
-        pass
+        return False
 
 
 # ── Shared language data ─────────────────────────────────────────────────

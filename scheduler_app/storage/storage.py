@@ -170,7 +170,18 @@ def _key_path() -> str:
 
 
 def _load_or_create_key() -> bytes:
-    """Return the 32-byte AES-256 master key, creating it on first use."""
+    """Return the 32-byte AES-256 master key, creating it on first use.
+
+    ST-DATA-001: "the key file is absent" and "the key file is damaged" are
+    completely different situations and used to be treated identically. Absent
+    means first run — mint a key. Damaged means a partial write or a bad sector
+    in a 32-byte file, and minting there silently and permanently orphaned every
+    .egu the user had ever saved: the old key was moved to backups/, but the
+    *damaged remnant* was what got backed up, so there was nothing to restore.
+
+    A damaged key now raises EguFileError and the file is left exactly as it is,
+    so a maintainer or a future recovery path still has the bytes to work with.
+    """
     global _cached_key
     if _cached_key is not None:
         return _cached_key
@@ -186,8 +197,10 @@ def _load_or_create_key() -> bytes:
         if len(key) == 32:
             _cached_key = key
             return _cached_key
-        # Invalid key file — regenerate
-        _backup_original(kp)
+        # Present but not a valid key: never overwrite it, never mint over it.
+        raise EguFileError(
+            tr("errors.key_file_damaged").format(
+                path=kp, size=len(key), backups=sub_dir(BACKUPS_DIR)))
 
     # Generate a fresh 256-bit key
     key = secrets.token_bytes(32)
@@ -455,6 +468,25 @@ def _backup_original(src: str) -> None:
         ts = datetime.now().strftime("%Y%m%d%H%M%S")
         dst = os.path.join(sub_dir(BACKUPS_DIR), f"{base}_{ts}{ext}")
     shutil.move(src, dst)
+
+
+def quarantine_corrupt(src: str) -> str:
+    """Move an unreadable container into ``backups/`` and return its new path.
+
+    ST-DATA-014. Distinct from :func:`_backup_original`, which keeps the
+    original basename: a quarantined file has to be *distinguishable* from a
+    healthy backup, so it gets a ``_corrupt_<timestamp>`` infix. Nothing is ever
+    deleted — the bytes are the user's schedule, and a future recovery path may
+    still be able to read them.
+
+    Raises whatever ``shutil.move`` raises; a caller that cannot move the file
+    must not pretend it recovered.
+    """
+    base, ext = os.path.splitext(os.path.basename(src))
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    dst = os.path.join(sub_dir(BACKUPS_DIR), f"{base}_corrupt_{ts}{ext}")
+    shutil.move(src, dst)
+    return dst
 
 
 def _migrate_json_file(src: str, dest_sav: str) -> bool:

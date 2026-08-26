@@ -232,37 +232,43 @@ class PlacementScorer:
                 before_counts[cls_key(rc)] = self._count_valid_fast(rc, generator)
             self.validator.add_placement(cls, day, slot, room)
 
-        # Count options after placement
-        penalty = 0.0
-        for rc in remaining_classes:
+        # ST-DATA-011: BOTH arms above mutate — the propagator pushes onto its
+        # simulation stack, the validator writes occupancy — so the revert has to
+        # run even when the scoring below raises. A leaked simulation is worse
+        # than a leaked score: revert_all_simulations() later pops it against a
+        # timetable that has moved on.
+        try:
+            # Count options after placement
+            penalty = 0.0
+            for rc in remaining_classes:
+                if prop is not None:
+                    after = prop.get_valid_count_fast(rc)
+                else:
+                    after = self._count_valid_fast(rc, generator)
+                before = before_counts[cls_key(rc)]
+                if before == 0:
+                    continue
+                if after == 0:
+                    # This placement would make a future class unplaceable
+                    penalty += w["lookahead_penalty"] * 10.0
+                else:
+                    # Fractional reduction in options
+                    reduction = 1.0 - (after / before)
+                    if reduction > 0:
+                        penalty += reduction * w["lookahead_penalty"]
+
+            # Focused neighbor impact: check graph neighbors that are
+            # still unscheduled (already temporarily placed above)
+            if self.conflict_graph is not None:
+                remaining_ids = {cls_key(rc) for rc in remaining_classes}
+                penalty += self._neighbor_impact(
+                    cls, generator, remaining_ids, before_counts)
+        finally:
+            # Revert temporary placement
             if prop is not None:
-                after = prop.get_valid_count_fast(rc)
+                prop.revert_simulation()
             else:
-                after = self._count_valid_fast(rc, generator)
-            before = before_counts[cls_key(rc)]
-            if before == 0:
-                continue
-            if after == 0:
-                # This placement would make a future class unplaceable
-                penalty += w["lookahead_penalty"] * 10.0
-            else:
-                # Fractional reduction in options
-                reduction = 1.0 - (after / before)
-                if reduction > 0:
-                    penalty += reduction * w["lookahead_penalty"]
-
-        # Focused neighbor impact: check graph neighbors that are
-        # still unscheduled (already temporarily placed above)
-        if self.conflict_graph is not None:
-            remaining_ids = {cls_key(rc) for rc in remaining_classes}
-            penalty += self._neighbor_impact(
-                cls, generator, remaining_ids, before_counts)
-
-        # Revert temporary placement
-        if prop is not None:
-            prop.revert_simulation()
-        else:
-            self.validator.remove_placement(cls, day, slot, room)
+                self.validator.remove_placement(cls, day, slot, room)
 
         return immediate + penalty
 

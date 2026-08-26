@@ -228,50 +228,68 @@ class SchedulingWorkflow:
 
         existing = snapshot_placements(self.state)
 
-        # Add new classes to state
-        for cls in new_classes:
-            self.state["classes"].append(cls)
+        # ST-DATA-011: the add is all-or-nothing. Without this, an optimizer,
+        # negotiator or feedback-logger failure left a half-added class in
+        # state["classes"] — sometimes already marked placed — that the user was
+        # never told about and could not see a cause for.
+        try:
+            # Add new classes to state
+            for cls in new_classes:
+                self.state["classes"].append(cls)
 
-        weights = self.get_weights()
-        placed, unplaced, rescheduled = optimized_batch_schedule(
-            self.state, new_classes, weights=weights)
+            weights = self.get_weights()
+            placed, unplaced, rescheduled = optimized_batch_schedule(
+                self.state, new_classes, weights=weights)
 
-        result = ScheduleNewResult(
-            placed=placed,
-            unplaced=unplaced,
-            rescheduled=rescheduled,
-        )
+            result = ScheduleNewResult(
+                placed=placed,
+                unplaced=unplaced,
+                rescheduled=rescheduled,
+            )
 
-        # Fast path: all new classes placed without rescheduling existing ones
-        new_ids = {cls_key(c) for c in new_classes}
-        new_placed = [p for p in placed if cls_key(p[0]) in new_ids]
-        if (len(new_placed) == len(new_classes) and not unplaced
-                and not rescheduled):
-            for cls, day, slot, room in new_placed:
-                effective_room = room if needs_physical_room(cls) else None
-                if not cls["pinned"]:
-                    mark_placed(cls, day, slot, effective_room)
-            if self._feedback:
-                self._feedback.log_batch_result(
-                    len(new_placed), 0, False, True)
-            result.single_success = True
+            # Fast path: all new classes placed without rescheduling existing ones
+            new_ids = {cls_key(c) for c in new_classes}
+            new_placed = [p for p in placed if cls_key(p[0]) in new_ids]
+            if (len(new_placed) == len(new_classes) and not unplaced
+                    and not rescheduled):
+                for cls, day, slot, room in new_placed:
+                    effective_room = room if needs_physical_room(cls) else None
+                    if not cls["pinned"]:
+                        mark_placed(cls, day, slot, effective_room)
+                if self._feedback:
+                    self._feedback.log_batch_result(
+                        len(new_placed), 0, False, True)
+                result.single_success = True
+                return result
+
+            # Single-class that could not be placed
+            if len(new_classes) == 1 and not placed:
+                cls = new_classes[0]
+                from scheduler_app.constraint_negotiator import ConstraintNegotiator
+                neg = ConstraintNegotiator(self.state)
+                report = neg.negotiate_class(cls)
+                result.single_failed = True
+                result.negotiation_report = report
+
+                # Remove the failed class from state regardless of pinned status
+                if cls in self.state["classes"]:
+                    self.state["classes"].remove(cls)
+                return result
+
             return result
-
-        # Single-class that could not be placed
-        if len(new_classes) == 1 and not placed:
-            cls = new_classes[0]
-            from scheduler_app.constraint_negotiator import ConstraintNegotiator
-            neg = ConstraintNegotiator(self.state)
-            report = neg.negotiate_class(cls)
-            result.single_failed = True
-            result.negotiation_report = report
-
-            # Remove the failed class from state regardless of pinned status
-            if cls in self.state["classes"]:
-                self.state["classes"].remove(cls)
-            return result
-
-        return result
+        except BaseException:
+            # ORDER IS LOAD-BEARING, and the opposite of the public
+            # rollback_schedule(): restore FIRST, while the new classes are
+            # still in state["classes"], so restore_placements() can see them
+            # and clear the placed=True the fast path may already have written.
+            # Removing them first would leave exactly that orphan behind.
+            # BaseException, not Exception: the optimizer is wall-clock bound
+            # and multiprocess, so KeyboardInterrupt here is realistic.
+            restore_placements(self.state, existing)
+            for _cls in new_classes:
+                if _cls in self.state["classes"]:
+                    self.state["classes"].remove(_cls)
+            raise
 
     def apply_schedule_result(self, result: ScheduleNewResult):
         """Commit the placements from a ScheduleNewResult."""
@@ -423,13 +441,41 @@ class SchedulingWorkflow:
         valid_days = set(self.state.get("days", []))
         valid_slots = set(self.state.get("slots", []))
 
-        # Build validator excluding all classes that will be re-placed
-        placed_keys = {cls_key(c) for c, _, _, _ in result.placed
-                       if not c["pinned"]}
+        # Build validator excluding EVERY class that will be re-placed —
+        # pinned ones included. ST-SCHED-002: pinned classes used to be excluded
+        # from this exclusion set and then skipped by the commit loop entirely,
+        # so two classes pinned to the same room/day/hour were both committed
+        # and reported to nobody, while the quality panel called the timetable
+        # clean.
+        placed_keys = {cls_key(c) for c, _, _, _ in result.placed}
         validator = ConstraintValidator(
             self.state, exclude_ids=placed_keys)
 
         rejected = []
+
+        # Pins first: they are fixed points the flexible classes must work
+        # around, so they have to be in the occupancy map before anything else
+        # is checked against it.
+        for cls_item, _day, _slot, _room in result.placed:
+            if not cls_item["pinned"]:
+                continue
+            day = cls_item.get("pinned_day")
+            slot = cls_item.get("pinned_time")
+            room = (cls_item.get("pinned_classroom")
+                    if needs_physical_room(cls_item) else None)
+            ok = (day in valid_days and slot in valid_slots
+                  and validator.check_placement(cls_item, day, slot, room))
+            if not ok:
+                # The pin is the user's explicit instruction, so it is NOT
+                # silently cleared — that would destroy the intent they typed
+                # in. It is reported instead, so the UI can show the clash and
+                # let them decide which pin to move.
+                rejected.append(cls_item.get("name", "?"))
+            # Register it either way: an infeasible pin still occupies the cell
+            # once committed, and flexible classes must not be steered into it.
+            if day in valid_days and slot in valid_slots:
+                validator.add_placement(cls_item, day, slot, room)
+
         for cls_item, day, slot, room in result.placed:
             if cls_item["pinned"]:
                 continue
@@ -638,6 +684,61 @@ class SchedulingWorkflow:
                 invalidated.append(cls["name"])
                 mark_unplaced(cls)
         return invalidated
+
+    @staticmethod
+    def reconcile_placements(state) -> list:
+        """Clear every placement or pin that points at an axis value the state
+        no longer has. Returns the affected class dicts.
+
+        ST-DATA-004. Removing a day, hour, room or lecturer in Setup used to
+        leave the classes already placed there pointing at something that no
+        longer exists — orphans reachable through completely ordinary UI use,
+        which then crashed analytics, export and reschedule (ST-DATA-003).
+
+        It lives in core rather than in ``SetupDialog`` so that import, undo and
+        any future entry point get the same repair; dialogs writing live state
+        is ST-ARCH-007. It only ever *clears* fields, never invents a placement,
+        so it cannot corrupt a good file and needs no schema bump.
+
+        A blank lecturer is deliberately treated as "unassigned", not "deleted":
+        ``new_class()`` ships ``"lecturer": ""``, ``SetupDialog`` never puts ""
+        into ``state["lecturers"]``, and the core reads blank as "no lecturer
+        constraint". Treating it as an orphan would unplace every not-yet-staffed
+        lesson on the first Setup OK.
+        """
+        days = set(state.get("days") or [])
+        slots = set(state.get("slots") or [])
+        rooms = set(state.get("classrooms") or [])
+        lecturers = set(state.get("lecturers") or [])
+        affected = []
+        for cls in state.get("classes", []):
+            physical = needs_physical_room(cls)
+            name = (cls.get("lecturer") or "").strip()
+            lecturer_ok = (not name) or name in lecturers
+            touched = False
+            if cls.get("pinned"):
+                day_bad = cls.get("pinned_day") not in days
+                time_bad = cls.get("pinned_time") not in slots
+                room_bad = physical and cls.get("pinned_classroom") not in rooms
+                if day_bad or time_bad or room_bad or not lecturer_ok:
+                    cls["pinned"] = False
+                    if day_bad:
+                        cls["pinned_day"] = None
+                    if time_bad:
+                        cls["pinned_time"] = None
+                    if room_bad:
+                        cls["pinned_classroom"] = None
+                    touched = True
+            if cls.get("placed") and (
+                    cls.get("placed_day") not in days
+                    or cls.get("placed_time") not in slots
+                    or (physical and cls.get("placed_classroom") not in rooms)
+                    or not lecturer_ok):
+                mark_unplaced(cls)
+                touched = True
+            if touched:
+                affected.append(cls)
+        return affected
 
     # ── Remove classes ───────────────────────────────────────────────────
 

@@ -176,26 +176,31 @@ class ConstraintValidator:
             cur_room = cls.get("pinned_classroom") if cls.get("pinned") else cls.get("placed_classroom")
             self.remove_placement(cls, cur_day, cur_time, cur_room)
 
-        # Occupancy conflicts
-        check_room = needs_physical_room(cls) and room is not None
-        slots_list = self.state["slots"][si:si + td]
-        for off, s in enumerate(slots_list):
-            key = (day, s)
-            if check_room and room in self.room_occ.get(key, set()):
-                reasons.append(tr("validation.room_occupied").format(room, display_day_value, s))
-            if cls["lecturer"] in self.lect_occ.get(key, set()):
-                reasons.append(
-                    tr("validation.lecturer_busy").format(
-                        cls['lecturer'], display_day_value, s))
-            for t in _active_targets(cls, off):
-                if (t["year"], t["branch"]) in self.group_occ.get(key, set()):
+        # ST-DATA-011: the class's own placement was lifted out of the occupancy
+        # maps above so it cannot conflict with itself. If anything below raises,
+        # putting it back is not optional — the validator would otherwise go on
+        # believing the cell is free and bless a real double-booking.
+        try:
+            # Occupancy conflicts
+            check_room = needs_physical_room(cls) and room is not None
+            slots_list = self.state["slots"][si:si + td]
+            for off, s in enumerate(slots_list):
+                key = (day, s)
+                if check_room and room in self.room_occ.get(key, set()):
+                    reasons.append(tr("validation.room_occupied").format(room, display_day_value, s))
+                if cls["lecturer"] in self.lect_occ.get(key, set()):
                     reasons.append(
-                        tr("validation.group_busy").format(
-                            t['year'], t['branch'], display_day_value, s))
-
-        # Restore the class's placement in occupancy maps
-        if already_placed:
-            self.add_placement(cls, cur_day, cur_time, cur_room)
+                        tr("validation.lecturer_busy").format(
+                            cls['lecturer'], display_day_value, s))
+                for t in _active_targets(cls, off):
+                    if (t["year"], t["branch"]) in self.group_occ.get(key, set()):
+                        reasons.append(
+                            tr("validation.group_busy").format(
+                                t['year'], t['branch'], display_day_value, s))
+        finally:
+            # Restore the class's placement in occupancy maps
+            if already_placed:
+                self.add_placement(cls, cur_day, cur_time, cur_room)
 
         return len(reasons) == 0, reasons
 

@@ -398,10 +398,9 @@ def test_missing_key_bin_is_created_on_first_use(dersis_home):
     assert open(key_path, "rb").read() == key
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-DATA-001 — a truncated key.bin is silently replaced with a fresh "
-           "random key during a load, orphaning every prior save; fixed in Phase 1")
+# ST-DATA-001 fixed in Phase 1: _load_or_create_key() now distinguishes an
+# absent key file (first run — mint one) from a damaged one (raise, and leave
+# the bytes untouched so they can still be recovered).
 def test_damaged_key_bin_is_not_silently_regenerated_on_load(dersis_home):
     """ST-DATA-001: a partially-written key.bin must not be overwritten by a load.
 
@@ -430,10 +429,9 @@ def test_damaged_key_bin_is_not_silently_regenerated_on_load(dersis_home):
         "prior .egu in saves/ is now permanently undecryptable")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-DATA-001 — _load_or_create_key cannot tell 'absent' from "
-           "'malformed' and mints a new key for both; fixed in Phase 1")
+# ST-DATA-001 fixed in Phase 1: _load_or_create_key() now distinguishes an
+# absent key file (first run — mint one) from a damaged one (raise, and leave
+# the bytes untouched so they can still be recovered).
 def test_malformed_key_bin_fails_loudly_instead_of_minting_a_new_key(dersis_home):
     """ST-DATA-001 at the API level: malformed key material must raise.
 

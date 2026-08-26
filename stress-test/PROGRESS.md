@@ -8,10 +8,101 @@ what has changed since. Per-finding state also lives in the
 | Phase | State | Branch |
 |---|---|---|
 | **0 — Critical stabilisation & test scaffold** | ✅ Complete | `fix/phase-0-test-scaffold` |
-| 1 — Data & correctness | Not started | — |
+| **1 — Data & correctness** | ✅ Complete | `fix/phase-1-data-correctness` |
 | 2 — Performance foundations | Not started | — |
 | 3 — Scheduling engine hardening | Not started | — |
 | 4–7 | Not started | — |
+
+---
+
+## Phase 1 — complete
+
+**Suite: 259 tests — 227 pass, 32 known-defect pins, 0 failures.** Five of Phase
+0's `xfail(strict=True)` pins flipped to passing and their markers were deleted:
+ST-DATA-001 (×2), ST-SCHED-002, ST-FUNC-013 (×2). That is the pins doing exactly
+the job they exist for.
+
+### Findings closed
+
+| ID | Sev | What changed |
+|---|---|---|
+| [ST-SCHED-013](12-findings-register.md#st-sched-013) | 🟡 Medium | The optimizer is reproducible. Every random draw in the package now comes from one seeded stream, and the LNS phase is bounded by **iteration count instead of the wall clock**. See "the register was not enough" below. |
+| [ST-SCHED-003](12-findings-register.md#st-sched-003) | 🟠 High | `filter_class_days` / `filter_class_times` intersect the class's allow-list with the actual grid, so a class allowed only on Saturday is no longer placed on Saturday on a Mon–Fri timetable. |
+| [ST-SCHED-004](12-findings-register.md#st-sched-004) | 🟠 High | New total `find_slot_index()`; `slot_index` deliberately still raises. A stale `allowed_times` no longer aborts the reschedule with `ValueError: '20:00' is not in list`. |
+| [ST-SCHED-002](12-findings-register.md#st-sched-002) | 🟠 High | `apply_reschedule` validates pins instead of skipping them. An infeasible pin is reported through the rejected list; the pin itself is left alone, because silently clearing it would destroy the instruction the user deliberately typed. |
+| [ST-DATA-001](12-findings-register.md#st-data-001) | 🟠 High | `_load_or_create_key` distinguishes an **absent** key file (first run — mint one) from a **damaged** one (raise, leave the bytes untouched). Previously a 10-byte truncation silently minted a new key and orphaned every save the user had ever made. |
+| [ST-DATA-003](12-findings-register.md#st-data-003) | 🟠 High | Every stored-placement reader is total: occupancy, conflict detection, analytics, the scorer, `validate_drop`. |
+| [ST-DATA-004](12-findings-register.md#st-data-004) | 🟠 High | New core-layer `SchedulingWorkflow.reconcile_placements()`, called from both `SetupDialog` sites and from Excel import, before the repaint. |
+| [ST-DATA-014](12-findings-register.md) | 🟢 Low | A corrupt settings container is quarantined to `backups/`, never rebuilt-from-`{}`-then-overwritten. |
+| [ST-DATA-005](12-findings-register.md) | 🟡 Medium | `_auto_save` no longer swallows everything: it reports, returns a bool, and never writes a container it failed to read. |
+| [ST-DATA-011](12-findings-register.md) | 🟡 Medium | `schedule_new_classes` is all-or-nothing; the four mutate-compute-restore sites got `try/finally`. |
+| [ST-DATA-012](12-findings-register.md) | 🟢 Low | New `scheduler_app/single_instance.py`, acquired before the language gate. |
+| [ST-FUNC-013](12-findings-register.md) | 🟢 Low | Exports warn about off-grid placements instead of vanishing them; the CSV writes them. |
+
+### Where the register was not enough
+
+Three places where following the recommendation literally would have shipped a
+half-fix. Each was **proved by building the half-fix and watching it fail**, not
+argued:
+
+1. **ST-SCHED-013 — a seed is necessary but not sufficient.** A tree carrying
+   only the seed change still ran 25 LNS iterations on a simulated fast machine
+   and 14 on a slow one, from the same seed and the same instance, landing on
+   different placements and different scores. The search was bounded by the wall
+   clock, so *machine speed was an input to the answer*. The register's Effort
+   "M" covers only the seed half.
+2. **ST-SCHED-003 — "drop stale constraint values during normalization" is
+   wrong.** An **empty** `allowed_days` means "no restriction", so emptying a
+   now-impossible allow-list would silently turn "only Saturday" into "any day"
+   and place the lesson on Monday looking like a success. Intersection, not
+   dropping; an empty intersection leaves the class unplaced with a reason.
+3. **ST-DATA-014 — "back up + warn" on *any* read failure is data loss dressed
+   up as recovery.** A prototype that quarantined on every exception destroyed a
+   perfectly good settings file on a transient `OSError`. Only `EguFileError`
+   means "genuinely unreadable"; everything else propagates.
+
+A fourth, smaller one: making the readers total turns a crash into a **silent
+drop**, which is worse — the printout looks complete. Hence
+`models.find_off_grid_placements()` and the export warnings.
+
+### Deliberate scope calls
+
+- **`slot_index` still raises.** Around forty call sites do `idx + duration`
+  arithmetic; returning `None` would trade a loud `ValueError` for an obscure
+  `TypeError`, and returning `-1` would be worse still — `-1` is a valid Python
+  index, so lessons would land in the last hour of the day. Stored-data readers
+  use `find_slot_index` instead.
+- **An infeasible pin is reported, not cleared.** The pin is what the user
+  typed.
+- **`find_off_grid_placements` is not called from `normalize_state_classes`,**
+  so it never runs on the `.egu` load path. Unplacing orphans at load would
+  discard the user's own placements with no way to see or undo it — the same
+  class of bug in a new place.
+- **CP-SAT keeps a wall-clock budget.** It gets `random_seed`, but
+  `summary['deterministic']` is False whenever it ran, so the app never claims a
+  reproducibility it cannot deliver. A deterministic CP-SAT budget needs
+  per-scale calibration; Phase 3, with ST-PERF-009.
+
+### Follow-ups this opened
+
+- **The 120 s `multi_start_time_limit` default needs revisiting.** 80 classes now
+  reproduce exactly, but take 77 s of that 120 s budget. A machine a third slower
+  hits the emergency cap and silently loses reproducibility (correctly reported,
+  but lost). Interacts with [ST-PERF-001](12-findings-register.md#st-perf-001) —
+  Phase 2 wants the solve off the UI thread anyway.
+- **Constraint lists on the non-day axes are still never pruned.** A class with
+  `required_classrooms=["R003"]` after R003 is deleted has zero candidate rooms
+  and is permanently unplaceable, with no message anywhere. `reconcile_placements`
+  clears *placements*, not constraints, and pruning changes semantics (an empty
+  allow-list means "no restriction"), so this needs its own finding and its own
+  decision rather than a silent fix here.
+- **Reconciling on file-open and on undo is deliberately NOT wired.** `open_file`
+  sets `state["lecturers"] = []` for files predating the lecturers feature, so an
+  unconditional reconcile-on-open would unplace that user's entire schedule,
+  silently.
+- **New strings are `en` + `tr` only** (12 keys across Phases 0–1). The other 20
+  locales fall back to English via `tr()` — never to a raw key — but need a
+  translator. Phase 5 owns the coverage check.
 
 ---
 

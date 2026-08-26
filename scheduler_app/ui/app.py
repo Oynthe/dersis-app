@@ -818,6 +818,10 @@ class SchedulerApp(QMainWindow):
         self.state_data = new_state()
         self.current_file = None
         self._config_path = storage.settings_path()
+        # Settings problems already reported this session, so the user is told
+        # once per kind rather than once per refresh (ST-DATA-005).
+        self._settings_problems = set()
+        self._pending_settings_report = None
         self._active_tutorial = None
 
         # Selection state
@@ -872,6 +876,13 @@ class SchedulerApp(QMainWindow):
         self._build_toolbar()
         self._build_main()
         self._build_status()
+
+        # _auto_load runs above, before any of these widgets exist, so a
+        # settings problem found during load had nowhere to go. Flush it now
+        # that there is a window — synchronously, so the report has landed by
+        # the time __init__ returns (ST-DATA-005/014). Also covers a container
+        # quarantined even earlier, by the language gate in first_run.
+        self._flush_startup_settings_report()
 
         # Shortcuts — only register here for keys that have NO menu QAction.
         # Keys that ARE on menu actions (Ctrl+Shift+A/B/P, Ctrl+P, Ctrl+R,
@@ -1811,11 +1822,116 @@ class SchedulerApp(QMainWindow):
     def _get_config_path():
         return storage.settings_path()
 
+    def _flush_startup_settings_report(self):
+        """Surface a settings problem detected before the window existed."""
+        from scheduler_app.ui import first_run as _first_run
+        quarantined = getattr(_first_run, "LAST_QUARANTINE", None)
+        if quarantined:
+            _first_run.LAST_QUARANTINE = None
+            self._report_settings_problem(
+                "corrupt", tr("errors.settings_corrupt").format(
+                    backup=quarantined, err=tr("errors.egu_could_not_decrypt")))
+        pending = self._pending_settings_report
+        if not pending:
+            return
+        self._pending_settings_report = None
+        log = getattr(self, "warning_log", None)
+        if log is not None:
+            try:
+                log.add(pending)
+            except Exception:
+                pass
+        try:
+            self._show_toast(pending, "error")
+        except Exception:
+            pass
+        QTimer.singleShot(0, lambda: QMessageBox.warning(
+            self, tr("status.settings_problem_title"), pending))
+
+    def _report_settings_problem(self, kind, message):
+        """Tell the user their settings could not be read or written.
+
+        Rate-limited per *kind* per session, deliberately. Autosave fires on
+        every ``refresh_grid``, so one dialog per failure would be worse than
+        the silence it replaces (ST-UI-009 measured 306-563 ms per refresh
+        action), and one warning-log entry per failure would feed the unbounded
+        ``warning_log._messages`` growth measured in ST-PERF-003.
+
+        Synchronous by design: the message must have reached at least one
+        channel by the time the caller returns. Only the modal is deferred,
+        because ``_auto_load`` runs from ``__init__`` before ``_build_main()``
+        has created the widgets it would otherwise need.
+        """
+        first_time = kind not in self._settings_problems
+        self._settings_problems.add(kind)
+        if not first_time:
+            return
+        log = getattr(self, "warning_log", None)
+        if log is not None:
+            try:
+                log.add(message)
+            except Exception:
+                pass
+        if getattr(self, "status_label", None) is None:
+            # Called from _auto_load, which runs before _build_main() creates
+            # the widgets. Stash it; __init__ flushes once the window exists.
+            self._pending_settings_report = message
+            return
+        try:
+            self._show_toast(message, "error")
+        except Exception:
+            pass
+        QTimer.singleShot(0, lambda: QMessageBox.warning(
+            self, tr("status.settings_problem_title"), message))
+
+    def _read_settings_container(self):
+        """Read the settings container, distinguishing the three outcomes.
+
+        ST-DATA-014: ``_auto_save`` used to do a read-modify-write whose read
+        fell back to ``{}`` on ANY exception and then wrote that ``{}`` over the
+        user's settings, so one unreadable load destroyed the saved schedule —
+        and autosave runs on every refresh.
+
+        absent        -> ``{}`` (first run)
+        EguFileError  -> genuinely unreadable: quarantine the bytes, report, ``{}``
+        anything else -> transient (a locked file, an I/O error): report and
+                         re-raise. Quarantining a perfectly good file because the
+                         disk hiccuped is data loss dressed up as recovery.
+        """
+        path = self._config_path
+        if not os.path.exists(path):
+            return {}
+        try:
+            data = storage.load_encrypted(path)
+        except storage.EguFileError as exc:
+            try:
+                dst = storage.quarantine_corrupt(path)
+            except Exception:
+                self._report_settings_problem(
+                    "unreadable", tr("errors.settings_unreadable").format(
+                        path=path, err=exc))
+                raise
+            # settings_path() resolves a legacy .uva only while the .egu is
+            # absent, so moving the file can change what it returns.
+            self._config_path = storage.settings_path()
+            self._report_settings_problem(
+                "corrupt", tr("errors.settings_corrupt").format(
+                    backup=dst, err=exc))
+            return {}
+        except Exception as exc:
+            self._report_settings_problem(
+                "unreadable", tr("errors.settings_unreadable").format(
+                    path=path, err=exc))
+            raise
+        return data if isinstance(data, dict) else {}
+
     def _auto_load(self):
         if not os.path.exists(self._config_path):
             return False
         try:
-            data = storage.load_encrypted(self._config_path)
+            data = self._read_settings_container()
+            if not data:
+                return False
             self.state_data = data.get("state", new_state())
             normalize_state_day_keys(self.state_data)
             normalize_state_classes(self.state_data)
@@ -1833,22 +1949,41 @@ class SchedulerApp(QMainWindow):
             return False
 
     def _auto_save(self):
+        """Persist state. Returns True on success.
+
+        ST-DATA-005 / ST-DATA-014. Two rules, both learned the hard way:
+
+        1. Never write a container we failed to READ. The old code fell back to
+           ``data = {}`` and wrote it, so one bad read destroyed the schedule.
+        2. Never raise. This runs from a Qt slot chain (``refresh_grid``) and
+           from the ``closeEvent`` virtual; an exception there aborts the
+           process under a real platform plugin. Failures are reported, not
+           thrown.
+        """
         try:
-            # Read-modify-write to preserve first-run flags and other keys
-            data = {}
-            if os.path.exists(self._config_path):
-                try:
-                    data = storage.load_encrypted(self._config_path)
-                except Exception:
-                    data = {}
+            data = self._read_settings_container()
+        except Exception:
+            return False  # already reported; do NOT overwrite an unreadable file
+        try:
             normalize_state_day_keys(self.state_data)
             normalize_state_classes(self.state_data)
             data["state"] = self.state_data
             data["last_file"] = self.current_file
             data["language"] = get_language()
+        except Exception as exc:
+            self._report_settings_problem(
+                "normalize", tr("errors.settings_write_failed").format(err=exc))
+            return False
+        try:
             storage.save_encrypted(data, self._config_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            self._report_settings_problem(
+                "write", tr("errors.settings_write_failed").format(err=exc))
+            return False
+        # A successful write re-arms the reports, so a disk that recovers and
+        # then fails again is not silently ignored for the rest of the session.
+        self._settings_problems.clear()
+        return True
 
     def _update_status(self):
         s = self.state_data
@@ -2494,7 +2629,7 @@ class SchedulerApp(QMainWindow):
             self.state_data)
         if invalidated:
             self._show_toast(
-                f"{len(invalidated)} placement(s) cleared (constraints changed)",
+                tr("status.placements_cleared_count", n=len(invalidated)),
                 "warning")
         self.refresh_grid()
         self._run_impact_analysis(snap_before)
@@ -2821,15 +2956,33 @@ class SchedulerApp(QMainWindow):
         lecturer_name = (cls.get("lecturer") or "").strip()
         dlg = SetupDialog(self, self.state_data, focus_lecturer=lecturer_name)
         dlg.exec()
+        if dlg.result:
+            self._reconcile_after_setup()
         self.refresh_grid()
         if dlg.result:
             self._run_impact_analysis(snap_before)
+
+    def _reconcile_after_setup(self):
+        """Repair placements orphaned by a setup change, and say how many.
+
+        Must run BEFORE the repaint: refresh_grid -> _update_side_panels ->
+        _refresh_open_slots reaches slot_index, which cannot resolve a slot the
+        user has just deleted (ST-DATA-003).
+        """
+        affected = SchedulingWorkflow.reconcile_placements(self.state_data)
+        if affected:
+            self._show_toast(
+                tr("status.placements_cleared_count", n=len(affected)),
+                "warning")
+        return affected
 
     def edit_setup(self):
         snap_before = capture_snapshot(self.state_data)
         is_initial = not self._has_baseline
         dlg = SetupDialog(self, self.state_data)
         dlg.exec()
+        if dlg.result:
+            self._reconcile_after_setup()
         self.refresh_grid()
         if dlg.result:
             if is_initial:
@@ -4544,6 +4697,9 @@ class SchedulerApp(QMainWindow):
             if dataset.state["classes"]:
                 s["classes"].extend(dataset.state["classes"])
 
+            # An import that replaces the lecturer or room lists orphans any
+            # placement referring to one the workbook omitted (ST-DATA-004).
+            SchedulingWorkflow.reconcile_placements(s)
             self.refresh_grid()
             self._update_status()
         except Exception as exc:
@@ -4988,5 +5144,18 @@ class SchedulerApp(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
-        self._auto_save()
-        event.accept()
+        # ST-DATA-005: quitting is the moment an unsaved change becomes
+        # permanently lost, so a failure here is the one worth interrupting the
+        # user for, even though _report_settings_problem has rate-limited it.
+        if self._auto_save():
+            event.accept()
+            return
+        resp = QMessageBox.question(
+            self, tr("status.settings_problem_title"),
+            tr("errors.settings_quit_anyway"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if resp == QMessageBox.StandardButton.Yes:
+            event.accept()
+        else:
+            event.ignore()

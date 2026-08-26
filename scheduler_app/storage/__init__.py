@@ -6,7 +6,8 @@ continue to work exactly as before.
 """
 from scheduler_app.storage.storage import *  # noqa: F401,F403
 from scheduler_app.storage.storage import (  # explicit for type checkers & Nuitka
-    UvaFileError,
+    UvaFileError, EguFileError,
+    quarantine_corrupt,
     root_dir, sub_dir, ensure_dirs,
     settings_path, negotiation_settings_path,
     learned_weights_path, feedback_log_path,

@@ -244,7 +244,7 @@ accordingly.
 - **Evidence** Deterministic repro: 4 mutually/infeasibly pinned classes → **6 committed hard-violations** (capacity 1, availability 1, room double-book 2, group clash 2), `apply_reschedule` rejected 0; `ConstraintValidator.check_placement` returns `False` for all 4. On the `large` preset, 7 pinned classes were committed with validator-confirmed violations and 0 rejections. Probe: `tests/pinned_infeasible_probe.py`.
 - **Root cause** `apply_reschedule` skips validation for any pinned class, trusting the pin. Two classes pinned to the same room/slot, or a pin that violates capacity/availability, is committed as-is.
 - **User impact** A user who manually pins classes can produce a schedule with real, invisible double-bookings that the quality panel reports as clean.
-- **Recommendation** Validate pins on commit; flag infeasible pins as conflicts instead of trusting them. **Effort** M · **Related** ST-SCHED-001 · **Status** Open
+- **Recommendation** Validate pins on commit; flag infeasible pins as conflicts instead of trusting them. **Effort** M · **Related** ST-SCHED-001 · **Status** **Fixed** (Phase 1, branch `fix/phase-1-data-correctness`)
 
 <a id="st-sched-003"></a>
 ### ST-SCHED-003 — Ghost-day / ghost-slot placements
@@ -252,14 +252,14 @@ accordingly.
 - **Evidence** A class with `allowed_days=['saturday']` on a Mon–Fri grid: `CandidateGenerator` returns 8/8 Saturday candidates, `check_placement` passes, `auto_place` commits `placed_day='saturday'` — a day that is not in `state['days']`. Probe: `tests/ghost_day_and_stale_time_probe.py, tests/legacy_solver_probe.py, tests/validator_integrity_probe.py` Task 1.
 - **Root cause** `filter_class_days` (and the times equivalent) apply the class's own allow/exclude lists but never intersect with the actual grid axes.
 - **User impact** Classes land on days/slots that don't exist in the timetable; they render off-grid or vanish from views, and downstream analytics/export can crash (ST-DATA-003/006).
-- **Recommendation** Intersect `allowed_days`/`allowed_times` with `state['days']`/`state['slots']` at candidate generation. **Effort** S · **Related** ST-SCHED-004, ST-DATA-003 · **Status** Open
+- **Recommendation** Intersect `allowed_days`/`allowed_times` with `state['days']`/`state['slots']` at candidate generation. **Effort** S · **Related** ST-SCHED-004, ST-DATA-003 · **Status** **Fixed** (Phase 1, branch `fix/phase-1-data-correctness`)
 
 <a id="st-sched-004"></a>
 ### ST-SCHED-004 — Out-of-grid allowed_times crashes reschedule
 - **Severity** High · **OBSERVED** · `candidate_generator.py:41`, `logic.py:17-18`
 - **Evidence** `allowed_times=['20:00']` (or `'23:00'`) with that value absent from `state['slots']` → `ValueError: '20:00' is not in list` at `logic.py:18`, deterministic. Probe: `tests/ghost_day_and_stale_time_probe.py, tests/legacy_solver_probe.py, tests/validator_integrity_probe.py` Task 2, `tests/error_edge_*`.
 - **Root cause** `slot_index` does `state['slots'].index(slot)` with no membership guard; stale constraints (e.g. after a slot is renamed/removed) reference values no longer present.
-- **Recommendation** Guard `slot_index`; drop/flag stale constraint values during normalization. **Effort** S · **Related** ST-SCHED-003, ST-DATA-003 · **Status** Open
+- **Recommendation** Guard `slot_index`; drop/flag stale constraint values during normalization. **Effort** S · **Related** ST-SCHED-003, ST-DATA-003 · **Status** **Fixed** (Phase 1, branch `fix/phase-1-data-correctness`)
 
 <a id="st-sched-005"></a>
 ### ST-SCHED-005 — CP-SAT availability checked only at start slot; losers silently dropped
@@ -279,7 +279,7 @@ accordingly.
 - **Evidence** 5 identical-input `optimize()` runs → 5 distinct placements, scores `[12.46, 12.10, 8.70, 8.82, 7.34]`, spread 5.12, population stdev 2.03 (~41% best-vs-worst). Placed-count is stable but quality is not. Probe: `tests/probe_cpsat_protection_semantics.py, tests/probe_cpsat_midblock_availability.py, tests/probe_optimizer_determinism.py`, `tests/scheduler_benchmark.py` determinism cell.
 - **Root cause** LNS and multi-start use the unseeded global `random`; no seed is threaded through.
 - **User impact** Regenerating a schedule gives a different (sometimes markedly worse) result each time; no reproducibility for support or comparison.
-- **Recommendation** Thread an optional seed through the optimizer; default to a fixed seed for reproducibility, expose "randomize" explicitly. **Effort** M · **Status** Open
+- **Recommendation** Thread an optional seed through the optimizer; default to a fixed seed for reproducibility, expose "randomize" explicitly. **Effort** M · **Status** **Fixed** (Phase 1, branch `fix/phase-1-data-correctness`)
 
 <a id="st-perf-001"></a>
 ### ST-PERF-001 — Super-linear solve time on the UI thread
@@ -317,20 +317,20 @@ accordingly.
 - **Evidence** Save a state (loads fine), truncate `key.bin` to 20 bytes, clear the in-process key cache, reload → prior save fails `EguFileError`, and `key.bin` is silently replaced with a new random 32-byte key (old one moved to `backups/`). Every prior `.egu` is now undecryptable, with no prompt. Probe: `probe_03_storage_key_and_formats.py`; independently reproduced by the security agent with a 3-byte truncation.
 - **Root cause** `_load_or_create_key` treats any key whose length ≠ 32 as "missing" and regenerates, rather than failing loudly — a partial write / disk corruption of a few bytes is indistinguishable from first run.
 - **User impact** A single bad sector or interrupted write in `key.bin` permanently locks the user out of **all** their saved timetables, silently.
-- **Recommendation** Distinguish "absent" from "malformed"; on malformed, fail loudly and offer restore from `backups/`; never auto-regenerate over a partially-present key. **Effort** M · **Related** ST-DATA-002, ST-DATA-014, ST-SEC-002 · **Status** Open
+- **Recommendation** Distinguish "absent" from "malformed"; on malformed, fail loudly and offer restore from `backups/`; never auto-regenerate over a partially-present key. **Effort** M · **Related** ST-DATA-002, ST-DATA-014, ST-SEC-002 · **Status** **Fixed** (Phase 1, branch `fix/phase-1-data-correctness`)
 
 <a id="st-data-003"></a>
 ### ST-DATA-003 — Removing a time slot after placement crashes everything downstream
 - **Severity** High · **OBSERVED** · `logic.py:18`, `analytics.py:150`, `dialogs.py:1813`
 - **Evidence** On a 20/20-placed state, deleting one time slot: 8 of 9 downstream ops crash (analytics `compute_all_metrics`, CSV & XLSX export, reschedule, UI refresh) with `ValueError`/`IndexError`; only PDF survives, and it **silently drops** the orphaned class. Removing a day / room / lecturer / year instead is tolerated (0 crashes) because those are membership lookups. Probe: `tests/probe_deleted_resources.py, tests/probe_empty_and_boundary.py, tests/probe_recovery_rollback.py`.
 - **Root cause** Placed classes retain `placed_time` referencing the deleted slot; `slot_index` and slot-indexed arrays assume membership. This is reachable through normal UI use because `SetupDialog` OK doesn't reconcile placements (ST-DATA-004).
-- **Recommendation** On slot/day/resource removal, unplace or re-validate affected classes; guard `slot_index`. **Effort** M · **Related** ST-DATA-004, ST-SCHED-003/004, ST-DATA-006 · **Status** Open
+- **Recommendation** On slot/day/resource removal, unplace or re-validate affected classes; guard `slot_index`. **Effort** M · **Related** ST-DATA-004, ST-SCHED-003/004, ST-DATA-006 · **Status** **Fixed** (Phase 1, branch `fix/phase-1-data-correctness`)
 
 <a id="st-data-004"></a>
 ### ST-DATA-004 — SetupDialog OK orphans placements
 - **Severity** High · **OBSERVED** · `dialogs.py:1813-1821`, `app.py:2828-2838`
 - **Evidence** Applying `SetupDialog` after removing a day / slot / room / lecturer leaves placed classes dangling (`placed=True` pointing at the removed axis) — 4/4 removal types produced orphans against the live dialog logic. This is the normal-UI trigger for ST-DATA-003. Probe: `tests/probe_autosave_and_refresh_perf.py, tests/probe_undo_and_drag_integrity.py, tests/probe_excel_import_and_clipboard_crash.py`, `tests/probe_deleted_resources.py, tests/probe_empty_and_boundary.py, tests/probe_recovery_rollback.py`.
-- **Recommendation** Reconcile placements on OK (unplace affected classes, warn the user with counts). **Effort** M · **Related** ST-DATA-003 · **Status** Open
+- **Recommendation** Reconcile placements on OK (unplace affected classes, warn the user with counts). **Effort** M · **Related** ST-DATA-003 · **Status** **Fixed** (Phase 1, branch `fix/phase-1-data-correctness`)
 
 <a id="st-ui-001"></a>
 ### ST-UI-001 — Timetable renderer silently hides conflicting lessons
