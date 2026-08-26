@@ -17,7 +17,7 @@ what has changed since. Per-finding state also lives in the
 
 ## Phase 1 — complete
 
-**Suite: 259 tests — 227 pass, 32 known-defect pins, 0 failures.** Five of Phase
+**Suite: 261 tests — 229 pass, 32 known-defect pins, 0 failures.** Five of Phase
 0's `xfail(strict=True)` pins flipped to passing and their markers were deleted:
 ST-DATA-001 (×2), ST-SCHED-002, ST-FUNC-013 (×2). That is the pins doing exactly
 the job they exist for.
@@ -86,9 +86,10 @@ drop**, which is worse — the printout looks complete. Hence
 ### Follow-ups this opened
 
 - **The 120 s `multi_start_time_limit` default needs revisiting.** 80 classes now
-  reproduce exactly, but take 77 s of that 120 s budget. A machine a third slower
-  hits the emergency cap and silently loses reproducibility (correctly reported,
-  but lost). Interacts with [ST-PERF-001](12-findings-register.md#st-perf-001) —
+  reproduce exactly, but the department-scale run was measured at 77 s once and
+  105 s on a busier machine — against a 120 s cap. The margin is thin and it is
+  contention-sensitive, so a slower or loaded machine hits the emergency cap and
+  loses reproducibility (correctly reported as such, but lost). Interacts with [ST-PERF-001](12-findings-register.md#st-perf-001) —
   Phase 2 wants the solve off the UI thread anyway.
 - **Constraint lists on the non-day axes are still never pruned.** A class with
   `required_classrooms=["R003"]` after R003 is deleted has zero candidate rooms
