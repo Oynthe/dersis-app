@@ -39,6 +39,15 @@ class Toast(QWidget):
         layout.setContentsMargins(15, 10, 15, 10)
         icon_text = _toast_icons.get(kind, "")
         lbl = QLabel(f"{icon_text}  {message}" if icon_text else message)
+        # ST-UI-007. A QLabel defaults to AutoText, which means Qt decides
+        # PER STRING whether to parse markup — True for `<` plus a tag it knows,
+        # False otherwise. So a toast about a class called "9-A <B> Subesi"
+        # renders as markup while the next one renders literally, decided by the
+        # user's own data. Measured: QLabel('R&D <b>Lab</b>') has sizeHint width
+        # 84 as AutoText and 168 as PlainText — Qt was eating half the message.
+        # Removing Qt's choice is the fix here, NOT escaping: html.escape on a
+        # string Qt would have shown literally puts '&amp;' on the screen.
+        lbl.setTextFormat(Qt.TextFormat.PlainText)
         lbl.setStyleSheet(f"color: {fg}; font-weight: bold; font-size: 10pt; border: none;")
         lbl.setWordWrap(True)
         lbl.setMaximumWidth(350)
@@ -228,6 +237,11 @@ class WarningLogPanel(QFrame):
         self._icon_label.setFixedWidth(16)
         header.addWidget(self._icon_label)
         self._latest_label = QLabel("—")
+        # ST-UI-007, same reason as Toast above. This label shows the newest
+        # warning, which interpolates class and branch names the user typed.
+        # `_line()` already escapes on the way into the QTextEdit body; the
+        # header is the half that was left.
+        self._latest_label.setTextFormat(Qt.TextFormat.PlainText)
         self._latest_label.setStyleSheet("font-size: 9pt; color: #475569;")
         self._latest_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)

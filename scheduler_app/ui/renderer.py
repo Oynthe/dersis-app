@@ -29,6 +29,8 @@ from scheduler_app.constants import (
     MATRIX_BORDER, MATRIX_DAY_BG, MATRIX_DAY_FG, MATRIX_BRANCH_BG,
     MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CELL_FG,
     MATRIX_CORNER_BG,
+    CELL_FG_CODE, CELL_FG_NAME, CELL_FG_LECTURER, CELL_FG_ROOM,
+    CELL_FG_BRANCH, CELL_FG_SEQUENTIAL,
 )
 from scheduler_app.translations import tr
 from scheduler_app.logic import (
@@ -334,10 +336,14 @@ def _measure_text_height(text, font, width, wrap=True):
     return br.height()
 
 
-def _needed_height_for_class(cls, cell_w, is_matrix=False):
+def _needed_height_for_class(cls, cell_w, is_matrix=False, conflict=False):
     """Compute the minimum pixel height to display *cls* content.
 
     *cell_w* is the available cell width (before internal margin/padding).
+
+    *conflict* reserves the strip the ÇAKIŞMA pill will occupy, so the pill gets
+    its own space instead of being painted over the protection badge — see
+    :func:`_conflict_pill_band`.
     """
     m = 4 if is_matrix else 6
     pad = 3 if is_matrix else 4
@@ -375,6 +381,9 @@ def _needed_height_for_class(cls, cell_w, is_matrix=False):
         f_badge = QFont("Segoe UI", 7)
         f_badge.setBold(True)
         total += _measure_text_height(bt, f_badge, inner_w, wrap=False) + 2
+
+    if conflict:
+        total += _conflict_pill_band(cell_w)
 
     total += m  # bottom margin
     return total
@@ -437,21 +446,27 @@ def _conflict_tooltip(base_tip, conflict, partner_labels):
             + nl + bullets)
 
 
-def _paint_conflict_pill(painter, rect):
-    """Draw the ÇAKIŞMA pill in the BOTTOM-right of *rect*.
+def _conflict_pill_geometry(rect):
+    """Where the ÇAKIŞMA pill goes in *rect*, as ``(QRectF | None, label, font)``.
 
-    Bottom, not top, and that is the whole point. Both paint methods draw the
-    class code first, centred, at ``rect.y() + 6`` — and at ``COL_DAY_W`` 150 a
-    full pill spans roughly x 86..146 against a centred five-character code at
+    Split out from the painter so the *height* calculation and the *paint* agree
+    by construction. They used not to, and the badge paid for it: see
+    :func:`_conflict_pill_band`.
+
+    Bottom-right, and that is the whole point. Both paint methods draw the class
+    code first, centred, at ``rect.y() + 6`` — and at ``COL_DAY_W`` 150 a full
+    pill spans roughly x 86..146 against a centred five-character code at
     x 57..92, so a top-right pill overlaps it; at ``lane_count`` 2 the lane is
     74 px and the pill covers the code completely. The class code is the
     identifier the warning log, the exports and every test key on, and it would
     be destroyed on exactly the cells that matter most.
 
-    ``QPainter.drawText`` does **not** clip to its rect either, so a pill wider
-    than its lane bleeds onto the neighbouring lesson and the user reads the
-    label on the wrong one. Measure first, shorten, then give up and let the
-    red border carry the signal alone.
+    A pill wider than its lane also bleeds onto the neighbouring lesson, so the
+    user reads the label on the wrong one — hence measure, shorten, then give up
+    and let the red border carry the signal alone. (The bleed is the graphics
+    *item* overflowing its own rect, not ``QPainter.drawText`` failing to clip;
+    ``drawText`` does clip. The earlier note here blamed the wrong mechanism,
+    which matters because it is what the next reader reasons from.)
     """
     from PyQt6.QtGui import QFontMetrics
 
@@ -464,12 +479,46 @@ def _paint_conflict_pill(painter, rect):
         label = tr("badges.conflict_short")
         pill_w = fm.horizontalAdvance(label) + 10
     if rect.width() < pill_w + 2:
-        return  # nothing legible fits; the red border still carries the signal
+        # nothing legible fits; the red border still carries the signal
+        return None, label, font
     pill_h = fm.height() + 2
     if rect.height() < pill_h + 8:
+        return None, label, font
+    return (QRectF(rect.right() - pill_w - 4,
+                   rect.bottom() - pill_h - 3, pill_w, pill_h),
+            label, font)
+
+
+def _conflict_pill_band(cell_w):
+    """Vertical strip at the bottom of a conflicted cell the pill will occupy.
+
+    ST-UI-005 / ST-UI-001. The pill is drawn *last*, over everything, and the
+    protection badge is the last line of cell text — so on a lesson that is both
+    conflicted and pinned they landed on top of each other. Measured before this
+    fix, badge rect against pill rect:
+
+        lane_count 1  cell 150.00x93   badge y 75..87   pill y 79..90   67x8 px
+        lane_count 2  cell  74.50x124  badge y 106..118 pill y 110..121 13x8 px
+        lane_count 3  cell  49.33x139  badge y 121..133 pill y 125..136 13x8 px
+
+    The pin marker was destroyed on exactly the cells where it explains the most
+    — an infeasible pin is committed deliberately (ST-SCHED-002) and the badge is
+    what tells the user the clash is theirs rather than the planner's.
+
+    Reserving the strip in both the height calculation and the paint keeps the
+    badge; it is not enough to move the badge, because the cell is grown to fit
+    its content and the pill would then overlap whatever became last.
+    """
+    probe = QRectF(0, 0, cell_w, 10_000)
+    pill, _label, _font = _conflict_pill_geometry(probe)
+    return 0.0 if pill is None else pill.height() + 3
+
+
+def _paint_conflict_pill(painter, rect):
+    """Draw the ÇAKIŞMA pill in the bottom-right of *rect*."""
+    pill, label, font = _conflict_pill_geometry(rect)
+    if pill is None:
         return
-    pill = QRectF(rect.right() - pill_w - 4,
-                  rect.bottom() - pill_h - 3, pill_w, pill_h)
     painter.setPen(QPen(Qt.PenStyle.NoPen))
     painter.setBrush(QBrush(QColor(CONFLICT_BORDER)))
     painter.drawRoundedRect(pill, 5, 5)
@@ -590,6 +639,10 @@ class LessonItem(QGraphicsRectItem):
         x, w = rect.x() + m + pad, rect.width() - 2 * m - 2 * pad
         y = rect.y() + m
         bottom_limit = rect.bottom() - m
+        if self._conflict:
+            # Keep the cell's own text out of the ÇAKIŞMA pill's strip; the pill
+            # is painted last and would otherwise cover the protection badge.
+            bottom_limit -= _conflict_pill_band(rect.width())
         center = Qt.AlignmentFlag.AlignHCenter
         wrap_center = center | Qt.TextFlag.TextWordWrap
         fm = painter.fontMetrics()
@@ -598,13 +651,13 @@ class LessonItem(QGraphicsRectItem):
         code = cls.get("class_code", "")
         if code:
             f = QFont("Segoe UI", 8); f.setBold(True)
-            painter.setFont(f); painter.setPen(QColor("#1D4ED8"))
+            painter.setFont(f); painter.setPen(QColor(CELL_FG_CODE))
             painter.drawText(QRectF(x, y, w, 14), center, code)
             y += 14
 
         # name (wrapped, centered)
         f = QFont("Segoe UI", 9); f.setBold(True)
-        painter.setFont(f); painter.setPen(QColor("#1E293B"))
+        painter.setFont(f); painter.setPen(QColor(CELL_FG_NAME))
         name_rect = QRectF(x, y, w, bottom_limit - y)
         br = painter.fontMetrics().boundingRect(
             int(x), int(y), int(w), int(bottom_limit - y),
@@ -615,7 +668,7 @@ class LessonItem(QGraphicsRectItem):
         # lecturer
         if y < bottom_limit:
             f.setBold(False); f.setPointSize(8); painter.setFont(f)
-            painter.setPen(QColor("#475569"))
+            painter.setPen(QColor(CELL_FG_LECTURER))
             lec_rect = QRectF(x, y, w, bottom_limit - y)
             br = painter.fontMetrics().boundingRect(
                 int(x), int(y), int(w), int(bottom_limit - y),
@@ -626,7 +679,7 @@ class LessonItem(QGraphicsRectItem):
         # room / location
         room = classroom_of(cls)
         if room and y < bottom_limit:
-            painter.setPen(QColor("#16A34A"))
+            painter.setPen(QColor(CELL_FG_ROOM))
             painter.drawText(QRectF(x, y, w, 13), center, room)
             y += 13
 
@@ -691,23 +744,23 @@ class LessonItem(QGraphicsRectItem):
             code = cls.get("class_code", "")
             if code:
                 f = QFont("Segoe UI", 7); f.setBold(True)
-                painter.setFont(f); painter.setPen(QColor("#1D4ED8"))
+                painter.setFont(f); painter.setPen(QColor(CELL_FG_CODE))
                 painter.drawText(QRectF(mx, my, mw, 11), center, code)
                 my += 11
 
             f = QFont("Segoe UI", 7); f.setBold(True)
-            painter.setFont(f); painter.setPen(QColor("#6D28D9"))
+            painter.setFont(f); painter.setPen(QColor(CELL_FG_BRANCH))
             painter.drawText(QRectF(mx, my, mw, 11), center, t["branch"])
             my += 11
 
             f.setPointSize(9)
-            painter.setFont(f); painter.setPen(QColor("#1E293B"))
+            painter.setFont(f); painter.setPen(QColor(CELL_FG_NAME))
             painter.drawText(QRectF(mx, my, mw, 14),
                              center | Qt.TextFlag.TextWordWrap, cls["name"])
             my += 14
 
             f.setPointSize(8); f.setBold(False)
-            painter.setFont(f); painter.setPen(QColor("#475569"))
+            painter.setFont(f); painter.setPen(QColor(CELL_FG_LECTURER))
             painter.drawText(QRectF(mx, my, mw, 12), center, cls["lecturer"])
             my += 14
 
@@ -722,7 +775,7 @@ class LessonItem(QGraphicsRectItem):
 
             if i == n - 1:
                 f.setPointSize(7); f.setBold(True); painter.setFont(f)
-                painter.setPen(QColor("#7C3AED"))
+                painter.setPen(QColor(CELL_FG_SEQUENTIAL))
                 painter.drawText(QRectF(mx, my, mw, 11),
                                  Qt.AlignmentFlag.AlignLeft, tr("badges.sequential"))
 
@@ -911,6 +964,8 @@ class MatrixLessonItem(QGraphicsRectItem):
         x, w = rect.x() + m + pad, rect.width() - 2 * m - 2 * pad
         y = rect.y() + m
         bottom_limit = rect.bottom() - m
+        if self._conflict:
+            bottom_limit -= _conflict_pill_band(rect.width())
         center = Qt.AlignmentFlag.AlignHCenter
         wrap_center = center | Qt.TextFlag.TextWordWrap
 
@@ -918,13 +973,13 @@ class MatrixLessonItem(QGraphicsRectItem):
         code = cls.get("class_code", "")
         if code and y < bottom_limit:
             f = QFont("Segoe UI", 7); f.setBold(True)
-            painter.setFont(f); painter.setPen(QColor("#1D4ED8"))
+            painter.setFont(f); painter.setPen(QColor(CELL_FG_CODE))
             painter.drawText(QRectF(x, y, w, 12), center, code)
             y += 12
 
         # name (wrapped, centered)
         f = QFont("Segoe UI", 8); f.setBold(True)
-        painter.setFont(f); painter.setPen(QColor("#1E293B"))
+        painter.setFont(f); painter.setPen(QColor(CELL_FG_NAME))
         name_avail = QRectF(x, y, w, bottom_limit - y)
         br = painter.fontMetrics().boundingRect(
             int(x), int(y), int(w), int(bottom_limit - y),
@@ -935,7 +990,7 @@ class MatrixLessonItem(QGraphicsRectItem):
         # lecturer
         if y < bottom_limit:
             f.setBold(False); painter.setFont(f)
-            painter.setPen(QColor("#475569"))
+            painter.setPen(QColor(CELL_FG_LECTURER))
             lec_avail = QRectF(x, y, w, bottom_limit - y)
             br = painter.fontMetrics().boundingRect(
                 int(x), int(y), int(w), int(bottom_limit - y),
@@ -945,7 +1000,7 @@ class MatrixLessonItem(QGraphicsRectItem):
 
         # room
         if self._room and y < bottom_limit:
-            painter.setPen(QColor("#16A34A"))
+            painter.setPen(QColor(CELL_FG_ROOM))
             painter.drawText(QRectF(x, y, w, 13), center, self._room)
             y += 13
 
@@ -1149,14 +1204,16 @@ class TimetableScene(QGraphicsScene):
         for b in blocks:
             block_w = _filtered_block_width(b, FILTER_MODE_DEFAULT)
             if b["span"] == 1:
-                needed = _needed_height_for_class(b["cls"], block_w)
+                needed = _needed_height_for_class(
+                    b["cls"], block_w, conflict=bool(b.get("conflict")))
                 if needed > row_heights[b["row"]]:
                     row_heights[b["row"]] = needed
 
         for b in blocks:
             if b["span"] > 1:
                 block_w = _filtered_block_width(b, FILTER_MODE_DEFAULT)
-                needed = _needed_height_for_class(b["cls"], block_w)
+                needed = _needed_height_for_class(
+                    b["cls"], block_w, conflict=bool(b.get("conflict")))
                 existing = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
                 if needed > existing:
                     extra = needed - existing
@@ -1242,13 +1299,15 @@ class TimetableScene(QGraphicsScene):
         row_heights = [ROW_SLOT_H] * ns
         for b in blocks:
             if b["span"] == 1:
-                needed = _needed_height_for_class(b["cls"], COL_DAY_W)
+                needed = _needed_height_for_class(
+                    b["cls"], COL_DAY_W, conflict=bool(b.get("conflict")))
                 if needed > row_heights[b["row"]]:
                     row_heights[b["row"]] = needed
 
         for b in blocks:
             if b["span"] > 1:
-                needed = _needed_height_for_class(b["cls"], COL_DAY_W)
+                needed = _needed_height_for_class(
+                    b["cls"], COL_DAY_W, conflict=bool(b.get("conflict")))
                 existing = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
                 if needed > existing:
                     extra = needed - existing
@@ -1420,7 +1479,9 @@ class TimetableScene(QGraphicsScene):
                     n_lanes = max(1, b.get("lane_count", 1))
                     lane_w = ((COL_BRANCH_W - (n_lanes - 1) * g) / n_lanes
                               if n_lanes > 1 else COL_BRANCH_W)
-                    needed = _needed_height_for_class(b["cls"], lane_w, is_matrix=True)
+                    needed = _needed_height_for_class(
+                        b["cls"], lane_w, is_matrix=True,
+                        conflict=bool(b.get("conflict")))
                     if needed > row_heights[b["row"]]:
                         row_heights[b["row"]] = needed
 
@@ -1430,7 +1491,9 @@ class TimetableScene(QGraphicsScene):
                     n_lanes = max(1, b.get("lane_count", 1))
                     lane_w = ((COL_BRANCH_W - (n_lanes - 1) * g) / n_lanes
                               if n_lanes > 1 else COL_BRANCH_W)
-                    needed = _needed_height_for_class(b["cls"], lane_w, is_matrix=True)
+                    needed = _needed_height_for_class(
+                        b["cls"], lane_w, is_matrix=True,
+                        conflict=bool(b.get("conflict")))
                     existing = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
                     if needed > existing:
                         extra = needed - existing

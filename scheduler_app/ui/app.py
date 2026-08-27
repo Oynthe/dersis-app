@@ -40,7 +40,7 @@ from scheduler_app.constants import (
     MIN_CELL_W, MIN_CELL_H, EMPTY_BG, HEADER_BG_DARK, TIME_BG, CORNER_BG,
     MATRIX_BORDER, MATRIX_DAY_BG, MATRIX_DAY_FG, MATRIX_BRANCH_BG,
     MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CELL_FG,
-    MATRIX_CORNER_BG,
+    MATRIX_CORNER_BG, OPEN_SLOTS_FG_ROOM,
 )
 from scheduler_app.translations import tr, get_language, set_language, is_rtl
 from scheduler_app.ui.day_keys import (
@@ -3379,8 +3379,9 @@ class SchedulerApp(QMainWindow):
             if selected_cls is not None:
                 no_slots = QLabel(tr("warnings.no_valid_placements"))
                 no_slots.setStyleSheet(
-                    "QLabel { font-size: 7.5pt; color: #9CA3AF;"
-                    "  padding: 12px; background: transparent; }")
+                    "QLabel { font-size: 7.5pt; color: %s;"
+                    "  padding: 12px; background: transparent; }"
+                    % OPEN_SLOTS_FG_ROOM)
                 no_slots.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 layout.addWidget(no_slots)
             layout.addStretch()
@@ -3424,8 +3425,8 @@ class SchedulerApp(QMainWindow):
 
                 room_label = QLabel(room)
                 room_label.setStyleSheet(
-                    "QLabel { font-size: 7.5pt; color: #9CA3AF;"
-                    "  background: transparent; }")
+                    "QLabel { font-size: 7.5pt; color: %s;"
+                    "  background: transparent; }" % OPEN_SLOTS_FG_ROOM)
                 row_layout.addWidget(room_label)
 
                 layout.addWidget(row)
