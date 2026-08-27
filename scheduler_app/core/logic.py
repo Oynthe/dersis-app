@@ -526,11 +526,60 @@ def get_year_color(state, year_name):
     return YEAR_COLORS[0]
 
 
+def occ_claim(occ, key, entity):
+    """Register one claim on ``entity`` at cell ``key``.
+
+    ST-SCHED-010. An occupancy cell used to be a ``set``, so two classes
+    contributing the same claim to one cell (two lecturer-less classes; a
+    locked class registered by both ``build_occupancy`` and the optimizer's
+    explicit add loop; two infeasibly-pinned classes sharing a room) collapsed
+    into one entry — and removing *either* of them erased the claim of the
+    other, after which the validator declared an occupied cell free. Cells are
+    now ``{entity: refcount}``; a cell is occupied while its count is positive.
+
+    Every reader in the codebase tests membership (``x in occ.get(key, set())``)
+    or takes ``set(cell)`` / ``bool(cell)``, all of which read a dict exactly as
+    they read a set, so this changes representation without changing any read.
+    """
+    cell = occ.get(key)
+    if cell is None:
+        occ[key] = {entity: 1}
+    else:
+        cell[entity] = cell.get(entity, 0) + 1
+
+
+def occ_release(occ, key, entity):
+    """Drop one claim on ``entity`` at cell ``key``; free it at zero.
+
+    The entry is deleted rather than left at 0 so that ``bool(cell)`` and
+    ``set(cell)`` keep meaning "what is occupying this cell", which is what
+    ``tests/test_state_transactions.py``'s occupancy fingerprint and the
+    negotiator's blocked-slot analysis both rely on.
+
+    A release with no matching claim is ignored rather than driven negative:
+    the alternative is that one unbalanced remove poisons the cell into a
+    permanently-negative count that no future claim can lift back to occupied.
+    """
+    cell = occ.get(key)
+    if not cell:
+        return
+    n = cell.get(entity)
+    if n is None:
+        return
+    if n <= 1:
+        del cell[entity]
+        if not cell:
+            del occ[key]
+    else:
+        cell[entity] = n - 1
+
+
 def build_occupancy(state, exclude_ids=None):
     """Build occupancy maps for rooms, lecturers, and student groups.
 
     Returns (room_occ, lect_occ, group_occ) where each is a dict mapping
-    (day, slot) -> set of identifiers.
+    (day, slot) -> {identifier: refcount}. See ``occ_claim`` for why the cell
+    is ref-counted rather than a plain set (ST-SCHED-010).
     """
     exclude_ids = exclude_ids or set()
     room_occ = {}
@@ -551,10 +600,10 @@ def build_occupancy(state, exclude_ids=None):
         for off, s in enumerate(slots_list):
             key = (day, s)
             if track_room:
-                room_occ.setdefault(key, set()).add(room)
-            lect_occ.setdefault(key, set()).add(cls["lecturer"])
+                occ_claim(room_occ, key, room)
+            occ_claim(lect_occ, key, cls["lecturer"])
             for t in _active_targets(cls, off):
-                group_occ.setdefault(key, set()).add((t["year"], t["branch"]))
+                occ_claim(group_occ, key, (t["year"], t["branch"]))
     return room_occ, lect_occ, group_occ
 
 
@@ -590,10 +639,10 @@ def _add_to_occupancy(state, cls, day, start_slot, room,
     for off, s in enumerate(slots_list):
         key = (day, s)
         if track_room:
-            room_occ.setdefault(key, set()).add(room)
-        lect_occ.setdefault(key, set()).add(cls["lecturer"])
+            occ_claim(room_occ, key, room)
+        occ_claim(lect_occ, key, cls["lecturer"])
         for t in _active_targets(cls, off):
-            group_occ.setdefault(key, set()).add((t["year"], t["branch"]))
+            occ_claim(group_occ, key, (t["year"], t["branch"]))
 
 
 def _remove_from_occupancy(state, cls, day, start_slot, room,
@@ -606,10 +655,10 @@ def _remove_from_occupancy(state, cls, day, start_slot, room,
     for off, s in enumerate(slots_list):
         key = (day, s)
         if track_room:
-            room_occ.get(key, set()).discard(room)
-        lect_occ.get(key, set()).discard(cls["lecturer"])
+            occ_release(room_occ, key, room)
+        occ_release(lect_occ, key, cls["lecturer"])
         for t in _active_targets(cls, off):
-            group_occ.get(key, set()).discard((t["year"], t["branch"]))
+            occ_release(group_occ, key, (t["year"], t["branch"]))
 
 
 def _get_valid_slots(state, cls, room_occ, lect_occ, group_occ):
@@ -816,329 +865,69 @@ def _unplaced_reason(state, cls, room_occ, lect_occ, group_occ):
     return tr("negotiation.all_slots_occupied")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  LEGACY SOLVER ENTRY POINTS  (ST-SCHED-007, ST-ARCH-004, ST-ARCH-011)
+# ══════════════════════════════════════════════════════════════════════════
+# These three names are the app's original solver. They have no live caller —
+# `batch_schedule` is imported by ui/dialogs.py:28 and never invoked — but they
+# are exported and importable, so they are a loaded gun: re-wire any of them and
+# you get a solver that silently enforces a different, weaker rule set.
+#
+# The audit measured exactly that (ST-SCHED-007). Driving a fully-unavailable
+# lecturer through all three placed the class at monday/09:00, because their
+# shared candidate generator `_get_valid_slots` never applied the lecturer
+# availability filters at all; and `reschedule_all` treated every non-pinned
+# placed class as movable, so it relocated a `protection="locked"` class from
+# friday/11:00 to monday/09:00. The optimized path got both right.
+#
+# Rather than teach the old rules the missing checks — which would have created
+# a fifth copy of the constraint logic, the very thing ST-ARCH-004 is about —
+# each entry point now forwards to its optimized counterpart, which validates
+# through ConstraintValidator like everything else. Return signatures are
+# unchanged; `optimized_auto_place` and `optimized_batch_schedule` already
+# documented themselves as drop-in replacements.
+#
+# Deleting them outright, along with the now-unreferenced `_solve_backtrack` /
+# `_get_valid_slots` / `_check_placement_fast` helpers, is ST-ARCH-011's job in
+# Phase 6. This phase closes the behavioural hole; that one removes the code.
+
+
 def batch_schedule(state, new_classes):
-    """Schedule multiple classes with two-phase optimization.
+    """Deprecated. Forwards to :func:`optimized_batch_schedule`.
 
-    Phase 1: Try to place new classes around existing placements (preserve them).
-    Phase 2: If any new class fails, reschedule ALL flexible classes together
-             (existing + new) to find the best overall arrangement.
+    .. deprecated::
+        Kept only so existing imports resolve. Call
+        ``optimized_batch_schedule`` directly.
 
-    Args:
-        state: The current schedule state (already has existing placed classes).
-        new_classes: List of class dicts to schedule.
-
-    Returns:
-        (placed_list, unplaced_list, rescheduled) where:
-        - placed_list: [(cls, day, slot, room), ...]
-        - unplaced_list: [(cls, reason), ...]
-        - rescheduled: bool — True if existing classes were rescheduled
+    Returns (placed_list, unplaced_list, rescheduled) — unchanged.
     """
-    new_ids = {cls_key(c) for c in new_classes}
-
-    # Collect existing flexible (non-pinned, non-locked, placed) classes
-    existing_flexible = [c for c in state["classes"]
-                         if c["placed"] and not c["pinned"]
-                         and c.get("protection") != "locked"
-                         and cls_key(c) not in new_ids]
-
-    # All pinned classes (existing + new)
-    all_pinned = [c for c in state["classes"] if c["pinned"]]
-    new_pinned = [c for c in new_classes if c["pinned"]]
-    new_flexible = [c for c in new_classes if not c["pinned"]]
-
-    # ── Phase 1: Try placing only new classes, existing stay fixed ──
-    room_occ, lect_occ, group_occ = build_occupancy(state, exclude_ids=new_ids)
-
-    placed_result = []
-    unplaced_result = []
-
-    # Place new pinned classes
-    pinned_ok = True
-    for cls in new_pinned:
-        day, slot, room = cls["pinned_day"], cls["pinned_time"], cls["pinned_classroom"]
-        if _check_placement_fast(state, cls, day, slot, room,
-                                  room_occ, lect_occ, group_occ):
-            _add_to_occupancy(state, cls, day, slot, room,
-                              room_occ, lect_occ, group_occ)
-            placed_result.append((cls, day, slot, room))
-        else:
-            pinned_ok = False
-            conflicts = find_conflicts(state, cls, day, slot, room)
-            reason = "; ".join(conflicts) if conflicts else tr("conflicts.batch_conflict")
-            unplaced_result.append((cls, reason))
-
-    # Try placing new flexible classes around existing
-    new_flexible_sorted = sorted(new_flexible,
-                                  key=lambda c: _constraint_tightness(state, c))
-
-    solution = _solve_backtrack(state, new_flexible_sorted,
-                                room_occ, lect_occ, group_occ,
-                                max_iterations=50000)
-
-    all_new_placed = all(s is not None for s in solution)
-
-    if all_new_placed and pinned_ok:
-        # Phase 1 succeeded — all new classes fit without moving existing
-        for i, cls in enumerate(new_flexible_sorted):
-            day, slot, room = solution[i]
-            placed_result.append((cls, day, slot, room))
-        # Include existing classes unchanged in results
-        for cls in existing_flexible:
-            placed_result.append((cls, cls["placed_day"],
-                                  cls["placed_time"], cls["placed_classroom"]))
-        return placed_result, unplaced_result, False
-
-    # ── Phase 2: Reschedule everything together ──
-    # Reset — build occupancy from only pinned classes
-    all_exclude = new_ids | {cls_key(c) for c in existing_flexible}
-    room_occ2, lect_occ2, group_occ2 = build_occupancy(
-        state, exclude_ids=all_exclude)
-
-    placed_result = []
-    unplaced_result = []
-
-    # Place ALL pinned classes (existing are already in occupancy via
-    # build_occupancy; new pinned need explicit placement)
-    for cls in new_pinned:
-        day, slot, room = cls["pinned_day"], cls["pinned_time"], cls["pinned_classroom"]
-        if _check_placement_fast(state, cls, day, slot, room,
-                                  room_occ2, lect_occ2, group_occ2):
-            _add_to_occupancy(state, cls, day, slot, room,
-                              room_occ2, lect_occ2, group_occ2)
-            placed_result.append((cls, day, slot, room))
-        else:
-            conflicts = find_conflicts(state, cls, day, slot, room)
-            reason = "; ".join(conflicts) if conflicts else tr("conflicts.pinned_conflict")
-            unplaced_result.append((cls, reason))
-
-    # Combine existing flexible + new flexible, sort by tightness
-    combined = existing_flexible + new_flexible
-    combined.sort(key=lambda c: _constraint_tightness(state, c))
-
-    # Build preferred placements map (existing classes prefer their current slot)
-    preferred = {}
-    for cls in existing_flexible:
-        preferred[cls_key(cls)] = (cls["placed_day"], cls["placed_time"],
-                                  cls["placed_classroom"])
-
-    solution2 = _solve_backtrack(state, combined,
-                                  room_occ2, lect_occ2, group_occ2,
-                                  max_iterations=80000,
-                                  preferred=preferred)
-
-    for i, cls in enumerate(combined):
-        if solution2[i] is not None:
-            day, slot, room = solution2[i]
-            placed_result.append((cls, day, slot, room))
-        else:
-            reason = _unplaced_reason(state, cls, room_occ2, lect_occ2, group_occ2)
-            unplaced_result.append((cls, reason))
-
-    return placed_result, unplaced_result, True
+    return optimized_batch_schedule(state, new_classes)
 
 
 def auto_place_class(state, new_cls):
-    """Automatically place a single class using the same two-phase logic.
+    """Deprecated. Forwards to :func:`optimized_auto_place`.
 
-    Phase 1: Find best slot for new_cls without moving existing classes.
-    Phase 2: If no slot found, reschedule all flexible classes together.
+    .. deprecated::
+        Kept only so existing imports resolve. Call ``optimized_auto_place``
+        directly.
 
-    For pinned classes, places at pinned position and reschedules others if needed.
-
-    The new_cls must already be in state["classes"] before calling.
-
-    Returns:
-        (success, placements, rescheduled) where:
-        - success: True if the new class was placed
-        - placements: dict {id(cls): (day, slot, room)} for ALL classes that
-          changed position (new + rescheduled existing)
-        - rescheduled: bool — True if existing classes were moved
+    Returns (success, placements, rescheduled) — unchanged.
     """
-    new_id = cls_key(new_cls)
-
-    # Existing flexible classes (not the new one, not pinned)
-    existing_flexible = [c for c in state["classes"]
-                         if c["placed"] and not c["pinned"]
-                         and cls_key(c) != new_id]
-
-    if new_cls["pinned"]:
-        # Pinned: must go at specified position
-        day = new_cls["pinned_day"]
-        slot = new_cls["pinned_time"]
-        room = new_cls["pinned_classroom"]
-
-        # Check if it fits without moving anything
-        exclude = {new_id}
-        room_occ, lect_occ, group_occ = build_occupancy(state, exclude_ids=exclude)
-
-        if _check_placement_fast(state, new_cls, day, slot, room,
-                                  room_occ, lect_occ, group_occ):
-            return True, {new_id: (day, slot, room)}, False
-
-        # Doesn't fit — reschedule existing flexible around the pinned class
-        all_exclude = {new_id} | {cls_key(c) for c in existing_flexible}
-        room_occ2, lect_occ2, group_occ2 = build_occupancy(
-            state, exclude_ids=all_exclude)
-
-        # Add the new pinned class to occupancy
-        if not _check_placement_fast(state, new_cls, day, slot, room,
-                                      room_occ2, lect_occ2, group_occ2):
-            # Conflicts with another pinned class — can't resolve
-            return False, {}, False
-
-        _add_to_occupancy(state, new_cls, day, slot, room,
-                          room_occ2, lect_occ2, group_occ2)
-
-        # Reschedule all existing flexible
-        combined = sorted(existing_flexible,
-                          key=lambda c: _constraint_tightness(state, c))
-        preferred = {cls_key(c): (c["placed_day"], c["placed_time"],
-                                  c["placed_classroom"]) for c in existing_flexible}
-
-        solution = _solve_backtrack(state, combined,
-                                     room_occ2, lect_occ2, group_occ2,
-                                     max_iterations=60000,
-                                     preferred=preferred)
-
-        # Check all existing got placed
-        placements = {new_id: (day, slot, room)}
-        all_ok = True
-        for i, cls in enumerate(combined):
-            if solution[i] is not None:
-                d, s, r = solution[i]
-                old = preferred.get(cls_key(cls))
-                if old != (d, s, r):
-                    placements[cls_key(cls)] = (d, s, r)
-            else:
-                all_ok = False
-                break
-
-        if not all_ok:
-            return False, {}, False
-
-        return True, placements, len(placements) > 1
-
-    # ── Non-pinned class ──
-    # Phase 1: find a slot without moving existing
-    exclude = {new_id}
-    room_occ, lect_occ, group_occ = build_occupancy(state, exclude_ids=exclude)
-
-    options = _get_valid_slots(state, new_cls, room_occ, lect_occ, group_occ)
-    if options:
-        # Pick best option by score
-        best = min(options,
-                   key=lambda o: _score_placement(state, new_cls, o[0], o[1], o[2],
-                                                   room_occ, lect_occ, group_occ))
-        return True, {new_id: best}, False
-
-    # Phase 2: reschedule everything
-    all_exclude = {new_id} | {cls_key(c) for c in existing_flexible}
-    room_occ2, lect_occ2, group_occ2 = build_occupancy(
-        state, exclude_ids=all_exclude)
-
-    combined = existing_flexible + [new_cls]
-    combined.sort(key=lambda c: _constraint_tightness(state, c))
-
-    preferred = {cls_key(c): (c["placed_day"], c["placed_time"],
-                              c["placed_classroom"]) for c in existing_flexible}
-
-    solution = _solve_backtrack(state, combined,
-                                 room_occ2, lect_occ2, group_occ2,
-                                 max_iterations=60000,
-                                 preferred=preferred)
-
-    # Find what the new class got
-    new_idx = combined.index(new_cls)
-    if solution[new_idx] is None:
-        return False, {}, False
-
-    placements = {}
-    for i, cls in enumerate(combined):
-        if solution[i] is not None:
-            d, s, r = solution[i]
-            if cls_key(cls) == new_id:
-                placements[new_id] = (d, s, r)
-            else:
-                old = preferred.get(cls_key(cls))
-                if old != (d, s, r):
-                    placements[cls_key(cls)] = (d, s, r)
-
-    return True, placements, len(placements) > 1
+    return optimized_auto_place(state, new_cls)
 
 
 def reschedule_all(state):
-    """Global re-optimization: unplace all flexible classes and re-solve.
+    """Deprecated. Forwards to :func:`optimized_reschedule_all`.
 
-    Preserves pinned classes and all hard constraints. Optimizes for
-    lecturer compactness (primary) and student group compactness (secondary).
+    .. deprecated::
+        Kept only so existing imports resolve. Call
+        ``optimized_reschedule_all`` directly — it also returns a summary,
+        which this signature has no room for.
 
-    Returns:
-        (placed_list, unplaced_list, changes) where:
-        - placed_list: [(cls, day, slot, room), ...]
-        - unplaced_list: [(cls, reason), ...]
-        - changes: list of dicts with old/new placements for classes that moved
+    Returns (placed_list, unplaced_list, changes) — unchanged.
     """
-    # Collect all pinned and flexible classes
-    flexible = [c for c in state["classes"]
-                if c["placed"] and not c["pinned"]]
-    pinned = [c for c in state["classes"] if c["pinned"]]
-
-    # Also include unplaced non-pinned classes (give them a chance)
-    unplaced_flex = [c for c in state["classes"]
-                     if not c["placed"] and not c["pinned"]]
-
-    # Save old placements for change tracking
-    old_placements = {}
-    for cls in flexible:
-        old_placements[cls_key(cls)] = (cls["placed_day"], cls["placed_time"],
-                                     cls["placed_classroom"])
-
-    # Build occupancy from only pinned classes
-    all_flex_ids = {cls_key(c) for c in flexible} | {cls_key(c) for c in unplaced_flex}
-    room_occ, lect_occ, group_occ = build_occupancy(
-        state, exclude_ids=all_flex_ids)
-
-    # Combine all flexible classes, sort by constraint tightness
-    combined = flexible + unplaced_flex
-    combined.sort(key=lambda c: _constraint_tightness(state, c))
-
-    # No preferred slots — we want full re-optimization
-    solution = _solve_backtrack(state, combined,
-                                room_occ, lect_occ, group_occ,
-                                max_iterations=100000)
-
-    placed_list = []
-    unplaced_list = []
-    changes = []
-
-    # Include pinned classes in placed list
-    for cls in pinned:
-        placed_list.append((cls, cls["pinned_day"], cls["pinned_time"],
-                            cls["pinned_classroom"]))
-
-    for i, cls in enumerate(combined):
-        if solution[i] is not None:
-            day, slot, room = solution[i]
-            placed_list.append((cls, day, slot, room))
-            old = old_placements.get(cls_key(cls))
-            if old and old != (day, slot, room):
-                changes.append({
-                    "cls": cls,
-                    "old_day": old[0], "old_time": old[1], "old_room": old[2],
-                    "new_day": day, "new_time": slot, "new_room": room,
-                })
-            elif not old:
-                # Newly placed (was unplaced before)
-                changes.append({
-                    "cls": cls,
-                    "old_day": None, "old_time": None, "old_room": None,
-                    "new_day": day, "new_time": slot, "new_room": room,
-                })
-        else:
-            reason = _unplaced_reason(state, cls, room_occ, lect_occ, group_occ)
-            unplaced_list.append((cls, reason))
-
-    return placed_list, unplaced_list, changes
+    placed, unplaced, changes, _summary = optimized_reschedule_all(state)
+    return placed, unplaced, changes
 
 
 def lighten_color(hex_color, factor=0.45):
@@ -1224,9 +1013,18 @@ def optimized_batch_schedule(state, new_classes, weights=None):
     from scheduler_app.candidate_generator import CandidateGenerator
     from scheduler_app.placement_scorer import PlacementScorer
 
+    from scheduler_app.models import PROTECTION_LOCKED
+
     new_ids = {cls_key(c) for c in new_classes}
+    # ST-SCHED-007: a `protection="locked"` class is not flexible. Phase 2
+    # re-solves everything in `existing_flexible` from scratch, so including
+    # locked classes here let adding one new lesson relocate a lesson the user
+    # had explicitly frozen — observed moving monday/09:00 -> tuesday/10:00.
+    # Excluded here, they stay in build_occupancy() and act as fixed points
+    # the reschedule has to work around, which is what "locked" means.
     existing_flexible = [c for c in state["classes"]
                          if c["placed"] and not c["pinned"]
+                         and c.get("protection") != PROTECTION_LOCKED
                          and cls_key(c) not in new_ids]
 
     new_pinned = [c for c in new_classes if c["pinned"]]
@@ -1276,9 +1074,15 @@ def optimized_batch_schedule(state, new_classes, weights=None):
             break
 
     if all_placed and pinned_ok:
-        for cls in existing_flexible:
-            placed_result.append((cls, cls["placed_day"],
-                                  cls["placed_time"], cls["placed_classroom"]))
+        # Every already-placed class keeps its position, locked ones included —
+        # they are absent from `existing_flexible` by design now, and leaving
+        # them out of the result would report them as no longer placed.
+        for cls in state["classes"]:
+            if (cls["placed"] and not cls["pinned"]
+                    and cls_key(cls) not in new_ids):
+                placed_result.append((cls, cls["placed_day"],
+                                      cls["placed_time"],
+                                      cls["placed_classroom"]))
         return placed_result, unplaced_result, False
 
     # ── Phase 2: Full reschedule ──

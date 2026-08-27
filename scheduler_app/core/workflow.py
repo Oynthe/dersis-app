@@ -15,14 +15,19 @@ from typing import Any, Callable, Optional
 from scheduler_app.models import (
     DEFAULT_OPTIMIZER_SEED,
     split_non_joint, needs_physical_room, room_fits_class,
+    get_room_candidates,
     copy_editable_class_fields,
     mark_placed, mark_unplaced,
     cls_key,
 )
+# ST-ARCH-004: `logic.find_conflicts` and `logic.respects_constraints` are
+# deliberately NOT imported here any more. They are the deprecated, weaker pair
+# — neither checks grid membership or lecturer availability — and every
+# decision in this module now goes through ConstraintValidator instead.
 from scheduler_app.logic import (
     find_slot_index,
-    slots_fit, total_duration, find_conflicts,
-    respects_constraints, find_valid_options,
+    slots_fit, total_duration,
+    find_valid_options,
     optimized_auto_place, optimized_batch_schedule,
     optimized_reschedule_all,
     score_placement, score_placement_explained,
@@ -32,6 +37,30 @@ from scheduler_app.logic import (
 
 
 # ── Result dataclasses ───────────────────────────────────────────────────────
+
+
+def drop_report(cls_item, reasons):
+    """One placement the commit step could not accept, as a plain dict.
+
+    ST-SCHED-001. A dropped lesson is data loss from the user's point of view,
+    and "Ders 12 disappeared" is not something they can act on — "Ders 12 was
+    removed because R001 is already taken on Monday at 09:00" is.
+    ``apply_reschedule`` used to return bare class names, so even a UI that
+    stopped throwing the list away could only report the first half.
+
+    ``class_uid`` rides along because class names are not unique in a real
+    dataset, so a name alone cannot be resolved back to a row.
+
+    A plain dict rather than a richer type on purpose: this crosses into
+    ui/app.py and into the results dialog, and a mapping needs no import and
+    no isinstance dance to consume.
+    """
+    return {
+        "name": cls_item.get("name", "?"),
+        "class_uid": cls_item.get("class_uid"),
+        "reasons": list(reasons or []),
+        "reason": "; ".join(reasons or ()),
+    }
 
 @dataclass
 class AutoPlaceResult:
@@ -475,6 +504,34 @@ class SchedulingWorkflow:
             frozen_unplaced = [(by_uid.get(cls_key(c), c), r)
                                for c, r in unplaced]
 
+            # ST-SCHED-014: negotiate against the schedule the solver is
+            # PROPOSING, not the one it started from.
+            #
+            # The snapshot above is taken before apply_reschedule, so without
+            # this every class still sits where it was when the user pressed
+            # Generate. The negotiator then answered "why can't this class be
+            # placed?" against a timetable in which the solve had not happened:
+            # it found the cells the proposal wants to use still free, called
+            # every unplaced class `status='ok'` with eight valid options and no
+            # suggestions, and `build_diagnostic_summary` — which recounts
+            # `not placed and not pinned` off the state it is handed — reported
+            # all 14 classes as unplaced when the solve had left 6. The results
+            # dialog listed 8 successes and then argued with itself.
+            #
+            # Mirrors apply_reschedule: a pinned class is committed by leaving
+            # it alone, since its position lives in the pinned_* fields.
+            frozen_unplaced_ids = {cls_key(c) for c, _ in frozen_unplaced}
+            for cls_item, day, slot, room in placed:
+                twin = by_uid.get(cls_key(cls_item))
+                if twin is None or twin["pinned"]:
+                    continue
+                mark_placed(twin, day, slot,
+                            room if needs_physical_room(twin) else None)
+            for twin_id in frozen_unplaced_ids:
+                twin = by_uid.get(twin_id)
+                if twin is not None and not twin["pinned"]:
+                    mark_unplaced(twin)
+
             def negotiation_factory():
                 return negotiate_after_optimization(
                     frozen_state, [], frozen_unplaced)
@@ -492,64 +549,48 @@ class SchedulingWorkflow:
     def apply_reschedule(self, result: RescheduleResult):
         """Commit reschedule placements, validating against current state.
 
-        Builds a fresh ConstraintValidator and checks each placement
-        before committing, so any state changes between optimization
-        and apply are caught. Returns list of rejected class names.
+        Screens the whole proposal through ``screen_placements`` — the same
+        rule the optimizer checks itself against (ST-ARCH-004) — so state
+        changes between optimization and apply are caught, and so "which
+        schedules are legal" has exactly one answer in this codebase.
+
+        Returns a list of :func:`drop_report` dicts, one per placement that
+        could not be committed as proposed. Each carries ``name``,
+        ``class_uid`` and a non-empty ``reason`` (ST-SCHED-001) — a bare list
+        of names could only tell the user that a lesson vanished, never what
+        to change to get it back.
         """
-        from scheduler_app.core.constraint_validator import ConstraintValidator
-        valid_days = set(self.state.get("days", []))
-        valid_slots = set(self.state.get("slots", []))
+        from scheduler_app.core.constraint_validator import screen_placements
+        from scheduler_app.models import PROTECTION_LOCKED
 
-        # Build validator excluding EVERY class that will be re-placed —
-        # pinned ones included. ST-SCHED-002: pinned classes used to be excluded
-        # from this exclusion set and then skipped by the commit loop entirely,
-        # so two classes pinned to the same room/day/hour were both committed
-        # and reported to nobody, while the quality panel called the timetable
-        # clean.
-        placed_keys = {cls_key(c) for c, _, _, _ in result.placed}
-        validator = ConstraintValidator(
-            self.state, exclude_ids=placed_keys)
+        immovable_ids = {
+            cls_key(c) for c in self.state.get("classes", [])
+            if not c.get("pinned")
+            and c.get("protection") == PROTECTION_LOCKED and c.get("placed")
+        }
+        accepted, conflicts = screen_placements(
+            self.state, result.placed, immovable_ids=immovable_ids)
+        accepted_keys = {cls_key(c) for c, _, _, _ in accepted}
 
-        rejected = []
+        rejected = [
+            drop_report(cls_item, reasons)
+            for cls_item, _d, _s, _r, reasons in conflicts
+        ]
 
-        # Pins first: they are fixed points the flexible classes must work
-        # around, so they have to be in the occupancy map before anything else
-        # is checked against it.
-        for cls_item, _day, _slot, _room in result.placed:
-            if not cls_item["pinned"]:
-                continue
-            day = cls_item.get("pinned_day")
-            slot = cls_item.get("pinned_time")
-            room = (cls_item.get("pinned_classroom")
-                    if needs_physical_room(cls_item) else None)
-            ok = (day in valid_days and slot in valid_slots
-                  and validator.check_placement(cls_item, day, slot, room))
-            if not ok:
-                # The pin is the user's explicit instruction, so it is NOT
-                # silently cleared — that would destroy the intent they typed
-                # in. It is reported instead, so the UI can show the clash and
-                # let them decide which pin to move.
-                rejected.append(cls_item.get("name", "?"))
-            # Register it either way: an infeasible pin still occupies the cell
-            # once committed, and flexible classes must not be steered into it.
-            if day in valid_days and slot in valid_slots:
-                validator.add_placement(cls_item, day, slot, room)
-
-        for cls_item, day, slot, room in result.placed:
+        for cls_item, day, slot, room in accepted:
             if cls_item["pinned"]:
+                # A pin is committed by leaving it alone: its position lives in
+                # pinned_day/pinned_time, and mark_placed would duplicate it
+                # into the placed_* fields.
                 continue
-            if day not in valid_days or slot not in valid_slots:
+            mark_placed(cls_item, day, slot, room)
+
+        # Anything proposed but not accepted loses its placement. A pinned or
+        # locked class is always accepted (reported, never dropped), so this
+        # never unplaces one.
+        for cls_item, _day, _slot, _room in result.placed:
+            if cls_key(cls_item) not in accepted_keys:
                 mark_unplaced(cls_item)
-                rejected.append(cls_item.get("name", "?"))
-                continue
-            effective_room = room if needs_physical_room(cls_item) else None
-            if not validator.check_placement(cls_item, day, slot,
-                                             effective_room):
-                mark_unplaced(cls_item)
-                rejected.append(cls_item.get("name", "?"))
-                continue
-            validator.add_placement(cls_item, day, slot, effective_room)
-            mark_placed(cls_item, day, slot, effective_room)
 
         for cls_item, _ in result.unplaced:
             if not cls_item["pinned"]:
@@ -569,6 +610,55 @@ class SchedulingWorkflow:
             self._feedback.log_reschedule_rejected(changes or [])
 
     # ── Drop validation ──────────────────────────────────────────────────
+    #
+    # ST-ARCH-004. Hard-constraint validation used to exist in four divergent
+    # implementations, and this — the drag-and-drop path, the one a user
+    # exercises by hand all day — went through the weakest of them:
+    # `logic.respects_constraints`, whose own docstring marks it deprecated
+    # because it checks neither grid membership nor lecturer availability.
+    # Every decision below now comes from ConstraintValidator, so the rule the
+    # optimizer enforces and the rule a drag enforces cannot drift apart.
+    #
+    # The three-phase split (basic constraints -> pick a room -> room
+    # constraints) is kept because ui/app.py reports each phase differently and
+    # restructuring that dialog flow is Phase 6 work. What changed is that all
+    # three phases now ask the same object.
+
+    @staticmethod
+    def _drop_validator(state, cls):
+        """The authoritative validator for a drag of *cls*.
+
+        `cls` is excluded from occupancy so that a placed class being moved
+        never collides with the position it is being moved out of.
+        """
+        from scheduler_app.core.constraint_validator import ConstraintValidator
+        return ConstraintValidator(state, exclude_ids={cls_key(cls)})
+
+    @staticmethod
+    def _availability_reasons(state, cls, day, slot):
+        """Structured reasons for every hour of the block the lecturer is
+        barred from. Empty when the lecturer is free for the whole block.
+
+        The block, not just the start hour: a duration-2 class dropped at
+        09:00 also occupies 10:00, and a lecturer blocked at 10:00 cannot
+        teach it (ST-SCHED-005/009 are the same gap in other code paths).
+        """
+        from scheduler_app.models import lecturer_available_at
+        lecturer = cls.get("lecturer", "")
+        if not lecturer:
+            return []
+        si = find_slot_index(state, slot)
+        if si is None:
+            return []
+        slots = state["slots"]
+        out = []
+        for off in range(total_duration(cls)):
+            idx = si + off
+            if idx >= len(slots):
+                break
+            if not lecturer_available_at(state, lecturer, day, slots[idx]):
+                out.append(("lecturer_unavailable", lecturer, day, slots[idx]))
+        return out
 
     @staticmethod
     def validate_drop(state, cls, day, slot, drag_backup=None) -> DropValidation:
@@ -611,13 +701,21 @@ class SchedulingWorkflow:
         if cls.get("excluded_times") and slot in cls["excluded_times"]:
             reasons.append(("time_excluded", slot, cls["excluded_times"]))
 
+        # ST-ARCH-004: the drag path never checked this. A lesson could be
+        # dragged onto an hour its own lecturer had marked unavailable, and the
+        # only thing that noticed was the room-conflict pass two phases later —
+        # which reported it as a room problem.
+        reasons.extend(
+            SchedulingWorkflow._availability_reasons(state, cls, day, slot))
+
         if reasons:
             return DropValidation(valid=False, reasons=reasons)
 
         return DropValidation(valid=True)
 
     @staticmethod
-    def find_drop_classroom(state, cls, day, slot, preferred_rooms=None):
+    def find_drop_classroom(state, cls, day, slot, preferred_rooms=None,
+                            validator=None):
         """Find the best classroom for a drop at (day, slot).
 
         Parameters
@@ -627,43 +725,80 @@ class SchedulingWorkflow:
 
         Returns (room, conflicts) — room is None if no compatible room exists.
         """
-        rooms = list(state["classrooms"])
-        if cls["required_classrooms"]:
-            rooms = [r for r in rooms if r in cls["required_classrooms"]]
-        if cls["excluded_classrooms"]:
-            rooms = [r for r in rooms if r not in cls["excluded_classrooms"]]
-        rooms = [r for r in rooms if room_fits_class(state, r, cls)]
+        # ST-ARCH-004: `models.get_room_candidates` is the authority on which
+        # rooms a lesson may occupy, and it answers `[None]` for online and
+        # lecturer-office lessons, which need no room at all. This used to
+        # filter `state["classrooms"]` by required/excluded/capacity without
+        # ever asking `needs_physical_room`, with two consequences for a lesson
+        # that needs no room: its (meaningless) room constraints could empty
+        # the list and the drop was refused outright, and otherwise the drag
+        # committed a *physical classroom* onto an online lesson — while
+        # apply_reschedule stores None for the very same lesson. The same
+        # lesson then showed a room or no room depending on whether the user
+        # dragged it or the optimizer placed it, and exports and room-load
+        # analytics disagreed with the timetable.
+        rooms = list(get_room_candidates(state, cls))
 
-        # Apply preference ordering
+        # Apply preference ordering. Meaningless for the [None] sentinel, and
+        # `pref in rooms` simply never matches there.
         if preferred_rooms:
             for pref in reversed(preferred_rooms):
                 if pref in rooms:
                     rooms = [pref] + [r for r in rooms if r != pref]
 
+        # ST-ARCH-004: `check_placement` / `find_conflicts` off ONE validator,
+        # rather than logic.find_conflicts -- which deliberately ignores the
+        # class's own allowed/excluded days and times ("For full validation,
+        # use ConstraintValidator.find_conflicts", says its own docstring) and
+        # so could hand back a room for a cell the class was never allowed on.
+        # Built once for the whole room scan rather than rebuilding occupancy
+        # for every candidate room, which is what the old code did. Callers that
+        # already hold a validator for this class pass it in: `check_drop_valid`
+        # runs on every dragMoveEvent, i.e. on every mouse move during a drag,
+        # so building occupancy twice per call is worth avoiding (measured
+        # 0.66 ms/call at 250 classes with one build).
+        if validator is None:
+            validator = SchedulingWorkflow._drop_validator(state, cls)
+
         for room in rooms:
-            conflicts = find_conflicts(state, cls, day, slot, room)
-            if not conflicts:
+            if validator.check_placement(cls, day, slot, room):
                 return room, []
 
         if rooms:
-            return rooms[0], find_conflicts(state, cls, day, slot, rooms[0])
+            return rooms[0], validator.find_conflicts(cls, day, slot, rooms[0])
         return None, ["no_compatible_classrooms"]
 
     @staticmethod
     def validate_drop_constraints(state, cls, day, slot, room) -> DropValidation:
-        """Check classroom-level constraints after room selection."""
-        if not respects_constraints(cls, day, slot, room, state=state):
+        """Check classroom-level constraints after room selection.
+
+        ST-ARCH-004: the verdict comes from ConstraintValidator, which -- unlike
+        the deprecated ``logic.respects_constraints`` this used to call -- also
+        enforces grid membership and lecturer availability across the block.
+        """
+        validator = SchedulingWorkflow._drop_validator(state, cls)
+        if not validator.respects_constraints(cls, day, slot, room):
             reasons = []
-            if cls["required_classrooms"] and room not in cls["required_classrooms"]:
-                reasons.append(("classroom_not_required", room,
-                                cls["required_classrooms"]))
-            if cls["excluded_classrooms"] and room in cls["excluded_classrooms"]:
-                reasons.append(("classroom_excluded", room))
-            if not room_fits_class(state, room, cls):
-                from scheduler_app.models import get_room_capacity
-                cap = get_room_capacity(state, room)
-                reasons.append(("classroom_capacity", room, cap,
-                                cls.get("participants", 0)))
+            if needs_physical_room(cls):
+                if cls["required_classrooms"] and room not in cls["required_classrooms"]:
+                    reasons.append(("classroom_not_required", room,
+                                    cls["required_classrooms"]))
+                if cls["excluded_classrooms"] and room in cls["excluded_classrooms"]:
+                    reasons.append(("classroom_excluded", room))
+                if not room_fits_class(state, room, cls):
+                    from scheduler_app.models import get_room_capacity
+                    cap = get_room_capacity(state, room)
+                    reasons.append(("classroom_capacity", room, cap,
+                                    cls.get("participants", 0)))
+            reasons.extend(
+                SchedulingWorkflow._availability_reasons(state, cls, day, slot))
+            if not reasons:
+                # The validator said no and none of the room rules explain it --
+                # the class's own day/time rules, or the grid, did. Never return
+                # valid=False with an empty reason list: ui/app.py renders
+                # exactly these strings, so an empty list is a rejection dialog
+                # with nothing in it (the ST-SCHED-009 failure mode).
+                reasons.append(("placement_invalid",))
             return DropValidation(valid=False, reasons=reasons, room=room)
         return DropValidation(valid=True, room=room)
 
@@ -709,16 +844,21 @@ class SchedulingWorkflow:
         else:
             mark_unplaced(cls)
 
-        # Check if placement is still valid after edit
+        # Check if placement is still valid after edit.
+        # ST-ARCH-004: judged by ConstraintValidator, not logic.find_conflicts,
+        # which does not look at the class's own constraints at all. Editing a
+        # class to forbid the very day it sits on, or to hand it to a lecturer
+        # who is unavailable then, used to leave the placement standing.
         placement_cleared = False
         if cls["placed"]:
             td = total_duration(cls)
             day = cls["placed_day"]
             slot = cls["placed_time"]
             room = cls["placed_classroom"] if needs_physical_room(cls) else None
+            validator = SchedulingWorkflow._drop_validator(state, cls)
             if (not day or not slot
                     or not slots_fit(state, slot, td)
-                    or find_conflicts(state, cls, day, slot, room)):
+                    or not validator.check_placement(cls, day, slot, room)):
                 mark_unplaced(cls)
                 placement_cleared = True
 
@@ -727,7 +867,20 @@ class SchedulingWorkflow:
     @staticmethod
     def validate_placements_after_edit(state) -> list:
         """Check all placed classes — return list of names whose placement
-        became invalid (and unplace them)."""
+        became invalid (and unplace them).
+
+        ST-ARCH-004: one ConstraintValidator for the whole sweep instead of a
+        fresh ``logic.find_conflicts`` scan per class. That is both the
+        authoritative rule set (the old one ignored the class's own
+        allowed/excluded days, times and rooms, and room capacity) and O(n)
+        occupancy construction instead of O(n) rescans of every placed class.
+
+        ``check_placement_explained`` lifts each class's own placement out of
+        the occupancy maps before judging it and puts it back afterwards, so a
+        class never reports a conflict with itself.
+        """
+        from scheduler_app.core.constraint_validator import ConstraintValidator
+        validator = ConstraintValidator(state)
         invalidated = []
         for cls in state["classes"]:
             if not cls.get("placed") or cls.get("pinned"):
@@ -737,11 +890,17 @@ class SchedulingWorkflow:
             room = (cls.get("placed_classroom")
                     if needs_physical_room(cls) else None)
             td = total_duration(cls)
-            if (not day or not slot
-                    or not slots_fit(state, slot, td)
-                    or find_conflicts(state, cls, day, slot, room)):
+            ok = bool(day) and bool(slot) and slots_fit(state, slot, td)
+            if ok:
+                ok, _reasons = validator.check_placement_explained(
+                    cls, day, slot, room)
+            if not ok:
                 invalidated.append(cls["name"])
                 mark_unplaced(cls)
+                # The class is no longer placed, so its claim on those cells
+                # must go too — otherwise every class judged after it sees a
+                # cell that nothing occupies as occupied.
+                validator.remove_placement(cls, day, slot, room)
         return invalidated
 
     @staticmethod
@@ -849,22 +1008,15 @@ class SchedulingWorkflow:
             if original_day and day != original_day:
                 return False
 
-        td = total_duration(cls)
-        if not slots_fit(state, slot, td):
-            return False
-        if cls["allowed_days"] and day not in cls["allowed_days"]:
-            return False
-        if cls.get("excluded_days") and day in cls["excluded_days"]:
-            return False
-        if cls["allowed_times"] and slot not in cls["allowed_times"]:
-            return False
-        if cls.get("excluded_times") and slot in cls["excluded_times"]:
-            return False
-
+        # ST-ARCH-004: this used to re-implement the rules a third time -- the
+        # same list as validate_drop, then the deprecated respects_constraints.
+        # It drives the drag highlight, so any disagreement with the rules
+        # _execute_drop actually applies shows the user a cell as droppable and
+        # then refuses the drop.
+        validator = SchedulingWorkflow._drop_validator(state, cls)
         room, conflicts = SchedulingWorkflow.find_drop_classroom(
-            state, cls, day, slot, preferred_rooms=preferred_rooms)
+            state, cls, day, slot, preferred_rooms=preferred_rooms,
+            validator=validator)
         if room is None or conflicts:
             return False
-        if not respects_constraints(cls, day, slot, room, state=state):
-            return False
-        return True
+        return validator.check_placement(cls, day, slot, room)

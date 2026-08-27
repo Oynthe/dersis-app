@@ -28,6 +28,8 @@ except ImportError:
 from scheduler_app.logic import slot_index, total_duration, _active_targets
 from scheduler_app.models import (
     DEFAULT_OPTIMIZER_SEED,
+    PROTECTION_LOCKED, PROTECTION_SOFT, PROTECTION_SAME_DAY,
+    PROTECTION_IMPROVE_ONLY,
     cls_key,
     room_fits_class, needs_physical_room,
     get_physical_room_candidates,
@@ -117,19 +119,54 @@ class CPSATScheduler:
         if self.progress_callback:
             self.progress_callback(tr("status.cpsat_building_model"))
 
-        # Categorize classes
+        # Categorize classes.
+        #
+        # ST-SCHED-006: this used to respect only LOCKED. `soft`, `same_day`
+        # and `improve_only` all fell through into `flexible`, so CP-SAT moved
+        # them freely — and because the optimizer computes `changes[]` from the
+        # heuristic's own bookkeeping, those moves did not even appear there,
+        # making them invisible to the impact panel and to undo.
+        #
+        # Protection is read off the class here rather than passed in, the same
+        # way LOCKED already was: CPSATScheduler runs in a subprocess over a
+        # state snapshot, and `_make_cpsat_state_snapshot` carries `protection`.
         pinned = [c for c in self.state["classes"] if c["pinned"]]
         locked = [c for c in self.state["classes"]
                   if not c["pinned"]
-                  and c.get("protection") == "locked" and c["placed"]]
+                  and c.get("protection") == PROTECTION_LOCKED and c["placed"]]
         locked_ids = {cls_key(c) for c in locked}
+
+        # Treated as immovable, i.e. re-asserted at their current placement:
+        #   - anything the caller named in protected_ids
+        #   - `soft`, which the heuristic path also freezes (schedule_optimizer
+        #     folds PROTECTION_SOFT into effective_protected_ids)
+        #   - `improve_only`. CP-SAT scores in a different currency from
+        #     PlacementScorer, so "only move somewhere that scores at least as
+        #     well" cannot be stated in this model. Not moving it always
+        #     satisfies the promise, so this is deliberately conservative:
+        #     CP-SAT declines to improve such a class rather than risk making
+        #     it worse. The heuristic phase still optimizes it properly.
+        frozen_protections = (PROTECTION_SOFT, PROTECTION_IMPROVE_ONLY)
         protected = [c for c in self.state["classes"]
                      if not c["pinned"] and cls_key(c) not in locked_ids
-                     and cls_key(c) in self.protected_ids
-                     and c["placed"]]
+                     and c["placed"]
+                     and (cls_key(c) in self.protected_ids
+                          or c.get("protection") in frozen_protections)]
+        protected_ids = {cls_key(c) for c in protected}
+
+        # `same_day` classes stay flexible — they may move, but only within the
+        # day they are on. Enforced by restricting their day domain below.
+        same_day_of = {
+            cls_key(c): c["placed_day"]
+            for c in self.state["classes"]
+            if not c["pinned"] and cls_key(c) not in locked_ids
+            and cls_key(c) not in protected_ids
+            and c.get("protection") == PROTECTION_SAME_DAY and c["placed"]
+        }
+
         flexible = [c for c in self.state["classes"]
                     if not c["pinned"] and cls_key(c) not in locked_ids
-                    and cls_key(c) not in self.protected_ids]
+                    and cls_key(c) not in protected_ids]
 
         if not flexible:
             # Nothing to optimize
@@ -157,6 +194,11 @@ class CPSATScheduler:
         slot_vars = {}
         room_vars = {}
         placed_vars = {}
+        # Domains kept alongside the variables so the heuristic hint below can
+        # check a value is admissible before hinting it.
+        day_domains = {}
+        slot_domains = {}
+        room_domains = {}
         # Assignment booleans: x[c, d, s, r] = 1 if class c at (d, s, r)
         # We use interval-based modeling instead for efficiency
 
@@ -173,6 +215,15 @@ class CPSATScheduler:
             valid_start_slots = self._valid_start_slots(cls)
             valid_rooms = self._valid_rooms(cls)
             is_physical = needs_physical_room(cls)
+
+            # ST-SCHED-006: `same_day` may move within its day only. Narrowing
+            # the day domain is the whole encoding. If the day it sits on is no
+            # longer a legal day for it, the intersection is empty and the class
+            # is left unplaced below — which is what the heuristic's
+            # RepairStrategy does with the same situation.
+            fixed_day = same_day_of.get(cid)
+            if fixed_day is not None:
+                valid_days = [d for d in valid_days if d == fixed_day]
 
             if not valid_days or not valid_start_slots or (is_physical and not valid_rooms):
                 # Cannot be placed at all
@@ -197,6 +248,9 @@ class CPSATScheduler:
                 cp_model.Domain.FromValues(slot_domain), f"s{fi}")
             room_vars[cid] = model.NewIntVarFromDomain(
                 cp_model.Domain.FromValues(room_domain), f"r{fi}")
+            day_domains[cid] = set(day_domain)
+            slot_domains[cid] = set(slot_domain)
+            room_domains[cid] = set(room_domain)
 
         # ══════════════════════════════════════════════════════════════
         #  HARD CONSTRAINTS
@@ -496,10 +550,24 @@ class CPSATScheduler:
                         else:
                             model.AddHint(placed_vars[cid], 0)
                             continue
-                        model.AddHint(placed_vars[cid], 1)
-                        model.AddHint(day_vars[cid], self._day_idx[d])
-                        model.AddHint(slot_vars[cid], self._slot_idx[s])
-                        model.AddHint(room_vars[cid], r_hint)
+                        # A hint outside a variable's domain makes the whole
+                        # model fail Validate(), and a MODEL_INVALID return
+                        # silently disables CP-SAT rather than reporting
+                        # anything. That is now reachable: `same_day` narrows
+                        # the day domain to one value (ST-SCHED-006) and the
+                        # heuristic may have proposed a different day. Hint only
+                        # what the domains can actually take.
+                        d_hint = self._day_idx[d]
+                        s_hint = self._slot_idx[s]
+                        if (d_hint in day_domains[cid]
+                                and s_hint in slot_domains[cid]
+                                and r_hint in room_domains[cid]):
+                            model.AddHint(placed_vars[cid], 1)
+                            model.AddHint(day_vars[cid], d_hint)
+                            model.AddHint(slot_vars[cid], s_hint)
+                            model.AddHint(room_vars[cid], r_hint)
+                        else:
+                            model.AddHint(placed_vars[cid], 0)
                     else:
                         model.AddHint(placed_vars[cid], 0)
                 else:
@@ -621,13 +689,41 @@ class CPSATScheduler:
         return [d for d in days if d in self._day_idx]
 
     def _valid_start_slots(self, cls):
+        """Start slots where the block fits AND the lecturer is available
+        for its WHOLE duration.
+
+        ST-SCHED-005. This used to intersect the class's allowed times with the
+        lecturer's available hours and then keep any start that fit the grid —
+        which constrains only the *first* hour. A duration-3 class whose
+        lecturer was free at 09:00 but not at 10:00 or 11:00 was therefore
+        placed at 09:00, spanning two hours the lecturer had blocked out.
+        ``ConstraintValidator.check_placement`` (which checks every slot of the
+        block) then rejected it at commit time and the class silently ended up
+        unplaced.
+
+        Lecturer availability is a day-set x hour-set product, so the set of
+        permitted hours does not vary by day and this start-slot filter is
+        exact; ``_valid_days`` handles the day dimension.
+
+        Note the two rules are deliberately NOT the same: a class's own
+        ``allowed_times``/``excluded_times`` constrain where the block may
+        *start* (matching ``ConstraintValidator.respects_constraints``), while
+        lecturer availability constrains every hour the block *covers*.
+        """
         times = filter_class_times(cls, self._slots)
-        _, times = apply_lecturer_availability_filters(
-            self.state, cls.get("lecturer", ""), self._days, times)
         td = total_duration(cls)
-        return [t for t in times
-                if t in self._slot_idx
-                and self._slot_idx[t] + td <= self._n_slots]
+        _, available_hours = apply_lecturer_availability_filters(
+            self.state, cls.get("lecturer", ""), self._days, self._slots)
+        available = set(available_hours)
+        starts = []
+        for t in times:
+            si = self._slot_idx.get(t)
+            if si is None or si + td > self._n_slots:
+                continue
+            if any(self._slots[si + k] not in available for k in range(td)):
+                continue
+            starts.append(t)
+        return starts
 
     def _valid_rooms(self, cls):
         if not needs_physical_room(cls):

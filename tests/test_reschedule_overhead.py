@@ -495,12 +495,13 @@ def test_negotiation_result_still_says_what_it_used_to(partial_schedule,
     user gets for why a lesson could not be timetabled.
     """
     state, placed, unplaced = partial_schedule
-    reference = negotiate_after_optimization(state, placed, unplaced)
-    assert reference is not None and reference["class_reports"], (
+    presolve = negotiate_after_optimization(state, placed, unplaced)
+    assert presolve is not None and presolve["class_reports"], (
         "the reference pass produced nothing — fixture is not exercising it")
 
     _stub_solver(monkeypatch, placed, unplaced)
-    result = _workflow(state).reschedule({}, seed=SEED)
+    workflow = _workflow(state)
+    result = workflow.reschedule({}, seed=SEED)
     negotiation = result.negotiation_result
 
     assert negotiation is not None, (
@@ -518,10 +519,28 @@ def test_negotiation_result_still_says_what_it_used_to(partial_schedule,
                                 "unplaced_count"}, (
         f"negotiation_result lost keys its consumers read: {sorted(negotiation)}")
     assert negotiation["unplaced_count"] == len(unplaced)
-    assert _report_signature(negotiation) == _report_signature(reference), (
-        "the deferred negotiation result disagrees with the eager one")
-    assert negotiation == reference, (
-        "the deferred negotiation result is not what the eager pass produced")
+
+    # The eager reference is computed on the schedule the proposal DESCRIBES,
+    # which is what the state holds once the proposal is committed.
+    #
+    # Phase 3 changed which state that is (ST-SCHED-014). This assertion used
+    # to compare against a pass over the PRE-solve state, and passed because
+    # the deferred pass analysed the pre-solve state too — which was the
+    # defect: the negotiation tab answered "why can't this class be placed?"
+    # against a timetable in which the solve had not happened, called every
+    # unplaced class "ok" with slots to spare, and reported all 20 classes as
+    # unplaced when the solve left 10. The deferral property this test exists
+    # for is untouched; only the baseline moved.
+    workflow.apply_reschedule(result)
+    eager = negotiate_after_optimization(state, placed, unplaced)
+
+    assert _report_signature(negotiation) == _report_signature(eager), (
+        "the deferred negotiation result disagrees with an eager pass over "
+        "the same schedule")
+    assert _report_signature(eager) != _report_signature(presolve), (
+        "committing the proposal did not change what the negotiation pass "
+        "says, so this comparison cannot tell the two states apart — pick a "
+        "fixture where the occupancy actually matters")
 
 
 def test_negotiation_result_survives_apply_unchanged(partial_schedule,
@@ -535,28 +554,48 @@ def test_negotiation_result_survives_apply_unchanged(partial_schedule,
     six free slots, then told it has none.
     """
     state, placed, unplaced = partial_schedule
-    reference = negotiate_after_optimization(state, placed, unplaced)
 
     _stub_solver(monkeypatch, placed, unplaced)
     workflow = _workflow(state)
     result = workflow.reschedule({}, seed=SEED)
 
+    before = result.negotiation_result
+    assert before is not None and before["class_reports"], (
+        "no negotiation report to compare — fixture is not exercising it")
+
     rejected = workflow.apply_reschedule(result)
     assert not rejected, f"the fixture proposal was rejected on apply: {rejected}"
 
-    # Non-vacuity: the committed timetable really does change the answer, so a
-    # value computed at read time instead of at reschedule time would differ.
-    recomputed = negotiate_after_optimization(state, placed, unplaced)
-    assert _report_signature(recomputed) != _report_signature(reference), (
-        "committing the proposal did not change what the negotiation pass "
-        "says, so this test cannot detect a value computed too late — pick a "
-        "fixture where the occupancy actually matters")
+    # Now move the live timetable out from under the report. If the value were
+    # computed at read time against `self.state` rather than pinned to the
+    # snapshot taken during reschedule(), this is what would make the dialog
+    # and the warning log disagree.
+    #
+    # (Before Phase 3 the non-vacuity step here was apply_reschedule itself,
+    # because the snapshot described the PRE-solve state and committing moved
+    # the live state away from it. That gap was the ST-SCHED-014 defect and is
+    # gone: the snapshot now describes the proposal, which is what apply
+    # commits. Perturbing the state explicitly restores the test's bite and
+    # tests the pinning property directly rather than as a side effect.)
+    from scheduler_app.core.models import mark_unplaced
+    for cls in state["classes"]:
+        if cls.get("placed") and not cls.get("pinned"):
+            mark_unplaced(cls)
+            break
+    else:
+        pytest.fail("nothing was committed, so the perturbation is a no-op")
 
-    assert result.negotiation_result == reference, (
-        "negotiation_result read after apply_reschedule() describes the "
-        "committed timetable instead of the one the reschedule reported on. "
-        "The value must be pinned to the state as of reschedule(), so the "
-        "dialog and the warning log agree.")
+    perturbed = negotiate_after_optimization(state, placed, unplaced)
+    assert _report_signature(perturbed) != _report_signature(before), (
+        "perturbing the live timetable did not change what a fresh "
+        "negotiation pass says, so this test cannot detect a value computed "
+        "too late — pick a fixture where the occupancy actually matters")
+
+    assert result.negotiation_result == before, (
+        "negotiation_result changed when the live state changed, so it is "
+        "being computed at read time rather than pinned to the state as of "
+        "reschedule(). ui/app.py reads it on both sides of "
+        "apply_reschedule(); the dialog and the warning log must agree.")
 
 
 def test_negotiation_pass_leaves_constraints_untouched(partial_schedule):

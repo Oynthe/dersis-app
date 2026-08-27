@@ -370,21 +370,20 @@ def test_raw_optimizer_output_is_clean_tiny(tiny_audit):
 
 @pytest.mark.engine
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason=(
-    "ST-SCHED-001 — the optimizer's internal occupancy bookkeeping lets two "
-    "distinct flexible classes take the same room/lecturer/group cell, so the "
-    "proposed schedule is invalid before apply_reschedule prunes it; "
-    "fixed in Phase 3"))
 def test_raw_optimizer_output_is_clean_small(small_trials):
-    """Pins ST-SCHED-001 (Critical).
+    """Regression guard for ST-SCHED-001 (Critical) — FIXED in Phase 3.
 
     The optimizer must never *propose* a schedule that breaks a hard
-    constraint. Today it does, and the only reason the user does not see the
-    double-booking is that ``apply_reschedule`` throws one of the colliding
-    classes away (see ST-SCHED-001's cover-up, pinned separately below).
+    constraint. It used to: ``_greedy_construct`` returned a snapshot of the
+    best solution it had found while its occupancy maps had been unwound back
+    to empty, so the LNS phase repaired against a grid it believed was free and
+    stacked classes on top of each other. ``apply_reschedule`` then hid the
+    damage by dropping the losers.
 
-    Every trial must be clean: the optimizer is non-deterministic
-    (ST-SCHED-013), so a single clean run is luck, not correctness.
+    A failure here means that desync is back: the user gets a timetable whose
+    lessons collide, or silently loses the ones the commit step throws away.
+
+    Every trial must be clean.
     """
     dirty = [(i, t["raw"]) for i, t in enumerate(small_trials)
              if hard_violation_count(t["raw"]) > 0]
@@ -397,26 +396,15 @@ def test_raw_optimizer_output_is_clean_small(small_trials):
 
 @pytest.mark.engine
 @pytest.mark.slow
-@pytest.mark.xfail(strict=False, reason=(
-    "ST-SCHED-001 — same defect as the `small` pin, at 80-class scale where it "
-    "is far denser (62-130 violation cells over ~76 placements); "
-    "NOT strict, see docstring; fixed in Phase 3"))
 def test_raw_optimizer_output_is_clean_normal(normal_audit):
-    """Pins ST-SCHED-001 (Critical) at department scale.
+    """Regression guard for ST-SCHED-001 (Critical) at department scale — FIXED.
 
-    ``strict=False`` on purpose, and this is the one deviation from the suite's
-    "strict pins so the fix turns the build red" convention. A single `normal`
-    trial is NOT a reliable failure: over 13 measured runs it came out entirely
-    clean once (raw 0 violations, 0 rejections, 77/80 placed) — roughly 8 %.
-    A strict marker would therefore XPASS and break the build about one run in
-    thirteen, for no reason connected to the code. Load starvation was ruled out
-    as the cause (6/6 `small` runs stayed dirty under full CPU saturation), so
-    this is plain ST-SCHED-013 RNG luck and cannot be engineered away here; a
-    second 120 s trial would be the alternative and is not worth the wall clock.
+    This is where the defect was densest: before the Phase 3 fix a single
+    80-class run proposed ~76 placements carrying 102 hard-violation cells
+    (36 room + 18 lecturer + 48 group). It now reports zero.
 
-    The red-when-fixed signal for ST-SCHED-001 lives on the two `small` pins,
-    which aggregate ``RAW_TRIALS`` trials and ARE strict. When those flip, delete
-    this decorator too.
+    A failure means the greedy/LNS occupancy desync is back at the scale a real
+    department actually runs at.
     """
     audit = normal_audit["raw"]
     assert hard_violation_count(audit) == 0, (
@@ -442,19 +430,16 @@ def test_apply_reschedule_drops_nothing_tiny(tiny_audit):
 
 @pytest.mark.engine
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason=(
-    "ST-SCHED-001 — apply_reschedule silently drops the classes that lost an "
-    "optimizer-produced collision, and the UI discards its rejected list; "
-    "fixed in Phase 3"))
 def test_apply_reschedule_drops_nothing_small(small_trials):
-    """Pins ST-SCHED-001 (Critical) — the silent data-loss half.
+    """Regression guard for ST-SCHED-001 (Critical) — FIXED in Phase 3.
 
-    Every class the optimizer placed must survive the commit. Today the commit
-    step re-validates, finds the collisions the optimizer created, and drops
-    the losers without telling anyone: the user asked for a timetable and
-    quietly got fewer lessons than the solver actually placed.
+    Every class the optimizer placed must survive the commit. The commit step
+    used to re-validate, find the collisions the optimizer had created, and
+    drop the losers without telling anyone: the user asked for a timetable and
+    quietly got fewer lessons than the solver had actually placed.
 
-    Checked over every trial because of ST-SCHED-013's non-determinism.
+    A failure means the optimizer is proposing placements the commit step
+    refuses — silent data loss from the user's point of view.
     """
     dropped = [(i, t["rejected"]) for i, t in enumerate(small_trials)
                if t["rejected"] != 0]
@@ -465,18 +450,13 @@ def test_apply_reschedule_drops_nothing_small(small_trials):
 
 @pytest.mark.engine
 @pytest.mark.slow
-@pytest.mark.xfail(strict=False, reason=(
-    "ST-SCHED-001 — apply_reschedule silently drops 11-21 of ~76 placements at "
-    "80-class scale; NOT strict, see docstring; fixed in Phase 3"))
 def test_apply_reschedule_drops_nothing_normal(normal_audit):
-    """Pins ST-SCHED-001 (Critical) — silent data loss at department scale.
+    """Regression guard for ST-SCHED-001 — silent data loss at department scale.
 
-    A whole department's worth of lessons the solver had already placed
-    disappear at commit time, with no message anywhere in the UI.
-
-    ``strict=False`` for the same reason as the raw-proposal pin above: the same
-    ~8 % of `normal` runs that come out collision-free also drop nothing, so a
-    strict marker XPASSes at random. The strict pins are on `small`.
+    A whole department's worth of lessons the solver had already placed used to
+    disappear at commit time, with no message anywhere in the UI: 11-21 of ~76
+    placements per run. Fixed in Phase 3; the commit now rejects nothing because
+    the optimizer no longer proposes anything invalid.
     """
     assert normal_audit["rejected"] == 0, (
         f"apply_reschedule silently dropped {normal_audit['rejected']} of "

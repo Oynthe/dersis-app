@@ -27,10 +27,14 @@ def create_occupancy_snapshot(validator):
     Returns a dict of deep-copied occupancy data that can be sent to
     worker processes.
     """
+    # ST-SCHED-010: cells are ref-counted `{entity: count}` maps, and the
+    # worker calls add_placement/remove_placement on the validator it rebuilds
+    # from this snapshot. Flattening to a set here would hand the worker cells
+    # it cannot decrement correctly, so copy the counts.
     return {
-        "room_occ": {k: set(v) for k, v in validator.room_occ.items()},
-        "lect_occ": {k: set(v) for k, v in validator.lect_occ.items()},
-        "group_occ": {k: set(v) for k, v in validator.group_occ.items()},
+        "room_occ": {k: dict(v) for k, v in validator.room_occ.items()},
+        "lect_occ": {k: dict(v) for k, v in validator.lect_occ.items()},
+        "group_occ": {k: dict(v) for k, v in validator.group_occ.items()},
     }
 
 
