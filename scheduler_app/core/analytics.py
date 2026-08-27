@@ -10,6 +10,7 @@ Computes metrics from the current timetable state:
 """
 
 from scheduler_app.logic import (
+    find_slot_index,
     get_placed_classes, occupied_slots_of, classroom_of, slot_index,
     total_duration,
 )
@@ -26,7 +27,9 @@ def _build_day_slot_map(state, placed, key_fn):
         day = effective_day(cls)
         start = effective_time(cls)
         td = total_duration(cls)
-        si = slot_index(state, start)
+        si = find_slot_index(state, start)
+        if si is None or day not in state["days"]:
+            continue  # placement orphaned by a removed slot/day (ST-DATA-003)
         indices = list(range(si, si + td))
         result.setdefault(k, {}).setdefault(day, []).extend(indices)
     # Sort each day's indices
@@ -81,7 +84,9 @@ def student_idle_distribution(state):
         day = effective_day(cls)
         start = effective_time(cls)
         td = total_duration(cls)
-        si = slot_index(state, start)
+        si = find_slot_index(state, start)
+        if si is None or day not in state["days"]:
+            continue  # placement orphaned by a removed slot/day (ST-DATA-003)
         indices = list(range(si, si + td))
         for t in cls.get("targets", []):
             gk = _group_key(t)
@@ -116,7 +121,9 @@ def room_utilization(state):
         day = effective_day(cls)
         start = effective_time(cls)
         td = total_duration(cls)
-        si = slot_index(state, start)
+        si = find_slot_index(state, start)
+        if si is None or day not in state["days"]:
+            continue  # placement orphaned by a removed slot/day (ST-DATA-003)
         for i in range(td):
             room_slots.setdefault(room, set()).add((day, si + i))
     result = {}
@@ -145,7 +152,9 @@ def busiest_slots(state):
     for cls in placed:
         start = effective_time(cls)
         td = total_duration(cls)
-        si = slot_index(state, start)
+        si = find_slot_index(state, start)
+        if si is None:
+            continue  # placement orphaned by a removed slot (ST-DATA-003)
         for i in range(td):
             s = state["slots"][si + i]
             counts[s] = counts.get(s, 0) + 1

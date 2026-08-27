@@ -3,6 +3,7 @@
 import copy
 import json
 import csv
+import hashlib
 import os
 import sys
 
@@ -795,6 +796,12 @@ class DraggableUnplacedList(QListWidget):
 
 # ── Main Application Window ─────────────────────────────────────────────────
 
+# How long refreshes are allowed to coalesce before the settings container is
+# rewritten (ST-PERF-002). Long enough that a burst of clicks costs one write,
+# short enough that a crash loses at most this much; every exit path flushes.
+AUTOSAVE_DEBOUNCE_MS = 1500
+
+
 class SchedulerApp(QMainWindow):
     def __init__(self, session=None, server_url=''):
         super().__init__()
@@ -818,12 +825,26 @@ class SchedulerApp(QMainWindow):
         self.state_data = new_state()
         self.current_file = None
         self._config_path = storage.settings_path()
+        # Settings problems already reported this session, so the user is told
+        # once per kind rather than once per refresh (ST-DATA-005).
+        self._settings_problems = set()
+        self._pending_settings_report = None
+        self._deferred_warnings = []
+        # ST-PERF-002: autosave is coalesced rather than run once per repaint.
+        # Created here, before _auto_load(), because that runs long before
+        # _build_main().
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.timeout.connect(self.flush_auto_save)
+        self._autosave_pending = False
+        self._autosave_fingerprint = None
         self._active_tutorial = None
 
         # Selection state
         self._selected_class = None
         self._selected_cell = None       # LessonItem (graphics) reference
         self._selected_classes = []      # selected class objects (possibly multiple)
+        self._open_slots_fp = None       # ST-PERF-006 rebuild guard
         self._selected_cells = []        # selected graphics items
         self._selection_anchor = None    # anchor graphics item for Shift+Click
         self._selected_empty_slot = None
@@ -872,6 +893,13 @@ class SchedulerApp(QMainWindow):
         self._build_toolbar()
         self._build_main()
         self._build_status()
+
+        # _auto_load runs above, before any of these widgets exist, so a
+        # settings problem found during load had nowhere to go. Flush it now
+        # that there is a window — synchronously, so the report has landed by
+        # the time __init__ returns (ST-DATA-005/014). Also covers a container
+        # quarantined even earlier, by the language gate in first_run.
+        self._flush_startup_settings_report()
 
         # Shortcuts — only register here for keys that have NO menu QAction.
         # Keys that ARE on menu actions (Ctrl+Shift+A/B/P, Ctrl+P, Ctrl+R,
@@ -1811,11 +1839,133 @@ class SchedulerApp(QMainWindow):
     def _get_config_path():
         return storage.settings_path()
 
+    def _flush_startup_settings_report(self):
+        """Surface a settings problem detected before the window existed."""
+        from scheduler_app.ui import first_run as _first_run
+        quarantined = getattr(_first_run, "LAST_QUARANTINE", None)
+        if quarantined:
+            _first_run.LAST_QUARANTINE = None
+            self._report_settings_problem(
+                "corrupt", tr("errors.settings_corrupt").format(
+                    backup=quarantined, err=tr("errors.egu_could_not_decrypt")))
+        pending = self._pending_settings_report
+        if not pending:
+            return
+        self._pending_settings_report = None
+        # Reaches the panel through _show_toast's mirror below, synchronously —
+        # which is what satisfies this method's "at least one channel before it
+        # returns" contract.
+        try:
+            self._show_toast(pending, "error")
+        except Exception:
+            pass
+        self._deferred_warning(tr("status.settings_problem_title"), pending)
+
+    def _deferred_warning(self, title, text):
+        """Show a modal warning on the next event-loop turn, owned by this window.
+
+        Deliberately NOT QTimer.singleShot(0, lambda: ...): a context-less
+        single shot outlives the window and then fires against a destroyed
+        widget, which corrupts the heap. Measured as 6/6 interpreter aborts
+        once the off-thread solve started pumping the event loop hard.
+        Qt's (msec, context, slot) overload is not exposed by PyQt6, so the
+        equivalent is a real QTimer parented to self — destroyed with the
+        window, and so never delivered to a dead one.
+        """
+        self._deferred_warnings.append((title, text))
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        # A BOUND METHOD, never a lambda. PyQt disconnects a bound-method slot
+        # when its QObject is destroyed; a lambda capturing self is just a
+        # callable, stays connected, and fires into a half-destroyed window —
+        # an access violation during teardown, not an exception.
+        timer.timeout.connect(self._drain_deferred_warnings)
+        timer.start(0)
+
+    def _drain_deferred_warnings(self):
+        pending, self._deferred_warnings = self._deferred_warnings, []
+        for title, text in pending:
+            QMessageBox.warning(self, title, text)
+
+    def _report_settings_problem(self, kind, message):
+        """Tell the user their settings could not be read or written.
+
+        Rate-limited per *kind* per session, deliberately. Autosave fires on
+        every ``refresh_grid``, so one dialog per failure would be worse than
+        the silence it replaces (ST-UI-009 measured 306-563 ms per refresh
+        action), and one warning-log entry per failure would feed the unbounded
+        ``warning_log._messages`` growth measured in ST-PERF-003.
+
+        Synchronous by design: the message must have reached at least one
+        channel by the time the caller returns. Only the modal is deferred,
+        because ``_auto_load`` runs from ``__init__`` before ``_build_main()``
+        has created the widgets it would otherwise need.
+        """
+        first_time = kind not in self._settings_problems
+        self._settings_problems.add(kind)
+        if not first_time:
+            return
+        # As above: _show_toast mirrors into the warning panel, so there is no
+        # separate log write here.
+        if getattr(self, "status_label", None) is None:
+            # Called from _auto_load, which runs before _build_main() creates
+            # the widgets. Stash it; __init__ flushes once the window exists.
+            self._pending_settings_report = message
+            return
+        try:
+            self._show_toast(message, "error")
+        except Exception:
+            pass
+        self._deferred_warning(tr("status.settings_problem_title"), message)
+
+    def _read_settings_container(self):
+        """Read the settings container, distinguishing the three outcomes.
+
+        ST-DATA-014: ``_auto_save`` used to do a read-modify-write whose read
+        fell back to ``{}`` on ANY exception and then wrote that ``{}`` over the
+        user's settings, so one unreadable load destroyed the saved schedule —
+        and autosave runs on every refresh.
+
+        absent        -> ``{}`` (first run)
+        EguFileError  -> genuinely unreadable: quarantine the bytes, report, ``{}``
+        anything else -> transient (a locked file, an I/O error): report and
+                         re-raise. Quarantining a perfectly good file because the
+                         disk hiccuped is data loss dressed up as recovery.
+        """
+        path = self._config_path
+        if not os.path.exists(path):
+            return {}
+        try:
+            data = storage.load_encrypted(path)
+        except storage.EguFileError as exc:
+            try:
+                dst = storage.quarantine_corrupt(path)
+            except Exception:
+                self._report_settings_problem(
+                    "unreadable", tr("errors.settings_unreadable").format(
+                        path=path, err=exc))
+                raise
+            # settings_path() resolves a legacy .uva only while the .egu is
+            # absent, so moving the file can change what it returns.
+            self._config_path = storage.settings_path()
+            self._report_settings_problem(
+                "corrupt", tr("errors.settings_corrupt").format(
+                    backup=dst, err=exc))
+            return {}
+        except Exception as exc:
+            self._report_settings_problem(
+                "unreadable", tr("errors.settings_unreadable").format(
+                    path=path, err=exc))
+            raise
+        return data if isinstance(data, dict) else {}
+
     def _auto_load(self):
         if not os.path.exists(self._config_path):
             return False
         try:
-            data = storage.load_encrypted(self._config_path)
+            data = self._read_settings_container()
+            if not data:
+                return False
             self.state_data = data.get("state", new_state())
             normalize_state_day_keys(self.state_data)
             normalize_state_classes(self.state_data)
@@ -1833,22 +1983,100 @@ class SchedulerApp(QMainWindow):
             return False
 
     def _auto_save(self):
+        """Persist state. Returns True on success.
+
+        ST-DATA-005 / ST-DATA-014. Two rules, both learned the hard way:
+
+        1. Never write a container we failed to READ. The old code fell back to
+           ``data = {}`` and wrote it, so one bad read destroyed the schedule.
+        2. Never raise. This runs from a Qt slot chain (``refresh_grid``) and
+           from the ``closeEvent`` virtual; an exception there aborts the
+           process under a real platform plugin. Failures are reported, not
+           thrown.
+        """
         try:
-            # Read-modify-write to preserve first-run flags and other keys
-            data = {}
-            if os.path.exists(self._config_path):
-                try:
-                    data = storage.load_encrypted(self._config_path)
-                except Exception:
-                    data = {}
+            data = self._read_settings_container()
+        except Exception:
+            return False  # already reported; do NOT overwrite an unreadable file
+        try:
             normalize_state_day_keys(self.state_data)
             normalize_state_classes(self.state_data)
             data["state"] = self.state_data
             data["last_file"] = self.current_file
             data["language"] = get_language()
+        except Exception as exc:
+            self._report_settings_problem(
+                "normalize", tr("errors.settings_write_failed").format(err=exc))
+            return False
+        try:
             storage.save_encrypted(data, self._config_path)
+        except Exception as exc:
+            self._report_settings_problem(
+                "write", tr("errors.settings_write_failed").format(err=exc))
+            return False
+        # A successful write re-arms the reports, so a disk that recovers and
+        # then fails again is not silently ignored for the rest of the session.
+        self._settings_problems.clear()
+        return True
+
+    def _state_fingerprint(self):
+        """A hash of exactly what would be written, or None if unhashable.
+
+        ST-PERF-002. Two things here are load-bearing:
+
+        1. The normalize calls. ``_auto_save`` mutates ``state_data`` on its way
+           out, so a fingerprint taken without them never matches the one taken
+           after a save and the delta check would never fire.
+        2. It hashes the WHOLE payload. Cheaper fingerprints — class names, the
+           class count, or ``state["classes"]`` alone — all look green and all
+           silently drop real edits: a drag mutates one class dict in place
+           (same count, same names) and a Setup room change touches
+           ``state["classrooms"]`` and nothing else. Losing a user's edit to a
+           performance optimisation is a far worse bug than the one being fixed.
+        """
+        try:
+            normalize_state_day_keys(self.state_data)
+            normalize_state_classes(self.state_data)
+            payload = {
+                "state": self.state_data,
+                "last_file": self.current_file,
+                "language": get_language(),
+            }
+            blob = json.dumps(payload, sort_keys=True, default=str,
+                              ensure_ascii=False)
         except Exception:
-            pass
+            return None  # unhashable: fall through to a real write attempt
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+    def request_auto_save(self):
+        """Ask for a save soon. Repeated calls coalesce into one write."""
+        self._autosave_pending = True
+        # start() on a running single-shot timer restarts it — that IS the
+        # coalescing: a burst of refreshes produces exactly one write.
+        self._autosave_timer.start(AUTOSAVE_DEBOUNCE_MS)
+
+    def flush_auto_save(self):
+        """Write now if anything actually changed. Returns True if state is safe.
+
+        Called from the debounce timer, from closeEvent, and before any path
+        that rebinds ``state_data`` — the timer reads that attribute live, so a
+        pending write must not be allowed to land against a different schedule.
+        """
+        self._autosave_timer.stop()
+        fp = self._state_fingerprint()
+        if fp is not None and fp == self._autosave_fingerprint:
+            self._autosave_pending = False
+            return True  # byte-identical to what is already on disk
+        if not self._autosave_pending and self._autosave_fingerprint is not None:
+            return True
+        ok = self._auto_save()
+        if ok:
+            self._autosave_pending = False
+            self._autosave_fingerprint = fp
+        # A failed write deliberately leaves _autosave_pending set and does NOT
+        # re-arm the timer: it is retried on the next refresh or on close, which
+        # is the same reach the un-debounced version had.
+        return ok
 
     def _update_status(self):
         s = self.state_data
@@ -1961,10 +2189,15 @@ class SchedulerApp(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════
 
     def refresh_grid(self):
-        """Full refresh: render + update all panels + auto-save."""
+        """Full refresh: render + update all panels + request an auto-save.
+
+        ST-PERF-002: this used to decrypt, re-encrypt and rewrite the whole
+        settings container on every call — 16.8 ms at 80 classes, 33.6 ms at
+        250, on an action as ordinary as clicking a lesson.
+        """
         self._render_current_tab()
         self._update_side_panels()
-        self._auto_save()
+        self.request_auto_save()
 
     def _render_current_tab(self):
         """Render only the visible timetable tab (no side effects)."""
@@ -2202,6 +2435,15 @@ class SchedulerApp(QMainWindow):
     # ══════════════════════════════════════════════════════════════════════
     #  FILE OPERATIONS
     # ══════════════════════════════════════════════════════════════════════
+
+    def _flush_before_state_swap(self):
+        """Land any pending write before state_data points somewhere else.
+
+        The debounce timer reads ``self.state_data`` when it fires, so without
+        this the pending write would persist the NEW schedule and the previous
+        one's last edit would never reach disk.
+        """
+        self.flush_auto_save()
 
     def new_schedule(self):
         if QMessageBox.question(
@@ -2494,7 +2736,7 @@ class SchedulerApp(QMainWindow):
             self.state_data)
         if invalidated:
             self._show_toast(
-                f"{len(invalidated)} placement(s) cleared (constraints changed)",
+                tr("status.placements_cleared_count", n=len(invalidated)),
                 "warning")
         self.refresh_grid()
         self._run_impact_analysis(snap_before)
@@ -2641,33 +2883,87 @@ class SchedulerApp(QMainWindow):
             return
         use_cpsat = (resched_dlg.result_mode == "deep")
 
+        # The solve now runs on a worker thread, so a failure inside it arrives
+        # on the `failed` signal rather than as an exception here
+        # (see _on_solve_failed).
+        self._do_reschedule(resched_dlg, use_cpsat,
+                            weights=self._get_learned_weights())
+
+    def _on_solve_failed(self, exc):
+        """The worker raised. Log it and offer a bug report, as before."""
+        tb = getattr(self._solver_task, "failure_traceback", "") or repr(exc)
         try:
-            self._do_reschedule(resched_dlg, use_cpsat, weights=self._get_learned_weights())
+            from datetime import datetime
+            log_path = storage.crash_log_path()
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"RESCHEDULE CRASH at {datetime.now()}\n")
+                f.write(f"{'='*60}\n")
+                f.write(tb + "\n")
         except Exception:
-            import traceback
-            tb = traceback.format_exc()
-            # Write to crash log
-            try:
-                from datetime import datetime
-                log_path = storage.crash_log_path()
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"\n{'='*60}\n")
-                    f.write(f"RESCHEDULE CRASH at {datetime.now()}\n")
-                    f.write(f"{'='*60}\n")
-                    f.write(tb + "\n")
-            except Exception:
-                pass
-            self.statusBar().clearMessage()
-            # Show crash dialog with bug report option
-            from scheduler_app.ui.bug_report import CrashReportDialog
-            dlg = CrashReportDialog(
-                exc_type_name='RescheduleError',
-                exc_message=tr('errors.optimization_error'),
-                traceback_text=tb,
-                log_path=storage.crash_log_path(),
-                parent=self,
-            )
-            dlg.exec()
+            pass
+        self._end_solve_ui()
+        from scheduler_app.ui.bug_report import CrashReportDialog
+        dlg = CrashReportDialog(
+            exc_type_name='RescheduleError',
+            exc_message=tr('errors.optimization_error'),
+            traceback_text=tb,
+            log_path=storage.crash_log_path(),
+            parent=self,
+        )
+        dlg.exec()
+
+    # ── Solve lifecycle (ST-PERF-001) ────────────────────────────────────
+
+    def _begin_solve_ui(self):
+        """Put the window into "solving" mode: progress visible, actions off.
+
+        Disabling the actions is not cosmetic. The whole point of the worker is
+        that the window stays clickable, so a user WILL press Generate again —
+        and two solves sharing one state dict and one apply_reschedule is how
+        this change would corrupt a timetable.
+        """
+        from PyQt6.QtWidgets import QProgressDialog
+        from PyQt6.QtCore import Qt as _Qt
+
+        self.statusBar().showMessage(tr("status.optimizing"))
+        dlg = QProgressDialog(tr("status.optimizing"), tr("buttons.cancel"),
+                              0, 1000, self)
+        dlg.setWindowModality(_Qt.WindowModality.WindowModal)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setMinimumDuration(0)
+        dlg.canceled.connect(self._on_solve_cancel_requested)
+        dlg.setValue(0)
+        self._solve_progress_dialog = dlg
+
+    def _end_solve_ui(self):
+        """Leave "solving" mode, whatever the outcome."""
+        dlg = getattr(self, "_solve_progress_dialog", None)
+        if dlg is not None:
+            self._solve_progress_dialog = None
+            dlg.close()
+            dlg.deleteLater()
+        self.statusBar().clearMessage()
+
+    def _on_solve_cancel_requested(self):
+        task = getattr(self, "_solver_task", None)
+        if task is not None:
+            task.cancel()
+        self.statusBar().showMessage(tr("status.reschedule_cancelled"))
+
+    def _on_solve_progress(self, progress):
+        """Update the bar. Runs on the GUI thread — no event pumping needed."""
+        dlg = getattr(self, "_solve_progress_dialog", None)
+        if dlg is not None:
+            dlg.setValue(int(progress.fraction * 1000))
+        self.statusBar().showMessage(tr("status.optimizing_run").format(
+            r=progress.run + 1, t=progress.total_runs,
+            i=progress.iteration, q=progress.best_score))
+
+    def _on_solve_cancelled(self):
+        self._end_solve_ui()
+        self._show_toast(tr("status.reschedule_cancelled"), "info")
 
     def _do_reschedule(self, resched_dlg, use_cpsat, weights):
         """Inner reschedule logic, separated for error handling."""
@@ -2680,31 +2976,41 @@ class SchedulerApp(QMainWindow):
             goal_weights = goals_to_weights(resched_dlg.result_goals)
             weights.update(goal_weights)
 
-        # Show progress during multi-start LNS optimization
-        self.statusBar().showMessage(tr("status.optimizing"))
-        QApplication.processEvents()
+        # ST-PERF-001. The solve used to run inline on the GUI thread, via a
+        # synchronous call into the workflow whose progress callback pumped the
+        # Qt event loop by hand. That callback WAS the freeze: the window only
+        # repainted because the solver reached back into Qt about three times a
+        # second, and between two pumps the app answered nothing — 25-120 s of
+        # "Not Responding" at a realistic department size, escapable only by
+        # killing the process and losing the schedule.
+        from scheduler_app.ui.solver_task import SolverTask
 
-        def _progress(iteration, best_score, current_score,
-                      run_number=0, total_runs=1):
-            msg = tr("status.optimizing_run").format(
-                r=run_number + 1, t=total_runs,
-                i=iteration, q=best_score)
-            self.statusBar().showMessage(msg)
-            from PyQt6.QtCore import QEventLoop
-            QApplication.processEvents(
-                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        existing = getattr(self, "_solver_task", None)
+        if existing is not None and existing.is_running:
+            return  # a solve is already running; the UI is disabled anyway
 
-        result = self._workflow.reschedule(
-            weights, use_cpsat=use_cpsat, progress_callback=_progress)
+        self._solve_snapshots = snapshots
+        task = SolverTask(self._workflow, weights, use_cpsat=use_cpsat,
+                          parent=self)
+        self._solver_task = task
+        task.progress.connect(self._on_solve_progress)
+        task.finished.connect(self._on_solve_finished)
+        task.failed.connect(self._on_solve_failed)
+        task.cancelled.connect(self._on_solve_cancelled)
+        self._begin_solve_ui()
+        task.start()
 
-        self.statusBar().clearMessage()
+    def _on_solve_finished(self, result):
+        """The worker produced a schedule. Everything from here is GUI-thread."""
+        snapshots = getattr(self, "_solve_snapshots", None)
+        self._end_solve_ui()
 
         # Show results with analytics
         results_dlg = BulkResultsDialog(
             self, result.placed, result.unplaced, bool(result.changes),
             analytics=result.analytics,
             reschedule_explanation=result.explanation,
-            negotiation_result=result.negotiation_result)
+            negotiation_source=lambda: result.negotiation_result)
         accepted = (results_dlg.exec() == BulkResultsDialog.DialogCode.Accepted
                     and results_dlg.result)
 
@@ -2821,21 +3127,88 @@ class SchedulerApp(QMainWindow):
         lecturer_name = (cls.get("lecturer") or "").strip()
         dlg = SetupDialog(self, self.state_data, focus_lecturer=lecturer_name)
         dlg.exec()
+        if dlg.result:
+            self._reconcile_after_setup()
         self.refresh_grid()
         if dlg.result:
             self._run_impact_analysis(snap_before)
+
+    def _reconcile_after_setup(self):
+        """Repair placements orphaned by a setup change, and say how many.
+
+        Must run BEFORE the repaint: refresh_grid -> _update_side_panels ->
+        _refresh_open_slots reaches slot_index, which cannot resolve a slot the
+        user has just deleted (ST-DATA-003).
+        """
+        affected = SchedulingWorkflow.reconcile_placements(self.state_data)
+        if affected:
+            self._show_toast(
+                tr("status.placements_cleared_count", n=len(affected)),
+                "warning")
+        return affected
 
     def edit_setup(self):
         snap_before = capture_snapshot(self.state_data)
         is_initial = not self._has_baseline
         dlg = SetupDialog(self, self.state_data)
         dlg.exec()
+        if dlg.result:
+            self._reconcile_after_setup()
         self.refresh_grid()
         if dlg.result:
             if is_initial:
                 self.mark_current_state_as_baseline()
             else:
                 self._run_impact_analysis(snap_before)
+
+    def _open_slots_selected_class(self):
+        """The class the open-slots panel filters to, or None.
+
+        Shared with the fingerprint so the two cannot disagree: the panel also
+        honours a single selection in the unplaced list, and a fingerprint that
+        only looked at ``_selected_class`` would freeze the panel whenever the
+        user picked something there.
+        """
+        selected = getattr(self, "_selected_class", None)
+        if selected is None and hasattr(self, "unplaced_list"):
+            upl = self.unplaced_list.selected_classes()
+            if len(upl) == 1:
+                selected = upl[0]
+        return selected
+
+    def _open_slots_fingerprint(self):
+        """Everything the open-slots panel's contents depend on.
+
+        ST-PERF-006. Getting this wrong is worse than not having it, and the
+        tempting version is the wrong one: a fingerprint of just the grid shape
+        (days / slots / classrooms) is stable for an entire editing session, so
+        the panel would be built once and then frozen, showing occupied slots as
+        free. Occupancy has to be in here, and so does the selection — the panel
+        filters itself to the selected class, so a selection change genuinely
+        changes what it shows (which is also what ST-UI-009 needs).
+        """
+        st = self.state_data
+        placed = tuple(
+            (c.get("placed_day"), c.get("placed_time"),
+             c.get("placed_classroom"), c.get("duration"),
+             bool(c.get("pinned")), c.get("pinned_day"),
+             c.get("pinned_time"), c.get("pinned_classroom"))
+            for c in st.get("classes", [])
+            if c.get("placed") or c.get("pinned"))
+        selected = self._open_slots_selected_class()
+        return (
+            tuple(st.get("days", [])),
+            tuple(st.get("slots", [])),
+            tuple(st.get("classrooms", [])),
+            len(st.get("classes", [])),
+            placed,
+            id(selected) if selected is not None else None,
+            id(getattr(self, "_selected_empty_slot", None) or 0),
+        )
+
+    def invalidate_open_slots(self):
+        """Force the next _refresh_open_slots to rebuild."""
+        self._open_slots_fp = None
 
     def _refresh_open_slots(self):
         """Update the live open-slots panel (grouped by day).
@@ -2845,6 +3218,16 @@ class SchedulerApp(QMainWindow):
         """
         if not hasattr(self, '_open_slots_layout'):
             return
+
+        # ST-PERF-006: this rebuilds hundreds of widgets and re-runs placement
+        # analysis (359 widgets and a 4.5 s pass at 250 classes), and
+        # refresh_grid reaches it twice per call. Skip it outright when nothing
+        # it displays has changed.
+        fp = self._open_slots_fingerprint()
+        if fp == getattr(self, "_open_slots_fp", None):
+            return
+        self._open_slots_fp = fp
+
         layout = self._open_slots_layout
         # Clear existing widgets
         while layout.count():
@@ -2859,12 +3242,7 @@ class SchedulerApp(QMainWindow):
             return
 
         # Determine if contextual filtering applies
-        selected_cls = getattr(self, '_selected_class', None)
-        # Also check unplaced list single selection
-        if selected_cls is None and hasattr(self, 'unplaced_list'):
-            upl_sel = self.unplaced_list.selected_classes()
-            if len(upl_sel) == 1:
-                selected_cls = upl_sel[0]
+        selected_cls = self._open_slots_selected_class()
 
         if selected_cls is not None:
             # Contextual mode: use find_valid_options for the selected class
@@ -2962,13 +3340,23 @@ class SchedulerApp(QMainWindow):
         layout.addStretch()
 
     def _refresh_warnings(self):
-        """Compute workload warnings and auto-negotiation diagnostics."""
+        """Compute workload warnings and auto-negotiation diagnostics.
+
+        ST-PERF-003: these are *derived* from the current timetable, so they are
+        handed to the panel as a set that replaces the previous one. Appending
+        them — which is what used to happen — meant the log accumulated 138 more
+        entries on every refresh and went on describing a timetable that no
+        longer existed.
+        """
         if not hasattr(self, 'warning_log'):
             return
         s = self.state_data
         placed = get_placed_classes(s)
         if not s["days"] or not s["slots"]:
+            self.warning_log.set_derived([])
             return
+
+        derived = []
 
         if placed:
             for yr in sorted(s["years"].keys()):
@@ -2989,19 +3377,23 @@ class SchedulerApp(QMainWindow):
                     light = [d for d, n in day_counts.items()
                              if n == 0 and sum(day_counts.values()) > 0]
                     if heavy:
-                        self.warning_log.log(
-                            f"{yr}/{br}: {tr('warnings.heavy_days_short')} {', '.join(day_label(d) for d in heavy)}",
-                            "warning")
+                        derived.append((
+                            f"{yr}/{br}: {tr('warnings.heavy_days_short')} "
+                            f"{', '.join(day_label(d) for d in heavy)}",
+                            "warning"))
                     if light:
-                        self.warning_log.log(
-                            f"{yr}/{br}: {tr('warnings.empty_days_short')} {', '.join(day_label(d) for d in light)}",
-                            "warning")
+                        derived.append((
+                            f"{yr}/{br}: {tr('warnings.empty_days_short')} "
+                            f"{', '.join(day_label(d) for d in light)}",
+                            "warning"))
 
-        # Auto-negotiation: analyze unplaced classes and log suggestions
-        self._run_auto_negotiation()
+        # Auto-negotiation: analyze unplaced classes and collect suggestions.
+        # It can mutate state (auto-apply), so publish AFTER it returns.
+        derived.extend(self._run_auto_negotiation())
+        self.warning_log.set_derived(derived)
 
     def _run_auto_negotiation(self):
-        """Automatically analyze unplaced/constrained classes and log suggestions.
+        """Analyze unplaced/constrained classes; RETURN the messages to show.
 
         This is the event-driven negotiation layer: it runs as part of every
         refresh cycle whenever unplaced classes or severe bottlenecks exist,
@@ -3009,12 +3401,14 @@ class SchedulerApp(QMainWindow):
         warning log panel without requiring any manual trigger.
         """
         if not hasattr(self, 'warning_log'):
-            return
+            return []
         s = self.state_data
         unplaced = [c for c in s.get("classes", [])
                     if not c.get("placed") and not c.get("pinned")]
         if not unplaced:
-            return
+            return []
+
+        derived = []
 
         from scheduler_app.constraint_negotiator import ConstraintNegotiator
         neg = ConstraintNegotiator(s)
@@ -3025,20 +3419,19 @@ class SchedulerApp(QMainWindow):
         for cls in unplaced:
             report = neg.negotiate_class(cls)
             if not report["suggestions"]:
-                self.warning_log.log(
-                    f"{cls['name']}: {report['summary']}", "warning")
+                derived.append((f"{cls['name']}: {report['summary']}", "warning"))
                 continue
 
-            # Log the top suggestions into the warning panel
+            # Collect the top suggestions for the warning panel
             top = report["suggestions"][0]
-            self.warning_log.log(
+            derived.append((
                 f"{cls['name']}: {report['summary']} "
                 f"— {tr('labels.suggestion')}: {top['description']}",
-                "warning")
+                "warning"))
             for sug in report["suggestions"][1:3]:
-                self.warning_log.log(
+                derived.append((
                     f"  {cls['name']}: {tr('labels.also')}: {sug['description']}",
-                    "info")
+                    "info"))
 
             # Auto-apply low-risk suggestions if enabled
             if auto_apply_enabled:
@@ -3047,9 +3440,9 @@ class SchedulerApp(QMainWindow):
                         if not applied_any:
                             self._push_undo(tr("actions.auto_negotiate"))
                         if apply_negotiation_suggestion(cls, sug):
-                            self.warning_log.log(
+                            derived.append((
                                 f"{cls['name']}: {tr('status.auto_applied')}: "
-                                f"{sug['description']}", "success")
+                                f"{sug['description']}", "success"))
                             applied_any = True
                             break
 
@@ -3059,6 +3452,8 @@ class SchedulerApp(QMainWindow):
             for cls in unplaced:
                 if not cls.get("placed"):
                     self._auto_place_and_apply(cls)
+
+        return derived
 
     def _get_negotiation_auto_apply(self):
         """Check if auto-apply of low-risk negotiation suggestions is enabled.
@@ -3125,6 +3520,13 @@ class SchedulerApp(QMainWindow):
             seen_item_ids.add(iid)
             deduped.append(it)
 
+        # ST-UI-009: re-clicking the lesson that is already selected used to
+        # redo the whole selection pass and rebuild the side panels — measured
+        # at 39 ms per click at 80 classes. Compared here, before
+        # _selected_cells is overwritten below.
+        unchanged = (deduped == self._selected_cells
+                     and self._selection_anchor is (anchor if deduped else None))
+
         new_set = set(deduped)
         for old in self._selected_cells:
             if old not in new_set:
@@ -3166,6 +3568,8 @@ class SchedulerApp(QMainWindow):
                 f"{tr('status.press_delete')}")
         else:
             self.status_label.setText(tr("status.ready"))
+        if unchanged:
+            return  # ST-UI-009: same selection, nothing for the panel to redo
         self._refresh_open_slots()
 
     def _select_class_gfx(self, cls, item, modifiers=None):
@@ -3213,9 +3617,14 @@ class SchedulerApp(QMainWindow):
 
     def _select_empty_slot(self, item):
         """Highlight an empty timetable slot on left click."""
-        self._clear_class_selection()
-        if self._selected_empty_slot is item:
+        # ST-UI-009: the identity check has to come first. Below
+        # _clear_class_selection() it still returned early, but only after
+        # paying for a full clear — 81 ms per re-click at 80 classes. Safe to
+        # move: the two selections are mutually exclusive, so when this slot is
+        # already selected there is no class selection left to clear.
+        if item is not None and self._selected_empty_slot is item:
             return
+        self._clear_class_selection()
         self._clear_empty_slot_selection()
         self._selected_empty_slot = item
         try:
@@ -3582,6 +3991,11 @@ class SchedulerApp(QMainWindow):
             if kind == "restricted_to_day":
                 formatted.append(tr("warnings.restricted_to_day").format(
                     d=display_day(r[1])))
+            elif kind == "slot_not_in_grid":
+                formatted.append(tr("validation.slot_not_in_grid").format(r[1]))
+            elif kind == "day_not_in_grid":
+                formatted.append(tr("validation.day_not_in_grid").format(
+                    day_label(r[1])))
             elif kind == "not_enough_slots":
                 formatted.append(tr("errors.not_enough_slots").format(
                     n=r[1], a=r[2], t=r[3]))
@@ -4539,6 +4953,9 @@ class SchedulerApp(QMainWindow):
             if dataset.state["classes"]:
                 s["classes"].extend(dataset.state["classes"])
 
+            # An import that replaces the lecturer or room lists orphans any
+            # placement referring to one the workbook omitted (ST-DATA-004).
+            SchedulingWorkflow.reconcile_placements(s)
             self.refresh_grid()
             self._update_status()
         except Exception as exc:
@@ -4983,5 +5400,18 @@ class SchedulerApp(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
-        self._auto_save()
-        event.accept()
+        # ST-DATA-005: quitting is the moment an unsaved change becomes
+        # permanently lost, so a failure here is the one worth interrupting the
+        # user for, even though _report_settings_problem has rate-limited it.
+        if self.flush_auto_save():
+            event.accept()
+            return
+        resp = QMessageBox.question(
+            self, tr("status.settings_problem_title"),
+            tr("errors.settings_quit_anyway"),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if resp == QMessageBox.StandardButton.Yes:
+            event.accept()
+        else:
+            event.ignore()

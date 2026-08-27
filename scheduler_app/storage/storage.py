@@ -164,13 +164,45 @@ _HEADER_FMT = "!4sH"  # magic(4) + version(uint16)
 _PAYLOAD_LEN_FMT = "!I"  # uint32
 _CHECKSUM_LEN = 32  # SHA-256
 
+# ── Append-only log container (ST-PERF-005) ───────────────────────────────
+#
+# The feedback log used to be one JSON array inside a single .egu, so every
+# append decrypted, re-serialised and re-encrypted the whole history: per-append
+# cost grew from 2.55 ms at n=1 to 99.9 ms at n=2000, and 2000 appends took
+# 108 s. EGL1 is a header followed by independently framed records:
+#
+#     header : b'EGL1' + uint16 version                          (6 bytes, once)
+#     record : uint32 payload length + one complete EGU1 container
+#
+# Each record carries its own salt, IV, GCM tag and checksum, so a torn tail
+# damages exactly one record and everything before it still decrypts. That
+# per-record salt is also why records are NOT given a shared salt with a counter
+# nonce: GCM nonce reuse across a partially rewritten file is a genuine
+# key-recovery risk, and this file shares the master key with the user's saved
+# timetables.
+_LOG_MAGIC = b"EGL1"
+_LOG_VERSION = 1
+_LOG_HEADER_FMT = "!4sH"
+_LOG_RECLEN_FMT = "!I"
+
 
 def _key_path() -> str:
     return os.path.join(sub_dir(KEYS_DIR), _KEY_FILE)
 
 
 def _load_or_create_key() -> bytes:
-    """Return the 32-byte AES-256 master key, creating it on first use."""
+    """Return the 32-byte AES-256 master key, creating it on first use.
+
+    ST-DATA-001: "the key file is absent" and "the key file is damaged" are
+    completely different situations and used to be treated identically. Absent
+    means first run — mint a key. Damaged means a partial write or a bad sector
+    in a 32-byte file, and minting there silently and permanently orphaned every
+    .egu the user had ever saved: the old key was moved to backups/, but the
+    *damaged remnant* was what got backed up, so there was nothing to restore.
+
+    A damaged key now raises EguFileError and the file is left exactly as it is,
+    so a maintainer or a future recovery path still has the bytes to work with.
+    """
     global _cached_key
     if _cached_key is not None:
         return _cached_key
@@ -186,8 +218,10 @@ def _load_or_create_key() -> bytes:
         if len(key) == 32:
             _cached_key = key
             return _cached_key
-        # Invalid key file — regenerate
-        _backup_original(kp)
+        # Present but not a valid key: never overwrite it, never mint over it.
+        raise EguFileError(
+            tr("errors.key_file_damaged").format(
+                path=kp, size=len(key), backups=sub_dir(BACKUPS_DIR)))
 
     # Generate a fresh 256-bit key
     key = secrets.token_bytes(32)
@@ -403,32 +437,192 @@ def load_encrypted(path: str):
         raise EguFileError(tr("errors.unrecognized_file_format"))
 
 
+def _log_record(entry) -> bytes:
+    """One framed, independently encrypted log record."""
+    container = _build_container(
+        json.dumps(entry, ensure_ascii=False).encode("utf-8"))
+    return struct.pack(_LOG_RECLEN_FMT, len(container)) + container
+
+
+def _write_log(entries: list, path: str) -> None:
+    """Write a whole EGL1 log atomically (creation, migration, compaction)."""
+    blob = bytearray(struct.pack(_LOG_HEADER_FMT, _LOG_MAGIC, _LOG_VERSION))
+    for entry in entries:
+        blob += _log_record(entry)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(bytes(blob))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _read_log_records(blob: bytes) -> list:
+    """Decode an EGL1 blob. A damaged tail costs only the records after it."""
+    header_size = struct.calcsize(_LOG_HEADER_FMT)
+    magic, version = struct.unpack_from(_LOG_HEADER_FMT, blob, 0)
+    if magic != _LOG_MAGIC:
+        raise EguFileError(tr("errors.invalid_egu_header"))
+    if version != _LOG_VERSION:
+        raise EguFileError(
+            tr("errors.unsupported_egu_version").format(
+                version=version, supported=_LOG_VERSION))
+    entries = []
+    off = header_size
+    len_size = struct.calcsize(_LOG_RECLEN_FMT)
+    while off + len_size <= len(blob):
+        (rec_len,) = struct.unpack_from(_LOG_RECLEN_FMT, blob, off)
+        off += len_size
+        if rec_len <= 0 or off + rec_len > len(blob):
+            break  # torn tail: keep every complete record before it
+        entries.append(json.loads(
+            _parse_container(blob[off:off + rec_len]).decode("utf-8")))
+        off += rec_len
+    return entries
+
+
 def save_encrypted_lines(entries: list, path: str) -> None:
-    """Save a list of dicts as encrypted .egu (array-of-objects)."""
-    save_encrypted(entries, path)
+    """Write *entries* as an append-only encrypted log."""
+    _write_log(list(entries), path)
 
 
 def load_encrypted_lines(path: str) -> list:
-    """Load an encrypted .egu/.uva that contains a JSON array of entry dicts.
+    """Load an encrypted entry log, in file order.
+
+    Reads the EGL1 append-only format, and transparently falls back to the
+    legacy single-array .egu/.uva/Fernet/plain-JSON forms so a log written by an
+    older build keeps loading.
 
     Returns an empty list if the file doesn't exist.
     """
     if not os.path.exists(path):
         return []
     try:
+        with open(path, "rb") as f:
+            blob = f.read()
+        if blob[:4] == _LOG_MAGIC:
+            return _read_log_records(blob)
         data = load_encrypted(path)
-        if isinstance(data, list):
-            return data
-        return []
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
 
 def append_encrypted_entry(entry: dict, path: str) -> None:
-    """Append a single entry dict to an encrypted array-of-objects .egu file."""
-    entries = load_encrypted_lines(path)
-    entries.append(entry)
-    save_encrypted(entries, path)
+    """Append one entry. O(1) in bytes written AND bytes read.
+
+    ST-PERF-005: this used to load the whole log, append in memory and rewrite
+    it, which is what made 2000 appends cost 108 s.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+    except FileNotFoundError:
+        _write_log([entry], path)
+        return
+
+    if head == _LOG_MAGIC:
+        # The hot path: a plain append. Deliberately NOT the temp-file dance —
+        # rewriting the file here would give back the O(n) this exists to remove.
+        with open(path, "ab") as f:
+            f.write(_log_record(entry))
+            f.flush()
+            os.fsync(f.fileno())
+        return
+
+    # A legacy single-array log, or an unreadable one. Convert once.
+    existing = load_encrypted_lines(path)
+    if not existing and os.path.getsize(path) > 0:
+        # Unreadable: preserve the bytes rather than overwrite them, the same
+        # way a corrupt settings container is handled (ST-DATA-014/ST-DATA-002).
+        quarantine_corrupt(path)
+        _write_log([entry], path)
+        return
+    _write_log(existing + [entry], path)
+
+
+def log_size(path: str) -> int:
+    """Size of the log in bytes, or 0 if absent. A stat, not a read."""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def log_entry_count(path: str) -> int:
+    """Number of records, without reading or decrypting their payloads.
+
+    Seeks over each record rather than reading the file in: only the 4-byte
+    length prefixes are ever read, so counting a large log stays cheap.
+    """
+    if not os.path.exists(path):
+        return 0
+    len_size = struct.calcsize(_LOG_RECLEN_FMT)
+    try:
+        with open(path, "rb") as f:
+            if f.read(4) != _LOG_MAGIC:
+                return len(load_encrypted_lines(path))
+            f.seek(struct.calcsize(_LOG_HEADER_FMT))
+            total = log_size(path)
+            count = 0
+            while True:
+                raw = f.read(len_size)
+                if len(raw) < len_size:
+                    break
+                (rec_len,) = struct.unpack(_LOG_RECLEN_FMT, raw)
+                if rec_len <= 0 or f.tell() + rec_len > total:
+                    break
+                f.seek(rec_len, 1)
+                count += 1
+            return count
+    except OSError:
+        return 0
+
+
+def load_encrypted_lines_since(path: str, skip: int) -> list:
+    """Records after the first *skip* of them, decrypting only those.
+
+    ST-PERF-005: ``PreferenceLearner.learn()`` runs after every manual move and
+    at every launch. Slicing the tail out of a full read would still decrypt the
+    whole history, which is the cost being removed.
+    """
+    if skip <= 0:
+        return load_encrypted_lines(path)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+    except OSError:
+        return []
+    if blob[:4] != _LOG_MAGIC:
+        return load_encrypted_lines(path)[skip:]
+    entries = []
+    off = struct.calcsize(_LOG_HEADER_FMT)
+    len_size = struct.calcsize(_LOG_RECLEN_FMT)
+    seen = 0
+    try:
+        while off + len_size <= len(blob):
+            (rec_len,) = struct.unpack_from(_LOG_RECLEN_FMT, blob, off)
+            off += len_size
+            if rec_len <= 0 or off + rec_len > len(blob):
+                break
+            if seen >= skip:
+                entries.append(json.loads(
+                    _parse_container(blob[off:off + rec_len]).decode("utf-8")))
+            seen += 1
+            off += rec_len
+    except Exception:
+        return []
+    return entries
 
 
 # ── Migration helpers ────────────────────────────────────────────────────
@@ -455,6 +649,25 @@ def _backup_original(src: str) -> None:
         ts = datetime.now().strftime("%Y%m%d%H%M%S")
         dst = os.path.join(sub_dir(BACKUPS_DIR), f"{base}_{ts}{ext}")
     shutil.move(src, dst)
+
+
+def quarantine_corrupt(src: str) -> str:
+    """Move an unreadable container into ``backups/`` and return its new path.
+
+    ST-DATA-014. Distinct from :func:`_backup_original`, which keeps the
+    original basename: a quarantined file has to be *distinguishable* from a
+    healthy backup, so it gets a ``_corrupt_<timestamp>`` infix. Nothing is ever
+    deleted — the bytes are the user's schedule, and a future recovery path may
+    still be able to read them.
+
+    Raises whatever ``shutil.move`` raises; a caller that cannot move the file
+    must not pretend it recovered.
+    """
+    base, ext = os.path.splitext(os.path.basename(src))
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    dst = os.path.join(sub_dir(BACKUPS_DIR), f"{base}_corrupt_{ts}{ext}")
+    shutil.move(src, dst)
+    return dst
 
 
 def _migrate_json_file(src: str, dest_sav: str) -> bool:

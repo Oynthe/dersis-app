@@ -181,9 +181,17 @@ class FeedbackLogger:
             all_entries = all_entries[-limit:]
         return all_entries
 
+    def log_size(self):
+        """Bytes on disk. Cheap enough to call on every learning pass."""
+        return storage.log_size(self.log_file)
+
     def entry_count(self):
-        """Return the total number of feedback entries."""
-        return len(storage.load_encrypted_lines(self.log_file))
+        """Number of logged entries, without decrypting any of them."""
+        return storage.log_entry_count(self.log_file)
+
+    def get_entries_since(self, skip):
+        """Entries after the first *skip*, decrypting only those (ST-PERF-005)."""
+        return storage.load_encrypted_lines_since(self.log_file, skip)
 
     def clear(self):
         """Clear all feedback entries."""

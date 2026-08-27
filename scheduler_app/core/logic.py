@@ -2,6 +2,7 @@
 
 from scheduler_app.constants import YEAR_COLORS
 from scheduler_app.models import (
+    DEFAULT_OPTIMIZER_SEED,
     room_fits_class, lecturer_available_at, needs_physical_room, display_room,
     get_room_candidates, get_physical_room_candidates,
     effective_day, effective_time, effective_room,
@@ -15,12 +16,35 @@ from scheduler_app.ui.day_keys import display_day
 
 
 def slot_index(state, slot_name):
+    """Grid index of *slot_name*. Raises ValueError if it is not on the grid.
+
+    Deliberately still raising (ST-SCHED-004). Around forty call sites do
+    ``idx + duration`` arithmetic on the result: returning None would turn every
+    unguarded one from a loud ValueError into an obscure TypeError, and
+    returning -1 would be worse still — -1 is a valid Python index, so lessons
+    would silently land in the last hour of the day. Call sites that legitimately
+    read a *stored* placement, which may be stale, use find_slot_index instead.
+    """
     return state["slots"].index(slot_name)
 
 
+def find_slot_index(state, slot_name):
+    """Grid index of *slot_name*, or None when it is not on the grid.
+
+    Use this wherever the slot comes from stored data (a placement, a pin, a
+    saved constraint) rather than from candidate generation: a user who removes
+    or renames a time slot leaves exactly those references dangling
+    (ST-DATA-003).
+    """
+    try:
+        return state["slots"].index(slot_name)
+    except ValueError:
+        return None
+
+
 def slots_fit(state, start_slot, duration):
-    idx = slot_index(state, start_slot)
-    return idx + duration <= len(state["slots"])
+    idx = find_slot_index(state, start_slot)
+    return idx is not None and idx + duration <= len(state["slots"])
 
 
 def total_duration(cls):
@@ -142,7 +166,15 @@ def build_virtual_classroom_day_layout(state, filter_fn):
 
 
 def get_consecutive_slots(state, start_slot, duration):
-    idx = slot_index(state, start_slot)
+    """The *duration* grid slots starting at *start_slot*; [] if it is off-grid.
+
+    Deliberately does NOT filter by day: an off-grid *day* still occupies real
+    hours, and callers (CSV export in particular) are required to keep
+    reporting such a placement rather than dropping it.
+    """
+    idx = find_slot_index(state, start_slot)
+    if idx is None:
+        return []
     return state["slots"][idx:idx + duration]
 
 
@@ -225,7 +257,12 @@ def _detect_occupancy_conflicts(state, candidate, day, start_slot, classroom):
         ex_room = classroom_of(existing)
         ex_occ = occupied_slots_of(state, existing)
         ex_start = effective_time(existing)
-        ex_start_idx = slot_index(state, ex_start)
+        # An existing placement can reference a slot/day the user has since
+        # deleted. It occupies no real cell, so it blocks nothing — skip it
+        # rather than crashing the drag-and-drop room picker (ST-DATA-003).
+        ex_start_idx = find_slot_index(state, ex_start)
+        if ex_start_idx is None or effective_day(existing) not in state["days"]:
+            continue
 
         for i, ns in enumerate(needed_slots):
             if (day, ns) not in ex_occ:
@@ -506,7 +543,9 @@ def build_occupancy(state, exclude_ids=None):
         start = effective_time(cls)
         room = classroom_of(cls)
         td = total_duration(cls)
-        start_idx = slot_index(state, start)
+        start_idx = find_slot_index(state, start)
+        if start_idx is None or day not in state["days"]:
+            continue  # orphaned placement — occupies no cell on this grid
         slots_list = state["slots"][start_idx:start_idx + td]
         track_room = needs_physical_room(cls) and room is not None
         for off, s in enumerate(slots_list):
@@ -1127,6 +1166,9 @@ def optimized_auto_place(state, new_cls, weights=None):
     Same return signature as auto_place_class.
     """
     from scheduler_app.schedule_optimizer import ScheduleOptimizer
+    # No seed needed: place_with_reschedule reaches only quick_place and
+    # _greedy_construct, and neither draws from the RNG. The randomized paths
+    # (_perturb_ordering, _lns_improve) are called only from optimize().
     optimizer = ScheduleOptimizer(state, weights=weights)
     return optimizer.place_with_reschedule(new_cls)
 
@@ -1136,7 +1178,9 @@ def optimized_reschedule_all(state, weights=None, protected_ids=None,
                              multi_start_runs=5,
                              multi_start_time_limit=120.0,
                              use_cpsat=False, cpsat_time_limit=15.0,
-                             parallel_workers=0):
+                             parallel_workers=0,
+                             seed=DEFAULT_OPTIMIZER_SEED,
+                             cancel_token=None, **optimizer_kwargs):
     """Hybrid timetable-wide reschedule with multi-start LNS + optional CP-SAT.
 
     Preserves pinned and protected placements. Uses greedy construction
@@ -1148,6 +1192,9 @@ def optimized_reschedule_all(state, weights=None, protected_ids=None,
     Args:
         parallel_workers: Number of worker processes for parallel
                           candidate evaluation. 0 = auto, negative = disabled.
+        seed: RNG seed; the default makes the result reproducible
+              (ST-SCHED-013). None draws a fresh seed. The seed used is
+              reported back as summary['seed'].
 
     Returns:
         (placed_list, unplaced_list, changes, summary) where summary
@@ -1160,7 +1207,8 @@ def optimized_reschedule_all(state, weights=None, protected_ids=None,
         multi_start_runs=multi_start_runs,
         multi_start_time_limit=multi_start_time_limit,
         use_cpsat=use_cpsat, cpsat_time_limit=cpsat_time_limit,
-        parallel_workers=parallel_workers)
+        parallel_workers=parallel_workers, seed=seed,
+        cancel_token=cancel_token, **optimizer_kwargs)
     return optimizer.optimize()
 
 

@@ -167,6 +167,23 @@ def main():
     # menus and lists render white-on-white).
     apply_light_palette(app)
 
+    # ST-DATA-012: claim the data directory BEFORE the language gate, which
+    # itself reads and writes settings/app_settings.egu — the very file two
+    # concurrent copies were clobbering last-writer-wins. After
+    # freeze_support() too, so spawned optimizer workers in a frozen build
+    # never fight over the lock.
+    import atexit
+    from PyQt6.QtWidgets import QMessageBox
+    from scheduler_app.single_instance import acquire_single_instance_lock
+    from scheduler_app.translations import tr as _tr
+
+    _instance_lock = acquire_single_instance_lock()
+    if _instance_lock is None:
+        QMessageBox.information(None, _tr("app.already_running_title"),
+                                _tr("app.already_running_body"))
+        sys.exit(0)
+    atexit.register(_instance_lock.release)
+
     # First-run language selection (local only — no network).
     from scheduler_app.first_run import run_language_gate
     run_language_gate()

@@ -168,6 +168,16 @@ def get_classroom_export_labels(classrooms, classes):
 
 
 # ── Protection levels ────────────────────────────────────────────────────
+# ── Optimizer determinism ───────────────────────────────────────────────────
+# ST-SCHED-013: the optimizer used the unseeded process-global `random`, so the
+# same input produced a different (sometimes markedly worse) timetable every
+# run. This is the default seed every entry point falls back to; pass
+# `seed=None` to draw a fresh one and randomize deliberately. It lives here
+# because models.py is the only constants home both core.schedule_optimizer and
+# core.lns_strategies can import without creating a cycle.
+DEFAULT_OPTIMIZER_SEED = 20260101
+
+
 PROTECTION_NONE = "none"               # Fully movable (default)
 PROTECTION_SOFT = "soft"               # Try to preserve; move if necessary
 PROTECTION_SAME_DAY = "same_day"       # Movable within the same day only
@@ -358,8 +368,29 @@ def filter_class_days(cls, all_days):
 
     If cls has allowed_days, only those are considered; otherwise all_days.
     Then excluded_days are removed.
+
+    ST-SCHED-003: the allow-list is INTERSECTED with the grid. Without that, a
+    class restricted to Saturday was placed on Saturday even on a Mon-Fri
+    timetable — a day that does not exist, so the lesson rendered off-grid or
+    vanished, and downstream analytics/export crashed on it.
+
+    Note the intersection is deliberately not a "drop stale values during
+    normalization" as the register suggests: an EMPTY allowed_days means "no
+    restriction" (see the ``or list(all_days)`` fallback), so emptying a
+    now-impossible allow-list would silently turn "only Saturday" into "any
+    day" and place the class on Monday looking like a success. An empty
+    intersection must instead leave the class unplaced, with a reason.
+
+    Order follows the allow-list, not the grid: candidate order feeds the
+    optimizer's tie-breaking, and this preserves the existing behaviour.
     """
-    days = cls.get("allowed_days") or list(all_days)
+    allowed = cls.get("allowed_days")
+    grid = list(all_days)
+    if allowed:
+        on_grid = set(grid)
+        days = [d for d in allowed if d in on_grid]
+    else:
+        days = grid
     if cls.get("excluded_days"):
         excluded = set(cls["excluded_days"])
         days = [d for d in days if d not in excluded]
@@ -371,8 +402,20 @@ def filter_class_times(cls, all_times):
 
     If cls has allowed_times, only those are considered; otherwise all_times.
     Then excluded_times are removed.
+
+    ST-SCHED-004: the allow-list is INTERSECTED with the grid, for the same
+    reason as :func:`filter_class_days`. A stale ``allowed_times`` value — one
+    left behind after a slot was renamed or removed — used to reach
+    ``slot_index`` and abort the whole reschedule with
+    ``ValueError: '20:00' is not in list``.
     """
-    times = cls.get("allowed_times") or list(all_times)
+    allowed = cls.get("allowed_times")
+    grid = list(all_times)
+    if allowed:
+        on_grid = set(grid)
+        times = [t for t in allowed if t in on_grid]
+    else:
+        times = grid
     if cls.get("excluded_times"):
         excluded = set(cls["excluded_times"])
         times = [t for t in times if t not in excluded]
@@ -538,6 +581,42 @@ def normalize_class_data(cls):
             else:
                 cls[key] = default
     return normalize_class_location_fields(cls)
+
+
+def find_off_grid_placements(state):
+    """Return ``[(cls, reason)]`` for every placement that is not on the grid.
+
+    A user who shortens the teaching day or renames an hour leaves the classes
+    already placed there pointing at a cell that no longer exists (ST-DATA-003,
+    created by ST-DATA-004). Those classes must never be silently dropped from
+    an export or a view — the whole point of printing the timetable is to see
+    what is on it.
+
+    Pure: inspects, never mutates. Deliberately NOT called from
+    ``normalize_state_classes`` (and so not from the .egu load path): unplacing
+    orphans at load time would silently discard the user's own placements with
+    no way to see or undo it, which is the same class of bug in a new place.
+    Callers decide what to do — warn, list, or offer to reconcile.
+
+    *reason* is one of ``"day"``, ``"slot"``, or ``"day+slot"``.
+    """
+    days = set(state.get("days", []))
+    slots = set(state.get("slots", []))
+    orphans = []
+    for cls in state.get("classes", []):
+        if not (cls.get("placed") or cls.get("pinned")):
+            continue
+        day = effective_day(cls)
+        slot = effective_time(cls)
+        bad_day = day not in days
+        bad_slot = slot not in slots
+        if bad_day and bad_slot:
+            orphans.append((cls, "day+slot"))
+        elif bad_day:
+            orphans.append((cls, "day"))
+        elif bad_slot:
+            orphans.append((cls, "slot"))
+    return orphans
 
 
 def normalize_state_classes(state):

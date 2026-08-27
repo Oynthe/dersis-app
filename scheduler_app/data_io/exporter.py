@@ -5,6 +5,7 @@ Does not modify scheduling logic or internal data.
 """
 
 import csv
+import warnings
 import os
 from typing import Any
 
@@ -31,6 +32,7 @@ from scheduler_app.models import (
 from scheduler_app.translations import tr
 from scheduler_app.ui.badge_formatter import get_badge
 from scheduler_app.ui.cell_formatter import plain_cell_text
+from scheduler_app.ui.day_keys import display_day
 
 
 class FinalSchedule:
@@ -377,7 +379,13 @@ def _export_csv(schedule: FinalSchedule, filepath: str):
         for cls in schedule.placed_classes():
             room = classroom_of(cls)
             code = cls.get("class_code", "")
-            for day, slot in occupied_slots_of(schedule.state, cls):
+            cells = occupied_slots_of(schedule.state, cls)
+            if not cells:
+                # Orphaned by a deleted hour. A flat file has room for it even
+                # though a grid does not, so write it at its stored position
+                # rather than dropping it (ST-DATA-003).
+                cells = [(effective_day(cls), effective_time(cls))]
+            for day, slot in cells:
                 targets = cls.get("targets", [])
                 if targets:
                     for t in targets:
@@ -887,6 +895,20 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     doc.build(elements)
 
 
+def _warn_about_off_grid_placements(state):
+    """Emit one warning per placement that no longer sits on the grid."""
+    from scheduler_app.models import find_off_grid_placements
+
+    for cls, reason in find_off_grid_placements(state):
+        name = cls.get("name") or cls.get("class_code") or "?"
+        warnings.warn(
+            tr("warnings.off_grid_placement").format(
+                name=name,
+                day=display_day(effective_day(cls)),
+                slot=effective_time(cls)),
+            stacklevel=2)
+
+
 # ── Public entry point ──────────────────────────────────────────────────────
 
 def export_schedule(schedule, format: str, filepath: str, mode: str = "everything"):
@@ -901,6 +923,12 @@ def export_schedule(schedule, format: str, filepath: str, mode: str = "everythin
     """
     if isinstance(schedule, dict):
         schedule = FinalSchedule(schedule)
+
+    # ST-DATA-003 / ST-FUNC-013: a placement orphaned by a deleted day or hour
+    # has no cell to be drawn in, so every grid-shaped export would simply omit
+    # it. Silence is the dangerous outcome — the printout looks complete. Say
+    # so once per orphan, before writing anything.
+    _warn_about_off_grid_placements(schedule.state)
 
     fmt = format.lower().strip(".")
     if fmt in ("xlsx", "excel"):

@@ -9,7 +9,7 @@ All strategies preserve pinned and protected classes.
 import random
 
 from scheduler_app.logic import slot_index, total_duration, _active_targets
-from scheduler_app.models import cls_key
+from scheduler_app.models import cls_key, DEFAULT_OPTIMIZER_SEED
 from scheduler_app.placement_scorer import DEFAULT_WEIGHTS
 
 
@@ -24,9 +24,15 @@ class DestroyStrategy:
     classes to temporarily remove from the timetable.
     """
 
-    def __init__(self, state, weights=None):
+    def __init__(self, state, weights=None, rng=None):
         self.state = state
         self.weights = weights or dict(DEFAULT_WEIGHTS)
+        # ST-SCHED-013. The stream is injected, never created per instance: the
+        # selector builds a fresh strategy every LNS iteration, so a per-instance
+        # Random(seed) would replay the identical shuffle forever and destroy
+        # exploration while still looking deterministic. The fallback exists
+        # only for direct construction outside the selector.
+        self.rng = rng if rng is not None else random.Random(DEFAULT_OPTIMIZER_SEED)
 
     def select(self, solution, flexible, destroy_size, pinned_ids=None,
                protected_ids=None):
@@ -268,7 +274,7 @@ class DayWindowDestroy(DestroyStrategy):
         # Pick the worst day
         worst_day = max(day_scores, key=day_scores.get)
         candidates = day_indices[worst_day]
-        random.shuffle(candidates)
+        self.rng.shuffle(candidates)
         return candidates[:destroy_size]
 
 
@@ -284,7 +290,7 @@ class RandomDestroy(DestroyStrategy):
                     if solution[i] is not None
                     and cls_key(cls) not in pinned_ids
                     and cls_key(cls) not in protected_ids]
-        random.shuffle(eligible)
+        self.rng.shuffle(eligible)
         return eligible[:destroy_size]
 
 
@@ -297,8 +303,8 @@ class ConflictGraphDestroy(DestroyStrategy):
     """
 
     def __init__(self, state, weights=None, conflict_graph=None,
-                 analyzer=None):
-        super().__init__(state, weights)
+                 analyzer=None, rng=None):
+        super().__init__(state, weights, rng=rng)
         self.conflict_graph = conflict_graph
         self.analyzer = analyzer
 
@@ -480,7 +486,7 @@ ALL_DESTROY_STRATEGIES = [
 ]
 
 
-def get_destroy_strategy(state, iteration, weights=None):
+def get_destroy_strategy(state, iteration, weights=None, rng=None):
     """Select a destroy strategy based on iteration number.
 
     Rotates through targeted strategies and intersperses random
@@ -488,7 +494,7 @@ def get_destroy_strategy(state, iteration, weights=None):
     """
     # Every 5th iteration use random for exploration
     if iteration % 5 == 4:
-        return RandomDestroy(state, weights=weights)
+        return RandomDestroy(state, weights=weights, rng=rng)
 
     # Rotate through targeted strategies
     targeted = [
@@ -499,7 +505,7 @@ def get_destroy_strategy(state, iteration, weights=None):
         DayWindowDestroy,
     ]
     idx = iteration % len(targeted)
-    return targeted[idx](state, weights=weights)
+    return targeted[idx](state, weights=weights, rng=rng)
 
 
 class AdaptiveStrategySelector:
@@ -516,7 +522,8 @@ class AdaptiveStrategySelector:
     """
 
     def __init__(self, state, weights=None, min_prob=0.05, decay=0.95,
-                 exploration_rate=0.1, conflict_graph=None, analyzer=None):
+                 exploration_rate=0.1, conflict_graph=None, analyzer=None,
+                 rng=None):
         """
         Args:
             state: Schedule state dict.
@@ -526,7 +533,11 @@ class AdaptiveStrategySelector:
             exploration_rate: Fraction of iterations using random strategy.
             conflict_graph: Optional ConflictGraph for graph-aware strategies.
             analyzer: Optional ConflictAnalyzer for graph-aware strategies.
+            rng: The optimizer's random stream. Shared with every strategy this
+                 selector builds, so the whole LNS phase is reproducible from a
+                 single seed (ST-SCHED-013).
         """
+        self._rng = rng if rng is not None else random.Random(DEFAULT_OPTIMIZER_SEED)
         self.state = state
         self.weights = weights
         self.min_prob = min_prob
@@ -559,8 +570,8 @@ class AdaptiveStrategySelector:
             (strategy_instance, strategy_index)
         """
         # Exploration: random strategy with some probability
-        if random.random() < self.exploration_rate:
-            idx = random.randrange(len(self._strategies))
+        if self._rng.random() < self.exploration_rate:
+            idx = self._rng.randrange(len(self._strategies))
         else:
             idx = self._weighted_select()
 
@@ -568,8 +579,9 @@ class AdaptiveStrategySelector:
         if strategy_cls is ConflictGraphDestroy:
             return strategy_cls(self.state, weights=self.weights,
                                 conflict_graph=self.conflict_graph,
-                                analyzer=self.analyzer), idx
-        return strategy_cls(self.state, weights=self.weights), idx
+                                analyzer=self.analyzer, rng=self._rng), idx
+        return strategy_cls(self.state, weights=self.weights,
+                            rng=self._rng), idx
 
     def update(self, strategy_idx, improved):
         """Update strategy performance after an iteration.
@@ -594,7 +606,7 @@ class AdaptiveStrategySelector:
     def _weighted_select(self):
         """Select a strategy index using probability-weighted sampling."""
         probs = self._get_probabilities()
-        r = random.random()
+        r = self._rng.random()
         cumulative = 0.0
         for i, p in enumerate(probs):
             cumulative += p

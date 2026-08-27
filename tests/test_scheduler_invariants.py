@@ -559,11 +559,10 @@ def test_feasible_pin_is_honored():
 
 
 @pytest.mark.engine
-@pytest.mark.xfail(strict=True, reason=(
-    "ST-SCHED-002 — apply_reschedule skips validation for pinned classes "
-    "(`if cls_item['pinned']: continue`), so two classes pinned to the same "
-    "room/day/slot are committed as-is and reported to nobody; "
-    "fixed in Phase 1"))
+# ST-SCHED-002 fixed in Phase 1: apply_reschedule validates pins instead of
+# trusting them. An infeasible pin is reported through the rejected list — the
+# pin itself is left alone, since silently clearing it would destroy the
+# instruction the user deliberately typed in.
 def test_colliding_pins_are_not_silently_committed():
     """Pins ST-SCHED-002 (High).
 

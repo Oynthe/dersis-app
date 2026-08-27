@@ -8,6 +8,7 @@ for O(1) conflict lookups.
 """
 
 from scheduler_app.logic import (
+    find_slot_index,
     slot_index, slots_fit, total_duration, get_consecutive_slots,
     get_placed_classes, classroom_of, _active_targets, targets_overlap,
     build_occupancy,
@@ -44,6 +45,13 @@ class ConstraintValidator:
 
     def respects_constraints(self, cls, day, slot, room):
         """Check if (day, slot, room) satisfies the class's own constraints."""
+        # ST-SCHED-003/004: a placement can only be valid on a cell that
+        # exists. `respects_constraints` reads cls["allowed_days"] directly and
+        # never goes through filter_class_days, so intersecting the allow-lists
+        # with the grid is NOT enough to stop the validator blessing a ghost
+        # day — this guard is what does it.
+        if day not in self.state["days"] or slot not in self.state["slots"]:
+            return False
         if cls["allowed_days"] and day not in cls["allowed_days"]:
             return False
         if cls.get("excluded_days") and day in cls["excluded_days"]:
@@ -80,8 +88,10 @@ class ConstraintValidator:
         Returns True if the placement is valid (no hard constraint violated).
         """
         td = total_duration(cls)
-        si = slot_index(self.state, start_slot)
-        if si + td > len(self.state["slots"]):
+        if day not in self.state["days"]:
+            return False
+        si = find_slot_index(self.state, start_slot)
+        if si is None or si + td > len(self.state["slots"]):
             return False
         if not self.respects_constraints(cls, day, start_slot, room):
             return False
@@ -107,8 +117,15 @@ class ConstraintValidator:
         """
         reasons = []
         td = total_duration(cls)
-        si = slot_index(self.state, start_slot)
         display_day_value = display_day(day)
+        if day not in self.state["days"]:
+            reasons.append(tr("validation.day_not_in_grid").format(
+                display_day_value))
+            return False, reasons
+        si = find_slot_index(self.state, start_slot)
+        if si is None:
+            reasons.append(tr("validation.slot_not_in_grid").format(start_slot))
+            return False, reasons
         allowed_days = ", ".join(display_day(d) for d in cls.get("allowed_days", []))
         excluded_days = ", ".join(display_day(d) for d in cls.get("excluded_days", []))
         if si + td > len(self.state["slots"]):
@@ -159,26 +176,31 @@ class ConstraintValidator:
             cur_room = cls.get("pinned_classroom") if cls.get("pinned") else cls.get("placed_classroom")
             self.remove_placement(cls, cur_day, cur_time, cur_room)
 
-        # Occupancy conflicts
-        check_room = needs_physical_room(cls) and room is not None
-        slots_list = self.state["slots"][si:si + td]
-        for off, s in enumerate(slots_list):
-            key = (day, s)
-            if check_room and room in self.room_occ.get(key, set()):
-                reasons.append(tr("validation.room_occupied").format(room, display_day_value, s))
-            if cls["lecturer"] in self.lect_occ.get(key, set()):
-                reasons.append(
-                    tr("validation.lecturer_busy").format(
-                        cls['lecturer'], display_day_value, s))
-            for t in _active_targets(cls, off):
-                if (t["year"], t["branch"]) in self.group_occ.get(key, set()):
+        # ST-DATA-011: the class's own placement was lifted out of the occupancy
+        # maps above so it cannot conflict with itself. If anything below raises,
+        # putting it back is not optional — the validator would otherwise go on
+        # believing the cell is free and bless a real double-booking.
+        try:
+            # Occupancy conflicts
+            check_room = needs_physical_room(cls) and room is not None
+            slots_list = self.state["slots"][si:si + td]
+            for off, s in enumerate(slots_list):
+                key = (day, s)
+                if check_room and room in self.room_occ.get(key, set()):
+                    reasons.append(tr("validation.room_occupied").format(room, display_day_value, s))
+                if cls["lecturer"] in self.lect_occ.get(key, set()):
                     reasons.append(
-                        tr("validation.group_busy").format(
-                            t['year'], t['branch'], display_day_value, s))
-
-        # Restore the class's placement in occupancy maps
-        if already_placed:
-            self.add_placement(cls, cur_day, cur_time, cur_room)
+                        tr("validation.lecturer_busy").format(
+                            cls['lecturer'], display_day_value, s))
+                for t in _active_targets(cls, off):
+                    if (t["year"], t["branch"]) in self.group_occ.get(key, set()):
+                        reasons.append(
+                            tr("validation.group_busy").format(
+                                t['year'], t['branch'], display_day_value, s))
+        finally:
+            # Restore the class's placement in occupancy maps
+            if already_placed:
+                self.add_placement(cls, cur_day, cur_time, cur_room)
 
         return len(reasons) == 0, reasons
 
@@ -186,8 +208,15 @@ class ConstraintValidator:
         """Return a list of human-readable conflict descriptions."""
         conflicts = []
         td = total_duration(cls)
-        si = slot_index(self.state, start_slot)
         display_day_value = display_day(day)
+        if day not in self.state["days"]:
+            conflicts.append(tr("validation.day_not_in_grid").format(
+                display_day_value))
+            return conflicts
+        si = find_slot_index(self.state, start_slot)
+        if si is None:
+            conflicts.append(tr("validation.slot_not_in_grid").format(start_slot))
+            return conflicts
         if si + td > len(self.state["slots"]):
             conflicts.append(tr("validation.duration_overflow"))
             return conflicts
@@ -237,7 +266,9 @@ class ConstraintValidator:
     def add_placement(self, cls, day, start_slot, room):
         """Register a placement in the occupancy maps."""
         td = total_duration(cls)
-        si = slot_index(self.state, start_slot)
+        si = find_slot_index(self.state, start_slot)
+        if si is None or day not in self.state["days"]:
+            return  # orphaned placement — occupies no cell on this grid
         slots_list = self.state["slots"][si:si + td]
         track_room = needs_physical_room(cls) and room is not None
         for off, s in enumerate(slots_list):
@@ -252,7 +283,9 @@ class ConstraintValidator:
     def remove_placement(self, cls, day, start_slot, room):
         """Remove a placement from the occupancy maps."""
         td = total_duration(cls)
-        si = slot_index(self.state, start_slot)
+        si = find_slot_index(self.state, start_slot)
+        if si is None or day not in self.state["days"]:
+            return  # orphaned placement — occupies no cell on this grid
         slots_list = self.state["slots"][si:si + td]
         track_room = needs_physical_room(cls) and room is not None
         for off, s in enumerate(slots_list):

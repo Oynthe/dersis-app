@@ -784,19 +784,22 @@ class RelaxationSuggester:
         elif orig_allowed:
             cls["allowed_days"] = list(orig_allowed) + [day]
 
-        _, times, rooms = self.generator.get_search_space(cls)
-        count = 0
-        for slot in (times if times else self.state["slots"]):
-            td = total_duration(cls)
-            if not slots_fit(self.state, slot, td):
-                continue
-            for room in (rooms if rooms else self.state["classrooms"]):
-                if self.validator.check_placement(cls, day, slot, room):
-                    count += 1
-
-        # Restore original constraints
-        cls["allowed_days"] = orig_allowed
-        cls["excluded_days"] = orig_excluded
+        # ST-DATA-011: the constraints are mutated to simulate a relaxation, so
+        # the restore has to happen even when the estimate raises — otherwise the
+        # class is left carrying a constraint the user never set.
+        try:
+            _, times, rooms = self.generator.get_search_space(cls)
+            count = 0
+            for slot in (times if times else self.state["slots"]):
+                td = total_duration(cls)
+                if not slots_fit(self.state, slot, td):
+                    continue
+                for room in (rooms if rooms else self.state["classrooms"]):
+                    if self.validator.check_placement(cls, day, slot, room):
+                        count += 1
+        finally:
+            cls["allowed_days"] = orig_allowed
+            cls["excluded_days"] = orig_excluded
         return count
 
     def _estimate_time_impact(self, cls, slot, is_exclusion_removal=False):
@@ -816,15 +819,18 @@ class RelaxationSuggester:
         elif orig_allowed:
             cls["allowed_times"] = list(orig_allowed) + [slot]
 
-        days, _, rooms = self.generator.get_search_space(cls)
-        count = 0
-        for day in (days if days else self.state["days"]):
-            for room in (rooms if rooms else self.state["classrooms"]):
-                if self.validator.check_placement(cls, day, slot, room):
-                    count += 1
-
-        cls["allowed_times"] = orig_allowed
-        cls["excluded_times"] = orig_excluded
+        # ST-DATA-011: restore even when the estimate raises, or the class is
+        # left carrying a constraint the user never set.
+        try:
+            days, _, rooms = self.generator.get_search_space(cls)
+            count = 0
+            for day in (days if days else self.state["days"]):
+                for room in (rooms if rooms else self.state["classrooms"]):
+                    if self.validator.check_placement(cls, day, slot, room):
+                        count += 1
+        finally:
+            cls["allowed_times"] = orig_allowed
+            cls["excluded_times"] = orig_excluded
         return count
 
     def _estimate_room_impact(self, cls, room, is_exclusion_removal=False):
@@ -839,18 +845,21 @@ class RelaxationSuggester:
         elif orig_required:
             cls["required_classrooms"] = list(orig_required) + [room]
 
-        days, times, _ = self.generator.get_search_space(cls)
-        count = 0
-        for day in (days if days else self.state["days"]):
-            for slot in (times if times else self.state["slots"]):
-                td = total_duration(cls)
-                if not slots_fit(self.state, slot, td):
-                    continue
-                if self.validator.check_placement(cls, day, slot, room):
-                    count += 1
-
-        cls["required_classrooms"] = orig_required
-        cls["excluded_classrooms"] = orig_excluded
+        # ST-DATA-011: restore even when the estimate raises, or the class is
+        # left carrying a constraint the user never set.
+        try:
+            days, times, _ = self.generator.get_search_space(cls)
+            count = 0
+            for day in (days if days else self.state["days"]):
+                for slot in (times if times else self.state["slots"]):
+                    td = total_duration(cls)
+                    if not slots_fit(self.state, slot, td):
+                        continue
+                    if self.validator.check_placement(cls, day, slot, room):
+                        count += 1
+        finally:
+            cls["required_classrooms"] = orig_required
+            cls["excluded_classrooms"] = orig_excluded
         return count
 
 
@@ -1272,19 +1281,21 @@ class ConstraintNegotiator:
         if not unplaced_list:
             return None
 
-        class_reports = []
-        for cls, reason in unplaced_list:
-            analysis = self.analyzer.analyze_class(cls)
-            suggestions = self.suggester.suggest_for_class(cls, analysis)
-            report = self.report_builder.build_class_report(
-                analysis, suggestions)
-            class_reports.append(report)
+        # ST-PERF-007: every unplaced class used to be analysed TWICE — once
+        # here and again below to build the identical `all_analyses` list.
+        # Built before the sort on purpose: the diagnostic summary expects them
+        # in unplaced_list order, not in report-priority order.
+        analyses = [self.analyzer.analyze_class(cls) for cls, _ in unplaced_list]
+        class_reports = [
+            self.report_builder.build_class_report(
+                analysis, self.suggester.suggest_for_class(cls, analysis))
+            for (cls, _reason), analysis in zip(unplaced_list, analyses)
+        ]
 
         class_reports.sort(key=lambda r: r["priority"])
 
         self._ensure_conflict_graph()
-        all_analyses = [self.analyzer.analyze_class(cls)
-                        for cls, _ in unplaced_list]
+        all_analyses = analyses
         diagnostic_summary = self.report_builder.build_diagnostic_summary(
             self.state, all_analyses,
             conflict_graph=self._conflict_graph,

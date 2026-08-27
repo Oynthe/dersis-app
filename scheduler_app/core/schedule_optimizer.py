@@ -28,7 +28,15 @@ import time
 from scheduler_app.logic import (
     slot_index, total_duration, get_placed_classes, classroom_of,
 )
-from scheduler_app.models import cls_key
+from scheduler_app.models import cls_key, DEFAULT_OPTIMIZER_SEED
+from scheduler_app.core.solver_worker import SolveCancelled
+
+# The shipped search budget. Named because the progress UI needs the same
+# denominators the optimizer actually runs (ST-PERF-001): a second copy of
+# these numbers elsewhere means the bar stops short of the end, or saturates
+# early, the moment the two drift.
+DEFAULT_MULTI_START_RUNS = 5
+DEFAULT_LNS_ITERATIONS = 200
 from scheduler_app.constraint_validator import ConstraintValidator
 from scheduler_app.candidate_generator import CandidateGenerator
 from scheduler_app.placement_scorer import PlacementScorer
@@ -86,7 +94,7 @@ def _make_cpsat_state_snapshot(state):
 
 def _cpsat_subprocess_worker(state_snap, weights, time_limit,
                              protected_indices, heuristic_indices,
-                             result_queue):
+                             result_queue, seed=DEFAULT_OPTIMIZER_SEED):
     """Run CP-SAT solver in an isolated subprocess.
 
     All arguments are plain serializable Python objects. Results are
@@ -106,7 +114,8 @@ def _cpsat_subprocess_worker(state_snap, weights, time_limit,
         solver = CPSATScheduler(
             state_snap, weights=weights,
             time_limit=time_limit,
-            protected_ids=protected_ids)
+            protected_ids=protected_ids,
+            seed=seed)
 
         heuristic_solution = None
         if heuristic_indices:
@@ -152,13 +161,16 @@ class ScheduleOptimizer:
     """
 
     def __init__(self, state, weights=None, max_iterations=100000,
-                 lns_iterations=200, lns_time_limit=30.0,
+                 lns_iterations=DEFAULT_LNS_ITERATIONS, lns_time_limit=30.0,
                  lns_no_improve_limit=50, destroy_fraction=0.25,
                  protected_ids=None, progress_callback=None,
-                 multi_start_runs=5, multi_start_time_limit=120.0,
+                 multi_start_runs=DEFAULT_MULTI_START_RUNS,
+                 multi_start_time_limit=3600.0,
                  use_cpsat=False, cpsat_time_limit=15.0,
                  parallel_workers=0,
-                 sa_initial_temp=2.0, sa_cooling_rate=0.995):
+                 sa_initial_temp=2.0, sa_cooling_rate=0.995,
+                 seed=DEFAULT_OPTIMIZER_SEED, deterministic_budget=True,
+                 cancel_token=None):
         """
         Args:
             state: The schedule state dict.
@@ -182,6 +194,23 @@ class ScheduleOptimizer:
             parallel_workers: Number of worker processes for parallel
                               candidate evaluation. 0 = auto (uses
                               min(cpu_count, 4)), negative = disabled.
+            seed: RNG seed. The default makes identical input produce an
+                  identical timetable (ST-SCHED-013). Pass ``None`` to draw a
+                  fresh seed from OS entropy — the deliberate "randomize" path.
+                  The seed actually used is reported as ``summary['seed']`` so a
+                  user or support case can replay a run exactly.
+            deterministic_budget: When True (default), the LNS phase is bounded
+                  by *iteration* counts rather than by the wall clock, so a slow
+                  machine reaches the same answer as a fast one. A seed alone
+                  does not achieve reproducibility: with a clock-bounded search,
+                  the same seed does a different amount of work per machine and
+                  lands somewhere else. ``multi_start_time_limit`` still applies
+                  as an emergency cap; when it fires the run is truncated and
+                  ``summary['deterministic']`` reports False.
+
+        Note: with ``deterministic_budget=True`` (the default) ``lns_time_limit``
+        no longer bounds the default path — it applies only when the budget is
+        wall-clock, or when a caller passes an explicit per-run override.
         """
         self.state = state
         self.weights = weights
@@ -199,6 +228,25 @@ class ScheduleOptimizer:
         self.parallel_workers = parallel_workers
         self.sa_initial_temp = sa_initial_temp
         self.sa_cooling_rate = sa_cooling_rate
+        # Draw a randomized seed from OS entropy, never from the process-global
+        # `random`: consuming that stream would make this run perturb — and be
+        # perturbed by — every other user of it.
+        if seed is None:
+            seed = random.SystemRandom().getrandbits(63)
+        self.seed = int(seed)
+        self._rng = random.Random(self.seed)
+        self.deterministic_budget = deterministic_budget
+        self._clock_capped = False
+        # ST-PERF-001. None on every path that is not a user-cancellable
+        # reschedule (auto-place, batch schedule), where _check_cancelled is a
+        # single `is not None` test — measured at no cost on an 80-class
+        # greedy-dominated run.
+        self.cancel_token = cancel_token
+
+    def _check_cancelled(self):
+        """Raise SolveCancelled if the user has asked this solve to stop."""
+        if self.cancel_token is not None:
+            self.cancel_token.raise_if_cancelled()
 
     def optimize(self):
         """Run multi-start timetable optimization.
@@ -259,273 +307,309 @@ class ScheduleOptimizer:
             workers = self.parallel_workers if self.parallel_workers > 0 else None
             parallel_pool = ParallelScorerPool(max_workers=workers)
 
-        # Save old placements for change tracking
-        old_placements = {}
-        for cls in flexible_placed:
-            old_placements[cls_key(cls)] = (
-                cls["placed_day"], cls["placed_time"], cls["placed_classroom"])
+        # ST-PERF-001: the pool must be shut down even when SolveCancelled
+        # unwinds through here, or a cancelled solve leaves its worker
+        # processes alive until the next garbage collection.
+        try:
+            # Save old placements for change tracking
+            old_placements = {}
+            for cls in flexible_placed:
+                old_placements[cls_key(cls)] = (
+                    cls["placed_day"], cls["placed_time"], cls["placed_classroom"])
 
-        # Score the initial timetable before optimization
-        tt_scorer = TimetableScorer(self.state, weights=self.weights)
+            # Score the initial timetable before optimization
+            tt_scorer = TimetableScorer(self.state, weights=self.weights)
 
-        # Compute baseline scores for improve_only classes
-        for c in flexible:
-            if (c.get("protection") == PROTECTION_IMPROVE_ONLY
-                    and c["placed"]):
-                improve_only_scores[cls_key(c)] = tt_scorer.placement_score(
-                    c, c["placed_day"], c["placed_time"],
-                    c["placed_classroom"])
+            # Compute baseline scores for improve_only classes
+            for c in flexible:
+                if (c.get("protection") == PROTECTION_IMPROVE_ONLY
+                        and c["placed"]):
+                    improve_only_scores[cls_key(c)] = tt_scorer.placement_score(
+                        c, c["placed_day"], c["placed_time"],
+                        c["placed_classroom"])
 
-        before_placements = []
-        for cls in pinned:
-            before_placements.append((cls, cls["pinned_day"],
-                                      cls["pinned_time"],
-                                      cls["pinned_classroom"]))
-        for cls in locked:
-            before_placements.append((cls, cls["placed_day"],
-                                      cls["placed_time"],
-                                      cls["placed_classroom"]))
-        for cls in protected:
-            before_placements.append((cls, cls["placed_day"],
-                                      cls["placed_time"],
-                                      cls["placed_classroom"]))
-        for cls in flexible_placed:
-            before_placements.append((cls, cls["placed_day"],
-                                      cls["placed_time"],
-                                      cls["placed_classroom"]))
-        before_detailed = tt_scorer.score_detailed(before_placements)
-
-        # ── Multi-start optimization ──
-        global_best_solution = None
-        global_best_quality = float("inf")
-        global_best_ordered = None
-        global_best_generator = None
-        global_start = time.time()
-        n_runs = max(1, self.multi_start_runs)
-
-        for run in range(n_runs):
-            # Check total time limit
-            elapsed_total = time.time() - global_start
-            if elapsed_total >= self.multi_start_time_limit:
-                break
-
-            # Build fresh validator for each run
-            exclude_ids = {cls_key(c) for c in all_flexible}
-            validator = ConstraintValidator(self.state,
-                                           exclude_ids=exclude_ids)
-            for cls in locked:
-                validator.add_placement(
-                    cls, cls["placed_day"], cls["placed_time"],
-                    cls["placed_classroom"])
-            for cls in protected:
-                validator.add_placement(
-                    cls, cls["placed_day"], cls["placed_time"],
-                    cls["placed_classroom"])
-
-            generator = CandidateGenerator(self.state, validator=validator)
-
-            # Build constraint propagator for incremental valid-count caching
-            cs = ConstraintState(self.state, validator, generator, all_flexible)
-            propagator = ConstraintPropagator(cs)
-
-            scorer = PlacementScorer(self.state, validator,
-                                     weights=self.weights,
-                                     conflict_graph=conflict_graph,
-                                     propagator=propagator,
-                                     parallel_pool=parallel_pool,
-                                     previous_placements=old_placements)
-
-            # Graph-enhanced ordering: first run uses conflict-graph
-            # difficulty, subsequent runs shuffle with controlled
-            # randomization
-            analyzer = ConflictAnalyzer(conflict_graph, validator)
-            ordered = analyzer.difficulty_ranking(all_flexible)
-            if run > 0:
-                ordered = self._perturb_ordering(ordered)
-
-            # Phase 1: Greedy construction
-            # First run uses warm-start from existing placements
-            ws = old_placements if run == 0 else None
-            solution, greedy_stats = self._greedy_construct(
-                ordered, validator, generator, scorer,
-                propagator=propagator,
-                improve_only_scores=improve_only_scores,
-                warm_start=ws)
-
-            # Remaining time budget for this run's LNS
-            elapsed_total = time.time() - global_start
-            remaining_time = self.multi_start_time_limit - elapsed_total
-            per_run_limit = min(
-                self.lns_time_limit,
-                remaining_time / max(1, n_runs - run))
-
-            # Phase 2: LNS improvement with adaptive strategies
-            # Reset propagator caches before LNS (greedy changed state)
-            if propagator is not None:
-                propagator.cs.reset()
-            solution, lns_stats = self._lns_improve(
-                ordered, solution, validator, generator, scorer,
-                tt_scorer, time_limit_override=per_run_limit,
-                run_number=run, total_runs=n_runs,
-                conflict_graph=conflict_graph, analyzer=analyzer,
-                propagator=propagator, same_day_map=same_day_map,
-                improve_only_scores=improve_only_scores)
-
-            # Evaluate this run's quality
-            run_placements = []
+            before_placements = []
             for cls in pinned:
-                run_placements.append((cls, cls["pinned_day"],
-                                       cls["pinned_time"],
-                                       cls["pinned_classroom"]))
+                before_placements.append((cls, cls["pinned_day"],
+                                          cls["pinned_time"],
+                                          cls["pinned_classroom"]))
             for cls in locked:
-                run_placements.append((cls, cls["placed_day"],
-                                       cls["placed_time"],
-                                       cls["placed_classroom"]))
+                before_placements.append((cls, cls["placed_day"],
+                                          cls["placed_time"],
+                                          cls["placed_classroom"]))
             for cls in protected:
-                run_placements.append((cls, cls["placed_day"],
-                                       cls["placed_time"],
-                                       cls["placed_classroom"]))
+                before_placements.append((cls, cls["placed_day"],
+                                          cls["placed_time"],
+                                          cls["placed_classroom"]))
+            for cls in flexible_placed:
+                before_placements.append((cls, cls["placed_day"],
+                                          cls["placed_time"],
+                                          cls["placed_classroom"]))
+            # A placement the user orphaned (by deleting the hour or day it sits
+            # on) describes no real cell, so it cannot contribute a "before" score.
+            # Drop it here rather than deeper down: this is the layer that knows
+            # these tuples came from stored state (ST-DATA-003).
+            on_grid_days = set(self.state.get("days", []))
+            on_grid_slots = set(self.state.get("slots", []))
+            before_placements = [
+                (c, d, sl, rm) for (c, d, sl, rm) in before_placements
+                if d in on_grid_days and sl in on_grid_slots
+            ]
+            before_detailed = tt_scorer.score_detailed(before_placements)
+
+            # ── Multi-start optimization ──
+            global_best_solution = None
+            global_best_quality = float("inf")
+            global_best_ordered = None
+            global_best_generator = None
+            global_start = time.time()
+            n_runs = max(1, self.multi_start_runs)
+
+            # `run`, `greedy_stats` and `lns_stats` are bound inside the loop but
+            # read by the summary below; initialise them so a capped run still
+            # produces a summary instead of an UnboundLocalError.
+            run = 0
+            greedy_stats = {}
+            lns_stats = {}
+
+            for run in range(n_runs):
+                # Emergency wall-clock cap. `run > 0` guarantees at least one
+                # complete run: breaking on run 0 leaves global_best_ordered None
+                # and optimize() then dies with `TypeError: 'NoneType' object is
+                # not iterable` while building the heuristic result.
+                self._check_cancelled()
+                elapsed_total = time.time() - global_start
+                if run > 0 and elapsed_total >= self.multi_start_time_limit:
+                    self._clock_capped = True
+                    break
+
+                # Build fresh validator for each run
+                exclude_ids = {cls_key(c) for c in all_flexible}
+                validator = ConstraintValidator(self.state,
+                                               exclude_ids=exclude_ids)
+                for cls in locked:
+                    validator.add_placement(
+                        cls, cls["placed_day"], cls["placed_time"],
+                        cls["placed_classroom"])
+                for cls in protected:
+                    validator.add_placement(
+                        cls, cls["placed_day"], cls["placed_time"],
+                        cls["placed_classroom"])
+
+                generator = CandidateGenerator(self.state, validator=validator)
+
+                # Build constraint propagator for incremental valid-count caching
+                cs = ConstraintState(self.state, validator, generator, all_flexible)
+                propagator = ConstraintPropagator(cs)
+
+                scorer = PlacementScorer(self.state, validator,
+                                         weights=self.weights,
+                                         conflict_graph=conflict_graph,
+                                         propagator=propagator,
+                                         parallel_pool=parallel_pool,
+                                         previous_placements=old_placements)
+
+                # Graph-enhanced ordering: first run uses conflict-graph
+                # difficulty, subsequent runs shuffle with controlled
+                # randomization
+                analyzer = ConflictAnalyzer(conflict_graph, validator)
+                ordered = analyzer.difficulty_ranking(all_flexible)
+                if run > 0:
+                    ordered = self._perturb_ordering(ordered)
+
+                # Phase 1: Greedy construction
+                # First run uses warm-start from existing placements
+                ws = old_placements if run == 0 else None
+                solution, greedy_stats = self._greedy_construct(
+                    ordered, validator, generator, scorer,
+                    propagator=propagator,
+                    improve_only_scores=improve_only_scores,
+                    warm_start=ws)
+
+                # Remaining time budget for this run's LNS. Under a
+                # deterministic budget there is none: LNS stops on iteration count,
+                # not on how fast this particular machine happens to be.
+                if self.deterministic_budget:
+                    per_run_limit = None
+                else:
+                    elapsed_total = time.time() - global_start
+                    remaining_time = self.multi_start_time_limit - elapsed_total
+                    per_run_limit = min(
+                        self.lns_time_limit,
+                        remaining_time / max(1, n_runs - run))
+
+                # Phase 2: LNS improvement with adaptive strategies
+                # Reset propagator caches before LNS (greedy changed state)
+                if propagator is not None:
+                    propagator.cs.reset()
+                solution, lns_stats = self._lns_improve(
+                    ordered, solution, validator, generator, scorer,
+                    tt_scorer, time_limit_override=per_run_limit,
+                    run_number=run, total_runs=n_runs,
+                    conflict_graph=conflict_graph, analyzer=analyzer,
+                    propagator=propagator, same_day_map=same_day_map,
+                    improve_only_scores=improve_only_scores)
+
+                # Evaluate this run's quality
+                run_placements = []
+                for cls in pinned:
+                    run_placements.append((cls, cls["pinned_day"],
+                                           cls["pinned_time"],
+                                           cls["pinned_classroom"]))
+                for cls in locked:
+                    run_placements.append((cls, cls["placed_day"],
+                                           cls["placed_time"],
+                                           cls["placed_classroom"]))
+                for cls in protected:
+                    run_placements.append((cls, cls["placed_day"],
+                                           cls["placed_time"],
+                                           cls["placed_classroom"]))
+                for i, cls in enumerate(ordered):
+                    if solution[i] is not None:
+                        run_placements.append(
+                            (cls, solution[i][0], solution[i][1], solution[i][2]))
+
+                run_quality = tt_scorer.score(run_placements)
+                run_placed_count = sum(1 for s in solution if s is not None)
+
+                # Keep best: prefer more classes placed, then lower quality score
+                if global_best_solution is None:
+                    is_better = True
+                else:
+                    best_placed_count = sum(
+                        1 for s in global_best_solution if s is not None)
+                    is_better = (run_placed_count > best_placed_count or
+                                 (run_placed_count == best_placed_count
+                                  and run_quality < global_best_quality))
+                if is_better:
+                    global_best_solution = list(solution)
+                    global_best_quality = run_quality
+                    global_best_ordered = ordered
+                    global_best_generator = generator
+
+            # Build heuristic result for potential CP-SAT seeding
+            ordered = global_best_ordered
+            solution = global_best_solution
+            generator = global_best_generator
+
+            heuristic_placed = []
+            for cls in pinned:
+                heuristic_placed.append((cls, cls["pinned_day"],
+                                         cls["pinned_time"],
+                                         cls["pinned_classroom"]))
+            for cls in locked:
+                heuristic_placed.append((cls, cls["placed_day"],
+                                         cls["placed_time"],
+                                         cls["placed_classroom"]))
+            for cls in protected:
+                heuristic_placed.append((cls, cls["placed_day"],
+                                         cls["placed_time"],
+                                         cls["placed_classroom"]))
             for i, cls in enumerate(ordered):
                 if solution[i] is not None:
-                    run_placements.append(
+                    heuristic_placed.append(
                         (cls, solution[i][0], solution[i][1], solution[i][2]))
 
-            run_quality = tt_scorer.score(run_placements)
-            run_placed_count = sum(1 for s in solution if s is not None)
+            heuristic_quality = tt_scorer.score(heuristic_placed)
 
-            # Keep best: prefer more classes placed, then lower quality score
-            if global_best_solution is None:
-                is_better = True
-            else:
-                best_placed_count = sum(
-                    1 for s in global_best_solution if s is not None)
-                is_better = (run_placed_count > best_placed_count or
-                             (run_placed_count == best_placed_count
-                              and run_quality < global_best_quality))
-            if is_better:
-                global_best_solution = list(solution)
-                global_best_quality = run_quality
-                global_best_ordered = ordered
-                global_best_generator = generator
+            # ── Phase 4 (optional): CP-SAT deep optimization ──
+            cpsat_used = False
+            cpsat_status = None
+            cpsat_status_label = None
+            if self.use_cpsat:
+                # Shut down parallel pool before CP-SAT to free resources
+                if parallel_pool is not None:
+                    parallel_pool.shutdown()
+                    parallel_pool = None
 
-        # Build heuristic result for potential CP-SAT seeding
-        ordered = global_best_ordered
-        solution = global_best_solution
-        generator = global_best_generator
+                cpsat_result = self._cpsat_optimize(
+                    heuristic_placed, tt_scorer, pinned, protected, all_flexible)
+                if cpsat_result is not None:
+                    cpsat_placed, cpsat_unplaced, cpsat_info = cpsat_result
+                    cpsat_quality = tt_scorer.score(cpsat_placed)
+                    cpsat_placed_count = len(cpsat_placed)
+                    heur_placed_count = len(heuristic_placed)
+                    cpsat_status = cpsat_info.get("status")
+                    cpsat_status_label = cpsat_info.get("status_label", cpsat_status)
+                    cpsat_used = True
 
-        heuristic_placed = []
-        for cls in pinned:
-            heuristic_placed.append((cls, cls["pinned_day"],
-                                     cls["pinned_time"],
-                                     cls["pinned_classroom"]))
-        for cls in locked:
-            heuristic_placed.append((cls, cls["placed_day"],
-                                     cls["placed_time"],
-                                     cls["placed_classroom"]))
-        for cls in protected:
-            heuristic_placed.append((cls, cls["placed_day"],
-                                     cls["placed_time"],
-                                     cls["placed_classroom"]))
-        for i, cls in enumerate(ordered):
-            if solution[i] is not None:
-                heuristic_placed.append(
-                    (cls, solution[i][0], solution[i][1], solution[i][2]))
+                    # Accept CP-SAT result if it's better
+                    if (cpsat_placed_count > heur_placed_count or
+                            (cpsat_placed_count == heur_placed_count
+                             and cpsat_quality < heuristic_quality)):
+                        heuristic_placed = cpsat_placed
+                        heuristic_quality = cpsat_quality
+                        # Rebuild solution/ordered from cpsat result
+                        # for change tracking below
 
-        heuristic_quality = tt_scorer.score(heuristic_placed)
+            # Build final results with change tracking
+            placed_list = []
+            unplaced_list = []
+            changes = []
 
-        # ── Phase 4 (optional): CP-SAT deep optimization ──
-        cpsat_used = False
-        cpsat_status = None
-        cpsat_status_label = None
-        if self.use_cpsat:
-            # Shut down parallel pool before CP-SAT to free resources
+            # Use heuristic_placed as the final result
+            placed_set = set()
+            for cls, day, slot, room in heuristic_placed:
+                placed_list.append((cls, day, slot, room))
+                placed_set.add(cls_key(cls))
+                if cls["pinned"] or cls_key(cls) in immovable_ids or cls_key(cls) in effective_protected_ids:
+                    continue
+                old = old_placements.get(cls_key(cls))
+                if old and old != (day, slot, room):
+                    changes.append({
+                        "cls": cls,
+                        "old_day": old[0], "old_time": old[1],
+                        "old_room": old[2],
+                        "new_day": day, "new_time": slot, "new_room": room,
+                    })
+                elif not old:
+                    changes.append({
+                        "cls": cls,
+                        "old_day": None, "old_time": None, "old_room": None,
+                        "new_day": day, "new_time": slot, "new_room": room,
+                    })
+
+            for cls in all_flexible:
+                if cls_key(cls) not in placed_set:
+                    reason = (generator.unplaced_reason(cls)
+                              if generator else tr("negotiation.no_valid_placement"))
+                    unplaced_list.append((cls, reason))
+
+            # Build after-optimization quality breakdown
+            after_detailed = tt_scorer.score_detailed(placed_list)
+
+            summary = {
+                "runs_completed": min(n_runs, run + 1)
+                                  if global_best_solution else 0,
+                "total_time": time.time() - global_start,
+                "before": before_detailed,
+                "after": after_detailed,
+                "improvement": {
+                    k: before_detailed.get(k, 0) - after_detailed.get(k, 0)
+                    for k in ["lecturer_gaps", "student_gaps", "fragmentation",
+                               "day_balance", "room_switching", "time_quality",
+                               "total"]
+                },
+                "classes_moved": len(changes),
+                "classes_placed": len(placed_list),
+                "classes_unplaced": len(unplaced_list),
+                "cpsat_used": cpsat_used,
+                "cpsat_status": cpsat_status,
+                "cpsat_status_label": cpsat_status_label,
+                "greedy_stats": greedy_stats,
+                "lns_strategy_stats": lns_stats.get("strategy_stats", []),
+                # ST-SCHED-013. `seed` is what you pass back to reproduce this exact
+                # timetable. `deterministic` is False when the answer cannot be
+                # reproduced: either the emergency clock cap truncated the search,
+                # or CP-SAT ran (its budget is still wall-clock — Phase 3).
+                "seed": self.seed,
+                "deterministic": (not self._clock_capped) and (not cpsat_used),
+            }
+
+            return placed_list, unplaced_list, changes, summary
+        finally:
             if parallel_pool is not None:
                 parallel_pool.shutdown()
-                parallel_pool = None
-
-            cpsat_result = self._cpsat_optimize(
-                heuristic_placed, tt_scorer, pinned, protected, all_flexible)
-            if cpsat_result is not None:
-                cpsat_placed, cpsat_unplaced, cpsat_info = cpsat_result
-                cpsat_quality = tt_scorer.score(cpsat_placed)
-                cpsat_placed_count = len(cpsat_placed)
-                heur_placed_count = len(heuristic_placed)
-                cpsat_status = cpsat_info.get("status")
-                cpsat_status_label = cpsat_info.get("status_label", cpsat_status)
-                cpsat_used = True
-
-                # Accept CP-SAT result if it's better
-                if (cpsat_placed_count > heur_placed_count or
-                        (cpsat_placed_count == heur_placed_count
-                         and cpsat_quality < heuristic_quality)):
-                    heuristic_placed = cpsat_placed
-                    heuristic_quality = cpsat_quality
-                    # Rebuild solution/ordered from cpsat result
-                    # for change tracking below
-
-        # Build final results with change tracking
-        placed_list = []
-        unplaced_list = []
-        changes = []
-
-        # Use heuristic_placed as the final result
-        placed_set = set()
-        for cls, day, slot, room in heuristic_placed:
-            placed_list.append((cls, day, slot, room))
-            placed_set.add(cls_key(cls))
-            if cls["pinned"] or cls_key(cls) in immovable_ids or cls_key(cls) in effective_protected_ids:
-                continue
-            old = old_placements.get(cls_key(cls))
-            if old and old != (day, slot, room):
-                changes.append({
-                    "cls": cls,
-                    "old_day": old[0], "old_time": old[1],
-                    "old_room": old[2],
-                    "new_day": day, "new_time": slot, "new_room": room,
-                })
-            elif not old:
-                changes.append({
-                    "cls": cls,
-                    "old_day": None, "old_time": None, "old_room": None,
-                    "new_day": day, "new_time": slot, "new_room": room,
-                })
-
-        for cls in all_flexible:
-            if cls_key(cls) not in placed_set:
-                reason = (generator.unplaced_reason(cls)
-                          if generator else tr("negotiation.no_valid_placement"))
-                unplaced_list.append((cls, reason))
-
-        # Build after-optimization quality breakdown
-        after_detailed = tt_scorer.score_detailed(placed_list)
-
-        summary = {
-            "runs_completed": min(n_runs, run + 1)
-                              if global_best_solution else 0,
-            "total_time": time.time() - global_start,
-            "before": before_detailed,
-            "after": after_detailed,
-            "improvement": {
-                k: before_detailed.get(k, 0) - after_detailed.get(k, 0)
-                for k in ["lecturer_gaps", "student_gaps", "fragmentation",
-                           "day_balance", "room_switching", "time_quality",
-                           "total"]
-            },
-            "classes_moved": len(changes),
-            "classes_placed": len(placed_list),
-            "classes_unplaced": len(unplaced_list),
-            "cpsat_used": cpsat_used,
-            "cpsat_status": cpsat_status,
-            "cpsat_status_label": cpsat_status_label,
-            "greedy_stats": greedy_stats,
-            "lns_strategy_stats": lns_stats.get("strategy_stats", []),
-        }
-
-        # Shut down parallel pool
-        if parallel_pool is not None:
-            parallel_pool.shutdown()
-
-        return placed_list, unplaced_list, changes, summary
 
     def _perturb_ordering(self, ordered):
         """Create a perturbed class ordering for multi-start diversity.
@@ -544,7 +628,7 @@ class ScheduleOptimizer:
         for start in range(0, n, block_size):
             end = min(start + block_size, n)
             block = perturbed[start:end]
-            random.shuffle(block)
+            self._rng.shuffle(block)
             perturbed[start:end] = block
 
         return perturbed
@@ -610,7 +694,11 @@ class ScheduleOptimizer:
                     _add(cls, ws[0], ws[1], ws[2])
                     warm_placed.add(i)
 
+        _cancel_token = self.cancel_token
+
         def solve(idx):
+            if _cancel_token is not None:
+                _cancel_token.raise_if_cancelled()
             if iterations[0] >= self.max_iterations:
                 return False
             iterations[0] += 1
@@ -714,17 +802,34 @@ class ScheduleOptimizer:
         destroy_size = max(2, int(eligible_count * self.destroy_fraction))
 
         # Adaptive strategy selector with conflict graph support
+        # The selector keeps ONE long-lived stream and hands it to each
+        # strategy it builds. Building a fresh Random(seed) per strategy would
+        # replay the identical shuffle every iteration and silently kill LNS
+        # exploration while still looking deterministic.
         adaptive = AdaptiveStrategySelector(
             self.state, weights=self.weights,
-            conflict_graph=conflict_graph, analyzer=analyzer)
+            conflict_graph=conflict_graph, analyzer=analyzer,
+            rng=self._rng)
 
         no_improve_count = 0
         start_time = time.time()
+        # `time_limit_override or ...` means a None override falls back to
+        # lns_time_limit, so the deterministic path has to be selected
+        # explicitly rather than by passing None through.
+        deterministic_loop = (self.deterministic_budget
+                              and time_limit_override is None)
         time_limit = time_limit_override or self.lns_time_limit
 
         for iteration in range(self.lns_iterations):
+            self._check_cancelled()
             elapsed = time.time() - start_time
-            if elapsed >= time_limit:
+            if deterministic_loop:
+                # Iteration-bounded: only the emergency cap can cut this short,
+                # and doing so costs reproducibility (reported in the summary).
+                if elapsed >= self.multi_start_time_limit:
+                    self._clock_capped = True
+                    break
+            elif elapsed >= time_limit:
                 break
             if no_improve_count >= self.lns_no_improve_limit:
                 break
@@ -782,7 +887,7 @@ class ScheduleOptimizer:
                 accept = True
             elif new_placed >= current_placed and temp > 0.01 and delta > 0:
                 # Probabilistic acceptance of slightly worse solutions
-                accept = random.random() < math.exp(-delta / temp)
+                accept = self._rng.random() < math.exp(-delta / temp)
             else:
                 accept = False
 
@@ -887,7 +992,7 @@ class ScheduleOptimizer:
             target=_cpsat_subprocess_worker,
             args=(state_snap, dict(self.weights or {}),
                   self.cpsat_time_limit, protected_indices,
-                  heuristic_indices, result_queue))
+                  heuristic_indices, result_queue, self.seed))
         proc.start()
 
         # Poll until the subprocess finishes, calling progress callback

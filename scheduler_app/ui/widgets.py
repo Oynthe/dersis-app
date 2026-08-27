@@ -1,4 +1,5 @@
 """Reusable PyQt6 widgets: Toast, MultiSelectButton, WarningLogPanel."""
+import html
 
 from PyQt6.QtWidgets import (
     QLabel, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
@@ -157,12 +158,45 @@ class MultiSelectButton(QPushButton):
         return super().eventFilter(obj, event)
 
 
+# Palette and glyphs for a log entry. Module constants because they used to be
+# rebuilt inside log(), which ran once per appended message.
+_LOG_COLORS = {
+    "info": "#1E40AF", "success": "#166534",
+    "warning": "#92400E", "error": "#991B1B",
+}
+_LOG_ICONS = {
+    "info": "\u2139\uFE0F", "success": "\u2705",
+    "warning": "\u26A0\uFE0F", "error": "\u274C",
+}
+
+
 class WarningLogPanel(QFrame):
-    """Persistent expandable warning/status log at bottom of main window."""
+    """Persistent expandable warning/status log at bottom of main window.
+
+    ST-PERF-003. Every entry used to be appended to one list that was never
+    cleared, while the panel rebuilt its entire HTML from that list on every
+    refresh. Twelve refreshes of an unchanged 250-class timetable grew the list
+    138 -> 1656 entries, the rendered document 404 -> 8099 characters, process
+    RSS by 480 MB, and per-refresh time from 2.1 s to 4.8 s. The log was
+    describing a timetable that no longer existed, at ever-increasing cost.
+
+    The fix is to separate two genuinely different kinds of message:
+
+    **sticky**  things that happened once and belong to history — a save
+                failure, an import result, a user action. Appended.
+    **derived** findings recomputed from the current timetable on every
+                refresh: conflicts, unplaced classes, negotiation notes.
+                Replaced wholesale, because the previous set describes a
+                timetable that has moved on.
+
+    ``_messages`` keeps its name — the finding and the roadmap's completion
+    criterion both name it — and is now the concatenation of the two.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._messages = []
+        self._sticky = []
+        self._derived = []
         self._expanded = False
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
@@ -210,40 +244,82 @@ class WarningLogPanel(QFrame):
 
         self.setMaximumHeight(30)
 
+    @property
+    def _messages(self):
+        """History followed by the findings derived from the current state."""
+        return self._sticky + self._derived
+
     def log(self, message, kind="info"):
-        """Add a message to the log."""
-        colors = {
-            "info": "#1E40AF", "success": "#166534",
-            "warning": "#92400E", "error": "#991B1B",
-        }
-        icons = {
-            "info": "\u2139\uFE0F", "success": "\u2705", "warning": "\u26A0\uFE0F", "error": "\u274C",
-        }
-        color = colors.get(kind, colors["info"])
-        icon = icons.get(kind, "i")
-        self._messages.append((message, kind))
-        self._latest_label.setText(message)
-        self._latest_label.setStyleSheet(
-            f"font-size: 9pt; color: {color}; font-weight: bold;")
-        self._icon_label.setText(icon)
-        self._icon_label.setStyleSheet(
-            f"font-size: 9pt; font-weight: bold; color: {color};")
-        # Update expanded log
-        lines = []
-        for msg, k in self._messages:
-            c = colors.get(k, colors["info"])
-            lines.append(f'<span style="color:{c}">{msg}</span>')
-        self._log_area.setHtml("<br>".join(lines))
-        # Auto-scroll to bottom
+        """Append one message to the sticky history.
+
+        For anything recomputed from the timetable on every refresh, use
+        :meth:`set_derived` instead — appending those is ST-PERF-003.
+        """
+        self._sticky.append((message, kind))
+        self._append_rendered(message, kind)
+        self._set_header(message, kind)
+
+    def set_derived(self, messages):
+        """Replace every finding derived from the current timetable.
+
+        *messages* is an ordered sequence of ``(text, kind)``. Replacing rather
+        than appending is the point: the previous set described a timetable that
+        has since changed, so keeping it is both wrong and unbounded.
+        """
+        new = [(str(m), k) for m, k in messages]
+        if new == self._derived:
+            return  # nothing to redraw; the common case on a repaint
+        self._derived = new
+        self._render_all()
+        combined = self._messages
+        if combined:
+            self._set_header(*combined[-1])
+        else:
+            self._reset_header()
+
+    def clear(self):
+        """User pressed Clear: empty both stores."""
+        self._sticky.clear()
+        self._derived.clear()
+        self._reset_header()
+        self._log_area.clear()
+
+    # ── Rendering ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _line(message, kind):
+        # escape(): these strings carry user-controlled class and branch names
+        # straight into rich text (ST-UI-007). The panel was already doing this
+        # unescaped; re-committing that into new code is avoidable even though
+        # the finding itself belongs to a later phase.
+        color = _LOG_COLORS.get(kind, _LOG_COLORS["info"])
+        return f'<span style="color:{color}">{html.escape(str(message))}</span>'
+
+    def _append_rendered(self, message, kind):
+        """Add one line without re-rendering the whole document."""
+        self._log_area.append(self._line(message, kind))
         sb = self._log_area.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def clear(self):
-        self._messages.clear()
+    def _render_all(self):
+        self._log_area.setHtml(
+            "<br>".join(self._line(m, k) for m, k in self._messages))
+        sb = self._log_area.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _set_header(self, message, kind):
+        color = _LOG_COLORS.get(kind, _LOG_COLORS["info"])
+        self._latest_label.setText(str(message))
+        self._latest_label.setStyleSheet(
+            f"font-size: 9pt; color: {color}; font-weight: bold;")
+        self._icon_label.setText(_LOG_ICONS.get(kind, "i"))
+        self._icon_label.setStyleSheet(
+            f"font-size: 9pt; font-weight: bold; color: {color};")
+
+    def _reset_header(self):
         self._latest_label.setText("—")
         self._latest_label.setStyleSheet("font-size: 9pt; color: #475569;")
         self._icon_label.setText("")
-        self._log_area.clear()
 
     def _toggle_expand(self):
         self._expanded = not self._expanded

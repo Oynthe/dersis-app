@@ -823,13 +823,10 @@ def test_csv_still_reports_offgrid_placements(tmp_path):
         f"off-grid day column says {d001[0][0]!r}, expected Saturday"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-FUNC-013 / ST-SCHED-004 — logic.slot_index() calls list.index() "
-           "unguarded, so a placed_time outside state['slots'] raises an "
-           "uncaught ValueError instead of being reconciled or reported; "
-           "'guard slot_index' is a Phase 1 roadmap task",
-)
+# ST-FUNC-013 / ST-SCHED-004 fixed in Phase 1: logic.find_slot_index() makes the
+# stored-placement readers total, and export_schedule() warns about every
+# off-grid placement instead of dropping it. The strict xfail that used to pin
+# this is gone because the defect is.
 @pytest.mark.parametrize("fmt", ("csv", "xlsx"))
 def test_offgrid_slot_does_not_crash_csv_and_xlsx(tmp_path, fmt, request):
     """ST-FUNC-013 (adjacent) — an off-grid *time* crashes csv/xlsx export.
