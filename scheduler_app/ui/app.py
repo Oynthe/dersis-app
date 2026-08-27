@@ -3206,8 +3206,18 @@ class SchedulerApp(QMainWindow):
     def edit_setup(self):
         snap_before = capture_snapshot(self.state_data)
         is_initial = not self._has_baseline
+        # ST-UI-014 (second clause) / ST-UI-021. Setup OK can unplace lessons --
+        # `_reconcile_after_setup` clears every placement pointing at a day,
+        # hour, room or lecturer that no longer exists -- and this path pushed
+        # no undo snapshot at all, so that was irreversible. It matters more now
+        # that the slot-list gate can let a user knowingly commit an edit that
+        # moves lessons: "continue" must be recoverable from.
+        self._push_undo(tr("actions.setup"))
         dlg = SetupDialog(self, self.state_data)
         dlg.exec()
+        if not dlg.result and self._undo_stack:
+            # Nothing changed -- do not leave a no-op step on the stack.
+            self._undo_stack.pop()
         if dlg.result:
             self._reconcile_after_setup()
         self.refresh_grid()

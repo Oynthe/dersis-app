@@ -606,6 +606,95 @@ def conflict_partner_index(conflicts):
     return {k: frozenset(v) for k, v in index.items()}
 
 
+SLOT_ERROR_DUPLICATE = "duplicate"
+SLOT_ERROR_BLANK = "blank"
+
+
+def parse_slot_lines(text):
+    """Parse the Setup time-slot box into ``(slots, problems)``.
+
+    ST-UI-021. The grid is **ordinal**: nothing in the package parses a slot as
+    a time (``grep`` for ``strptime`` / ``%H:%M`` / ``split(":")`` over
+    ``scheduler_app/`` returns zero hits), duration is counted in *rows*, and
+    ``"1. Ders"``, ``"08:00-08:45"`` and ``"Öğle Arası"`` all work end to end —
+    placement, occupancy, spanning, export. So a format rule would reject
+    setups the engine handles perfectly, and there is exactly **one** hard
+    requirement:
+
+    **Uniqueness.** Every lookup is ``list.index()``, which returns the first
+    match, so a repeated label makes every later row with that name permanently
+    unreachable. Measured on a four-hour day with ``09:00`` typed twice: the
+    grid draws 4 rows, only 3 can ever hold a lesson, and 3 of 4 classes place.
+    ``reconcile_placements`` sees nothing wrong, because it is a membership test
+    and every label is still a member.
+
+    ``problems`` is a list of ``(line_number, kind, text)`` with 1-based line
+    numbers, so the dialog can point at the line rather than describing it.
+
+    Deliberately does NOT deduplicate. Dropping the second ``09:00`` shortens
+    the grid by a row, which silently re-points every multi-row lesson below it
+    and can push one off the end entirely — a silent repair of a silent
+    corruption. The duplicate is refused and named instead.
+    """
+    slots = []
+    problems = []
+    seen = {}
+    for lineno, raw in enumerate(text.split("\n"), start=1):
+        value = raw.strip()
+        if not value:
+            if raw and not raw.isspace():
+                problems.append((lineno, SLOT_ERROR_BLANK, raw))
+            continue
+        if value in seen:
+            problems.append((lineno, SLOT_ERROR_DUPLICATE, value))
+            continue
+        seen[value] = lineno
+        slots.append(value)
+    return slots, problems
+
+
+def slot_meaning_changes(state, new_slots):
+    """Placed/pinned classes whose covered cells change under *new_slots*.
+
+    ST-UI-021. A slot label is a **by-name reference into an ordered list**, so
+    editing that list can silently change which hours an existing lesson
+    occupies without changing anything about the lesson. Nothing catches it:
+    ``reconcile_placements`` is a membership test, and every label is still a
+    member.
+
+    Measured on a clean schedule — ``["09:00","10:00","11:00","12:00","1. Ara",
+    "13:00"]`` with a 2-hour lesson at 12:00 and a 1-hour lesson at 13:00, zero
+    oracle violations. Sorting the list alone produces **6 hard violations**
+    (a double-booked room and a lecturer in two places), because the 2-hour
+    lesson stops covering ``["12:00", "1. Ara"]`` and starts covering
+    ``["12:00", "13:00"]``. ``reconcile_placements`` returns ``[]``.
+
+    This compares the thing the engine actually defines — the tuple of cells a
+    class covers — rather than trying to recognise the *edits* that are
+    dangerous. A reorder, a mid-list substitution (``"09:00"`` replaced by
+    ``"08:30"`` between two untouched neighbours) and an insertion are all the
+    same defect seen three ways, and an edit-shaped detector catches only the
+    ones someone thought of.
+
+    Returns ``[(cls, before_cells, after_cells)]``. **Pinned classes are
+    included**: ``pinned_time`` is the same kind of by-name reference as
+    ``placed_time``, and ``validate_placements_after_edit`` skips pins — so
+    leaving them out means a reorder silently moves the one thing the user
+    explicitly said must not move (ST-SCHED-002).
+    """
+    after = dict(state)
+    after["slots"] = list(new_slots)
+    changed = []
+    for cls in get_placed_classes(state):
+        start = effective_time(cls)
+        td = total_duration(cls)
+        before_cells = tuple(get_consecutive_slots(state, start, td))
+        after_cells = tuple(get_consecutive_slots(after, start, td))
+        if before_cells != after_cells:
+            changed.append((cls, before_cells, after_cells))
+    return changed
+
+
 def _sweep_lanes(entries):
     """Greedy interval-graph lane assignment. Sets ``entry['lane']``; returns peak.
 

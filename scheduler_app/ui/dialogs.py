@@ -26,6 +26,8 @@ from scheduler_app import storage
 from scheduler_app.logic import (
     find_valid_options, get_placed_classes,
     occupied_slots_of, classroom_of, batch_schedule,
+    parse_slot_lines, slot_meaning_changes,
+    SLOT_ERROR_DUPLICATE, SLOT_ERROR_BLANK,
 )
 from scheduler_app.widgets import MultiSelectButton
 from scheduler_app.ui.day_keys import DAY_KEYS, day_label, normalize_day_list, normalize_day_value
@@ -776,6 +778,20 @@ class SetupDialog(QDialog):
         default_slots = "\n".join(state["slots"]) if state["slots"] else "08:00\n09:00\n10:00\n11:00\n12:00\n13:00\n14:00\n15:00"
         self.slots_text.setPlainText(default_slots)
         slot_layout.addWidget(self.slots_text)
+
+        # ST-UI-021. A live status strip rather than a structured widget.
+        # A QTimeEdit-per-row would hard-code HH:MM -- the one rule the grid
+        # must NOT have, since nothing parses a slot as a time and "1. Ders"
+        # is a legitimate label -- and a list with move-up/move-down would
+        # turn reordering, which silently corrupts a committed timetable,
+        # into a one-click affordance. Validate in place instead; both Excel
+        # buttons below keep working untouched because the widget is the same.
+        self._slots_status = QLabel("")
+        self._slots_status.setWordWrap(True)
+        self._slots_status.setStyleSheet("font-size: 8pt; padding: 2px;")
+        slot_layout.addWidget(self._slots_status)
+        self.slots_text.textChanged.connect(self._refresh_slot_status)
+
         slots_io = QHBoxLayout()
         slots_io.addStretch()
         _b = QPushButton("⬇ " + tr("dialogs.import.excel_title"))
@@ -1216,8 +1232,47 @@ class SetupDialog(QDialog):
         self._set_selected_days([k for k in DAY_KEYS if k not in current])
 
     def _get_current_slots(self):
-        """Read current time slots from the Slots text widget."""
-        return [s.strip() for s in self.slots_text.toPlainText().strip().split("\n") if s.strip()]
+        """Read current time slots from the Slots text widget.
+
+        De-duplicated (ST-UI-021). Callers reading this mid-edit — notably
+        ``LecturerConstraintsDialog``, which builds one checkbox per slot into a
+        ``{slot: checkbox}`` map — must never receive a repeated label, or the
+        map loses a box to the collision and that hour's availability silently
+        cannot be edited. The user is separately refused at OK; this keeps every
+        reader safe in the meantime.
+        """
+        slots, _problems = parse_slot_lines(self.slots_text.toPlainText())
+        return slots
+
+    def _slot_problems(self):
+        """``(slots, problems)`` for the current text (ST-UI-021)."""
+        return parse_slot_lines(self.slots_text.toPlainText())
+
+    def _refresh_slot_status(self):
+        """Show slot-list problems as the user types, before they press OK.
+
+        Diagnosed on the way in rather than only on the way out: a user whose
+        saved file already carries a duplicate sees it the moment the dialog
+        opens, instead of being blocked by a modal after they have made ten
+        other edits.
+        """
+        if not hasattr(self, "_slots_status"):
+            return
+        _slots, problems = self._slot_problems()
+        dupes = [p for p in problems if p[1] == SLOT_ERROR_DUPLICATE]
+        if dupes:
+            listed = ", ".join(
+                tr("setup.slots_dup_item").format(line=ln, value=val)
+                for ln, _kind, val in dupes[:4])
+            self._slots_status.setText(
+                f"⚠ {tr('setup.slots_duplicate')} {listed}")
+            self._slots_status.setStyleSheet(
+                "font-size: 8pt; padding: 3px; color: #991B1B; "
+                "background: #FEE2E2; border: 1px solid #DC2626; "
+                "border-radius: 3px;")
+        else:
+            self._slots_status.setText("")
+            self._slots_status.setStyleSheet("font-size: 8pt; padding: 2px;")
 
     def _update_lec_row_display(self, row, av):
         """Update the Status and Summary columns for a lecturer row."""
@@ -1757,7 +1812,53 @@ class SetupDialog(QDialog):
         from scheduler_app.plans import ENTITY_CLASSROOMS, ENTITY_LECTURERS
 
         days = self._get_current_days()
-        slots = [s.strip() for s in self.slots_text.toPlainText().strip().split("\n") if s.strip()]
+
+        # ST-UI-021. Uniqueness is the ONE hard rule the grid has, because every
+        # lookup is `list.index()` and the first match wins: a repeated label
+        # makes every later row with that name permanently unreachable.
+        # Measured on a four-hour day with 09:00 typed twice — 4 rows drawn,
+        # 3 addressable, 3 of 4 classes placed — and reconcile_placements sees
+        # nothing, because it is a membership test and every label is a member.
+        #
+        # REFUSED, not silently de-duplicated: dropping the second 09:00
+        # shortens the grid by a row, which re-points every multi-row lesson
+        # below it and can push one off the end entirely. That would be a silent
+        # repair of a silent corruption.
+        slots, slot_problems = self._slot_problems()
+        dupes = [p for p in slot_problems if p[1] == SLOT_ERROR_DUPLICATE]
+        if dupes:
+            listed = "\n".join(
+                "  " + tr("setup.slots_dup_item").format(line=ln, value=val)
+                for ln, _kind, val in dupes)
+            QMessageBox.warning(
+                self, tr("setup.time_slots"),
+                tr("setup.slots_duplicate_body").format(lines=listed))
+            return
+
+        # A slot label is a by-name reference into an ORDERED list, so editing
+        # that list can change which hours an existing lesson occupies without
+        # touching the lesson at all. Measured: sorting a clean schedule gave 6
+        # hard violations — a double-booked room and a lecturer in two places —
+        # with reconcile_placements reporting []. Compare covered CELLS rather
+        # than trying to recognise the dangerous edit shapes: a reorder, a
+        # mid-list substitution and a removal are one defect seen three ways,
+        # and an edit-shaped test catches only the ones someone thought of.
+        #
+        # Reported and confirmed, never repaired: pinned lessons are included,
+        # and a pin is the user's instruction (ST-SCHED-002).
+        moved = slot_meaning_changes(self.state, slots)
+        if moved:
+            names = "\n".join(
+                "  • " + (c.get("name") or c.get("class_code") or "?")
+                for c, _b, _a in moved[:10])
+            if len(moved) > 10:
+                names += "\n  …"
+            if QMessageBox.question(
+                    self, tr("setup.time_slots"),
+                    tr("setup.slots_moved_body").format(
+                        n=len(moved), names=names)
+            ) != QMessageBox.StandardButton.Yes:
+                return
 
         rooms = []
         capacities = {}
