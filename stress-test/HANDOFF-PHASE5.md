@@ -25,7 +25,7 @@ prompt for the next session, plus what Phase 4 left behind.
 > STATE OF THE REPO
 > - Branch for your work: `fix/phase-5-consistency`, cut from
 >   `fix/phase-4-workflow-ux` (or from `main` if that has merged).
-> - Suite: **526 tests — 502 pass, 24 known-defect pins, 0 failures.** Both lanes
+> - Suite: **539 tests — 515 pass, 24 known-defect pins, 0 failures.** Both lanes
 >   exit 0.
 >
 > ENVIRONMENT
@@ -100,6 +100,25 @@ renderer and the shell, which Phase 4 modified:
    before assuming it still does not matter.
 7. **`Claude Code Review` CI fails** on every PR and did so before this work
    started. Unrelated; needs whoever owns that workflow's configuration.
+
+## The single most useful thing Phase 4 learned
+
+**Run the adversarial verification, and mutation-test every fix it produces.**
+43 verifiers found **34 confirmed defects** in six commits that had a green
+suite — including a Critical-adjacent one (the Online tab silently dropping
+every conflict mark) that no test could have caught, because no test in the
+repository built a `TimetableScene`.
+
+Then, while fixing them, three more traps:
+
+* **A mutation test that cannot see its own mutation manufactures confidence.**
+  Stale `__pycache__` made a working fix report *GREEN — PINS NOTHING*. Clear
+  the cache between runs.
+* **A threshold can sit exactly on the broken value.** A regression test
+  asserted `count >= 2`; the measurements are 4 when working and 2 when broken.
+  It would have certified the bug. Measure both sides before choosing a bound.
+* **A new feature can mask the defect its own test was written for.** The
+  conflict appendix kept a needle alive no matter what the grid cell did.
 
 ## Lessons from Phase 4 worth carrying
 

@@ -46,7 +46,7 @@ Import/export/UI-workflow correctness. Detailed in
 | ST-FUNC-010 | 🟡 Medium | High | Rows with a space in the class ID are silently dropped by the importer | OBSERVED |
 | ST-FUNC-011 | 🟢 Low | High | Workbook with zero recognized sheets "imports successfully" (`is_valid=True`, empty result) | OBSERVED |
 | ST-FUNC-012 | 🟢 Low | High | No dedup of duplicate `class_code` / classroom / lecturer names — silently accepted | OBSERVED |
-| ST-FUNC-013 | 🟢 Low | High | PDF export silently omits classes whose placement is outside the current grid (data loss, no warning) | OBSERVED |
+| ST-FUNC-013 | 🟢 Low | High | PDF export silently omits classes whose placement is outside the current grid (data loss, no warning) | OBSERVED · **Fixed** (Phase 1 warned; Phase 4 added the PDF appendix — 4 strict pins deleted) |
 
 ## Scheduler
 

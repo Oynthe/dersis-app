@@ -22,8 +22,9 @@ what has changed since. Per-finding state also lives in the
 > has a ready-to-paste prompt, what Phase 4 changed that Phase 5 will touch,
 > and the gaps this work deliberately left behind.
 
-**Suite: 526 tests — 502 pass, 24 known-defect pins, 0 failures.** Both lanes
-exit 0. Four pins were **deleted** because the defect they guarded is closed:
+**Suite: 539 tests — 515 pass, 24 known-defect pins, 0 failures.** Both lanes
+exit 0. (526 at the end of the six feature commits; the adversarial
+verification round below added 13 more.) Four pins were **deleted** because the defect they guarded is closed:
 all four `ST-FUNC-013` PDF cases went `XPASS(strict)` when the export appendix
 landed — the suite doing exactly the job it exists for.
 
@@ -143,6 +144,72 @@ the UI honest about the consequence: `summary['deterministic']` is now surfaced.
   stored slot through `logic.slot_index`; with one orphaned lesson, 3 of 4 calls
   died. Skipped blockers are *counted* and reported, because
   `ConstraintValidator.add_placement` returns early on the identical condition.
+
+### The adversarial verification round
+
+The six Phase 4 commits were then attacked by 43 verifier agents, with every
+candidate defect independently reproduced or refuted by a second agent that
+defaulted to REFUTED. **30 CONFIRMED, 4 PARTLY, 3 REFUTED.** All 34 are fixed
+or deferred with a stated reason, across five follow-up commits.
+
+The pass earned its keep several times over. What it found, grouped:
+
+**Live user-visible defects Phase 4 introduced or left**
+
+- The **Online / Lecturer-office tab discarded every conflict mark**. The
+  adapter stamped the flags on both render modes; the virtual scene builder
+  constructed its `LessonItem`s without passing them. One dropdown click away
+  on the default tab. Nothing caught it because **no test in the repository
+  built a `TimetableScene`** — every conflict test asserted on the adapter's
+  blocks, one layer short of what the user sees.
+- **A class name with angle brackets vanished from the PDF.** reportlab reads
+  `<Vekil> Dersi` as an unknown tag and drops it. A bare `&` is tolerated,
+  which is why the first version of the test pinned nothing.
+- **The PDF `everything` matrix still dropped a claimant**, and stacked cells
+  **overprinted the rows above and below** (`rowHeights` is fixed; reportlab
+  draws over neighbours rather than growing a row).
+- **The XLSX everything matrix stacked a class against itself** when it carried
+  two identical target dicts — what a user gets typing `"A, B, A"` as branches.
+- **The app called the user a liar about their own pin.** `apply_reschedule`
+  reports two events through one list; on the project's own dataset generator
+  **13 of 13 rejections** are "your pin clashes where you put it", and all were
+  reported as errors reading "could not be committed where the planner put it".
+- **"Move X (frees N slots)" overstated N.** Blockers were counted per cell, so
+  a cell blocked by two lessons credited both — moving either frees nothing.
+- **The Setup undo was worse than no undo** — see below.
+
+**Phase 4's own tests that pinned nothing**
+
+`make_app`'s TierEnforcement snapshot named three wrong attributes behind a
+`hasattr` guard, so it restored nothing while looking like isolation. Three
+other tests were vacuous — including one whose assertion
+(`quick.isDefault() or not deep.isDefault()`) is TRUE in exactly the state its
+failure message describes. **ST-UI-002's rendering half had no test at all**:
+the status bar could be reverted wholesale with the suite still green.
+
+**A withdrawal**
+
+Phase 4 added an undo snapshot to `edit_setup`. `_push_undo` deep-copies
+`state["classes"]` and nothing else, while Setup rewrites the axis lists — so
+"Undo: setup change" restored placements onto hours the grid no longer has,
+resurrecting the ST-DATA-003 orphans from a button labelled as a safety net.
+It also cleared the redo stack on cancel. A half-transaction undo is not a
+partial fix; it was withdrawn. ST-UI-014's second clause needs full-state
+snapshots — ST-ARCH-012, Phase 6.
+
+**A broken measuring tool, worth recording**
+
+Stale `__pycache__` invalidated three consecutive measurements: `inspect.getsource`
+reads the file while the running function came from cached bytecode, so a
+mutation test reported *GREEN — PINS NOTHING* for a fix that was working. The
+conclusion on offer was "drop the fix". The mutation harness now clears the
+cache before every run. **A mutation test that cannot see its own mutation is
+worse than none: it manufactures confidence.**
+
+A second, subtler masking: one test could not go red because the conflict
+appendix — added earlier in the same phase — listed the same names through its
+own escaped path and kept the needle alive regardless of what the grid cell
+did. A new feature was hiding the defect its own test was written for.
 
 ### Known gaps left behind
 
