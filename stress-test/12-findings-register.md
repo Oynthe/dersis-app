@@ -60,16 +60,16 @@ Scheduling-engine correctness, constraint enforcement, scalability. Detailed in
 | ST-SCHED-003 | 🟠 High | High | **Ghost-day / ghost-slot placements**: `allowed_days`/`allowed_times` are never intersected with the grid, so a class allowed only on Saturday is placed on Saturday even on a Mon–Fri grid | OBSERVED · [detail](#st-sched-003) |
 | ST-SCHED-004 | 🟠 High | High | Stale `allowed_times` value not in `state['slots']` causes an uncaught `ValueError` that crashes reschedule | OBSERVED · [detail](#st-sched-004) |
 | ST-SCHED-005 | 🟠 High | High | CP-SAT deep mode enforces lecturer availability only at the **start** slot; multi-hour classes are placed across unavailable hours, then silently dropped | OBSERVED · [detail](#st-sched-005) |
-| ST-SCHED-006 | 🟠 High | High | CP-SAT deep mode ignores `soft` / `same_day` / `improve_only` protection — only `LOCKED` is respected; protected placements move without appearing in `changes[]` | OBSERVED |
+| ST-SCHED-006 | 🟠 High | High | CP-SAT deep mode ignores `soft` / `same_day` / `improve_only` protection — only `LOCKED` is respected; protected placements move without appearing in `changes[]` | OBSERVED -> **Fixed** (Phase 3) |
 | ST-SCHED-007 | 🟡 Medium | High | Legacy backtracking solver family (`reschedule_all` / `batch_schedule` / `auto_place_class`) ignores lecturer availability entirely and moves `LOCKED` classes | OBSERVED · [detail](#st-sched-007) |
 | ST-SCHED-008 | 🟡 Medium | High | Malformed `lecturer_availability` (missing sub-keys) raises `KeyError` on the validation hot path | OBSERVED |
-| ST-SCHED-009 | 🟡 Medium | High | `ConstraintValidator.find_conflicts` returns `[]` for a placement `check_placement` rejects — conflict UI can't explain the rejection | OBSERVED |
-| ST-SCHED-010 | 🟡 Medium | High | Occupancy maps are ref-count-free sets: temporarily removing one class erases a co-located class's occupancy, corrupting subsequent validity checks | OBSERVED |
+| ST-SCHED-009 | 🟡 Medium | High | `ConstraintValidator.find_conflicts` returns `[]` for a placement `check_placement` rejects — conflict UI can't explain the rejection | OBSERVED -> **Fixed** (Phase 3) |
+| ST-SCHED-010 | 🟡 Medium | High | Occupancy maps are ref-count-free sets: temporarily removing one class erases a co-located class's occupancy, corrupting subsequent validity checks | OBSERVED -> **Fixed** (Phase 3) |
 | ST-SCHED-011 | 🟡 Medium | High | "Move conflicting class" relaxation suggestions never emit — blockers tallied by `id()` but looked up by `cls_key()` | OBSERVED |
-| ST-SCHED-012 | 🟡 Medium | High | Greedy construction recursion depth == flexible-class count; ~1000+ classes raise `RecursionError` (pathological preset of 1200 crashes) | OBSERVED |
+| ST-SCHED-012 | 🟡 Medium | High | Greedy construction recursion depth == flexible-class count; ~1000+ classes raise `RecursionError` (pathological preset of 1200 crashes) | OBSERVED -> **Fixed** (Phase 3) |
 | ST-SCHED-013 | 🟡 Medium | High | Optimizer is **non-deterministic** (unseeded global RNG): identical input → different placements and up to ~40% quality spread | OBSERVED · [detail](#st-sched-013) |
-| ST-SCHED-014 | 🟢 Low | High | Infeasible (oversubscribed) instances produce misleading explanations that don't name the root global constraint; negotiation mislabels unplaceable classes "ok" | OBSERVED |
-| ST-SCHED-015 | 🟢 Low | High | `neighbor_impact_penalty` objective term (weight 4.0) is dead code — `_neighbor_impact` always returns 0.0 | OBSERVED |
+| ST-SCHED-014 | 🟢 Low | High | Infeasible (oversubscribed) instances produce misleading explanations that don't name the root global constraint; negotiation mislabels unplaceable classes "ok" | OBSERVED -> **Fixed** (Phase 3) |
+| ST-SCHED-015 | 🟢 Low | High | `neighbor_impact_penalty` objective term (weight 4.0) is dead code — `_neighbor_impact` always returns 0.0 | OBSERVED -> **Fixed** (Phase 3) |
 
 ## Performance
 
@@ -80,11 +80,11 @@ Detailed in [06-performance-audit.md](06-performance-audit.md).
 | ST-PERF-001 | 🔴 Critical | High | Super-linear solve time (~O(n^1.77)); routine reschedule is 25–120 s at 80 classes and effectively unusable beyond ~250 — **on the UI thread, no cancellation** | OBSERVED · [detail](#st-perf-001) |
 | ST-PERF-002 | 🟠 High | High | `refresh_grid` does a **full encrypted state rewrite every call**; a single refresh is 0.65 s (80 cls) → 2.5–4.7 s (250 cls) | OBSERVED · [detail](#st-perf-002) |
 | ST-PERF-003 | 🟠 High | High | Warning log never cleared + O(n²) HTML rebuild → memory leak: 12 refreshes grew RSS +480 MB and per-refresh time 2.1 s → 4.8 s | OBSERVED · [detail](#st-perf-003) |
-| ST-PERF-004 | 🟠 High | High | Greedy backtracking exhausts its 100 000-iteration budget already at 25 classes (moderate density) | OBSERVED |
+| ST-PERF-004 | 🟠 High | High | Greedy backtracking exhausts its 100 000-iteration budget already at 25 classes (moderate density) | OBSERVED -> **Fixed** (Phase 3) |
 | ST-PERF-005 | 🟡 Medium | High | Feedback logging rewrites the whole log per append → O(n²); 2000 appends took 108 s; `PreferenceLearner.learn()` re-reads the full log each call | OBSERVED · [detail](#st-perf-005) |
 | ST-PERF-006 | 🟡 Medium | High | Open-slots & warnings panels rebuild hundreds of widgets and re-run heavy analysis on every refresh (359 widgets, 4.5 s warnings pass at 250 cls) | OBSERVED |
 | ST-PERF-007 | 🟡 Medium | High | `workflow.reschedule` runs a second expensive `negotiate_after_optimization` pass whenever any class is unplaced (+10 s wrapper overhead at 25 cls) | OBSERVED |
-| ST-PERF-008 | 🟡 Medium | High | Greedy construction phase is not wall-clock bounded — a single restart overran a 25 s budget to 55 s | OBSERVED |
+| ST-PERF-008 | 🟡 Medium | High | Greedy construction phase is not wall-clock bounded — a single restart overran a 25 s budget to 55 s | OBSERVED -> **Fixed** (Phase 3) |
 | ST-PERF-009 | 🟢 Low | High | CP-SAT deep path yields no improvement at normal scale within a 5 s limit (helps only small instances) | OBSERVED |
 
 ## Data
@@ -148,7 +148,7 @@ Detailed in [10-code-architecture-audit.md](10-code-architecture-audit.md).
 | ST-ARCH-001 | 🔴 Critical | High | **Zero automated tests** (0% coverage) over a codebase with multiple probe-confirmed correctness holes; CI runs none | OBSERVED · [detail](#st-arch-001) |
 | ST-ARCH-002 | 🟠 High | High | CI validation workflow is **dead** — triggers on `master`, the repo's only branch is `main` | OBSERVED |
 | ST-ARCH-003 | 🟠 High | High | UI ships a **parallel** Excel/CSV export engine (`app.py._write_excel`, 496 LOC) duplicating and drifting from `data_io/exporter.py` | OBSERVED |
-| ST-ARCH-004 | 🟠 High | High | Hard-constraint validation exists in **four divergent implementations**; production drag-drop uses the deprecated weaker one | OBSERVED |
+| ST-ARCH-004 | 🟠 High | High | Hard-constraint validation exists in **four divergent implementations**; production drag-drop uses the deprecated weaker one | OBSERVED -> **Fixed** (Phase 3) |
 | ST-ARCH-005 | 🟠 High | High | `ui/app.py` is a god object: 4 961 LOC, Maintainability Index 0.00, ~135 methods, 10+ responsibilities | OBSERVED |
 | ST-ARCH-006 | 🟠 High | High | Persistence critical path wrapped in silent exception swallowing (22 of 55 broad excepts are single-statement silent) | OBSERVED |
 | ST-ARCH-007 | 🟠 High | High | Shared-mutable-state-dict with no ownership boundary: dialogs write live state; normalization runs as an autosave side effect | OBSERVED |
@@ -236,7 +236,7 @@ accordingly.
 - **Reproduction** `tests/schedule_oracle.py` + `tests/verify_optimizer_conflicts.py`, seed 42.
 - **Root cause** The optimizer's internal placement bookkeeping permits two **distinct** flexible classes to occupy the same room/lecturer/target slot; the raw proposed schedule is invalid. `apply_reschedule` re-validates and **silently drops** the losing class (its rejection list is discarded by the UI — see ST-SCHED-005 note), rather than the optimizer never producing the collision.
 - **User impact** For small/normal instances the committed schedule ends up clean *only because* classes are dropped (silently unplaced), i.e. the tool quietly refuses to place work it could have placed. When combined with pinned classes (ST-SCHED-002) the committed schedule can retain real double-bookings.
-- **Recommendation** Treat a raw schedule containing hard violations as a solver bug: add an assertion/repair pass; surface dropped classes to the user; fix the internal occupancy bookkeeping (relates to ST-SCHED-010). **Effort** L · **Related** ST-SCHED-002, ST-SCHED-005, ST-SCHED-010 · **Status** Open
+- **Recommendation** Treat a raw schedule containing hard violations as a solver bug: add an assertion/repair pass; surface dropped classes to the user; fix the internal occupancy bookkeeping (relates to ST-SCHED-010). **Effort** L · **Related** ST-SCHED-002, ST-SCHED-005, ST-SCHED-010 · **Status** **Fixed** (Phase 3, branch `fix/phase-3-engine-hardening`). Root cause was a single seam: `_greedy_construct` returned `best_solution` as a snapshot while its backtracking stack unwound the occupancy maps behind it, so `_lns_improve` repaired against a grid it believed was empty. Raw violations `small` 18 -> 0, `normal` 102 -> 0, placement counts unchanged. The recommended assert-and-repair pass exists as a tripwire and measures 0 on every preset
 
 <a id="st-sched-002"></a>
 ### ST-SCHED-002 — Colliding pinned placements committed unvalidated
@@ -265,13 +265,13 @@ accordingly.
 ### ST-SCHED-005 — CP-SAT availability checked only at start slot; losers silently dropped
 - **Severity** High · **OBSERVED** · `cpsat_scheduler.py:606-619`, `workflow.py:423-438`, `app.py:2703-2713`
 - **Evidence** A duration-3 class with a lecturer available only at the start hour is placed spanning 2 unavailable hours; `ConstraintValidator.check_placement=False`; `apply_reschedule` returns `rejected=['BIG3H']` but `result.placed` had reported it placed, and the UI **discards the rejected list** (`app.py:2703-2713`), so the class silently ends `placed=False`. Probe: `tests/probe_cpsat_protection_semantics.py, tests/probe_cpsat_midblock_availability.py, tests/probe_optimizer_determinism.py`.
-- **Recommendation** Model availability across the whole duration in CP-SAT; surface `apply_reschedule`'s rejected list in the UI. **Effort** M · **Related** ST-SCHED-001, ST-SCHED-006 · **Status** Open
+- **Recommendation** Model availability across the whole duration in CP-SAT; surface `apply_reschedule`'s rejected list in the UI. **Effort** M · **Related** ST-SCHED-001, ST-SCHED-006 · **Status** **Fixed** (Phase 3, branch `fix/phase-3-engine-hardening`). `CPSATScheduler._valid_start_slots` requires the lecturer to be available for the whole block, not just the start hour
 
 <a id="st-sched-007"></a>
 ### ST-SCHED-007 — Legacy solver family ignores availability and moves LOCKED classes
 - **Severity** Medium · **OBSERVED** · `core/logic.py:522-588, 1043`
 - **Evidence** A fully-unavailable lecturer: legacy `reschedule_all` / `auto_place_class` / `batch_schedule` all place at monday/09:00 (availability violated), and `reschedule_all` moved a `protection=locked` class from friday/11:00 → monday/09:00. The optimized path leaves it correctly fixed/unplaced. Probe: `tests/ghost_day_and_stale_time_probe.py, tests/legacy_solver_probe.py, tests/validator_integrity_probe.py` Tasks 3-4.
-- **Note** These legacy entry points are **dead code** (ST-ARCH-011) — no live caller — but they are exported, importable, and imported by `ui/dialogs.py:28`. They are latent regressions if ever re-wired. **Recommendation** Delete the dead legacy solver family. **Effort** M · **Related** ST-ARCH-004, ST-ARCH-011 · **Status** Open
+- **Note** These legacy entry points are **dead code** (ST-ARCH-011) — no live caller — but they are exported, importable, and imported by `ui/dialogs.py:28`. They are latent regressions if ever re-wired. **Recommendation** Delete the dead legacy solver family. **Effort** M · **Related** ST-ARCH-004, ST-ARCH-011 · **Status** **Fixed** (Phase 3, branch `fix/phase-3-engine-hardening`). The legacy entry points forward to their optimized counterparts rather than carrying a fifth copy of the constraint rules; deleting the now-dead helpers is ST-ARCH-011's job in Phase 6
 
 <a id="st-sched-013"></a>
 ### ST-SCHED-013 — Non-deterministic optimizer

@@ -75,9 +75,17 @@ cancellable; a single refresh on 250 classes is < 300 ms; 100 refreshes show fla
 RSS. **Regression tests:** a perf smoke test asserting refresh latency and no
 unbounded `warning_log._messages` growth.
 
-## Phase 3 — Scheduling engine hardening
+## Phase 3 — Scheduling engine hardening ✅ COMPLETE
 
 *Goal: correct, scalable, diagnosable solving.*
+
+> **Done** on `fix/phase-3-engine-hardening`. All six tasks landed; see
+> [`PROGRESS.md`](PROGRESS.md#phase-3--complete) for what the register got wrong
+> and what was left behind. Completion criteria met, with one qualification
+> recorded there: the residual oracle violations on the three largest presets
+> are all attributable to the preset generator's own infeasible **pins**
+> (measured `flexible=0`), which DERSİS reports rather than clears by design
+> (ST-SCHED-002).
 
 | Task | Findings | I/U/R/E | Effort |
 |---|---|---|---|

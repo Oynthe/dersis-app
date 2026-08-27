@@ -10,17 +10,281 @@ what has changed since. Per-finding state also lives in the
 | **0 — Critical stabilisation & test scaffold** | ✅ Complete | `fix/phase-0-test-scaffold` |
 | **1 — Data & correctness** | ✅ Complete | `fix/phase-1-data-correctness` |
 | **2 — Performance foundations** | ✅ Complete | `fix/phase-2-performance` |
-| 2 — Performance foundations | Not started | — |
-| 3 — Scheduling engine hardening | Not started | — |
+| **3 — Scheduling engine hardening** | ✅ Complete | `fix/phase-3-engine-hardening` |
 | 4–7 | Not started | — |
+
+---
+
+## Phase 3 — complete
+
+> **Starting the next session?** → [`HANDOFF-PHASE4.md`](HANDOFF-PHASE4.md)
+> has a ready-to-paste prompt, what Phase 3 built that the UI does not yet
+> consume, and the ten known gaps this work deliberately left behind.
+
+**Suite: 456 tests — 428 pass, 28 known-defect pins, 0 failures.** Both lanes
+exit 0 (fast 410 pass / 28 pins, slow 18 pass). The 28 pins are exactly the ones Phase 2 left behind; **every pin this
+phase created was closed by this phase**, and the four ST-SCHED-001 pins the
+handoff named as the scoreboard turned red and had their markers deleted.
+
+**The Critical is closed at the root, not papered over.** `repaired_conflicts`
+— the assert-and-repair pass added as a safety net — measures **0 on every
+preset**, meaning nothing ever reaches it. The optimizer stopped producing
+invalid schedules rather than learning to clean up after itself.
+
+### Completion criteria
+
+| Criterion | Result |
+|---|---|
+| Oracle: raw optimizer output has zero hard violations on **all** presets | ✅ zero **optimizer-caused** violations on all six (`tiny` → `pathological`); see the qualification below |
+| CP-SAT respects availability across duration and all protection levels | ✅ |
+| 1200-class instance completes without `RecursionError` | ✅ 853 placed, no error, stock recursion limit |
+
+**The qualification on criterion 1, stated plainly.** On `large`, `very_large`
+and `pathological` the oracle still reports hard violations — 9, 10 and 89. Every
+one belongs to a **pinned** class: measured `flexible=0` at all three scales. The
+preset generator emits mutually infeasible pins (93 pins on `pathological`), and
+DERSİS deliberately commits an infeasible pin rather than clearing it, because
+the pin is an instruction the user typed (ST-SCHED-002, Phase 1). Those cells are
+now *named* in `summary['infeasible_fixed']` instead of being silent. So the
+criterion is met for everything the engine is responsible for; what remains is
+the input's, and it is reported.
+
+### Findings closed
+
+| ID | Sev | What changed |
+|---|---|---|
+| [ST-SCHED-001](12-findings-register.md#st-sched-001) | 🔴 Critical | The optimizer no longer proposes hard-constraint violations. `small` 18 → 0, `normal` 102 → 0, **with the placement count unchanged** (21 and 76). |
+| [ST-ARCH-004](12-findings-register.md) | 🟠 High | One validator. Drag-and-drop, the class editor, the placement sweep and the legacy solvers all reach their verdict through `ConstraintValidator`; `screen_placements()` is the single commit rule. |
+| [ST-SCHED-005](12-findings-register.md#st-sched-005) | 🟠 High | CP-SAT models lecturer availability across a class's whole duration, not just its start hour. |
+| [ST-SCHED-006](12-findings-register.md) | 🟠 High | All four protection levels honoured — including two the register did not know were broken. |
+| [ST-SCHED-007](12-findings-register.md#st-sched-007) | 🟡 Medium | The legacy solver family forwards to the optimized path; it no longer places an unavailable lecturer or moves a locked class. |
+| [ST-SCHED-009](12-findings-register.md) | 🟡 Medium | `find_conflicts` is guaranteed non-empty whenever `check_placement` rejects. |
+| [ST-SCHED-010](12-findings-register.md) | 🟡 Medium | Occupancy cells are ref-counted, so removing one of two classes claiming a cell no longer frees the survivor's claim. |
+| [ST-SCHED-012](12-findings-register.md) | 🟡 Medium | Greedy construction is iterative. 1200 classes complete; depth is heap-bound. |
+| [ST-PERF-004](12-findings-register.md) | 🟠 High | The greedy phase has a real stopping condition. It converges instead of burning its budget. |
+| [ST-PERF-008](12-findings-register.md) | 🟡 Medium | The greedy phase is wall-clock bounded. 125–291 s against a 5 s budget → 6.4 s. |
+| [ST-SCHED-014](12-findings-register.md) | 🟢 Low | `summary['infeasibility']` names the global bottleneck with numbers; the negotiator analyses the schedule being proposed. |
+| [ST-SCHED-015](12-findings-register.md) | 🟢 Low | The dead `neighbor_impact` term is gone, from all four places it lived. |
+
+### The one that mattered: ST-SCHED-001's actual root cause
+
+The register attributes it to "the optimizer's internal placement bookkeeping".
+That is the symptom. The defect is a **single seam**, in
+`ScheduleOptimizer._greedy_construct`.
+
+`solve()` recorded its answer as a *snapshot* (`best_solution`) taken at a leaf,
+while continuing to mutate `solution` and the occupancy maps. It has two exits:
+
+* **Full success** — every class placed. It returns `True` and each frame
+  returns without running its matching `_remove`, so occupancy still describes
+  the answer.
+* **Anything else** — a partial best, or the iteration budget running out. Every
+  frame falls through to `_remove`, the stack unwinds completely, and occupancy
+  empties back to the baseline — while `best_solution` still claims a full set of
+  placements.
+
+In the second case the caller was handed a solution and a validator that
+disagreed about **every cell in it**. Measured on `small`: 20 placements
+returned, **0** of them known to the validator. `_lns_improve` then ran its
+entire repair loop against a grid it believed was empty and stacked classes on
+top of each other — exactly the 18 room/lecturer/group double-books the oracle
+reported. `apply_reschedule` hid the damage by dropping the losers.
+
+This also explains the shape of the bug that nothing had explained before: **why
+`tiny` was always clean.** Five classes, 5/5 placed, so the greedy takes its
+full-success exit and the desync never happens. The finding's own evidence
+("reproduces at `multi_start_runs=1`, 6 distinct-class collision cells") is the
+same seam seen from the other end.
+
+The fix is a reconciliation loop of eight lines. Everything else in this phase is
+consequence or defence.
+
+### Where the register was not enough
+
+As in Phases 1 and 2, each of these was proved by building the naive version and
+watching it fail — or by measuring rather than assuming.
+
+1. **"Add an assertion/repair pass" would have shipped the bug.** A repair pass
+   that drops colliding classes produces the *same committed timetable*
+   `apply_reschedule` already produced — clean, and short by however many classes
+   collided. It converts a silent drop in one place into a silent drop in
+   another. The repair pass is here, but as a tripwire: it measures 0 on every
+   preset, and a non-zero `summary['repaired_conflicts']` is now defined as an
+   engine defect rather than a normal outcome.
+
+2. **ST-SCHED-015's "dead code — always returns 0.0" is right about the value and
+   wrong about the consequence.** `_neighbor_impact` did measure 0.0 on all 3307
+   calls across `small` and `normal`. But `neighbor_impact_penalty` is also half
+   of the user-facing **"minimal disruption" slider**
+   (`optimization_goals._GOAL_WEIGHT_MAP`), so this was not dead code — it was a
+   *slider running at half strength*. And deleting the key from `DEFAULT_WEIGHTS`
+   alone raises `KeyError` on every reschedule with custom goals, because
+   `goals_to_weights` accumulates into `{k: 0.0 for k in DEFAULT_WEIGHTS}` with
+   no membership guard. Four sites, one commit.
+
+3. **ST-SCHED-006 is worse than "only LOCKED is respected", in two ways the
+   register does not mention.**
+   * `same_day` was ignored by **greedy construction** too, not just by CP-SAT.
+     `RepairStrategy` filtered candidates by the original day; `_greedy_construct`
+     did not. So the protection held or not depending on whether LNS happened to
+     destroy and repair that class — a coin flip presented as a guarantee.
+   * `improve_only` was **broken in both engines**. The gate is
+     `candidate_score <= baseline`, but the candidates were scored with
+     `PlacementScorer` and the baseline computed with
+     `TimetableScorer.placement_score` — different functions on different scales
+     (measured: −0.20…0.60 against −3.67…8.34). For **4 of 10** measured classes
+     the gate kept **zero** candidates, *including the class's own current
+     placement* — so the protection that promises "never worse" could force the
+     class to be unplaced entirely. Both sides now use the same scorer, which
+     makes "stay where you are" always admissible.
+
+4. **A wall-clock bound sampled every N nodes is not a wall-clock bound.** The
+   first version checked the deadline every 512 search nodes, on the reasoning
+   that `time.time()` is measurable at 100 000 nodes. It moved a 5 s budget from
+   125–291 s to 65–168 s — because the quantity that needs bounding is *seconds
+   between two looks at the clock*, and one node calls `generate()` over
+   days × slots × rooms and then scores every candidate against the look-ahead
+   window. The interval in nodes was bounded; the interval in seconds was not.
+   Checking every node costs tens of nanoseconds against a node costing
+   microseconds to milliseconds.
+
+5. **"Bound the greedy phase" (ST-PERF-004) is not about the number.** Cutting
+   `max_iterations` bounds the time and silently costs placements — the classic
+   trap. Measurement first: placements are **identical at every budget from 100
+   to 100 000** (`small` 21, `normal` 76, `large` 231 from 500 up), while the
+   full pipeline costs 257 s against 175 s on `normal` and 43.8 s against 10.3 s
+   on `small`. The budget was buying nothing at all. So the fix is not a smaller
+   number but a *stopping condition*: the search ends when it stops improving its
+   incumbent, which is a reason rather than a timeout.
+
+6. **Making `find_conflicts` total is the opposite of the usual trap.** Phase 1's
+   lesson is that guarding a reader turns a crash into a silent drop. Here the
+   silent case came first — `check_placement` said no and `find_conflicts`
+   returned `[]`, so the UI refused a drop with nothing to say. Both the
+   availability-across-the-block gap and a backstop for any future rule now
+   guarantee a non-empty list.
+
+### Behaviour changes worth knowing
+
+- **`apply_reschedule` returns dicts, not names.** Each entry carries `name`,
+  `class_uid`, `reason` and `reasons`. `ui/app.py` still discards the value —
+  wiring it into the results dialog is Phase 4's "Why unplaced?" panel — but the
+  data it needs now exists. A `str` subclass was tried first, to keep every
+  existing caller working untouched; it was rejected because a consumer cannot
+  tell a rich entry from a bare name without introspection, which is exactly the
+  ambiguity the finding is about.
+- **The negotiation report describes the proposed schedule, not the pre-solve
+  one.** This is the ST-SCHED-014 fix and it changes what the negotiation tab
+  says. Two Phase 2 tests pinned the old baseline and were updated; see below.
+- **`improve_only` under CP-SAT is frozen in place, deliberately.** CP-SAT scores
+  in a different currency from `PlacementScorer`, so "only move somewhere at
+  least as good" cannot be stated in that model. Not moving always satisfies the
+  promise, so CP-SAT declines to improve such a class rather than risk making it
+  worse; the heuristic phase still optimizes it properly, and now correctly
+  (point 3 above). The alternative — leaving it free to move, as it was — breaks
+  the promise outright.
+- **The legacy solver family is now a set of forwarding shims.** ~325 lines of
+  divergent constraint logic became unreachable. `_solve_backtrack`,
+  `_get_valid_slots` and `_check_placement_fast` are dead; deleting them is
+  ST-ARCH-011's job in Phase 6.
+- **`find_drop_classroom` returns `None` for a lesson that needs no room**, which
+  is `get_room_candidates`' sentinel rather than a failure. `ui/app.py` was
+  taught the difference in both places it checked. Before this, a drag committed
+  a *physical classroom* onto an online lesson while `apply_reschedule` stored
+  `None` for the same lesson — so the same lesson showed a room or not depending
+  on how it was placed, and exports disagreed with the timetable.
+- **`summary` gained four keys**: `repaired_conflicts`, `repaired_classes`,
+  `infeasible_fixed`, `infeasibility`.
+
+### Tests changed rather than added
+
+Five test files were written by agents that never touched `scheduler_app/**`, so
+the fail-before/pass-after guarantee holds for everything they pin. Five tests
+needed the implementer to change them, and each is a case where landing the fix
+made the *test* wrong rather than the code:
+
+1. `test_auto_place_class_never_displaces_a_locked_class` was **unsatisfiable**
+   once locked classes stopped being movable: it asserted both "the newcomer was
+   placed" and "the locked class did not move", on a board where the only legal
+   cell for the newcomer was the locked one. Rebuilt with a *displaceable* class
+   in the way, so the displacement pass provably runs and the locked lesson
+   provably survives it. (Both the adversarial verifier and the implementer
+   reached this independently.)
+2. `test_neighbor_impact_loop_body_never_executes` monkeypatched the method the
+   fix deletes, so it hard-errored with `AttributeError` the moment the deletion
+   landed. Replaced by `test_neighbor_impact_term_stays_deleted`, which pins that
+   it stays gone; the pre-deletion measurement is recorded in its docstring.
+3. `test_neighbor_impact_penalty_weight_changes_no_score` became **silently
+   vacuous** after the deletion: `PlacementScorer.__init__` merges an unknown
+   weight key in as an orphan, so swinging it across nine orders of magnitude
+   changed nothing by construction. Deleted; `test_scoring_digest_is_unchanged`
+   is the durable tripwire and its golden is unchanged across the deletion.
+4. `_drop_verdict`, the drag-and-drop harness, states that it mirrors
+   `ui/app.py::_execute_drop` "phase for phase" — and hard-coded the pre-fix
+   `if room is None: reject`. Updated to mirror the fixed code, which is what its
+   own contract requires.
+5. **Two Phase 2 tests** (`test_negotiation_result_still_says_what_it_used_to`,
+   `test_negotiation_result_survives_apply_unchanged`) compared the negotiation
+   report against a pass over the **pre-solve** state — the baseline
+   ST-SCHED-014 deliberately moves. Their ST-PERF-007 property is untouched and
+   both still assert it; the second now perturbs the live state explicitly to
+   test the pinning directly, because "committing changed the answer" is no
+   longer a source of contrast now that the snapshot describes the proposal.
+
+One companion test was **added** by the implementer:
+`test_a_harmless_edit_leaves_the_lesson_where_it_was`. Without it, the five
+`test_editing_a_class_does_not_leave_it_on_a_now_illegal_cell` cases are all
+satisfied by an `apply_class_edit` that unplaces the lesson on *every* edit —
+their own escape hatch accepts the unplaced branch as a pass. The pair would
+have permanently certified a bulk-unplace as correct.
+
+### Two latent bugs found in passing
+
+- **`schedule_optimizer.py` never imported `tr`**, so the `generator is None`
+  branch of the unplaced-reason fallback raised `NameError` instead of reporting.
+- **`check_placement_explained` corrupted occupancy for an excluded class.** It
+  lifts the class's own placement out of the maps and restores it in a `finally`
+  — but for a class in `exclude_ids` the lift finds nothing to release while the
+  restore really claims the cell, permanently marking a free cell occupied for
+  every later check. Reachable now that `screen_placements` excludes every class
+  it is about to test.
+
+### Known gaps left behind
+
+1. **`changes[]` still omits protected classes** (`schedule_optimizer.py`, the
+   `cls_key(cls) in effective_protected_ids` skip). It no longer *matters*,
+   because protected classes no longer move — the defect is closed by
+   construction rather than by fixing the builder. If a future change lets them
+   move again, the move will be invisible to the impact panel. Undo and rollback
+   are snapshot-based and were never affected, contrary to the finding text.
+2. **`multi_start_time_limit` is not a global bound.** It is applied per phase —
+   the greedy deadline is `global_start + limit` but LNS restarts its own clock —
+   so a full solve can take roughly twice the number the user was shown. Bounding
+   it globally is a Phase 4 UX decision, not a correctness one.
+3. **The presets carry no `protection` levels and no pre-placed classes**, which
+   is why the `improve_only` currency bug survived three phases of oracle runs.
+   `dataset_gen` should grow a protection-bearing preset; that belongs with
+   Phase 7's testing work.
+4. **`test_drop_accounting_closes_on_a_real_solve` asserts `0 == 0`** now that
+   nothing is dropped, and it is among the more expensive setups in the fast
+   lane. It is a legitimate future regression guard, but it is paying for
+   coverage it no longer provides.
+5. **New user-facing strings are `en` + `tr` only** (4 keys this phase, ~19
+   across Phases 0–3). The other 20 locales fall back to English via `tr()` —
+   never to a raw key — but need a translator. Phase 5 owns the coverage check.
+6. **The re-entrancy guard is still only half-covered** (carried from Phase 2).
+   `SolverTask.start()` is idempotent and pinned; that `SchedulerApp` disables
+   Generate / undo / import while a solve runs is still not, because pinning it
+   means driving the real window through a complete solve.
+7. **`Claude Code Review` CI fails** on every PR and did so before this work
+   started. Unrelated; needs whoever owns that workflow's configuration.
 
 ---
 
 ## Phase 2 — complete
 
-> **Starting the next session?** → [`HANDOFF-PHASE3.md`](HANDOFF-PHASE3.md) has a
-> ready-to-paste prompt, the merge order for the stacked PRs, and the seven known
-> gaps this work deliberately left behind.
+> [`HANDOFF-PHASE3.md`](HANDOFF-PHASE3.md) was the prompt for the phase above;
+> it is kept as a record. Phase 3's own gaps are listed in its section.
 
 
 **Suite: 339 tests — 307 pass, 32 known-defect pins, 0 failures.** The non-slow
