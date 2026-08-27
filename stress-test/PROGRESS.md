@@ -18,7 +18,7 @@ what has changed since. Per-finding state also lives in the
 
 ## Phase 2 — complete
 
-> **Starting the next session?** → [](HANDOFF-PHASE3.md) has a
+> **Starting the next session?** → [`HANDOFF-PHASE3.md`](HANDOFF-PHASE3.md) has a
 > ready-to-paste prompt, the merge order for the stacked PRs, and the seven known
 > gaps this work deliberately left behind.
 
