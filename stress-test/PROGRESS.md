@@ -11,7 +11,221 @@ what has changed since. Per-finding state also lives in the
 | **1 — Data & correctness** | ✅ Complete | `fix/phase-1-data-correctness` |
 | **2 — Performance foundations** | ✅ Complete | `fix/phase-2-performance` |
 | **3 — Scheduling engine hardening** | ✅ Complete | `fix/phase-3-engine-hardening` |
-| 4–7 | Not started | — |
+| **4 — Core workflow UX** | ✅ Complete | `fix/phase-4-workflow-ux` |
+| 5–7 | Not started | — |
+
+---
+
+## Phase 4 — complete
+
+> **Starting the next session?** → [`HANDOFF-PHASE5.md`](HANDOFF-PHASE5.md)
+> has a ready-to-paste prompt, what Phase 4 changed that Phase 5 will touch,
+> and the gaps this work deliberately left behind.
+
+**Suite: 539 tests — 515 pass, 24 known-defect pins, 0 failures.** Both lanes
+exit 0. (526 at the end of the six feature commits; the adversarial
+verification round below added 13 more.) Four pins were **deleted** because the defect they guarded is closed:
+all four `ST-FUNC-013` PDF cases went `XPASS(strict)` when the export appendix
+landed — the suite doing exactly the job it exists for.
+
+### Findings closed
+
+| ID | Sev | What changed |
+|---|---|---|
+| [ST-UI-001](12-findings-register.md#st-ui-001) | 🔴 Critical | Every lesson that occupies a cell now renders in it. Contested runs split into lanes *inside* the column; conflicts are marked from a validator verdict, not from geometry. |
+| [ST-UI-002](12-findings-register.md#st-ui-002) | 🟠 High | One `schedule_counts()` feeds the status bar, the dashboard card and `compute_all_metrics`. Pinned is a subset annotation, not a peer segment. |
+| [ST-UI-003](12-findings-register.md#st-ui-003) | 🟠 High | The dashboard reads `effective_room` — the currency the rest of the app already used. `room_switching` 0.0 → 0.8 on the audit's own fixture. |
+| [ST-UI-021](12-findings-register.md#st-ui-021) | 🟠 High | **New finding.** Duplicate slot labels refused and named; slot edits that move existing lessons are reported and confirmed. |
+| [ST-SCHED-011](12-findings-register.md) | 🟡 Medium | "Move conflicting class" suggestions emit for the first time: 0 → 15 of 19 on `small`. |
+| [ST-UI-015](12-findings-register.md) | 🟡 Medium | `PlaceClassDialog` explains the 0-options case and disables a button that cannot succeed. |
+| [ST-FUNC-013](12-findings-register.md) | 🟢 Low | PDF appendix lists every off-grid placement and every conflict by class code. Four strict pins deleted. |
+| [ST-SCHED-014](12-findings-register.md) | 🟢 Low | The global bottleneck sentence reaches the results dialog; `apply_reschedule`'s rejected list reaches the warning log. |
+
+### Where the register was not enough
+
+As in Phases 1–3, each was proved by building the naive version and watching it
+fail, or by measuring rather than assuming.
+
+1. **ST-UI-001 is not one renderer bug but five occupancy builders that
+   disagree.** Two lessons double-booked in R001 monday 09:00, before the fix:
+   screen showed `ZZZ999` (dict overwrite, last wins); PDF classroom/group
+   showed `AAA111` (an explicit `continue`, first wins); XLSX filtered sheets
+   showed both; the XLSX everything-matrix showed one. **A user who checked on
+   screen and then printed got two different, both-incomplete timetables.** The
+   register's recommendation names two of the five.
+2. **The collision is order-dependent, not "last wins".** A span row against a
+   start row either *overdraws* or hides one, purely on `state["classes"]`
+   order. The single real collision the `large` preset produces is exactly that
+   shape, so a fix handling only "two starts in one cell" does not fix it.
+3. **Splitting and labelling are different questions.** Two online lessons
+   share an hour legitimately — a naive geometric sweep of `large` reports 14
+   collisions, of which **13 are that**. And a real clash can show only one
+   block (one group in two rooms puts one lesson on each room's tab). Splitting
+   is geometric and per-view; the conflict mark is a validator verdict and
+   view-independent.
+4. **ST-UI-002's own recommendation — "clamp/assert non-negative" — is the
+   worst available fix.** With 4 pins also carrying `placed=True` and 3 lessons
+   genuinely unplaced, the old formula gives −1 and the clamp gives **0**, while
+   the truth is **3** and those 3 are in the sidebar on the same screen. It
+   replaces an impossible number with a confidently wrong one.
+   `tests/test_placement_vocabulary.py` is mutation-tested against exactly that
+   implementation: **8 of its 10 core tests go red under it.**
+5. **ST-UI-002's `-5 yerleşmemiş` evidence is a harness artifact.**
+   `stress-test/tests/_ui_boot.py::greedy_place` calls `mark_placed` on pinned
+   classes; `git show 365b24b` confirms `apply_reschedule` skipped pins even at
+   the audit commit. The formula is wrong regardless — it encodes a
+   disjointness nothing enforces — so the counter is structurally total rather
+   than trusting the invariant.
+6. **ST-UI-003's cause is worse than "reads a missing key".** `cls.get("room","")`
+   is passed as `room_override`, and because `""` is not the `_ROOM_UNSET`
+   sentinel it *wins* — actively defeating a correct `placed_classroom`
+   fallback.
+7. **The roadmap's "Structured time-slot entry" is the wrong fix, and cites the
+   wrong finding.** `grep` for `strptime` / `%H:%M` / `split(":")` returns
+   **zero hits**: nothing parses a slot as a time, so `"1. Ders"` and
+   `"Öğle Arası"` are first-class and a `QTimeEdit` per row would hard-code the
+   one rule the grid must not have. Uniqueness is the only hard rule. See
+   ST-UI-021.
+8. **The handoff's known gap #4 is wrong.** `required_classrooms=["R003"]` after
+   R003 is deleted *already* produces a correct message with suggestions
+   (`InfeasibilityAnalyzer.analyze_class`, category `required_room_missing`) —
+   verified against the exact input the handoff names, with `participants=0` to
+   remove the capacity confound. Only the wiring was missing. Writing the
+   proposed new reachability check would have created a second answer to one
+   question.
+
+### A correction to the Phase 2 record
+
+PROGRESS.md's Phase 2 section states `multi_start_time_limit` was "raised 120 s
+→ 3600 s". **On the production path that is inert.** Measured by spying on the
+real constructor through the live `SchedulingWorkflow.reschedule`:
+
+```
+ScheduleOptimizer.__init__ default : 3600.0
+optimized_reschedule_all default   : 120.0
+what the LIVE reschedule path uses : 120.0
+```
+
+`SolverTask` is built with no optimizer kwargs, so every production solve goes
+through `optimized_reschedule_all`'s own 120.0 (logic.py:1309, 1338), and
+`grep multi_start_time_limit scheduler_app/ui/` returns nothing. The suite
+already documented the truth — `tests/test_greedy_bounds.py:129` calls out
+`normal` as "still clock-capped at 120 s by `optimized_reschedule_all`'s
+`multi_start_time_limit=120.0`". Only the Phase 2 summary is misleading.
+
+**Deliberately not changed here.** Raising it has real runtime consequences
+(`test_bounding_does_not_cost_placements` runs ~123 s *because* of this cap),
+and the Phase 4 task-6 implementation spec that proposed a global deadline was
+calibrated on 3600.0 throughout — its adversarial reviewer returned
+*materially-wrong* for that reason, and showed the proposed change would
+truncate run 4 on `normal` and cost the reproducibility it was meant to
+protect. It needs its own measurement pass. What Phase 4 did instead was make
+the UI honest about the consequence: `summary['deterministic']` is now surfaced.
+
+### Behaviour changes worth knowing
+
+- **The status bar reads differently.** `80 classes │ ✅ 78 placed 📌 incl. 4
+  pinned │ ⏳ 2 unplaced`. Pinned moved from a peer segment to a subset
+  annotation because the three numbers otherwise summed to more than the class
+  count. A new `⚠ N not on the timetable` segment appears when a placement
+  points at a deleted day or hour — those are `scheduled` but drawn nowhere and
+  absent from the unplaced panel, so the count used to exceed what the grid
+  showed with no way to find the difference.
+- **The reschedule modes are renamed** `Hızlı` / `Kapsamlı` (were `Standart` /
+  `Derin (CP-SAT)`), Quick is the default, and Thorough warns that its result
+  may not be reproducible — which is true, and was never said.
+- **A duplicate time slot is now refused at Setup OK.** A user whose saved file
+  already contains one is blocked until they fix it; the live status strip shows
+  the problem the moment the dialog opens, so it is diagnosed before they click.
+- **`edit_setup` now pushes an undo snapshot** (and pops it if cancelled). It
+  previously pushed none, so every unplacement `_reconcile_after_setup`
+  performed was irreversible.
+- **`negotiate_class` no longer raises on an off-grid placement.** It read a
+  stored slot through `logic.slot_index`; with one orphaned lesson, 3 of 4 calls
+  died. Skipped blockers are *counted* and reported, because
+  `ConstraintValidator.add_placement` returns early on the identical condition.
+
+### The adversarial verification round
+
+The six Phase 4 commits were then attacked by 43 verifier agents, with every
+candidate defect independently reproduced or refuted by a second agent that
+defaulted to REFUTED. **30 CONFIRMED, 4 PARTLY, 3 REFUTED.** All 34 are fixed
+or deferred with a stated reason, across five follow-up commits.
+
+The pass earned its keep several times over. What it found, grouped:
+
+**Live user-visible defects Phase 4 introduced or left**
+
+- The **Online / Lecturer-office tab discarded every conflict mark**. The
+  adapter stamped the flags on both render modes; the virtual scene builder
+  constructed its `LessonItem`s without passing them. One dropdown click away
+  on the default tab. Nothing caught it because **no test in the repository
+  built a `TimetableScene`** — every conflict test asserted on the adapter's
+  blocks, one layer short of what the user sees.
+- **A class name with angle brackets vanished from the PDF.** reportlab reads
+  `<Vekil> Dersi` as an unknown tag and drops it. A bare `&` is tolerated,
+  which is why the first version of the test pinned nothing.
+- **The PDF `everything` matrix still dropped a claimant**, and stacked cells
+  **overprinted the rows above and below** (`rowHeights` is fixed; reportlab
+  draws over neighbours rather than growing a row).
+- **The XLSX everything matrix stacked a class against itself** when it carried
+  two identical target dicts — what a user gets typing `"A, B, A"` as branches.
+- **The app called the user a liar about their own pin.** `apply_reschedule`
+  reports two events through one list; on the project's own dataset generator
+  **13 of 13 rejections** are "your pin clashes where you put it", and all were
+  reported as errors reading "could not be committed where the planner put it".
+- **"Move X (frees N slots)" overstated N.** Blockers were counted per cell, so
+  a cell blocked by two lessons credited both — moving either frees nothing.
+- **The Setup undo was worse than no undo** — see below.
+
+**Phase 4's own tests that pinned nothing**
+
+`make_app`'s TierEnforcement snapshot named three wrong attributes behind a
+`hasattr` guard, so it restored nothing while looking like isolation. Three
+other tests were vacuous — including one whose assertion
+(`quick.isDefault() or not deep.isDefault()`) is TRUE in exactly the state its
+failure message describes. **ST-UI-002's rendering half had no test at all**:
+the status bar could be reverted wholesale with the suite still green.
+
+**A withdrawal**
+
+Phase 4 added an undo snapshot to `edit_setup`. `_push_undo` deep-copies
+`state["classes"]` and nothing else, while Setup rewrites the axis lists — so
+"Undo: setup change" restored placements onto hours the grid no longer has,
+resurrecting the ST-DATA-003 orphans from a button labelled as a safety net.
+It also cleared the redo stack on cancel. A half-transaction undo is not a
+partial fix; it was withdrawn. ST-UI-014's second clause needs full-state
+snapshots — ST-ARCH-012, Phase 6.
+
+**A broken measuring tool, worth recording**
+
+Stale `__pycache__` invalidated three consecutive measurements: `inspect.getsource`
+reads the file while the running function came from cached bytecode, so a
+mutation test reported *GREEN — PINS NOTHING* for a fix that was working. The
+conclusion on offer was "drop the fix". The mutation harness now clears the
+cache before every run. **A mutation test that cannot see its own mutation is
+worse than none: it manufactures confidence.**
+
+A second, subtler masking: one test could not go red because the conflict
+appendix — added earlier in the same phase — listed the same names through its
+own escaped path and kept the needle alive regardless of what the grid cell
+did. A new feature was hiding the defect its own test was written for.
+
+### Known gaps left behind
+
+1. **`multi_start_time_limit` still is not a global bound**, and is 120 s in
+   production rather than the 3600 s Phase 2 recorded. See the correction above.
+   Needs its own measurement pass.
+2. **`targets.index(t)` is unchanged in all three everything-matrix builders.**
+   Switching the renderer's copy to `enumerate` is correct in isolation but
+   would create a new screen-vs-PDF-vs-XLSX divergence for duplicate-target
+   non-joint classes. Fix all three together or none.
+3. **A legacy `.egu` carrying a duplicate slot has no in-app repair path.**
+   `SetupDialog` is the only writer of `state["slots"]`, so the user must delete
+   the line by hand; no "remove duplicates" affordance is offered.
+4. **New strings are `en` + `tr` only** (~30 keys across Phases 0–4). Phase 5
+   owns the coverage check.
+5. **`Claude Code Review` CI still fails**, as it has since before this work.
 
 ---
 
@@ -396,6 +610,11 @@ not compile under PyQt6** — the context-object overload is not exposed. A real
   autosaving. That now happens up to 1.5 s later, or on close. Every load path
   still normalizes, so the exposure is an in-session mutation read by something
   else inside the debounce window.
+- **⚠ Corrected in Phase 4 — this change is inert on the production path.** The
+  raise moved `ScheduleOptimizer`'s own default; every production solve goes
+  through `optimized_reschedule_all`, whose signature default is still 120.0 and
+  which passes it explicitly. Measured live: the reschedule path uses **120.0**.
+  See the Phase 4 section, "A correction to the Phase 2 record".
 - `multi_start_time_limit` raised 120 s → 3600 s. That cap existed to bound a
   freeze the user could not escape; now that the solve is cancellable, truncating
   the search is the wrong trade, and a cap that fires costs reproducibility

@@ -34,10 +34,11 @@ from scheduler_app.translations import tr
 from scheduler_app.logic import (
     get_placed_classes, total_duration, classroom_of,
     get_year_color, lighten_color, build_virtual_classroom_day_layout,
+    assign_component_lanes, find_schedule_conflicts, conflict_partner_index,
 )
 from scheduler_app.models import (
     get_protection_label, effective_day, effective_time,
-    is_sequential_class, slot_offset_for_target,
+    is_sequential_class, slot_offset_for_target, cls_key,
 )
 from scheduler_app.ui.badge_formatter import get_badge, badge_text
 from scheduler_app.ui.cell_formatter import tooltip_text
@@ -110,30 +111,43 @@ class RendererAdapter:
 
     @staticmethod
     def _default_filtered_blocks(state, filter_fn):
-        """Yield layout blocks for the legacy single-column filtered timetable."""
-        entries = RendererAdapter._filtered_entries(state, filter_fn)
-        occupied = {}
+        """Yield layout blocks for the legacy single-column filtered timetable.
 
+        ST-UI-001. This used to write every entry into an
+        ``occupied[(row, col)]`` dict keyed by cell, then keep only the entries
+        still marked ``"start"``. A second lesson claiming a cell therefore
+        **overwrote** the first and produced no block at all — and because it is
+        still ``placed``/``pinned`` it is absent from the unplaced panel too, so
+        it became unreachable from the entire UI: no item to click, select,
+        edit, unplace or drag.
+
+        Worse, ``"start"`` and ``"span"`` overwrote each other, so a long lesson
+        against one starting underneath it either *overdrew* (both blocks
+        emitted, painted on top of one another) or dropped one, depending purely
+        on the order of ``state["classes"]``. That is the shape of the one real
+        collision the audit's ``large`` preset produces.
+
+        Every entry now becomes a block. Contested runs are split into lanes
+        *inside the same column*, so the grid geometry, ``cell_at``,
+        ``cell_rect``, the drop highlight and the empty-slot loop are all
+        untouched, and an uncontested lesson keeps the full column width.
+        """
+        entries = RendererAdapter._filtered_entries(state, filter_fn)
+
+        by_col = {}
         for entry in entries:
-            for d in range(entry["span"]):
-                r = entry["row"] + d
-                if r < len(state["slots"]):
-                    if d == 0:
-                        occupied[(r, entry["col"])] = ("start", entry)
-                    else:
-                        occupied[(r, entry["col"])] = ("span", entry)
+            by_col.setdefault(entry["col"], []).append(entry)
 
         blocks = []
-        for key, val in occupied.items():
-            kind, entry = val
-            if kind != "start":
-                continue
-            blocks.append(dict(entry))
+        for col_entries in by_col.values():
+            assign_component_lanes(col_entries)
+            blocks.extend(col_entries)
 
         occ_set = set()
         for b in blocks:
             for d in range(b["span"]):
                 occ_set.add((b["row"] + d, b["col"]))
+        blocks.sort(key=lambda b: (b["col"], b["row"], b["lane"], b["order"]))
         return blocks, occ_set
 
     @staticmethod
@@ -143,35 +157,93 @@ class RendererAdapter:
         return layout["blocks"], layout["occupied_subcolumns"]
 
     @staticmethod
-    def filtered_layout(state, filter_fn, mode=FILTER_MODE_DEFAULT):
-        """Return filtered blocks plus any mode-specific geometry metadata."""
+    def _stamp_conflicts(blocks, conflict_partners, label_index=None):
+        """Mark blocks whose class cannot coexist with something, anywhere.
+
+        ST-UI-001. Deliberately **not** geometric, because splitting a cell and
+        labelling a conflict are different questions with different answers:
+
+        * a cell may hold two blocks and be perfectly legal — two online lessons
+          share an hour without contending for anything;
+        * a real double-booking may show only one block in the current view —
+          one student group in two different rooms puts one lesson on each
+          room's tab.
+
+        So the split answers "how many lessons are in this cell" and this
+        answers "can these lessons coexist". A geometric label would raise a
+        false alarm on the first case and stay silent on the second.
+        """
+        label_index = label_index or {}
+        for b in blocks:
+            partners = conflict_partners.get(cls_key(b["cls"]), ())
+            b["conflict"] = bool(partners)
+            b["conflict_partners"] = tuple(partners)
+            # Resolved here, once per block, from an index built once per
+            # sweep. Resolving names inside the item constructor instead is
+            # O(len(state["classes"])) per conflicted item -- on the
+            # pathological preset ~1200 items x 1200 classes per scene
+            # rebuild, and cls_key() *mutates* a class dict that has no uid,
+            # so it is not even a read-only scan. That is the ST-PERF-003
+            # mistake in a new place.
+            b["conflict_labels"] = tuple(
+                label_index[k] for k in partners if k in label_index)
+
+    @staticmethod
+    def filtered_layout(state, filter_fn, mode=FILTER_MODE_DEFAULT,
+                        conflict_partners=None):
+        """Return filtered blocks plus any mode-specific geometry metadata.
+
+        *conflict_partners* is a :func:`conflict_partner_index` mapping. Pass it
+        in when one refresh feeds several views; omit it and it is computed
+        here, so the adapter stays usable on its own (the sweep costs ~1.5 ms on
+        a fully-placed 250-class grid, against the 306-563 ms repaint
+        ST-UI-009 was about, so it needs no memoising).
+        """
+        if conflict_partners is None:
+            conflict_partners = conflict_partner_index(
+                find_schedule_conflicts(state))
+        label_index = (build_class_label_index(state)
+                       if conflict_partners else {})
         if mode == FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP:
             layout = build_virtual_classroom_day_layout(state, filter_fn)
-            return {
+            result = {
                 "blocks": layout["blocks"],
                 "occ": layout["occupied_subcolumns"],
                 "day_groups": layout["day_groups"],
                 "total_subcolumns": layout["total_subcolumns"],
                 "virtual_day_subcolumns": True,
             }
-        blocks, occ = RendererAdapter._default_filtered_blocks(state, filter_fn)
-        return {
-            "blocks": blocks,
-            "occ": occ,
-            "day_groups": [],
-            "total_subcolumns": len(state.get("days", [])),
-            "virtual_day_subcolumns": False,
-        }
+        else:
+            blocks, occ = RendererAdapter._default_filtered_blocks(
+                state, filter_fn)
+            result = {
+                "blocks": blocks,
+                "occ": occ,
+                "day_groups": [],
+                "total_subcolumns": len(state.get("days", [])),
+                "virtual_day_subcolumns": False,
+            }
+        RendererAdapter._stamp_conflicts(
+            result["blocks"], conflict_partners, label_index)
+        return result
 
     @staticmethod
-    def filtered_blocks(state, filter_fn, mode=FILTER_MODE_DEFAULT):
+    def filtered_blocks(state, filter_fn, mode=FILTER_MODE_DEFAULT,
+                        conflict_partners=None):
         """Yield layout blocks for a filtered (single-grid) timetable."""
-        layout = RendererAdapter.filtered_layout(state, filter_fn, mode=mode)
+        layout = RendererAdapter.filtered_layout(
+            state, filter_fn, mode=mode, conflict_partners=conflict_partners)
         return layout["blocks"], layout["occ"]
 
     @staticmethod
-    def everything_blocks(state, year):
-        """Yield layout blocks for the everything-matrix of *year*."""
+    def everything_blocks(state, year, conflict_partners=None):
+        """Yield layout blocks for the everything-matrix of *year*.
+
+        ST-UI-001: this had the same cell-keyed ``occupied`` dict as the
+        filtered view, and dropped a colliding lesson the same way. Entries are
+        now laned per column, so every lesson that belongs on this matrix gets
+        a block.
+        """
         placed = get_placed_classes(state)
         days = state["days"]
         slots = state["slots"]
@@ -180,7 +252,8 @@ class RendererAdapter:
             return []
         n_branches = len(branches)
 
-        occupied = {}
+        entries = []
+        order = 0
         for c in placed:
             c_day = effective_day(c)
             c_start = effective_time(c)
@@ -190,38 +263,60 @@ class RendererAdapter:
             start_si = slots.index(c_start)
             dur = c["duration"]
 
+            # Deliberately still `targets.index(t)`, not `enumerate`. `.index`
+            # compares dicts by ==, so a non-joint class carrying two identical
+            # target dicts resolves both to 0 and draws both sub-blocks at the
+            # same offset. `enumerate` would move the second — but the same
+            # `.index(t)` line lives in the PDF everything table
+            # (exporter.py) and the XLSX everything matrix (app.py), so
+            # changing it here alone would make the screen disagree with both
+            # exports for that class. Three surfaces, three answers is the
+            # failure this whole task is about. Fix all three together or none.
             for t in c["targets"]:
                 if t["year"] != year or t["branch"] not in branches:
                     continue
-                b_idx = branches.index(t["branch"])
                 t_idx = c["targets"].index(t)
-                slot_off = slot_offset_for_target(c, t_idx)
-                actual_start = start_si + slot_off
-                for d_off in range(dur):
-                    si = actual_start + d_off
-                    if si >= len(slots):
-                        break
-                    okey = (si, d_idx, b_idx)
-                    if d_off == 0:
-                        span = min(dur, len(slots) - actual_start)
-                        occupied[okey] = ("start", c, span)
-                    else:
-                        occupied[okey] = ("span", None, 0)
+                b_idx = branches.index(t["branch"])
+                actual_start = start_si + slot_offset_for_target(c, t_idx)
+                if actual_start >= len(slots):
+                    continue
+                span = min(dur, len(slots) - actual_start)
+                if span <= 0:
+                    continue
+                entries.append({
+                    "cls": c,
+                    "col": d_idx * n_branches + b_idx,
+                    "row": actual_start,
+                    "end_row": actual_start + span,
+                    "span": span,
+                    "order": order,
+                    "lane": 0,
+                    "lane_count": 1,
+                })
+                order += 1
 
+        by_col = {}
+        for e in entries:
+            by_col.setdefault(e["col"], []).append(e)
+
+        yr_color = get_year_color(state, year)
+        bg = lighten_color(yr_color, 0.6)
         blocks = []
-        for okey, val in occupied.items():
-            kind, c, span = val
-            if kind != "start":
-                continue
-            si, d_idx, b_idx = okey
-            col = d_idx * n_branches + b_idx
-            yr_color = get_year_color(state, year)
-            bg = lighten_color(yr_color, 0.6)
-            room = classroom_of(c)
-            blocks.append({
-                "cls": c, "col": col, "row": si, "span": span,
-                "base_color": yr_color, "bg_color": bg, "room": room,
-            })
+        for col_entries in by_col.values():
+            assign_component_lanes(col_entries)
+            for e in col_entries:
+                e["base_color"] = yr_color
+                e["bg_color"] = bg
+                e["room"] = classroom_of(e["cls"])
+                blocks.append(e)
+        blocks.sort(key=lambda b: (b["col"], b["row"], b["lane"], b["order"]))
+
+        if conflict_partners is None:
+            conflict_partners = conflict_partner_index(
+                find_schedule_conflicts(state))
+        RendererAdapter._stamp_conflicts(
+            blocks, conflict_partners,
+            build_class_label_index(state) if conflict_partners else {})
         return blocks
 
 
@@ -286,8 +381,101 @@ def _needed_height_for_class(cls, cell_w, is_matrix=False):
 
 
 def _filtered_block_width(block, mode):
-    """Return the width used to render a filtered timetable block."""
-    return COL_DAY_W
+    """Return the width used to render a filtered timetable block.
+
+    ST-UI-001: a contested run is split into ``lane_count`` lanes inside the
+    same column, so the lanes plus the gaps between them still add up to
+    ``COL_DAY_W`` and the column geometry is unchanged.
+    """
+    n = max(1, block.get("lane_count", 1))
+    if n == 1:
+        return COL_DAY_W
+    return (COL_DAY_W - (n - 1) * GRID_GAP) / n
+
+
+def _paint_selection_ring(painter, rect):
+    """A black ring just inside the border, for a lesson whose border is red.
+
+    ST-UI-001. Selection used to be signalled by widening the border by 1 px in
+    the same colour. On a conflicted lesson that colour is already red and
+    already 3 px, so selecting one was very nearly invisible -- the two states
+    competed for a single channel. The conflict border now has a constant width
+    and selection draws its own ring.
+    """
+    painter.setPen(QPen(QColor("#000000"), 1, Qt.PenStyle.DashLine))
+    painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+    painter.drawRoundedRect(rect.adjusted(5, 5, -5, -5), 4, 4)
+
+
+CONFLICT_BORDER = "#DC2626"
+
+
+def class_display_label(cls):
+    """``[CODE] Name``, or just the name when there is no code."""
+    code = cls.get("class_code", "")
+    return f"[{code}] {cls['name']}" if code else cls["name"]
+
+
+def build_class_label_index(state):
+    """``{cls_key: "[CODE] Name"}`` for every class, built once per sweep."""
+    return {cls_key(c): class_display_label(c)
+            for c in state.get("classes", [])}
+
+
+def _conflict_tooltip(base_tip, conflict, partner_labels):
+    """Append the conflict partners to *base_tip* when there are any.
+
+    The partner names are the point: "this lesson clashes" is not actionable,
+    "this lesson clashes with Fizik I" is. *partner_labels* is resolved once
+    per sweep by RendererAdapter._stamp_conflicts, never per item.
+    """
+    if not conflict or not partner_labels:
+        return base_tip
+    nl = "\n"
+    bullets = nl.join("  • " + name for name in partner_labels)
+    return (base_tip + nl + nl + tr("conflicts.tooltip_header")
+            + nl + bullets)
+
+
+def _paint_conflict_pill(painter, rect):
+    """Draw the ÇAKIŞMA pill in the BOTTOM-right of *rect*.
+
+    Bottom, not top, and that is the whole point. Both paint methods draw the
+    class code first, centred, at ``rect.y() + 6`` — and at ``COL_DAY_W`` 150 a
+    full pill spans roughly x 86..146 against a centred five-character code at
+    x 57..92, so a top-right pill overlaps it; at ``lane_count`` 2 the lane is
+    74 px and the pill covers the code completely. The class code is the
+    identifier the warning log, the exports and every test key on, and it would
+    be destroyed on exactly the cells that matter most.
+
+    ``QPainter.drawText`` does **not** clip to its rect either, so a pill wider
+    than its lane bleeds onto the neighbouring lesson and the user reads the
+    label on the wrong one. Measure first, shorten, then give up and let the
+    red border carry the signal alone.
+    """
+    from PyQt6.QtGui import QFontMetrics
+
+    font = QFont("Segoe UI", 7)
+    font.setBold(True)
+    fm = QFontMetrics(font)
+    label = tr("badges.conflict")
+    pill_w = fm.horizontalAdvance(label) + 10
+    if rect.width() < pill_w + 8:
+        label = tr("badges.conflict_short")
+        pill_w = fm.horizontalAdvance(label) + 10
+    if rect.width() < pill_w + 2:
+        return  # nothing legible fits; the red border still carries the signal
+    pill_h = fm.height() + 2
+    if rect.height() < pill_h + 8:
+        return
+    pill = QRectF(rect.right() - pill_w - 4,
+                  rect.bottom() - pill_h - 3, pill_w, pill_h)
+    painter.setPen(QPen(Qt.PenStyle.NoPen))
+    painter.setBrush(QBrush(QColor(CONFLICT_BORDER)))
+    painter.drawRoundedRect(pill, 5, 5)
+    painter.setFont(font)
+    painter.setPen(QColor("#FFFFFF"))
+    painter.drawText(pill, Qt.AlignmentFlag.AlignCenter, label)
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -326,7 +514,8 @@ class LessonItem(QGraphicsRectItem):
     """Interactive lesson block in the filtered timetable."""
 
     def __init__(self, cls, state, base_color, bg_color, rect,
-                 app, day, slot):
+                 app, day, slot, conflict=False, conflict_partners=(),
+                 conflict_labels=()):
         super().__init__(rect)
         self.cls = cls
         self.state = state
@@ -341,13 +530,20 @@ class LessonItem(QGraphicsRectItem):
         self._is_sequential = is_sequential_class(cls)
 
         self._ghost = False
+        # ST-UI-001: set when this lesson cannot coexist with another one
+        # somewhere on the timetable — a validator verdict, not "there are two
+        # blocks in this cell".
+        self._conflict = bool(conflict)
+        self._conflict_partners = tuple(conflict_partners)
+        self._conflict_labels = tuple(conflict_labels)
 
         self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
 
         # Tooltip with class details
-        self.setToolTip(tooltip_text(cls))
+        self.setToolTip(_conflict_tooltip(
+            tooltip_text(cls), self._conflict, self._conflict_labels))
 
     def set_ghost(self, enabled):
         """Toggle ghost (semi-transparent) mode during drag."""
@@ -364,11 +560,26 @@ class LessonItem(QGraphicsRectItem):
             self._paint_sequential(painter)
         else:
             self._paint_joint(painter)
+        # ST-UI-001: last, so it is never painted over by the cell's own text.
+        if self._conflict:
+            _paint_conflict_pill(painter, self.rect())
+            if self._selected:
+                _paint_selection_ring(painter, self.rect())
 
     def _paint_joint(self, painter):
         rect = self.rect()
-        bw = 3 if self._selected else 2
-        bc = QColor("#000000") if self._selected else QColor(self._base_color)
+        if self._conflict:
+            # ST-UI-001: a conflicted lesson is red whichever tab it is on,
+            # including tabs where the other half of the clash is not
+            # visible. Width is CONSTANT: selection gets its own black ring
+            # below, because a 1 px width change in the same red was the
+            # only thing distinguishing a selected conflicted lesson from an
+            # unselected one -- two signals competing for one channel.
+            bw = 3
+            bc = QColor(CONFLICT_BORDER)
+        else:
+            bw = 3 if self._selected else 2
+            bc = QColor("#000000") if self._selected else QColor(self._base_color)
         painter.setPen(QPen(bc, bw))
         painter.setBrush(QBrush(QColor(self._bg_color)))
         painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6, 6)
@@ -437,8 +648,18 @@ class LessonItem(QGraphicsRectItem):
         rect = self.rect()
         cls = self.cls
         n = len(cls["targets"])
-        bw = 3 if self._selected else 2
-        bc = QColor("#000000") if self._selected else QColor(self._base_color)
+        if self._conflict:
+            # ST-UI-001: a conflicted lesson is red whichever tab it is on,
+            # including tabs where the other half of the clash is not
+            # visible. Width is CONSTANT: selection gets its own black ring
+            # below, because a 1 px width change in the same red was the
+            # only thing distinguishing a selected conflicted lesson from an
+            # unselected one -- two signals competing for one channel.
+            bw = 3
+            bc = QColor(CONFLICT_BORDER)
+        else:
+            bw = 3 if self._selected else 2
+            bc = QColor("#000000") if self._selected else QColor(self._base_color)
 
         # outer border + base fill
         painter.setPen(QPen(bc, bw))
@@ -637,7 +858,8 @@ class EmptySlotItem(QGraphicsRectItem):
 class MatrixLessonItem(QGraphicsRectItem):
     """Interactive lesson cell for the 'Show Everything' matrix view."""
 
-    def __init__(self, rect, cls, room, border_color, bg_color, app=None):
+    def __init__(self, rect, cls, room, border_color, bg_color, app=None,
+                 conflict=False, conflict_partners=(), conflict_labels=()):
         super().__init__(rect)
         self.cls = cls
         self.app = app
@@ -647,14 +869,18 @@ class MatrixLessonItem(QGraphicsRectItem):
         self._selected = False
         self._drag_start = None
         self._ghost = False
+        self._conflict = bool(conflict)          # ST-UI-001
+        self._conflict_partners = tuple(conflict_partners)
+        self._conflict_labels = tuple(conflict_labels)
         self.setPen(QPen(self._bc, 2))
         self.setBrush(QBrush(self._bg))
         self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         # Tooltip
-        self.setToolTip(tooltip_text(cls, include_groups=False,
-                                     include_duration=False))
+        self.setToolTip(_conflict_tooltip(
+            tooltip_text(cls, include_groups=False, include_duration=False),
+            self._conflict, self._conflict_labels))
 
     def mark_selected(self, selected):
         self._selected = selected
@@ -669,8 +895,12 @@ class MatrixLessonItem(QGraphicsRectItem):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         rect = self.rect()
-        bw = 3 if self._selected else 2
-        bc = QColor("#000000") if self._selected else self._bc
+        if self._conflict:
+            bw = 3                                # ST-UI-001, constant
+            bc = QColor(CONFLICT_BORDER)
+        else:
+            bw = 3 if self._selected else 2
+            bc = QColor("#000000") if self._selected else self._bc
         painter.setPen(QPen(bc, bw))
         painter.setBrush(QBrush(self._bg))
         painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6, 6)
@@ -727,6 +957,12 @@ class MatrixLessonItem(QGraphicsRectItem):
                 painter.setPen(QColor(color))
                 painter.drawText(QRectF(x, y, w, 11), center,
                                  f"{emoji} {label}" if label else emoji)
+
+        # ST-UI-001: last, so the cell's own text never paints over it.
+        if self._conflict:
+            _paint_conflict_pill(painter, rect)
+            if self._selected:
+                _paint_selection_ring(painter, rect)
 
     # ── interaction ──────────────────────────────────────────────
 
@@ -978,12 +1214,20 @@ class TimetableScene(QGraphicsScene):
                 self.empty_items.append(ei)
 
         for b in blocks:
-            x = COL_TIME_W + g + b["col"] * (COL_DAY_W + g)
+            # ST-UI-001: lane 0 sits where the single block used to, and a
+            # timetable with no collisions has lane_count 1 everywhere, so this
+            # is the old geometry exactly.
+            lane_w = _filtered_block_width(b, FILTER_MODE_DEFAULT)
+            x = (COL_TIME_W + g + b["col"] * (COL_DAY_W + g)
+                 + b["lane"] * (lane_w + g))
             y = row_y[b["row"]]
             h = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
             item = LessonItem(
                 b["cls"], state, b["base_color"], b["bg_color"],
-                QRectF(x, y, COL_DAY_W, h), app, b["day"], b["slot"])
+                QRectF(x, y, lane_w, h), app, b["day"], b["slot"],
+                conflict=b.get("conflict", False),
+                conflict_partners=b.get("conflict_partners", ()),
+                conflict_labels=b.get("conflict_labels", ()))
             self.addItem(item)
             self.lesson_items.append(item)
 
@@ -1077,15 +1321,26 @@ class TimetableScene(QGraphicsScene):
             x = group["x"] + b["lane"] * (COL_DAY_W + g)
             y = row_y[b["row"]]
             h = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
+            # ST-UI-001. `filtered_layout` stamps the conflict flags on BOTH
+            # modes' blocks; this branch used to drop them on the floor, so the
+            # Online / Lecturer-office tab drew a genuine clash — the same
+            # lecturer twice, or one student group twice — with a normal
+            # year-coloured border and a tooltip that said nothing, while every
+            # other tab painted it red. Labelling is view-independent by
+            # design; this was the one view that did not honour it.
             item = LessonItem(
                 b["cls"], state, b["base_color"], b["bg_color"],
-                QRectF(x, y, COL_DAY_W, h), app, b["day"], b["slot"])
+                QRectF(x, y, COL_DAY_W, h), app, b["day"], b["slot"],
+                conflict=b.get("conflict", False),
+                conflict_partners=b.get("conflict_partners", ()),
+                conflict_labels=b.get("conflict_labels", ()))
             self.addItem(item)
             self.lesson_items.append(item)
 
         self.setSceneRect(0, 0, total_w, total_h)
 
-    def build_filtered(self, state, filter_fn, app, mode=FILTER_MODE_DEFAULT):
+    def build_filtered(self, state, filter_fn, app, mode=FILTER_MODE_DEFAULT,
+                       conflict_partners=None):
         self.clear()
         self.lesson_items.clear()
         self.empty_items.clear()
@@ -1098,7 +1353,8 @@ class TimetableScene(QGraphicsScene):
             return
 
         g = GRID_GAP
-        layout = RendererAdapter.filtered_layout(state, filter_fn, mode=mode)
+        layout = RendererAdapter.filtered_layout(
+            state, filter_fn, mode=mode, conflict_partners=conflict_partners)
         if layout["virtual_day_subcolumns"]:
             self._build_filtered_virtual_subcolumns(
                 state, app, days, slots, layout, g)
@@ -1108,7 +1364,7 @@ class TimetableScene(QGraphicsScene):
 
     # ── everything view ──────────────────────────────────────────
 
-    def build_everything(self, state, app=None):
+    def build_everything(self, state, app=None, conflict_partners=None):
         """Build the full 'Show Everything' matrix for all years."""
         self.clear()
         self.lesson_items.clear()
@@ -1150,7 +1406,8 @@ class TimetableScene(QGraphicsScene):
             max_w = max(max_w, grid_w)
 
             # blocks
-            eblocks = RendererAdapter.everything_blocks(state, yr)
+            eblocks = RendererAdapter.everything_blocks(
+                state, yr, conflict_partners=conflict_partners)
             e_occ = set()
             for b in eblocks:
                 for d in range(b["span"]):
@@ -1160,14 +1417,20 @@ class TimetableScene(QGraphicsScene):
             row_heights = [ROW_ESLOT_H] * ns  # start with minimum
             for b in eblocks:
                 if b["span"] == 1:
-                    needed = _needed_height_for_class(b["cls"], COL_BRANCH_W, is_matrix=True)
+                    n_lanes = max(1, b.get("lane_count", 1))
+                    lane_w = ((COL_BRANCH_W - (n_lanes - 1) * g) / n_lanes
+                              if n_lanes > 1 else COL_BRANCH_W)
+                    needed = _needed_height_for_class(b["cls"], lane_w, is_matrix=True)
                     if needed > row_heights[b["row"]]:
                         row_heights[b["row"]] = needed
 
             # For multi-span blocks, check if total height is enough
             for b in eblocks:
                 if b["span"] > 1:
-                    needed = _needed_height_for_class(b["cls"], COL_BRANCH_W, is_matrix=True)
+                    n_lanes = max(1, b.get("lane_count", 1))
+                    lane_w = ((COL_BRANCH_W - (n_lanes - 1) * g) / n_lanes
+                              if n_lanes > 1 else COL_BRANCH_W)
+                    needed = _needed_height_for_class(b["cls"], lane_w, is_matrix=True)
                     existing = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
                     if needed > existing:
                         extra = needed - existing
@@ -1237,13 +1500,23 @@ class TimetableScene(QGraphicsScene):
 
             # lesson blocks
             for b in eblocks:
-                x = data_x + b["col"] * (COL_BRANCH_W + g)
+                # ST-UI-001: lanes inside the branch column, so a contested
+                # cell shows every lesson in it and an uncontested one is
+                # exactly where it always was.
+                n_lanes = max(1, b.get("lane_count", 1))
+                lane_w = ((COL_BRANCH_W - (n_lanes - 1) * g) / n_lanes
+                          if n_lanes > 1 else COL_BRANCH_W)
+                x = (data_x + b["col"] * (COL_BRANCH_W + g)
+                     + b.get("lane", 0) * (lane_w + g))
                 ry = y_offset + row_y[b["row"]]
                 h = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
                 item = MatrixLessonItem(
-                    QRectF(x, ry, COL_BRANCH_W, h),
+                    QRectF(x, ry, lane_w, h),
                     b["cls"], b.get("room", ""),
-                    b["base_color"], b["bg_color"], app)
+                    b["base_color"], b["bg_color"], app,
+                    conflict=b.get("conflict", False),
+                    conflict_partners=b.get("conflict_partners", ()),
+                    conflict_labels=b.get("conflict_labels", ()))
                 self.addItem(item)
                 self.lesson_items.append(item)
 

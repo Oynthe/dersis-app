@@ -60,6 +60,8 @@ from scheduler_app.logic import (
     get_placed_classes,
     occupied_slots_of, classroom_of, total_duration,
     build_virtual_classroom_day_layout,
+    find_schedule_conflicts, conflict_partner_index,
+    schedule_counts,
     find_valid_options,
     get_year_color, lighten_color,
     apply_negotiation_suggestion,
@@ -849,6 +851,8 @@ class SchedulerApp(QMainWindow):
         self._selected_cells = []        # selected graphics items
         self._selection_anchor = None    # anchor graphics item for Shift+Click
         self._selected_empty_slot = None
+        self._conflicts = []             # ST-UI-001, refreshed per repaint
+        self._conflict_partners = {}
 
         # Drag-and-drop state
         self._dragging_cls = None
@@ -2080,23 +2084,48 @@ class SchedulerApp(QMainWindow):
         return ok
 
     def _update_status(self):
+        """Render the status bar from the one placement vocabulary (ST-UI-002).
+
+        This used to compute ``n_unplaced = n_total - n_pinned - n_placed``,
+        which double-subtracts a class carrying both flags, and to render pinned
+        as a segment BESIDE placed. So its numbers summed to more than the class
+        count whenever a pin was also placed — ``4 sabit + 77 yerleşti + 3
+        yerleşmedi`` against 80 — and to a negative unplaced count when enough
+        of them were. Pinned is a subset annotation now, because that is what it
+        is, and the count comes from the same function the dashboard card
+        calls. (`BulkResultsDialog` deliberately does NOT: it reports the
+        OPERATION — "this run placed 56 of the 60 you asked for" — and is shown
+        BEFORE the user accepts, so a state trio rendered there would describe
+        the pre-solve timetable.)
+        """
         s = self.state_data
-        n_total = len(s["classes"])
-        n_pinned = sum(1 for c in s["classes"] if c["pinned"])
-        n_placed = sum(1 for c in s["classes"] if c["placed"])
-        n_protected = sum(1 for c in s["classes"]
-                          if c.get("protection", "none") != "none"
-                          and not c["pinned"])
-        n_unplaced = n_total - n_pinned - n_placed
+        counts = schedule_counts(s)
         fname = os.path.basename(self.current_file) if self.current_file else tr("app.untitled")
+        placed_txt = f"{counts['scheduled']} {tr('status.placed')}"
+        if counts["pinned_of_scheduled"]:
+            placed_txt += (
+                f"  \U0001F4CC "
+                + tr("status.pinned_subset").format(
+                    n=counts["pinned_of_scheduled"]))
         status = (
             f"\U0001F4C4 {fname}   \u2502   "
-            f"\U0001F4DA {n_total} {tr('status.classes')}   \u2502   "
-            f"\U0001F4CC {n_pinned} {tr('status.pinned')}   \u2502   "
-            f"\u2705 {n_placed} {tr('status.placed')}   \u2502   "
-            f"\u23F3 {n_unplaced} {tr('status.unplaced')}")
-        if n_protected > 0:
-            status += f"   \u2502   \U0001F6E1 {n_protected} {tr('labels.protected')}"
+            f"\U0001F4DA {counts['total']} {tr('status.classes')}   \u2502   "
+            f"\u2705 {placed_txt}   \u2502   "
+            f"\u23F3 {counts['unscheduled']} {tr('status.unplaced')}")
+        if counts["protected_of_scheduled"]:
+            status += (
+                f"   \u2502   \U0001F6E1 {counts['protected_of_scheduled']} "
+                f"{tr('labels.protected')}")
+        if counts["off_grid_of_scheduled"]:
+            # ST-DATA-003. These are scheduled but drawn nowhere, and the
+            # unplaced panel excludes them too (same `not placed and not
+            # pinned` predicate), so without this line the user reads a placed
+            # count higher than the number of lessons on the grid and has no
+            # way to find the difference.
+            status += (
+                f"   \u2502   \u26A0 "
+                + tr("status.off_grid_subset").format(
+                    n=counts["off_grid_of_scheduled"]))
         self.status_label.setText(status)
 
     # ── Filter updates ────────────────────────────────────────────────────
@@ -2210,6 +2239,20 @@ class SchedulerApp(QMainWindow):
         self._update_filters()
         self._update_status()
 
+        # ST-UI-001: this sweep feeds whichever timetable tab is being drawn.
+        # The warning log runs its OWN sweep in `_conflict_log_entries`, on
+        # purpose — `_run_auto_negotiation` can move classes between the two,
+        # so reusing this result there would describe a timetable that no
+        # longer exists. (An earlier version of this comment claimed one sweep
+        # served both and therefore guaranteed they agree. There are two, and
+        # the second one is why they agree.)
+        #
+        # Measured at ~1.5 ms on a fully-placed 250-class grid and 9 ms at 600,
+        # against the 306-563 ms repaint ST-UI-009 was about, so neither is
+        # memoised.
+        self._conflicts = find_schedule_conflicts(self.state_data)
+        self._conflict_partners = conflict_partner_index(self._conflicts)
+
         tab_idx = self.notebook.currentIndex()
         if tab_idx == 0:
             self._render_grid(
@@ -2272,13 +2315,17 @@ class SchedulerApp(QMainWindow):
     def _render_grid(self, view, filter_fn, mode=FILTER_MODE_DEFAULT):
         """Build a filtered timetable in the given TimetableView."""
         scene = TimetableScene()
-        scene.build_filtered(self.state_data, filter_fn, self, mode=mode)
+        scene.build_filtered(
+            self.state_data, filter_fn, self, mode=mode,
+            conflict_partners=getattr(self, "_conflict_partners", None))
         view.setScene(scene)
 
     def _render_everything(self, view):
         """Build the 'Show Everything' matrix in the given TimetableView."""
         scene = TimetableScene()
-        scene.build_everything(self.state_data, self)
+        scene.build_everything(
+            self.state_data, self,
+            conflict_partners=getattr(self, "_conflict_partners", None))
         view.setScene(scene)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -3007,17 +3054,35 @@ class SchedulerApp(QMainWindow):
         self._end_solve_ui()
 
         # Show results with analytics
+        # ST-SCHED-014. `summary` is available BEFORE the dialog (unlike
+        # apply_reschedule's rejected list, which cannot exist until after the
+        # modal returns), so the one sentence that names WHY the whole instance
+        # cannot be built goes on the dialog itself. It answers a different
+        # question from the per-class reasons beside it: "you are asking for 14
+        # class-hours and the building has 8 room-hours" is something no list of
+        # unplaced classes can ever say, and it is the only kind of problem that
+        # rearranging lessons cannot fix.
+        summary = result.summary or {}
+        infeasibility = summary.get("infeasibility")
         results_dlg = BulkResultsDialog(
             self, result.placed, result.unplaced, bool(result.changes),
             analytics=result.analytics,
             reschedule_explanation=result.explanation,
-            negotiation_source=lambda: result.negotiation_result)
+            negotiation_source=lambda: result.negotiation_result,
+            infeasibility=infeasibility)
         accepted = (results_dlg.exec() == BulkResultsDialog.DialogCode.Accepted
                     and results_dlg.result)
 
         if accepted:
             self._push_undo(tr("actions.reschedule"))
-            self._workflow.apply_reschedule(result)
+            # ST-SCHED-001. This return value was discarded. Each entry is a
+            # placement the optimizer proposed and the COMMIT step refused --
+            # a different category from result.unplaced, which the solver knew
+            # it could not place. A rejection here means the state changed
+            # between optimizing and applying, so the user asked for a
+            # timetable and silently got a different one.
+            rejected = self._workflow.apply_reschedule(result)
+            self._report_rejected_placements(rejected)
             self._clear_impact_flags()
 
             moved = len(result.changes)
@@ -3044,6 +3109,12 @@ class SchedulerApp(QMainWindow):
                     cpsat_st = result.summary.get("cpsat_status_label") or result.summary.get("cpsat_status", "")
                     engine_info += f" + CP-SAT ({cpsat_st})"
                 msg += f"\n({engine_info}, {elapsed:.1f}s)"
+                # ST-SCHED-013: say so when this timetable cannot be
+                # regenerated from the same settings, rather than letting the
+                # silence imply that it can.
+                note = self._reproducibility_note(result.summary)
+                if note:
+                    msg += f"\n⚠ {note}"
 
             if result.analytics:
                 msg += f"\n{tr('analytics.schedule_quality')}: {result.analytics['global_score']:.0f}/100 ({tr('labels.grade')}: {result.analytics['grade']})"
@@ -3151,6 +3222,27 @@ class SchedulerApp(QMainWindow):
     def edit_setup(self):
         snap_before = capture_snapshot(self.state_data)
         is_initial = not self._has_baseline
+        # ST-UI-014's second clause ("setup edits are irreversible") is real,
+        # and it CANNOT be fixed here. Phase 4 tried: it pushed an undo
+        # snapshot before the dialog and popped it again on cancel. Adversarial
+        # verification showed that made things worse in three ways, so it was
+        # withdrawn.
+        #
+        # `_push_undo` deep-copies `state_data["classes"]` and nothing else,
+        # while Setup rewrites days, slots, classrooms, lecturers and years. So
+        # undoing a Setup change restores the classes WITH THEIR OLD
+        # PLACEMENTS onto the NEW grid — resurrecting exactly the orphans
+        # ST-DATA-003 is about, from a button labelled "Undo: setup change".
+        # A half-transaction undo is not a partial fix; it is a data-corruption
+        # bug wearing a safety label.
+        #
+        # It also clears the redo stack (so Setup+Cancel silently destroyed
+        # redo even though nothing changed) and, at the 50-step cap, evicted
+        # the oldest undo step that popping could not put back.
+        #
+        # Making this genuinely undoable needs full-state snapshots — that is
+        # ST-ARCH-012, Phase 6. Until then Setup stays un-undoable, which is at
+        # least honest.
         dlg = SetupDialog(self, self.state_data)
         dlg.exec()
         if dlg.result:
@@ -3391,7 +3483,121 @@ class SchedulerApp(QMainWindow):
         # Auto-negotiation: analyze unplaced classes and collect suggestions.
         # It can mutate state (auto-apply), so publish AFTER it returns.
         derived.extend(self._run_auto_negotiation())
+
+        # ST-UI-001. Recomputed here rather than reused from
+        # _render_current_tab because _run_auto_negotiation can move classes.
+        # Appended last so a conflict becomes the panel's headline (set_derived
+        # shows the final entry), and capped because the panel re-renders its
+        # whole document from this list: the pathological preset reaches five
+        # figures of pairs, several times the 1656 entries ST-PERF-003 was
+        # about. The CAP IS ON THE LOG, NOT ON DETECTION — every conflicted
+        # lesson is still marked in the grid.
+        derived.extend(self._conflict_log_entries())
+
         self.warning_log.set_derived(derived)
+
+    @staticmethod
+    def _reproducibility_note(summary):
+        """A line for the result toast when the solve cannot be reproduced.
+
+        ST-SCHED-013. `summary['deterministic']` is
+        `(not clock_capped) and (not cpsat_used)`, so it is False whenever the
+        Thorough mode ran OR the time budget truncated the search. The second
+        case matters most: the user did not choose it, and nothing else on
+        screen distinguishes a timetable they can regenerate from one they
+        cannot.
+
+        Phase 1 was careful that the ENGINE never claims a reproducibility it
+        cannot deliver, and then nothing surfaced the flag -- so the UI made the
+        claim on its behalf by staying quiet.
+
+        Silent on the normal case: a note that appears every time is a note
+        nobody reads. A missing key is treated as reproducible, so an older or
+        partial summary does not raise a false alarm.
+        """
+        if not summary or summary.get("deterministic", True):
+            return ""
+        return tr("status.not_reproducible_note")
+
+    def _report_rejected_placements(self, rejected):
+        """Say so when the commit step refused a placement the solver proposed.
+
+        ST-SCHED-001 / ST-SCHED-002. `apply_reschedule` reports TWO different
+        events through one list, and telling a user the wrong one is worse than
+        telling them nothing:
+
+        * ``committed=True`` -- a pinned or locked class that clashes where the
+          USER put it. It is committed, because the pin is their instruction.
+          Nothing failed. On the project's own dataset generator 13 of 13
+          rejections are this kind, and the first version of this method
+          reported every one as an error reading "could not be committed where
+          the planner put it" -- about a lesson sitting exactly where the user
+          pinned it, after a reschedule that went fine.
+        * ``committed=False`` -- the commit step refused a placement the
+          optimizer proposed, i.e. the state changed between optimizing and
+          applying. That is nearly always a race or a defect, and is a
+          different category from `result.unplaced`: the solver knew about
+          those and the results dialog explains them.
+
+        Only the second is an error, and only the second gets a toast. The
+        first is a warning, and the grid already headlines it in red
+        (ST-UI-001) -- which is the right surface for it.
+        """
+        if not rejected:
+            return
+        refused = [e for e in rejected if not e.get("committed")]
+        clashing_pins = [e for e in rejected if e.get("committed")]
+
+        for entry in clashing_pins:
+            self.warning_log.log(
+                tr("status.pinned_clash").format(
+                    name=entry.get("name", "?"),
+                    reason=entry.get("reason", "")),
+                "warning")
+        for entry in refused:
+            self.warning_log.log(
+                tr("status.placement_refused").format(
+                    name=entry.get("name", "?"),
+                    reason=entry.get("reason", "")),
+                "error")
+        if refused:
+            self._show_toast(
+                tr("status.placements_refused_toast").format(n=len(refused)),
+                "warning")
+
+    _MAX_CONFLICT_LOG_ENTRIES = 25
+
+    _CONFLICT_KIND_KEYS = {
+        "room": "conflicts.room",
+        "lecturer": "conflicts.lecturer",
+        "target": "conflicts.student_group",
+    }
+
+    @staticmethod
+    def _conflict_label(cls):
+        code = cls.get("class_code", "")
+        return f"[{code}] {cls['name']}" if code else cls["name"]
+
+    def _conflict_log_entries(self):
+        """Warning-log lines for the conflicts found this refresh."""
+        conflicts = self._conflicts = find_schedule_conflicts(self.state_data)
+        self._conflict_partners = conflict_partner_index(conflicts)
+        entries = []
+        for rec in conflicts[:self._MAX_CONFLICT_LOG_ENTRIES]:
+            kinds = ", ".join(
+                tr(self._CONFLICT_KIND_KEYS[k]) for k in rec["kinds"]
+                if k in self._CONFLICT_KIND_KEYS)
+            entries.append((
+                tr("conflicts.cell_pair").format(
+                    day=day_label(rec["day"]), slot=rec["slot"],
+                    a=self._conflict_label(rec["a"]),
+                    b=self._conflict_label(rec["b"]),
+                    kinds=kinds),
+                "error"))
+        extra = len(conflicts) - self._MAX_CONFLICT_LOG_ENTRIES
+        if extra > 0:
+            entries.append((tr("conflicts.more").format(n=extra), "error"))
+        return entries
 
     def _run_auto_negotiation(self):
         """Analyze unplaced/constrained classes; RETURN the messages to show.
@@ -4379,6 +4585,9 @@ class SchedulerApp(QMainWindow):
         placed = get_placed_classes(s)
         days = s["days"]
         slots = s["slots"]
+        # ST-UI-001: one scan for the whole workbook, so every sheet marks the
+        # same clashes and the file agrees with the screen and the PDF.
+        conflict_partners = conflict_partner_index(find_schedule_conflicts(s))
 
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
@@ -4590,6 +4799,16 @@ class SchedulerApp(QMainWindow):
                         )
                         data_cell = ws.cell(row=row, column=col)
                         _apply_lesson_cell(data_cell, classes[0], rich)
+                        # ST-UI-001: stacking already kept both lessons here --
+                        # what was missing is saying that they clash. A shared
+                        # cell that is NOT a conflict (two online lessons) keeps
+                        # its normal year colour.
+                        keys = {cls_key(x) for x in classes}
+                        if any(conflict_partners.get(cls_key(x), frozenset())
+                               & (keys - {cls_key(x)}) for x in classes):
+                            data_cell.fill = PatternFill(
+                                start_color="FEE2E2", end_color="FEE2E2",
+                                fill_type="solid")
                     elif key in covered:
                         ws.cell(row=row, column=col).border = cell_border
                     else:
@@ -4666,6 +4885,19 @@ class SchedulerApp(QMainWindow):
                             )
                         data_cell = ws.cell(row=row, column=col)
                         _apply_lesson_cell(data_cell, block["cls"], rich)
+                        # ST-UI-001. This sheet lanes concurrent lessons rather
+                        # than stacking them, so it never had an "overlap"
+                        # branch to hang the marker on -- and marked no clashes
+                        # at all, while the physical sheets in the same
+                        # workbook did. The rule is the same non-geometric one
+                        # the renderer uses: a lesson is marked if the VALIDATOR
+                        # says it cannot coexist with something, not if two
+                        # blocks happen to share a cell (two online lessons at
+                        # one hour is normal and must stay unmarked).
+                        if conflict_partners.get(cls_key(block["cls"])):
+                            data_cell.fill = PatternFill(
+                                start_color="FEE2E2", end_color="FEE2E2",
+                                fill_type="solid")
                         for rr in range(row, row + span):
                             ws.cell(row=rr, column=col).border = cell_border
                     elif key in covered:
@@ -4778,6 +5010,7 @@ class SchedulerApp(QMainWindow):
                         bc.alignment = center_nowrap
 
                 occupied = {}
+                claims = {}
                 for c in placed:
                     c_day = effective_day(c)
                     c_start = effective_time(c)
@@ -4803,11 +5036,38 @@ class SchedulerApp(QMainWindow):
                             if si >= len(slots):
                                 break
                             okey = (si, d_idx, b_idx)
+                            # Identity, not equality, and not a plain append:
+                            # this runs inside `for t in c["targets"]`, so a
+                            # class carrying two IDENTICAL target dicts (a user
+                            # typing "A, B, A" as a year's branches) claimed the
+                            # same cell twice and was then found "overlapping"
+                            # with ITSELF -- pulled out of occupied_start and
+                            # stacked against its own duplicate, losing its
+                            # merge and its year colour. `is not` because two
+                            # distinct classes can compare equal by value.
+                            bucket = claims.setdefault(okey, [])
+                            if all(x is not c for x in bucket):
+                                bucket.append(c)
                             if d_off == 0:
                                 span = min(dur, len(slots) - actual_start)
                                 occupied[okey] = ("start", c, span)
                             else:
                                 occupied[okey] = ("span", None, 0)
+
+                # ST-UI-001. The dict above keeps the LAST writer, so a second
+                # lesson claiming a cell used to erase the first from this
+                # sheet -- while the filtered sheets in the SAME workbook
+                # already stacked both. Pull every contested claimant out and
+                # stack them, exactly as _write_filtered_sheet does.
+                overlapping = {id(c) for cs in claims.values() if len(cs) > 1
+                               for c in cs}
+                overlap_cells = {}
+                for okey, cs in claims.items():
+                    keep = [c for c in cs if id(c) in overlapping]
+                    if keep:
+                        overlap_cells[okey] = keep
+                for okey in overlap_cells:
+                    occupied.pop(okey, None)
 
                 for si, slot in enumerate(slots):
                     erow = si + 3
@@ -4827,7 +5087,24 @@ class SchedulerApp(QMainWindow):
                         for b_idx in range(n_branches):
                             col = 3 + d_idx * n_branches + b_idx
                             okey = (si, d_idx, b_idx)
-                            if okey in occupied:
+                            if okey in overlap_cells:
+                                claimants = overlap_cells[okey]
+                                keys = {cls_key(x) for x in claimants}
+                                conflicted = any(
+                                    conflict_partners.get(cls_key(x), frozenset())
+                                    & (keys - {cls_key(x)})
+                                    for x in claimants)
+                                rich = _build_stacked_rich_cell(
+                                    claimants, include_room=True,
+                                    include_targets=False)
+                                dc = ws.cell(row=erow, column=col, value=rich)
+                                fill_hex = "FEE2E2" if conflicted else "F1F5F9"
+                                dc.fill = PatternFill(
+                                    start_color=fill_hex, end_color=fill_hex,
+                                    fill_type="solid")
+                                dc.border = cell_border
+                                dc.alignment = center_wrap
+                            elif okey in occupied:
                                 kind, cls, span = occupied[okey]
                                 if kind == "span":
                                     ws.cell(row=erow, column=col).border = cell_border

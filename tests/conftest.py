@@ -80,6 +80,73 @@ def dersis_home(tmp_path, monkeypatch):
 
 # ── Qt ──────────────────────────────────────────────────────────────────────
 
+@pytest.fixture
+def make_app(qapp, dersis_home, monkeypatch):
+    """Factory for a real, isolated, never-shown ``SchedulerApp``.
+
+    Constructing ``SchedulerApp()`` bare leaks across tests, and the failure is
+    the nastiest kind: **a timer that outlives the test that armed it**.
+
+    ``SchedulerApp.__init__`` starts ``FirstRunController``, which drives
+    ``QTimer``-based ``_write_flag`` calls. Those fire on a later iteration of
+    the event loop — by which time ``dersis_home`` has rebound
+    ``storage._ROOT_DIR`` to a *different* test's directory. The write then
+    lands in that test's settings file, and if the test in question is one that
+    deliberately plants a corrupt container (``test_settings_recovery``), the
+    stray write quarantines it and raises a toast **inside an unrelated test**,
+    failing an assertion about a channel nobody used.
+
+    Observed exactly that: three modules building ``SchedulerApp`` bare made
+    ``test_absent_settings_file_on_first_run_is_not_an_error`` fail with a
+    corruption toast naming another test's ``backups/`` path. Running it alone
+    passed. This mirrors the isolation ``test_settings_recovery.make_window``
+    and ``test_import_ui_flow`` already do by hand.
+
+    ``TierEnforcement`` is a process-wide singleton that ``SchedulerApp``
+    registers into and never unregisters, so its registries are snapshotted too.
+    """
+    from scheduler_app.ui.first_run import FirstRunController
+    from scheduler_app.ui.tier_enforcement import TierEnforcement
+
+    monkeypatch.setattr(FirstRunController, "start", lambda self: None)
+
+    # These names are load-bearing and were wrong on first writing: the guard
+    # was `hasattr(...)`, so three misspelled names silently snapshotted and
+    # restored NOTHING while looking like isolation. Kept in one tuple, matching
+    # the list test_settings_recovery.make_window uses, and asserted non-empty
+    # below so a rename cannot make this quietly do nothing again.
+    registry_names = ("_gated_widgets", "_gated_actions", "_on_tier_changed",
+                      "_export_submenu_refreshers")
+
+    enforcer = TierEnforcement.instance()
+    registries = [n for n in registry_names if hasattr(enforcer, n)]
+    assert registries, (
+        "TierEnforcement exposes none of %r — this fixture is restoring "
+        "nothing. Update registry_names." % (registry_names,)
+    )
+    saved = {n: list(getattr(enforcer, n)) for n in registries}
+
+    built = []
+
+    def _factory():
+        from scheduler_app.ui.app import SchedulerApp
+        win = SchedulerApp()
+        built.append(win)
+        return win
+
+    try:
+        yield _factory
+    finally:
+        for win in built:
+            try:
+                win.close()
+                win.deleteLater()
+            except Exception:
+                pass
+        for name, value in saved.items():
+            setattr(enforcer, name, value)
+
+
 @pytest.fixture(scope="session")
 def qapp():
     """One offscreen QApplication for the whole session (Qt allows only one)."""

@@ -12,7 +12,7 @@ Computes metrics from the current timetable state:
 from scheduler_app.logic import (
     find_slot_index,
     get_placed_classes, occupied_slots_of, classroom_of, slot_index,
-    total_duration,
+    total_duration, schedule_counts,
 )
 from scheduler_app.models import effective_day, effective_time
 
@@ -124,7 +124,10 @@ def room_utilization(state):
         si = find_slot_index(state, start)
         if si is None or day not in state["days"]:
             continue  # placement orphaned by a removed slot/day (ST-DATA-003)
-        for i in range(td):
+        # Same duration overrun as busiest_slots. Here it does not raise — a set
+        # accepts any index — it silently claims hours the grid does not have,
+        # so one 2-hour lesson on a one-hour day reported 200% utilization.
+        for i in range(min(td, len(state["slots"]) - si)):
             room_slots.setdefault(room, set()).add((day, si + i))
     result = {}
     for room in state["classrooms"]:
@@ -155,7 +158,17 @@ def busiest_slots(state):
         si = find_slot_index(state, start)
         if si is None:
             continue  # placement orphaned by a removed slot (ST-DATA-003)
-        for i in range(td):
+        # ST-DATA-003, duration half. The `si is None` guard above covers a
+        # placement whose START slot was deleted. It does not cover a block
+        # whose start still exists but whose DURATION now overruns the end of
+        # the day — place a 2-hour lesson at 15:00, then delete the 16:00 hour
+        # in Setup. `reconcile_placements` does not catch that either (it only
+        # checks membership of `placed_time`), so the class stays placed and
+        # this used to index past the end and raise IndexError, out of
+        # `compute_all_metrics`, out of `DashboardWidget.refresh`, and into
+        # `ui/app.py`, which calls it with no `try`. The hours that do not
+        # exist are simply not counted.
+        for i in range(min(td, len(state["slots"]) - si)):
             s = state["slots"][si + i]
             counts[s] = counts.get(s, 0) + 1
     return dict(sorted(counts.items(), key=lambda x: -x[1]))
@@ -206,10 +219,17 @@ def compute_all_metrics(state):
     placed = get_placed_classes(state)
     lec_gaps_per_day, lec_gaps_total = lecturer_gap_distribution(state)
     stu_gaps_per_day, stu_gaps_total = student_idle_distribution(state)
+    counts = schedule_counts(state)
     return {
-        "placed_count": len(placed),
-        "unplaced_count": len([c for c in state["classes"] if not c["placed"] and not c["pinned"]]),
-        "total_classes": len(state["classes"]),
+        # ST-UI-002. These keep their historical names — they are
+        # `scheduled`/`unscheduled` and always were — but now come from the same
+        # function the status bar and the results dialog call, so the dashboard
+        # card and the status bar cannot disagree again.
+        "placed_count": counts["scheduled"],
+        "unplaced_count": counts["unscheduled"],
+        "pinned_count": counts["pinned_of_scheduled"],
+        "off_grid_count": counts["off_grid_of_scheduled"],
+        "total_classes": counts["total"],
         "lec_gaps_per_day": lec_gaps_per_day,
         "lec_gaps_total": lec_gaps_total,
         "student_gaps_per_day": stu_gaps_per_day,

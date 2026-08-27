@@ -5,6 +5,7 @@ Does not modify scheduling logic or internal data.
 """
 
 import csv
+import html
 import warnings
 import os
 from typing import Any
@@ -22,12 +23,13 @@ except ImportError:
 from scheduler_app.logic import (
     get_placed_classes, occupied_slots_of, classroom_of, total_duration,
     get_year_color, lighten_color, build_virtual_classroom_day_layout,
+    find_schedule_conflicts, conflict_partner_index,
 )
 from scheduler_app.models import (
     get_classroom_export_labels,
     get_protection_label,
     effective_day, effective_time,
-    slot_offset_for_target,
+    slot_offset_for_target, cls_key, find_off_grid_placements,
 )
 from scheduler_app.translations import tr
 from scheduler_app.ui.badge_formatter import get_badge
@@ -403,32 +405,81 @@ def _export_csv(schedule: FinalSchedule, filepath: str):
 # ── PDF export (optional) ───────────────────────────────────────────────────
 
 
-def _pdf_rich_paragraph(cls, cell_style, include_room=False, include_targets=False):
-    """Build a color-coded Paragraph for a class in a PDF cell."""
-    from reportlab.platypus import Paragraph
+def _pdf_rich_markup(cls, include_room=False, include_targets=False):
+    """The colour-coded markup for one class, without wrapping it in a Paragraph.
 
+    Split out from :func:`_pdf_rich_paragraph` so a contested cell can join
+    several classes' markup into ONE Paragraph (ST-UI-001). reportlab's ``SPAN``
+    merges rows, not columns, so a PDF cell cannot be split into lanes the way
+    the screen is — stacking every claimant into the cell is the shape the XLSX
+    writer already uses, and it is what makes the two agree.
+    """
+    # reportlab parses this as markup, so every interpolated value is USER
+    # TEXT and must be escaped: a class named "Fizik & Kimya" or a lecturer
+    # called "<Vekil>" otherwise mangles the cell or raises out of the whole
+    # export. Only the data is escaped, never the template.
+    esc = html.escape
     parts = []
     code = cls.get("class_code", "")
     if code:
-        parts.append(f'<font color="#1D4ED8" size="7"><b>{code}</b></font>')
-    parts.append(f'<font color="#1E293B" size="8"><b>{cls["name"]}</b></font>')
+        parts.append(
+            f'<font color="#1D4ED8" size="7"><b>{esc(str(code))}</b></font>')
+    parts.append(
+        f'<font color="#1E293B" size="8"><b>{esc(str(cls["name"]))}</b></font>')
     if cls.get("lecturer"):
-        parts.append(f'<font color="#475569" size="7">{cls["lecturer"]}</font>')
+        parts.append(
+            f'<font color="#475569" size="7">{esc(str(cls["lecturer"]))}</font>')
     if include_room:
         room = classroom_of(cls)
         if room:
-            parts.append(f'<font color="#16A34A" size="7">{room}</font>')
+            parts.append(
+                f'<font color="#16A34A" size="7">{esc(str(room))}</font>')
     if include_targets:
         groups = ", ".join(
             f"{t['year']}/{t['branch']}" for t in cls.get("targets", []))
         if groups:
-            parts.append(f'<font color="#6D28D9" size="6">{groups}</font>')
+            parts.append(
+                f'<font color="#6D28D9" size="6">{esc(groups)}</font>')
     # Protection badge
     emoji, label, b_color = get_badge(cls)
     if emoji:
         parts.append(
-            f'<font color="{b_color}" size="6"><b>{label}</b></font>')
-    return Paragraph("<br/>".join(parts), cell_style)
+            f'<font color="{b_color}" size="6"><b>{esc(str(label))}</b></font>')
+    return "<br/>".join(parts)
+
+
+def _pdf_rich_paragraph(cls, cell_style, include_room=False, include_targets=False):
+    """Build a color-coded Paragraph for a class in a PDF cell."""
+    from reportlab.platypus import Paragraph
+
+    return Paragraph(
+        _pdf_rich_markup(cls, include_room=include_room,
+                         include_targets=include_targets),
+        cell_style)
+
+
+def _pdf_conflict_paragraph(classes, cell_style, conflicted,
+                            include_room=False, include_targets=False):
+    """One Paragraph holding every class that claims a contested PDF cell.
+
+    ST-UI-001. ``_build_filtered_table`` used to ``continue`` past any class
+    whose start cell was already taken — keeping the FIRST claimant, where the
+    screen kept the LAST. So a user who checked the timetable on screen and
+    then printed it got two different, both-incomplete documents. Every
+    claimant is now stacked into the cell, and *conflicted* (a validator
+    verdict, not "there are two of them here") adds the ÇAKIŞMA marker.
+    """
+    from reportlab.platypus import Paragraph
+
+    blocks = [_pdf_rich_markup(c, include_room=include_room,
+                               include_targets=include_targets)
+              for c in classes]
+    markup = '<br/><font color="#DC2626">---</font><br/>'.join(blocks)
+    if conflicted:
+        markup = (f'<font color="#DC2626" size="7"><b>'
+                  f'{html.escape(tr("badges.conflict"))}</b></font><br/>'
+                  + markup)
+    return Paragraph(markup, cell_style)
 
 
 def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"):
@@ -456,6 +507,10 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     placed = schedule.placed_classes()
     days = schedule.days
     slots = schedule.slots
+    # ST-UI-001: one scan for the whole document, so every page marks the
+    # same clashes and the printout agrees with the screen.
+    conflicts = find_schedule_conflicts(state)
+    conflict_partners = conflict_partner_index(conflicts)
 
     page_size = landscape(A3)
     doc = SimpleDocTemplate(
@@ -520,8 +575,21 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             header.append(Paragraph(tr(f"weekdays.{day}"), hdr_style))
 
         # Build occupancy map: (slot_index, day) -> (cls, span) or "covered"
-        occupied_start = {}
-        covered = set()
+        #
+        # ST-UI-001. This used to `continue` past any class whose start cell
+        # was already claimed, keeping the FIRST claimant — while the screen's
+        # dict-overwrite kept the LAST. A user who checked the timetable on
+        # screen and then printed it therefore got two different, both-
+        # incomplete documents, each missing a lesson the other showed.
+        #
+        # reportlab's SPAN merges rows, not columns, so a PDF cell cannot be
+        # split into lanes the way the grid is. Instead every claimant is
+        # stacked into each covered cell and the merge is dropped — which is
+        # exactly what ui/app.py::_write_filtered_sheet already does for XLSX,
+        # so this makes the three surfaces agree rather than inventing a fourth
+        # behaviour.
+        entries = []
+        claims = {}
         for cls in placed:
             if not filter_fn(cls):
                 continue
@@ -533,12 +601,28 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             span = min(total_duration(cls), len(slots) - start_si)
             if span <= 0:
                 continue
-            key = (start_si, c_day)
-            if key in occupied_start:
-                continue
-            occupied_start[key] = (cls, span)
+            entry = {"cls": cls, "day": c_day, "start_si": start_si,
+                     "span": span}
+            entries.append(entry)
             for off in range(span):
-                covered.add((start_si + off, c_day))
+                claims.setdefault((start_si + off, c_day), []).append(entry)
+
+        overlapping = {id(e["cls"]) for cells in claims.values()
+                       if len(cells) > 1 for e in cells}
+
+        occupied_start = {}
+        covered = set()
+        overlap_cells = {}
+        for entry in entries:
+            if id(entry["cls"]) in overlapping:
+                for off in range(entry["span"]):
+                    overlap_cells.setdefault(
+                        (entry["start_si"] + off, entry["day"]), []).append(entry)
+                continue
+            occupied_start[(entry["start_si"], entry["day"])] = (
+                entry["cls"], entry["span"])
+            for off in range(entry["span"]):
+                covered.add((entry["start_si"] + off, entry["day"]))
 
         table_data = [header]
         style_cmds = [
@@ -554,6 +638,10 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
         ]
         cell_bg_cmds = []
         row_heights = [24]  # header row
+        # Rows holding a stacked contested cell need more than MIN_ROW_H:
+        # reportlab does NOT grow a fixed-height row to fit its content, it
+        # overprints the neighbours. Measured per cell below.
+        tall_rows = {}
 
         for si, slot in enumerate(slots):
             data_row_idx = si + 1
@@ -586,6 +674,32 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                                  (col_idx, data_row_idx + off),
                                  (col_idx, data_row_idx + off),
                                  rl_colors.HexColor(light)))
+                elif key in overlap_cells:
+                    claimants = [e["cls"] for e in overlap_cells[key]]
+                    keys = {cls_key(c) for c in claimants}
+                    conflicted = any(
+                        conflict_partners.get(cls_key(c), frozenset())
+                        & (keys - {cls_key(c)})
+                        for c in claimants)
+                    stack_para = _pdf_conflict_paragraph(
+                        claimants, cell_style, conflicted,
+                        include_room=include_room,
+                        include_targets=include_targets)
+                    row.append(stack_para)
+                    # Two or more lessons in one cell is taller than one, and
+                    # rowHeights is FIXED -- an unmeasured stack silently
+                    # overprints the hours above and below it, which on a
+                    # printed timetable is worse than the drop it replaced.
+                    # day_w - 4 because LEFTPADDING and RIGHTPADDING are both
+                    # 2; + 6 for TOPPADDING + BOTTOMPADDING.
+                    _w, _h = stack_para.wrap(day_w - 4, 1e6)
+                    tall_rows[data_row_idx] = max(
+                        tall_rows.get(data_row_idx, MIN_ROW_H), _h + 6)
+                    cell_bg_cmds.append(
+                        ("BACKGROUND", (col_idx, data_row_idx),
+                         (col_idx, data_row_idx),
+                         rl_colors.HexColor(
+                             "#FEE2E2" if conflicted else "#F1F5F9")))
                 elif key in covered:
                     row.append("")
                 else:
@@ -595,6 +709,9 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                          (col_idx, data_row_idx), COL_EMPTY))
             table_data.append(row)
             row_heights.append(MIN_ROW_H)
+
+        for _ri, _h in tall_rows.items():
+            row_heights[_ri] = _h
 
         # Default empty bg first, then override with lesson colors
         style_cmds.extend(cell_bg_cmds)
@@ -749,7 +866,14 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                     ("BACKGROUND", (c, 1), (c, 1), COL_BRANCH_HDR))
 
         # Build occupancy map: (slot_idx, day_idx, branch_idx) -> (kind, cls, span)
-        occupied = {}
+        #
+        # ST-UI-001. This was a plain dict assignment, so a second claimant of a
+        # cell overwrote the first and printed nowhere -- the same defect the
+        # filtered PDF tables had, left behind when they were fixed. Every
+        # claimant is collected first, and any ENTRY that shares a cell is
+        # routed to the stacked branch.
+        entries = []
+        claims = {}
         for c in placed:
             c_day = effective_day(c)
             c_start = effective_time(c)
@@ -765,19 +889,43 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                 t_idx = c["targets"].index(t)
                 slot_off = slot_offset_for_target(c, t_idx)
                 actual_start = start_si + slot_off
-                for d_off in range(dur):
-                    si = actual_start + d_off
-                    if si >= len(slots):
-                        break
-                    okey = (si, d_idx, b_idx)
-                    if d_off == 0:
-                        span = min(dur, len(slots) - actual_start)
-                        occupied[okey] = ("start", c, span)
-                    else:
-                        occupied[okey] = ("span", None, 0)
+                if actual_start >= len(slots):
+                    continue
+                span = min(dur, len(slots) - actual_start)
+                if span <= 0:
+                    continue
+                entry = {"cls": c, "start_si": actual_start, "span": span,
+                         "d_idx": d_idx, "b_idx": b_idx}
+                entries.append(entry)
+                for off in range(span):
+                    okey = (actual_start + off, d_idx, b_idx)
+                    bucket = claims.setdefault(okey, [])
+                    # Identity on the ENTRY, not on the class: a joint class
+                    # contested in Year-1/A must keep rendering normally in the
+                    # Year-1/B column, where nothing contests it.
+                    if all(x is not entry for x in bucket):
+                        bucket.append(entry)
+
+        overlapping = {id(e) for cells in claims.values() if len(cells) > 1
+                       for e in cells}
+        occupied = {}
+        overlap_cells = {}
+        for entry in entries:
+            if id(entry) in overlapping:
+                for off in range(entry["span"]):
+                    overlap_cells.setdefault(
+                        (entry["start_si"] + off, entry["d_idx"],
+                         entry["b_idx"]), []).append(entry)
+                continue
+            base = (entry["start_si"], entry["d_idx"], entry["b_idx"])
+            occupied[base] = ("start", entry["cls"], entry["span"])
+            for off in range(1, entry["span"]):
+                occupied[(entry["start_si"] + off, entry["d_idx"],
+                          entry["b_idx"])] = ("span", None, 0)
 
         cell_bg_cmds = []
         row_heights = [24, 18]  # header rows
+        tall_rows = {}
 
         for si, slot in enumerate(slots):
             data_row = si + 2  # after 2 header rows
@@ -794,7 +942,25 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                 for b_idx in range(n_branches):
                     col = 2 + d_idx * n_branches + b_idx
                     okey = (si, d_idx, b_idx)
-                    if okey in occupied:
+                    if okey in overlap_cells:
+                        claimants = [e["cls"] for e in overlap_cells[okey]]
+                        ckeys = {cls_key(x) for x in claimants}
+                        conflicted = any(
+                            conflict_partners.get(cls_key(x), frozenset())
+                            & (ckeys - {cls_key(x)})
+                            for x in claimants)
+                        stack_para = _pdf_conflict_paragraph(
+                            claimants, cell_style, conflicted,
+                            include_room=True, include_targets=False)
+                        row.append(stack_para)
+                        _w, _h = stack_para.wrap(data_col_w - 4, 1e6)
+                        tall_rows[data_row] = max(
+                            tall_rows.get(data_row, MIN_ROW_H), _h + 6)
+                        cell_bg_cmds.append(
+                            ("BACKGROUND", (col, data_row), (col, data_row),
+                             rl_colors.HexColor(
+                                 "#FEE2E2" if conflicted else "#F1F5F9")))
+                    elif okey in occupied:
                         kind, cls, span = occupied[okey]
                         if kind == "span":
                             row.append("")
@@ -825,6 +991,9 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
             table_data.append(row)
             row_heights.append(MIN_ROW_H)
+
+        for _ri, _h in tall_rows.items():
+            row_heights[_ri] = _h
 
         style_cmds.extend(cell_bg_cmds)
 
@@ -891,6 +1060,67 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
     if not elements:
         elements.append(Paragraph(tr("warnings.no_schedule_data"), title_style))
+
+    # ── Appendix: everything the grid could not say ───────────────────
+    #
+    # ST-FUNC-013 + ST-UI-001. Two different ways a lesson goes missing from a
+    # printed timetable, one page:
+    #
+    #   * a placement on a day or hour the user has since deleted has no cell
+    #     to be drawn in, so every grid-shaped page simply omits it;
+    #   * a double-booking is now stacked into its cell rather than dropped,
+    #     but a stacked cell is easy to miss on a dense page.
+    #
+    # export_schedule() already raises a Python warning per orphan, which the
+    # GUI surfaces — but the *printout* said nothing, and the printout is what
+    # gets pinned to a noticeboard. Silence is the dangerous outcome precisely
+    # because the paper looks complete.
+    #
+    # Placed AFTER the `if not elements` check on purpose: appending first
+    # would make `elements` non-empty and silently delete the "no schedule
+    # data" page that the empty-export test pins.
+    appendix_rows = []
+    for cls, _reason in find_off_grid_placements(state):
+        appendix_rows.append((
+            tr("export.appendix_offgrid"),
+            cls.get("class_code", ""),
+            cls.get("name", ""),
+            cls.get("lecturer", ""),
+            f"{display_day(effective_day(cls))} {effective_time(cls) or ''}",
+        ))
+    for rec in conflicts:
+        a, b = rec["a"], rec["b"]
+        appendix_rows.append((
+            tr("export.appendix_conflict"),
+            f'{a.get("class_code", "")} / {b.get("class_code", "")}',
+            f'{a.get("name", "")}  /  {b.get("name", "")}',
+            f'{a.get("lecturer", "")}  /  {b.get("lecturer", "")}',
+            f'{display_day(rec["day"])} {rec["slot"]}',
+        ))
+
+    if appendix_rows:
+        elements.append(PageBreak())
+        elements.append(Paragraph(tr("export.appendix_title"), title_style))
+        head = [Paragraph(h, branch_hdr_style) for h in (
+            tr("labels.type"), tr("labels.class_code"), tr("labels.class_name"),
+            tr("labels.lecturer"), tr("labels.day"))]
+        # Escaped: these rows carry class and lecturer names straight from the
+        # user's file into reportlab's markup parser.
+        data = [head] + [[Paragraph(html.escape(str(v)), cell_style)
+                          for v in row]
+                         for row in appendix_rows]
+        appendix = Table(
+            data,
+            colWidths=[avail_w * f for f in (0.20, 0.15, 0.33, 0.20, 0.12)],
+            repeatRows=1)
+        appendix.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, COL_GRID),
+            ("BACKGROUND", (0, 0), (-1, 0), COL_DAY_HDR),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(appendix)
 
     doc.build(elements)
 

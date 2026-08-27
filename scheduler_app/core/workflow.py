@@ -572,8 +572,16 @@ class SchedulingWorkflow:
             self.state, result.placed, immovable_ids=immovable_ids)
         accepted_keys = {cls_key(c) for c, _, _, _ in accepted}
 
+        # Every conflict is reported, never truncated: ST-SCHED-002 requires a
+        # clashing pin to be named, and the invariants suite pins that. But the
+        # two kinds are not the same event, so each entry says which it is.
+        # `committed=True` -- a pin or locked class sitting exactly where the
+        # user put it, which also clashes. Nothing failed; the user's
+        # instruction stands. `committed=False` -- the commit step refused a
+        # placement the optimizer proposed, i.e. the state changed underneath.
         rejected = [
-            drop_report(cls_item, reasons)
+            dict(drop_report(cls_item, reasons),
+                 committed=cls_key(cls_item) in accepted_keys)
             for cls_item, _d, _s, _r, reasons in conflicts
         ]
 

@@ -3,6 +3,7 @@
 from scheduler_app.constants import YEAR_COLORS
 from scheduler_app.models import (
     DEFAULT_OPTIMIZER_SEED,
+    PROTECTION_NONE,
     room_fits_class, lecturer_available_at, needs_physical_room, display_room,
     get_room_candidates, get_physical_room_candidates,
     effective_day, effective_time, effective_room,
@@ -103,24 +104,13 @@ def build_virtual_classroom_day_layout(state, filter_fn):
             "bg_color": lighten_color(base_color, 0.45),
         })
 
+    # One lane count per DAY: this view exists for the online/office filter,
+    # where concurrency is the normal case, so a stable day-wide subcolumn
+    # count is what the user wants. The default filtered view uses
+    # assign_component_lanes instead, which splits only contested rows.
     lane_counts = {}
     for day in days:
-        ordered = sorted(
-            day_entries[day],
-            key=lambda entry: (entry["row"], -entry["span"], entry["order"]),
-        )
-        active = []
-        peak_lane_count = 0
-        for entry in ordered:
-            active = [item for item in active if item["end_row"] > entry["row"]]
-            used_lanes = {item["lane"] for item in active}
-            lane = 0
-            while lane in used_lanes:
-                lane += 1
-            entry["lane"] = lane
-            active.append(entry)
-            peak_lane_count = max(peak_lane_count, lane + 1)
-        lane_counts[day] = max(1, peak_lane_count)
+        lane_counts[day] = max(1, _sweep_lanes(day_entries[day]))
 
     day_groups = []
     subcolumn_start = 0
@@ -180,6 +170,110 @@ def get_consecutive_slots(state, start_slot, duration):
 
 def get_placed_classes(state):
     return [c for c in state["classes"] if c["placed"] or c["pinned"]]
+
+
+def schedule_counts(state):
+    """The one placement vocabulary. Every counter a user sees comes from here.
+
+    ST-UI-002. Three definitions of "placed" used to be on screen at once — the
+    status bar counted ``placed`` only, the dashboard counted ``placed or
+    pinned``, and the results dialog counted its own event list — and the status
+    bar's ``total - pinned - placed`` could render a NEGATIVE number, because a
+    class that is both pinned and ``placed=True`` was subtracted twice.
+
+    **The register's own recommendation — "clamp/assert non-negative" — is the
+    worst available fix.** On a state with 80 classes, 4 pins that also carry
+    ``placed=True``, and 3 genuinely unplaced lessons, the old formula gives −1
+    and the clamp gives **0**, while the truth is **3** — and those 3 are listed
+    in the unplaced sidebar on the same screen. The clamp replaces an impossible
+    number with a confidently wrong one. An ``assert`` is no better: it crashes
+    the repaint on a file the grid can still draw.
+
+    So the buckets are disjoint **by construction** rather than by trusting the
+    "pinned implies not placed" invariant. That invariant is real but is held by
+    caller convention at nine ``mark_placed`` sites and enforced nowhere, and no
+    loader repairs a state that breaks it, so a ``.egu`` carrying it would
+    render a negative forever.
+
+    ``scheduled``               has a cell on the timetable: ``pinned or
+                                placed`` — the same set as
+                                :func:`get_placed_classes`. A pin carries its
+                                position in ``pinned_*`` and ``apply_reschedule``
+                                deliberately never calls ``mark_placed`` on one
+                                (ST-SCHED-002), so pinned *is* scheduled. A pin
+                                that clashes is scheduled too: it is committed
+                                and it occupies the cell. Its problem is a
+                                conflict to render (ST-UI-001), not a smaller
+                                number.
+    ``pinned_of_scheduled``     a SUBSET annotation, never a bucket of its own.
+                                Rendering it as a peer segment is the other half
+                                of the finding: ``4 sabit + 77 yerleşti + 3
+                                yerleşmedi`` sums to 84 against 80 classes, and
+                                users read a status bar as a partition.
+    ``protected_of_scheduled``  the other subset annotation — a movement policy,
+                                orthogonal to placement.
+    ``off_grid_of_scheduled``   scheduled, but at a day or hour the grid no
+                                longer has. Counted separately because it is the
+                                one case where ``scheduled`` genuinely does not
+                                equal what the grid draws: such a lesson is
+                                drawn by nothing AND absent from the unplaced
+                                panel, so without this the user reads "77
+                                yerleşmiş" over a grid showing 75. It stays
+                                inside ``scheduled`` — the user did place it,
+                                and Phase 1 deliberately does not unplace
+                                orphans at load — but it is now sayable.
+    ``unscheduled``             ``total - scheduled``; identical to the
+                                ``not placed and not pinned`` predicate the
+                                unplaced panel and ``PlaceClassDialog`` use.
+
+    ``0 <= unscheduled <= total``, ``pinned_of_scheduled <= scheduled`` and
+    ``scheduled + unscheduled == total`` hold for **any** input, including a
+    state that violates the invariant.
+
+    Bracket access on ``classes``/``placed``/``pinned`` is deliberate, and both
+    flags are read *unconditionally*: the property is **never quieter than the
+    grid**. A malformed class dict must not raise in ``get_placed_classes`` —
+    which the renderer iterates — while being counted silently here, because
+    that is the Phase 1 lesson ("making a reader total converts a crash into a
+    silent drop") in a place where the crash is the honest outcome.
+
+    Not "byte-identical to ``get_placed_classes``", which is unachievable and
+    was claimed here in error: this function legitimately needs ``pinned`` even
+    when ``placed`` is truthy, and needs the effective day and slot, none of
+    which that function reads. ``protection`` is the one tolerant read, because
+    that key genuinely has a default.
+    """
+    days = set(state.get("days") or [])
+    slots = set(state.get("slots") or [])
+    total = scheduled = pinned_of = protected_of = off_grid_of = 0
+    for cls in state["classes"]:
+        total += 1
+        # BOTH read unconditionally. `cls["pinned"] or cls["placed"]` would
+        # short-circuit on a pinned class and never touch "placed", so a class
+        # dict missing that key would raise in get_placed_classes — which the
+        # grid iterates — and be counted silently here. The property that
+        # matters is not "identical to get_placed_classes" (unachievable: this
+        # function legitimately needs `pinned` and the effective day/slot,
+        # which that one never reads) but NEVER QUIETER THAN THE GRID.
+        is_placed = cls["placed"]
+        is_pinned = cls["pinned"]
+        if not (is_placed or is_pinned):
+            continue
+        scheduled += 1
+        if is_pinned:
+            pinned_of += 1
+        elif cls.get("protection", PROTECTION_NONE) != PROTECTION_NONE:
+            protected_of += 1
+        if effective_day(cls) not in days or effective_time(cls) not in slots:
+            off_grid_of += 1
+    return {
+        "total": total,
+        "scheduled": scheduled,
+        "pinned_of_scheduled": pinned_of,
+        "protected_of_scheduled": protected_of,
+        "off_grid_of_scheduled": off_grid_of,
+        "unscheduled": total - scheduled,
+    }
 
 
 def occupied_slots_of(state, cls):
@@ -407,6 +501,267 @@ def find_conflicting_classes(state, candidate, day, start_slot, classroom):
     if cls_key(candidate) in conflicting and candidate not in result:
         result.append(candidate)
     return result
+
+
+def find_schedule_conflicts(state):
+    """Every hard occupancy conflict in the timetable **as it stands**.
+
+    ST-UI-001. ``find_conflicting_classes`` answers "would this candidate clash
+    if I put it here?". This answers "what is already double-booked?" — the
+    question the grid, the warning log and the exports need, and the only one an
+    engine that deliberately commits an infeasible pin (ST-SCHED-002) can be
+    asked without re-solving.
+
+    Returns a list of dicts, ordered deterministically::
+
+        {"a": cls, "b": cls, "day": day, "slot": slot, "kinds": (...)}
+
+    ``(a, b)`` is ordered by ``cls_key`` so a pair is reported once, ``day``/
+    ``slot`` is the first contested cell, and ``kinds`` is a sorted tuple drawn
+    from ``'room'`` / ``'lecturer'`` / ``'target'``.
+
+    The occupancy rules follow ``_detect_occupancy_conflicts``: a room clash
+    only between two lessons that both need a physical room — two online
+    lessons sharing an hour is normal and must not be reported — lecturer by
+    name, and targets per slot offset via ``_active_targets``, so a non-joint
+    class only blocks the group whose sub-block covers that hour.
+
+    Four deliberate divergences from ``find_conflicting_classes``, each because
+    that function answers "may I put this candidate here?" and this one answers
+    "what is already wrong?":
+
+    1. **No lecturer-availability sentinel.** That function lists a class as its
+       own conflict partner when its lecturer is unavailable. This returns
+       *pairs*, and "the lecturer is not available" is not a pair; it is
+       reported by the negotiator and by the validator's reasons.
+    2. **A blank lecturer is not a lecturer clash, and a blank room is not a
+       room clash.** ``_detect_occupancy_conflicts`` compares
+       ``existing["lecturer"] == candidate["lecturer"]`` with no truthiness
+       guard, so two lessons that have *no* lecturer match each other. That is
+       harmless when screening one candidate and wrong when reporting a defect
+       to the user.
+    3. **A block that overruns the end of the day is still scanned**, for the
+       hours it does cover. ``find_conflicting_classes`` returns ``[]`` outright
+       when ``slots_fit`` fails. A lesson can end up overrunning after the user
+       shortens the day in Setup, and it really does occupy — and double-book —
+       the hours that remain.
+    4. **A placement on a day the grid does not have is skipped.** It occupies
+       no cell anyone can see, so reporting it would put a red conflict in the
+       warning log for two lessons that are drawn nowhere. Those are reported
+       as orphans by ``models.find_off_grid_placements`` instead, which is the
+       one oracle for "not on the grid".
+    """
+    days = state.get("days", [])
+    cells = {}
+    for cls in get_placed_classes(state):
+        # Divergence 4. occupied_slots_of deliberately does not filter by day
+        # (an off-grid day still consumes real hours, which the CSV export must
+        # keep reporting), so the day check belongs here.
+        if effective_day(cls) not in days:
+            continue
+        room = display_room(cls)
+        phys = needs_physical_room(cls)
+        # occupied_slots_of slices state["slots"], so the enumerate index IS the
+        # offset into the class's own block, and a block overrunning the end of
+        # the day is simply shorter (divergence 3). A placement whose start slot
+        # is off-grid yields [] and contributes nothing.
+        for offset, (day, slot) in enumerate(occupied_slots_of(state, cls)):
+            cells.setdefault((day, slot), []).append(
+                (cls, room, phys, _active_targets(cls, offset)))
+
+    pairs = {}
+    for (day, slot), claims in cells.items():
+        if len(claims) < 2:
+            continue
+        for i in range(len(claims)):
+            cls_a, room_a, phys_a, tgt_a = claims[i]
+            for j in range(i + 1, len(claims)):
+                cls_b, room_b, phys_b, tgt_b = claims[j]
+                kinds = set()
+                if phys_a and phys_b and room_a and room_a == room_b:
+                    kinds.add("room")
+                if cls_a["lecturer"] and cls_a["lecturer"] == cls_b["lecturer"]:
+                    kinds.add("lecturer")
+                if targets_overlap(tgt_a, tgt_b):
+                    kinds.add("target")
+                if not kinds:
+                    continue
+                ka, kb = cls_key(cls_a), cls_key(cls_b)
+                first, second = ((cls_a, cls_b) if ka <= kb else (cls_b, cls_a))
+                key = (ka, kb) if ka <= kb else (kb, ka)
+                rec = pairs.get(key)
+                if rec is None:
+                    pairs[key] = {"a": first, "b": second, "day": day,
+                                  "slot": slot, "kinds": kinds}
+                else:
+                    rec["kinds"] |= kinds
+
+    out = list(pairs.values())
+    for rec in out:
+        rec["kinds"] = tuple(sorted(rec["kinds"]))
+    out.sort(key=lambda r: (
+        days.index(r["day"]), r["slot"], cls_key(r["a"]), cls_key(r["b"])))
+    return out
+
+
+def conflict_partner_index(conflicts):
+    """``{cls_key: frozenset(cls_key, ...)}`` from *conflicts*.
+
+    The renderer needs "is this lesson in any conflict, and with what?" per
+    block; recomputing that from the pair list once per block would be
+    quadratic in a view that already draws every lesson.
+    """
+    index = {}
+    for rec in conflicts:
+        ka, kb = cls_key(rec["a"]), cls_key(rec["b"])
+        index.setdefault(ka, set()).add(kb)
+        index.setdefault(kb, set()).add(ka)
+    return {k: frozenset(v) for k, v in index.items()}
+
+
+SLOT_ERROR_DUPLICATE = "duplicate"
+
+
+def parse_slot_lines(text):
+    """Parse the Setup time-slot box into ``(slots, problems)``.
+
+    ST-UI-021. The grid is **ordinal**: nothing in the package parses a slot as
+    a time (``grep`` for ``strptime`` / ``%H:%M`` / ``split(":")`` over
+    ``scheduler_app/`` returns zero hits), duration is counted in *rows*, and
+    ``"1. Ders"``, ``"08:00-08:45"`` and ``"Öğle Arası"`` all work end to end —
+    placement, occupancy, spanning, export. So a format rule would reject
+    setups the engine handles perfectly, and there is exactly **one** hard
+    requirement:
+
+    **Uniqueness.** Every lookup is ``list.index()``, which returns the first
+    match, so a repeated label makes every later row with that name permanently
+    unreachable. Measured on a four-hour day with ``09:00`` typed twice: the
+    grid draws 4 rows, only 3 can ever hold a lesson, and 3 of 4 classes place.
+    ``reconcile_placements`` sees nothing wrong, because it is a membership test
+    and every label is still a member.
+
+    ``problems`` is a list of ``(line_number, kind, text)`` with 1-based line
+    numbers, so the dialog can point at the line rather than describing it.
+
+    Deliberately does NOT deduplicate. Dropping the second ``09:00`` shortens
+    the grid by a row, which silently re-points every multi-row lesson below it
+    and can push one off the end entirely — a silent repair of a silent
+    corruption. The duplicate is refused and named instead.
+    """
+    slots = []
+    problems = []
+    seen = {}
+    for lineno, raw in enumerate(text.split("\n"), start=1):
+        value = raw.strip()
+        if not value:
+            # A line that is empty after stripping is simply skipped. The
+            # branch that used to report SLOT_ERROR_BLANK here was
+            # unreachable: `not value` means `raw` is empty or all
+            # whitespace, and `raw and not raw.isspace()` is false for both.
+            continue
+        if value in seen:
+            problems.append((lineno, SLOT_ERROR_DUPLICATE, value))
+            continue
+        seen[value] = lineno
+        slots.append(value)
+    return slots, problems
+
+
+def slot_meaning_changes(state, new_slots):
+    """Placed/pinned classes whose covered cells change under *new_slots*.
+
+    ST-UI-021. A slot label is a **by-name reference into an ordered list**, so
+    editing that list can silently change which hours an existing lesson
+    occupies without changing anything about the lesson. Nothing catches it:
+    ``reconcile_placements`` is a membership test, and every label is still a
+    member.
+
+    Measured on a clean schedule — ``["09:00","10:00","11:00","12:00","1. Ara",
+    "13:00"]`` with a 2-hour lesson at 12:00 and a 1-hour lesson at 13:00, zero
+    oracle violations. Sorting the list alone produces **6 hard violations**
+    (a double-booked room and a lecturer in two places), because the 2-hour
+    lesson stops covering ``["12:00", "1. Ara"]`` and starts covering
+    ``["12:00", "13:00"]``. ``reconcile_placements`` returns ``[]``.
+
+    This compares the thing the engine actually defines — the tuple of cells a
+    class covers — rather than trying to recognise the *edits* that are
+    dangerous. A reorder, a mid-list substitution (``"09:00"`` replaced by
+    ``"08:30"`` between two untouched neighbours) and an insertion are all the
+    same defect seen three ways, and an edit-shaped detector catches only the
+    ones someone thought of.
+
+    Returns ``[(cls, before_cells, after_cells)]``. **Pinned classes are
+    included**: ``pinned_time`` is the same kind of by-name reference as
+    ``placed_time``, and ``validate_placements_after_edit`` skips pins — so
+    leaving them out means a reorder silently moves the one thing the user
+    explicitly said must not move (ST-SCHED-002).
+    """
+    after = dict(state)
+    after["slots"] = list(new_slots)
+    changed = []
+    for cls in get_placed_classes(state):
+        start = effective_time(cls)
+        td = total_duration(cls)
+        before_cells = tuple(get_consecutive_slots(state, start, td))
+        after_cells = tuple(get_consecutive_slots(after, start, td))
+        if before_cells != after_cells:
+            changed.append((cls, before_cells, after_cells))
+    return changed
+
+
+def _sweep_lanes(entries):
+    """Greedy interval-graph lane assignment. Sets ``entry['lane']``; returns peak.
+
+    Entries need ``row``, ``end_row``, ``span`` and ``order``. Lifted verbatim
+    out of :func:`build_virtual_classroom_day_layout` so the default filtered
+    view can reuse the *algorithm* without inheriting that function's day-wide
+    subcolumn packaging.
+    """
+    ordered = sorted(entries, key=lambda e: (e["row"], -e["span"], e["order"]))
+    active = []
+    peak = 0
+    for entry in ordered:
+        active = [item for item in active if item["end_row"] > entry["row"]]
+        used_lanes = {item["lane"] for item in active}
+        lane = 0
+        while lane in used_lanes:
+            lane += 1
+        entry["lane"] = lane
+        active.append(entry)
+        peak = max(peak, lane + 1)
+    return peak
+
+
+def assign_component_lanes(entries):
+    """Lane each connected run of overlapping *entries* independently.
+
+    Sets ``lane`` and ``lane_count`` in place.
+
+    The difference from :func:`build_virtual_classroom_day_layout` is the whole
+    point. That function gives a whole DAY one lane count, which is right for
+    the online view — concurrency is normal there and the user expects wide
+    days — and wrong for a room timetable, where one collision at Monday 09:00
+    would halve the width of every other Monday hour and put a second empty
+    drop target in each of them. Here only the rows that are actually contested
+    are split; an uncontested lesson keeps the full column.
+    """
+    if not entries:
+        return
+    _sweep_lanes(entries)
+    ordered = sorted(entries, key=lambda e: (e["row"], -e["span"], e["order"]))
+    component, comp_end, components = [], -1, []
+    for entry in ordered:
+        if component and entry["row"] >= comp_end:
+            components.append(component)
+            component = []
+        component.append(entry)
+        comp_end = max(comp_end, entry["end_row"])
+    if component:
+        components.append(component)
+    for group in components:
+        n = max(e["lane"] for e in group) + 1
+        for e in group:
+            e["lane_count"] = n
 
 
 def _unplace(cls):

@@ -1,5 +1,6 @@
 """All dialog windows: Setup, AddClass, PlaceClass, SelectClass, Warnings, OpenSlots, PostAdd, BulkAdd."""
 
+import html
 import os
 
 from PyQt6.QtWidgets import (
@@ -26,6 +27,8 @@ from scheduler_app import storage
 from scheduler_app.logic import (
     find_valid_options, get_placed_classes,
     occupied_slots_of, classroom_of, batch_schedule,
+    parse_slot_lines, slot_meaning_changes,
+    SLOT_ERROR_DUPLICATE,
 )
 from scheduler_app.widgets import MultiSelectButton
 from scheduler_app.ui.day_keys import DAY_KEYS, day_label, normalize_day_list, normalize_day_value
@@ -776,6 +779,27 @@ class SetupDialog(QDialog):
         default_slots = "\n".join(state["slots"]) if state["slots"] else "08:00\n09:00\n10:00\n11:00\n12:00\n13:00\n14:00\n15:00"
         self.slots_text.setPlainText(default_slots)
         slot_layout.addWidget(self.slots_text)
+
+        # ST-UI-021. A live status strip rather than a structured widget.
+        # A QTimeEdit-per-row would hard-code HH:MM -- the one rule the grid
+        # must NOT have, since nothing parses a slot as a time and "1. Ders"
+        # is a legitimate label -- and a list with move-up/move-down would
+        # turn reordering, which silently corrupts a committed timetable,
+        # into a one-click affordance. Validate in place instead; both Excel
+        # buttons below keep working untouched because the widget is the same.
+        self._slots_status = QLabel("")
+        self._slots_status.setWordWrap(True)
+        self._slots_status.setStyleSheet("font-size: 8pt; padding: 2px;")
+        slot_layout.addWidget(self._slots_status)
+        self.slots_text.textChanged.connect(self._refresh_slot_status)
+        # `setPlainText` above ran BEFORE that connection, so nothing evaluated
+        # the text the dialog opens with. Without this call the strip is blank
+        # until the user types — and the case it exists for is precisely a
+        # saved file that ALREADY contains a duplicate, where the user has no
+        # reason to touch the box at all and would meet the problem as a modal
+        # after making ten other edits.
+        self._refresh_slot_status()
+
         slots_io = QHBoxLayout()
         slots_io.addStretch()
         _b = QPushButton("⬇ " + tr("dialogs.import.excel_title"))
@@ -1216,8 +1240,47 @@ class SetupDialog(QDialog):
         self._set_selected_days([k for k in DAY_KEYS if k not in current])
 
     def _get_current_slots(self):
-        """Read current time slots from the Slots text widget."""
-        return [s.strip() for s in self.slots_text.toPlainText().strip().split("\n") if s.strip()]
+        """Read current time slots from the Slots text widget.
+
+        De-duplicated (ST-UI-021). Callers reading this mid-edit — notably
+        ``LecturerConstraintsDialog``, which builds one checkbox per slot into a
+        ``{slot: checkbox}`` map — must never receive a repeated label, or the
+        map loses a box to the collision and that hour's availability silently
+        cannot be edited. The user is separately refused at OK; this keeps every
+        reader safe in the meantime.
+        """
+        slots, _problems = parse_slot_lines(self.slots_text.toPlainText())
+        return slots
+
+    def _slot_problems(self):
+        """``(slots, problems)`` for the current text (ST-UI-021)."""
+        return parse_slot_lines(self.slots_text.toPlainText())
+
+    def _refresh_slot_status(self):
+        """Show slot-list problems as the user types, before they press OK.
+
+        Diagnosed on the way in rather than only on the way out: a user whose
+        saved file already carries a duplicate sees it the moment the dialog
+        opens, instead of being blocked by a modal after they have made ten
+        other edits.
+        """
+        if not hasattr(self, "_slots_status"):
+            return
+        _slots, problems = self._slot_problems()
+        dupes = [p for p in problems if p[1] == SLOT_ERROR_DUPLICATE]
+        if dupes:
+            listed = ", ".join(
+                tr("setup.slots_dup_item").format(line=ln, value=val)
+                for ln, _kind, val in dupes[:4])
+            self._slots_status.setText(
+                f"⚠ {tr('setup.slots_duplicate')} {listed}")
+            self._slots_status.setStyleSheet(
+                "font-size: 8pt; padding: 3px; color: #991B1B; "
+                "background: #FEE2E2; border: 1px solid #DC2626; "
+                "border-radius: 3px;")
+        else:
+            self._slots_status.setText("")
+            self._slots_status.setStyleSheet("font-size: 8pt; padding: 2px;")
 
     def _update_lec_row_display(self, row, av):
         """Update the Status and Summary columns for a lecturer row."""
@@ -1757,7 +1820,53 @@ class SetupDialog(QDialog):
         from scheduler_app.plans import ENTITY_CLASSROOMS, ENTITY_LECTURERS
 
         days = self._get_current_days()
-        slots = [s.strip() for s in self.slots_text.toPlainText().strip().split("\n") if s.strip()]
+
+        # ST-UI-021. Uniqueness is the ONE hard rule the grid has, because every
+        # lookup is `list.index()` and the first match wins: a repeated label
+        # makes every later row with that name permanently unreachable.
+        # Measured on a four-hour day with 09:00 typed twice — 4 rows drawn,
+        # 3 addressable, 3 of 4 classes placed — and reconcile_placements sees
+        # nothing, because it is a membership test and every label is a member.
+        #
+        # REFUSED, not silently de-duplicated: dropping the second 09:00
+        # shortens the grid by a row, which re-points every multi-row lesson
+        # below it and can push one off the end entirely. That would be a silent
+        # repair of a silent corruption.
+        slots, slot_problems = self._slot_problems()
+        dupes = [p for p in slot_problems if p[1] == SLOT_ERROR_DUPLICATE]
+        if dupes:
+            listed = "\n".join(
+                "  " + tr("setup.slots_dup_item").format(line=ln, value=val)
+                for ln, _kind, val in dupes)
+            QMessageBox.warning(
+                self, tr("setup.time_slots"),
+                tr("setup.slots_duplicate_body").format(lines=listed))
+            return
+
+        # A slot label is a by-name reference into an ORDERED list, so editing
+        # that list can change which hours an existing lesson occupies without
+        # touching the lesson at all. Measured: sorting a clean schedule gave 6
+        # hard violations — a double-booked room and a lecturer in two places —
+        # with reconcile_placements reporting []. Compare covered CELLS rather
+        # than trying to recognise the dangerous edit shapes: a reorder, a
+        # mid-list substitution and a removal are one defect seen three ways,
+        # and an edit-shaped test catches only the ones someone thought of.
+        #
+        # Reported and confirmed, never repaired: pinned lessons are included,
+        # and a pin is the user's instruction (ST-SCHED-002).
+        moved = slot_meaning_changes(self.state, slots)
+        if moved:
+            names = "\n".join(
+                "  • " + (c.get("name") or c.get("class_code") or "?")
+                for c, _b, _a in moved[:10])
+            if len(moved) > 10:
+                names += "\n  …"
+            if QMessageBox.question(
+                    self, tr("setup.time_slots"),
+                    tr("setup.slots_moved_body").format(
+                        n=len(moved), names=names)
+            ) != QMessageBox.StandardButton.Yes:
+                return
 
         rooms = []
         capacities = {}
@@ -2603,16 +2712,30 @@ class PlaceClassDialog(QDialog):
         layout.addLayout(sel_row)
         _install_select_all_shortcut(self, self.tree)
 
+        # ST-UI-015. The dialog used to dead-end on its most important case:
+        # "0 gecerli yerlestirme bulundu" over an empty table, with the
+        # "Yerlestir" button still ENABLED -- and pressing it said "select a
+        # placement option first", instructing the user to pick a row from a
+        # table with no rows. This panel says why, and what to change.
+        self._explain_label = QLabel("")
+        self._explain_label.setWordWrap(True)
+        self._explain_label.setTextFormat(Qt.TextFormat.RichText)
+        self._explain_label.setStyleSheet(
+            "background: #FEF3C7; color: #92400E; padding: 8px; "
+            "border: 1px solid #F59E0B; border-radius: 4px; font-size: 9pt;")
+        self._explain_label.setVisible(False)
+        layout.addWidget(self._explain_label)
+
         # Bottom
         bottom = QHBoxLayout()
         self.info_label = QLabel(tr("dialogs.place.select_class_above"))
         bottom.addWidget(self.info_label)
         bottom.addStretch()
-        place_btn = QPushButton(tr("buttons.place"))
-        place_btn.clicked.connect(self._place)
+        self._place_btn = QPushButton(tr("buttons.place"))
+        self._place_btn.clicked.connect(self._place)
         cancel_btn = QPushButton(tr("buttons.cancel"))
         cancel_btn.clicked.connect(self.reject)
-        bottom.addWidget(place_btn)
+        bottom.addWidget(self._place_btn)
         bottom.addWidget(cancel_btn)
         layout.addLayout(bottom)
 
@@ -2637,6 +2760,62 @@ class PlaceClassDialog(QDialog):
             item.setData(2, Qt.ItemDataRole.UserRole, room)
 
         self.info_label.setText(f"{len(options)} {tr('dialogs.place.valid_found')}")
+
+        # A button that cannot succeed must not invite a click -- but disabling
+        # it ALONE would just convert a loud dead end into a quiet one, so the
+        # reason goes on screen at the same time.
+        self._place_btn.setEnabled(bool(options))
+        if options:
+            self._explain_label.setVisible(False)
+            self._explain_label.clear()
+        else:
+            self._explain_label.setText(self._explain_unplaceable(candidate))
+            self._explain_label.setVisible(True)
+
+    def _explain_unplaceable(self, candidate):
+        """Why this class has no valid placement, and what would change it.
+
+        Uses the per-class negotiator entry point, not the full report:
+        `negotiate_class` costs 0.3 ms (small) to 11 ms (large) and does not
+        build the conflict graph, while `full_diagnostic` is 18 ms to 2.3 s --
+        the ST-PERF-007 number. This runs on every combo change, so the
+        difference is the whole reason the panel is affordable.
+        """
+        from scheduler_app.constraint_negotiator import ConstraintNegotiator
+
+        try:
+            report = ConstraintNegotiator(self.state).negotiate_class(candidate)
+        except Exception:
+            # Never let the explanation be the thing that breaks the dialog.
+            return f"<b>{tr('dialogs.place.no_options_title')}</b>"
+
+        parts = [f"<b>{tr('dialogs.place.no_options_title')}</b>"]
+        for reason in report.get("blocking_reasons", [])[:3]:
+            parts.append(f"&nbsp;&nbsp;• {html.escape(str(reason))}")
+        suggestions = report.get("suggestions", [])
+        if suggestions:
+            parts.append(f"<b>{tr('dialogs.place.what_to_change')}</b>")
+            for sug in suggestions[:3]:
+                # The impact is already inside `description` for the
+                # move_conflicting type ("...frees 3 slots"), so appending
+                # impact_label there reads as a stutter.
+                if sug.get("type") == "move_conflicting":
+                    parts.append(
+                        f"&nbsp;&nbsp;→ {html.escape(str(sug['description']))}")
+                else:
+                    parts.append(
+                        f"&nbsp;&nbsp;→ {html.escape(str(sug['description']))} "
+                        f"<i>({html.escape(str(sug['impact_label']))})</i>")
+        n_off_grid = report.get("off_grid_blockers", 0)
+        if n_off_grid:
+            # ST-DATA-003: these lessons are skipped when counting blockers
+            # because they occupy no cell -- and they are mentioned nowhere
+            # else in the UI, so saying nothing here would hide them a third
+            # time.
+            parts.append(
+                f"&nbsp;&nbsp;⚠ "
+                + tr("dialogs.place.off_grid_note").format(n=n_off_grid))
+        return "<br>".join(parts)
 
     def _place(self):
         selected = self.tree.selectedItems()
@@ -3787,7 +3966,8 @@ class BulkResultsDialog(QDialog):
 
     def __init__(self, parent, placed, unplaced, rescheduled=False,
                  analytics=None, reschedule_explanation=None,
-                 negotiation_result=None, negotiation_source=None):
+                 negotiation_result=None, negotiation_source=None,
+                 infeasibility=None):
         super().__init__(parent)
         self.setStyleSheet(DIALOG_STYLESHEET())
         self.setWindowTitle("\U0001F4CB  " + tr("dialogs.bulk_results.title"))
@@ -3842,6 +4022,30 @@ class BulkResultsDialog(QDialog):
         summary.setWordWrap(True)
         layout.addWidget(summary)
 
+        # ST-SCHED-014. The global bottleneck, above the per-class list and
+        # visually distinct from it, because it answers a different question.
+        # A list of unplaced classes says which lessons did not fit; this says
+        # the instance CANNOT be built -- 'you are asking for 14 class-hours
+        # and the building offers 8 room-hours' -- which is arithmetic rather
+        # than search, and is the only kind of problem that no amount of
+        # rearranging can fix. Told 'all candidate slots are occupied' forty
+        # times instead, a user starts adding rooms at random.
+        #
+        # diagnose_infeasibility is deliberately one-sided: it reports only
+        # what it can PROVE, and passing its checks does NOT mean the instance
+        # is satisfiable. The wording must not promise the converse.
+        if infeasibility and infeasibility.get("message"):
+            bottleneck = QLabel(
+                f"<b>{tr('dialogs.bulk_results.impossible_title')}</b><br>"
+                f"{html.escape(str(infeasibility['message']))}")
+            bottleneck.setWordWrap(True)
+            bottleneck.setStyleSheet(
+                "background: #FEE2E2; color: #991B1B; padding: 8px; "
+                "border: 1px solid #DC2626; border-radius: 4px; "
+                "font-size: 9pt;")
+            layout.addWidget(bottleneck)
+            self._bottleneck_label = bottleneck
+
         tabs = QTabWidget()
         layout.addWidget(tabs)
 
@@ -3873,8 +4077,13 @@ class BulkResultsDialog(QDialog):
             for cls, reason in unplaced:
                 code = cls.get("class_code", "")
                 display_name = f"[{code}] {cls['name']}" if code else cls["name"]
-                QTreeWidgetItem(unplaced_tree, [
+                item = QTreeWidgetItem(unplaced_tree, [
                     display_name, cls["lecturer"], reason])
+                # ST-UI-015: the reason is ELIDED by Qt, not truncated -- the
+                # full text is present but unreachable (measured: 163 chars
+                # needing 1956 px in a 224 px column, with no tooltip). The
+                # data was always there; nothing surfaced it.
+                item.setToolTip(2, reason)
             tabs.addTab(unplaced_tree,
                         f"{tr('labels.unplaced')} ({len(unplaced)})")
 
@@ -4173,11 +4382,28 @@ class RescheduleDialog(QDialog):
         bottom = QHBoxLayout()
         bottom.addStretch()
 
+        # Task 6. The two modes used to be equally-primary buttons labelled
+        # "Standart" and "Derin (CP-SAT)", with tooltips reading "Multi-start
+        # LNS optimization" and "Deep optimization with constraint solver".
+        # A school administrator cannot choose between two acronyms, and
+        # neither label said what the choice costs. They now say what the user
+        # GETS, and Quick is marked as the recommended default so a first
+        # reschedule does not require an engine decision.
         std_btn = QPushButton(tr("optimization.standard"))
         std_btn.setStyleSheet(
             "background: #1D4ED8; color: white; font-weight: bold; "
             "padding: 8px 20px; font-size: 10pt;")
-        std_btn.setToolTip(tr("optimization.lns_tooltip"))
+        # "normally the same timetable", not "the same timetable": the
+        # production budget is multi_start_time_limit=120 s, and when that cap
+        # fires the search is truncated and summary['deterministic'] goes False
+        # — on an 80-class instance it measurably does. The result toast says so
+        # when it happens (_reproducibility_note); the tooltip must not promise
+        # more than the engine delivers.
+        std_btn.setToolTip(
+            tr("optimization.lns_tooltip")
+            + "\n(" + tr("optimization.recommended") + ")")
+        std_btn.setDefault(True)
+        std_btn.setAutoDefault(True)
         std_btn.clicked.connect(lambda: self._accept_mode("standard"))
         bottom.addWidget(std_btn)
 
@@ -4186,9 +4412,25 @@ class RescheduleDialog(QDialog):
             deep_btn.setStyleSheet(
                 "background: #7C3AED; color: white; font-weight: bold; "
                 "padding: 8px 20px; font-size: 10pt;")
-            deep_btn.setToolTip(tr("optimization.cpsat_tooltip"))
+            # ST-SCHED-013. summary['deterministic'] is
+            # `(not clock_capped) and (not cpsat_used)`, so pressing this
+            # button ALWAYS forfeits reproducibility. Phase 1 was careful the
+            # engine never claims a reproducibility it cannot deliver; saying
+            # nothing here would let the UI make the claim on its behalf.
+            deep_btn.setToolTip(
+                tr("optimization.cpsat_tooltip")
+                + "\n⚠ " + tr("optimization.not_reproducible"))
+            deep_btn.setDefault(False)
             deep_btn.clicked.connect(lambda: self._accept_mode("deep"))
             bottom.addWidget(deep_btn)
+        else:
+            # Without OR-Tools the button simply was not rendered, so a user
+            # following a colleague's instructions saw a dialog that did not
+            # match the description and was told nothing.
+            note = QLabel(tr("optimization.deep_unavailable"))
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #64748B; font-size: 8pt; padding: 4px;")
+            layout.addWidget(note)
 
         cancel_btn = QPushButton(tr("buttons.cancel"))
         cancel_btn.clicked.connect(self.reject)

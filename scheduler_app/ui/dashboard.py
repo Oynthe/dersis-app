@@ -13,7 +13,7 @@ from PyQt6.QtCore import Qt, QRectF
 from PyQt6.QtGui import QColor, QPainter, QFont, QPen, QBrush
 
 from scheduler_app.translations import tr
-from scheduler_app.models import effective_day, effective_time
+from scheduler_app.models import effective_day, effective_time, effective_room
 from scheduler_app.ui.day_keys import day_label
 from scheduler_app.analytics import compute_all_metrics
 from scheduler_app.timetable_scorer import TimetableScorer
@@ -248,6 +248,7 @@ class DashboardWidget(QWidget):
         # ── Summary cards row ──
         cards_row = QHBoxLayout()
         cards_row.setSpacing(10)
+        self._pinned_of_scheduled = 0        # ST-UI-002 subset annotation
         self._card_placed = MetricCard(tr("labels.placed"), "0", "#10B981")
         self._card_unplaced = MetricCard(tr("labels.unplaced"), "0", "#EF4444")
         self._card_rooms = MetricCard(tr("dashboard.avg_room_use"), "0%", "#3B82F6")
@@ -363,7 +364,8 @@ class DashboardWidget(QWidget):
         """Recompute metrics from current state and update all panels."""
         self._state = state
         if not state or not state.get("classes"):
-            self._card_placed.set_value("—")
+            self._pinned_of_scheduled = 0
+            self._card_placed.set_value("—", title=self._placed_card_title())
             self._card_unplaced.set_value("—")
             self._card_rooms.set_value("—")
             self._card_gaps.set_value("—")
@@ -372,7 +374,12 @@ class DashboardWidget(QWidget):
         m = compute_all_metrics(state)
 
         # ── Summary cards ──
-        self._card_placed.set_value(m["placed_count"])
+        # ST-UI-002: same trio as the status bar, and the pinned subset is an
+        # annotation on the card title rather than a card of its own -- a pin is
+        # one lesson, counted once.
+        self._pinned_of_scheduled = m.get("pinned_count", 0)
+        self._card_placed.set_value(m["placed_count"],
+                                    title=self._placed_card_title())
         self._card_unplaced.set_value(m["unplaced_count"])
         utils = m["room_utilization"]
         avg_util = round(sum(utils.values()) / len(utils), 1) if utils else 0
@@ -430,6 +437,14 @@ class DashboardWidget(QWidget):
         # ── Schedule quality score ──
         self._refresh_quality(state)
 
+    def _placed_card_title(self):
+        """"Yerlesti", plus the pinned subset when there is one (ST-UI-002)."""
+        title = tr("labels.placed")
+        if getattr(self, "_pinned_of_scheduled", 0):
+            title += "  " + tr("status.pinned_subset").format(
+                n=self._pinned_of_scheduled)
+        return title
+
     def _refresh_quality(self, state):
         """Compute and display the schedule quality score."""
         classes = state.get("classes", [])
@@ -438,7 +453,15 @@ class DashboardWidget(QWidget):
             day = effective_day(cls)
             slot = effective_time(cls)
             if day and slot:
-                room = cls.get("room", "")
+                # ST-UI-003. This used to be `cls.get("room", "")`. No class
+                # dict has a "room" key, so every tuple carried "" — and ""
+                # is not the _ROOM_UNSET sentinel, so it won as a
+                # room_override and *overrode* the correct placed_classroom /
+                # pinned_classroom fallback. Every room-derived number
+                # downstream collapsed to zero. `effective_room` is the same
+                # currency logic.analyze_schedule and apply_reschedule use, so
+                # this screen now scores the timetable the rest of the app does.
+                room = effective_room(cls)
                 placements.append((cls, day, slot, room))
 
         if not placements:
@@ -495,7 +518,7 @@ class DashboardWidget(QWidget):
         """Update all translatable text (called when language changes)."""
         self._header.setText("\U0001F4CA  " + tr("dashboard.title"))
         self._card_placed.set_value(self._card_placed._value.text(),
-                                     title=tr("labels.placed"))
+                                     title=self._placed_card_title())
         self._card_unplaced.set_value(self._card_unplaced._value.text(),
                                        title=tr("labels.unplaced"))
         self._card_rooms.set_value(self._card_rooms._value.text(),

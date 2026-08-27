@@ -46,7 +46,7 @@ Import/export/UI-workflow correctness. Detailed in
 | ST-FUNC-010 | 🟡 Medium | High | Rows with a space in the class ID are silently dropped by the importer | OBSERVED |
 | ST-FUNC-011 | 🟢 Low | High | Workbook with zero recognized sheets "imports successfully" (`is_valid=True`, empty result) | OBSERVED |
 | ST-FUNC-012 | 🟢 Low | High | No dedup of duplicate `class_code` / classroom / lecturer names — silently accepted | OBSERVED |
-| ST-FUNC-013 | 🟢 Low | High | PDF export silently omits classes whose placement is outside the current grid (data loss, no warning) | OBSERVED |
+| ST-FUNC-013 | 🟢 Low | High | PDF export silently omits classes whose placement is outside the current grid (data loss, no warning) | OBSERVED · **Fixed** (Phase 1 warned; Phase 4 added the PDF appendix — 4 strict pins deleted) |
 
 ## Scheduler
 
@@ -65,7 +65,7 @@ Scheduling-engine correctness, constraint enforcement, scalability. Detailed in
 | ST-SCHED-008 | 🟡 Medium | High | Malformed `lecturer_availability` (missing sub-keys) raises `KeyError` on the validation hot path | OBSERVED |
 | ST-SCHED-009 | 🟡 Medium | High | `ConstraintValidator.find_conflicts` returns `[]` for a placement `check_placement` rejects — conflict UI can't explain the rejection | OBSERVED -> **Fixed** (Phase 3) |
 | ST-SCHED-010 | 🟡 Medium | High | Occupancy maps are ref-count-free sets: temporarily removing one class erases a co-located class's occupancy, corrupting subsequent validity checks | OBSERVED -> **Fixed** (Phase 3) |
-| ST-SCHED-011 | 🟡 Medium | High | "Move conflicting class" relaxation suggestions never emit — blockers tallied by `id()` but looked up by `cls_key()` | OBSERVED |
+| ST-SCHED-011 | 🟡 Medium | High | "Move conflicting class" relaxation suggestions never emit — blockers tallied by `id()` but looked up by `cls_key()` | OBSERVED · **Fixed** (Phase 4) |
 | ST-SCHED-012 | 🟡 Medium | High | Greedy construction recursion depth == flexible-class count; ~1000+ classes raise `RecursionError` (pathological preset of 1200 crashes) | OBSERVED -> **Fixed** (Phase 3) |
 | ST-SCHED-013 | 🟡 Medium | High | Optimizer is **non-deterministic** (unseeded global RNG): identical input → different placements and up to ~40% quality spread | OBSERVED · [detail](#st-sched-013) |
 | ST-SCHED-014 | 🟢 Low | High | Infeasible (oversubscribed) instances produce misleading explanations that don't name the root global constraint; negotiation mislabels unplaceable classes "ok" | OBSERVED -> **Fixed** (Phase 3) |
@@ -116,9 +116,9 @@ agent's screen-by-screen findings are merged on completion.
 
 | ID | Sev | Conf | Title | Evidence |
 |---|---|---|---|---|
-| ST-UI-001 | 🔴 Critical | High | **Timetable renderer silently hides one of two conflicting lessons** — two classes in one room/slot render as one, with no conflict indicator anywhere; a double-booked group looks conflict-free | OBSERVED · [detail](#st-ui-001) |
-| ST-UI-002 | 🟠 High | High | Placed-count disagreement across dashboard / status bar / results dialog (3 definitions); status bar can show a **negative** unplaced count ("-5 yerleşmemiş") | OBSERVED · [detail](#st-ui-002) |
-| ST-UI-003 | 🟠 High | High | Dashboard "room switching" quality bar and room-utilization metrics are **always zero** — code reads a nonexistent `'room'` key | OBSERVED · [detail](#st-ui-003) |
+| ST-UI-001 | 🔴 Critical | High | **Timetable renderer silently hides one of two conflicting lessons** — two classes in one room/slot render as one, with no conflict indicator anywhere; a double-booked group looks conflict-free | OBSERVED · **Fixed** (Phase 4) · [detail](#st-ui-001) |
+| ST-UI-002 | 🟠 High | High | Placed-count disagreement across dashboard / status bar / results dialog (3 definitions); status bar can show a **negative** unplaced count ("-5 yerleşmemiş") | OBSERVED · **Fixed** (Phase 4) · [detail](#st-ui-002) |
+| ST-UI-003 | 🟠 High | High | Dashboard "room switching" quality bar and room-utilization metrics are **always zero** — code reads a nonexistent `'room'` key | OBSERVED · **Fixed** (Phase 4) · [detail](#st-ui-003) |
 | ST-UI-004 | 🟠 High | High | Timetable grid is **mouse-only and invisible to assistive tech** — zero accessibility API usage, no keyboard navigation, custom-painted text | OBSERVED · [detail](#st-ui-004) |
 | ST-UI-005 | 🟠 High | High | Most in-cell text **fails WCAG AA contrast** — room label 1.55–2.14:1, pinned badge 2.3:1, class code 3.4:1 (the room, the most critical field, is least legible) | OBSERVED · [detail](#st-ui-005) |
 | ST-UI-006 | 🟠 High | High | **Color is the only encoding** of class grouping (year color) and there is no legend anywhere; online vs face-to-face distinguished only by low-contrast text | OBSERVED |
@@ -130,14 +130,50 @@ agent's screen-by-screen findings are merged on completion.
 | ST-UI-012 | 🟡 Medium | High | Extreme class names deform the whole grid row (~5× height); sequential cells clip names and show ambiguous branch-only labels | OBSERVED |
 | ST-UI-013 | 🟡 Medium | High | Responsive breakdown below ~1400 px: truncated tabs; fixed-width sidebar (~43%) starves the grid to 2.5 day columns at 1000 px | OBSERVED |
 | ST-UI-014 | 🟡 Medium | High | Inconsistent destructive-action protection across four delete paths; setup edits are irreversible and unconfirmed | OBSERVED |
-| ST-UI-015 | 🟡 Medium | High | `PlaceClassDialog` dead-ends on the most important case (0 valid placements) — no negotiator reasons shown | OBSERVED |
+| ST-UI-015 | 🟡 Medium | High | `PlaceClassDialog` dead-ends on the most important case (0 valid placements) — no negotiator reasons shown | OBSERVED · **Fixed** (Phase 4) |
 | ST-UI-016 | 🟡 Medium | Medium | 33-step tutorial auto-fires over a modal on first run, obscuring the whole app | OBSERVED |
 | ST-UI-017 | 🟢 Low | High | Toolbar dropdown buttons indistinguishable from action buttons (menu caret hidden); Open-Slots rows advertise clickability but do nothing | OBSERVED |
 | ST-UI-018 | 🟢 Low | High | Dark-themed bug/crash dialogs in a light-only app; inconsistent button order/roles app-wide | OBSERVED |
 | ST-UI-019 | 🟢 Low | High | Warning log: unbounded duplicate spam, no timestamps, redundant phrasing, 120 px cap; thin selection border, no hover state | OBSERVED |
 | ST-UI-020 | 🟢 Low | High | Empty state offers no guidance (blank canvas + misleading "Çevrimiçi" filter); language switch hidden behind a flag-only menu entry; terminology drift across screens | OBSERVED |
+| ST-UI-021 | 🟠 High | High | **Time slots are free text with no uniqueness check.** A duplicated label silently deletes one usable hour per day; reordering the list silently moves every multi-slot lesson | OBSERVED · **Fixed** (Phase 4) · [detail](#st-ui-021) |
 
 *Full screen-by-screen writeups and 38 evidence screenshots in [09-ui-ux-audit.md](09-ui-ux-audit.md).*
+
+<a id="st-ui-021"></a>
+### ST-UI-021 — Time-slot list has no uniqueness check, and reordering it silently moves lessons
+
+- **Category** UI · **Severity** High · **Confidence** High · **OBSERVED**
+- **Component** `ui/dialogs.py` `SetupDialog` (the slots `QTextEdit` and `_ok`), against every `state["slots"]` consumer
+- **Raised in Phase 4.** The roadmap's "Structured time-slot entry with validation" row cites ST-UI-014, which is a
+  different finding ("Inconsistent destructive-action protection across four delete paths"). The real source is
+  [09-ui-ux-audit.md](09-ui-ux-audit.md)'s SetupDialog section. ST-UI-014's *second* clause ("setup edits are
+  irreversible and unconfirmed") is separately load-bearing here and was also fixed.
+- **Evidence — a duplicate costs one usable hour per day, permanently and invisibly.** Every lookup is
+  `list.index()`, which returns the first match, so a repeated label makes every later row with that name
+  unreachable. Measured on a four-hour day with `09:00` typed twice: the grid draws 4 rows, only 3 can hold a
+  lesson, and 3 of 4 classes place (clean control: 4 of 4). `find_valid_options` still offers 4 candidates — one is
+  a phantom resolving to the same cell. `reconcile_placements` reports nothing, because it is a membership test and
+  every label is still a member.
+- **Evidence — reordering a CLEAN schedule produces 6 hard violations.** On
+  `["09:00","10:00","11:00","12:00","1. Ara","13:00"]` with a 2-hour lesson at 12:00 and a 1-hour lesson at 13:00
+  (oracle-clean), sorting the list alone gives a double-booked room and a lecturer in two places, because the
+  2-hour lesson stops covering `["12:00","1. Ara"]` and starts covering `["12:00","13:00"]`.
+  `reconcile_placements` returns `[]`.
+- **Root cause** A slot label is a **by-name reference into an ordered list**. Editing the list can change which
+  hours an existing lesson occupies without touching the lesson, and nothing validates the list or notices the
+  change.
+- **The contract, proved** `grep` for `strptime` / `%H:%M` / `split(":")` over `scheduler_app/` returns **zero
+  hits** — nothing parses a slot as a time, and duration is counted in *rows*. So `"1. Ders"`, `"Öğle Arası"` and
+  `"08:00-08:45"` are first-class, HH:MM validation would reject legitimate setups, and **uniqueness is the only
+  hard rule**.
+- **Recommendation (as implemented)** Refuse duplicates and name the line; never sort or de-duplicate silently
+  (dropping a row re-points every lesson below it and can push one off the grid). Detect meaning changes by
+  comparing each placed/pinned class's **covered cells** before and after — a reorder, a mid-list substitution and
+  a removal are one defect seen three ways, and an edit-shaped detector catches only the ones someone thought of.
+  Report and confirm, never repair: pins are included, and a pin is the user's instruction (ST-SCHED-002).
+  **Effort** M · **Related** ST-UI-014, ST-DATA-003, ST-DATA-004 · **Status** **Fixed** (Phase 4, branch
+  `fix/phase-4-workflow-ux`)
 
 ## Architecture
 
@@ -340,7 +376,7 @@ accordingly.
 - **Reproduction** Hand-place (or import — see ST-FUNC-002, ST-SCHED-002) two classes into the same room/day/slot; open the room or group view.
 - **Root cause** The renderer builds an occupancy dict keyed by (day, slot); a second class at the same key **overwrites** the first instead of being detected as a collision.
 - **User impact** The core artifact of the whole application — the visible timetable — can silently omit real lessons. A user whose schedule contains any overlap (from a corrupted import, a colliding pin, or the optimizer's own hard-violations) will print and publish a timetable that is missing classes, with nothing on screen to warn them.
-- **Recommendation** Detect key collisions in `_default_filtered_blocks`/`everything_blocks`; render conflicting entries stacked (split cell) with a red "ÇAKIŞMA" chip and push one warning-log entry per conflict. **Effort** M · **Related** ST-SCHED-001, ST-SCHED-002, ST-UI-002 · **Status** Open
+- **Recommendation** Detect key collisions in `_default_filtered_blocks`/`everything_blocks`; render conflicting entries stacked (split cell) with a red "ÇAKIŞMA" chip and push one warning-log entry per conflict. **Effort** M · **Related** ST-SCHED-001, ST-SCHED-002, ST-UI-002 · **Status** **Fixed** (Phase 4, branch `fix/phase-4-workflow-ux`)
 
 <a id="st-ui-002"></a>
 ### ST-UI-002 — Placed-count disagreement; negative unplaced count
@@ -348,13 +384,13 @@ accordingly.
 - **Component** `ui/app.py:1853-1868` (formula at 1861), `core/analytics.py:197-202`
 - **Evidence** Dashboard "Yerleşti **56**" and status bar "**52** yerleşmiş + 4 sabitlenmiş + 24 yerleşmemiş" are visible at once (dashboard counts placed OR pinned via `get_placed_classes`; status bar counts only `placed=True`). Worse, the status formula `n_unplaced = total - pinned - placed` **double-subtracts** classes that are both pinned and `placed=True`: on the large dataset the status bar rendered "**-5 yerleşmemiş**" — an impossible number shown to the user. Evidence: `evidence/ux-large-everything.png`, `evidence/screen-4-dashboard.png`.
 - **User impact** The completion metric can't be trusted; "how many are placed?" has three answers and one of them is negative.
-- **Recommendation** Define one canonical trio in core (`scheduled = placed ∪ effective-pinned`, `unscheduled = rest`); use it in status bar, dashboard, and `BulkResultsDialog`; clamp/assert non-negative. **Effort** S · **Related** ST-UI-001, ST-UI-003 · **Status** Open
+- **Recommendation** Define one canonical trio in core (`scheduled = placed ∪ effective-pinned`, `unscheduled = rest`); use it in status bar, dashboard, and `BulkResultsDialog`; clamp/assert non-negative. **Effort** S · **Related** ST-UI-001, ST-UI-003 · **Status** **Fixed** (Phase 4, branch `fix/phase-4-workflow-ux`)
 
 <a id="st-ui-003"></a>
 ### ST-UI-003 — Dashboard room metrics always zero
 - **Severity** High · **OBSERVED** · `ui/dashboard.py:441`, `schedule_analytics.py:45-62`, `models.py:116-120`
 - **Evidence** On a hand-built 4-class/2-room schedule with a real R1→R2 switch: the dashboard "Oda Değişimi" bar reads **0.0** while the true room-switch penalty is 0.8; `ScheduleAnalytics` room_metrics via the dashboard path report `total_rooms=0, avg_utilization=0.0` vs correct `total_rooms=2, avg_utilization=0.10`. The analytics code reads a `'room'` key that no class dict has (the field is `placed_classroom`). The quality gauge itself is unaffected (room_metrics aren't used in the global score), but the room breakdown bar and room-utilization analytics are silently zero. Probe: `scenarios/probe_dashboard_room_key_bug.py`. Evidence: `evidence/dashboard-room-switching-zero.png`.
-- **Recommendation** Read `placed_classroom` / `classroom_of(cls)`; add a test asserting non-zero room metrics on a known schedule. **Effort** S · **Related** ST-UI-002 · **Status** Open
+- **Recommendation** Read `placed_classroom` / `classroom_of(cls)`; add a test asserting non-zero room metrics on a known schedule. **Effort** S · **Related** ST-UI-002 · **Status** **Fixed** (Phase 4, branch `fix/phase-4-workflow-ux`)
 
 <a id="st-ui-004"></a>
 ### ST-UI-004 — Timetable grid mouse-only, invisible to assistive tech
