@@ -1,0 +1,39 @@
+{
+  "preset": "large",
+  "n_classes": 250,
+  "reschedule_sec": 132.608,
+  "error": null,
+  "raw_placed": 232,
+  "raw_unplaced": 18,
+  "raw_violations": {
+    "availability": 3,
+    "capacity": 7,
+    "room_double_book": 2,
+    "group_clash": 4
+  },
+  "apply_sec": 0.002,
+  "apply_rejected": 0,
+  "applied_violations": {
+    "availability": 3,
+    "capacity": 7,
+    "room_double_book": 2,
+    "group_clash": 4
+  },
+  "applied_n_placed": 232,
+  "applied_samples": [
+    "[availability] Ders 22: lecturer 'Lect-002' not available at monday/14:00",
+    "[capacity] Ders 52: room 'R005' cap 20 < participants 25 at wednesday/16:00",
+    "[availability] Ders 181: lecturer 'Lect-015' not available at tuesday/12:00",
+    "[availability] Ders 194: lecturer 'Lect-021' not available at thursday/09:00",
+    "[capacity] Ders 194: room 'R004' cap 20 < participants 55 at thursday/09:00",
+    "[capacity] Ders 194: room 'R004' cap 20 < participants 55 at thursday/10:00"
+  ],
+  "raw_samples": [
+    "[availability] Ders 22: lecturer 'Lect-002' not available at monday/14:00",
+    "[capacity] Ders 52: room 'R005' cap 20 < participants 25 at wednesday/16:00",
+    "[availability] Ders 181: lecturer 'Lect-015' not available at tuesday/12:00",
+    "[availability] Ders 194: lecturer 'Lect-021' not available at thursday/09:00",
+    "[capacity] Ders 194: room 'R004' cap 20 < participants 55 at thursday/09:00",
+    "[capacity] Ders 194: room 'R004' cap 20 < participants 55 at thursday/10:00"
+  ]
+}

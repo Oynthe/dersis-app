@@ -1,0 +1,32 @@
+scale,n_classes,n_rooms,n_slots,grid_cells,density,config,seed,status,wall_seconds,placed,unplaced,moved,greedy_iters,greedy_exhausted,runs_completed,opt_total_time,q_before_total,q_after_total,cpsat_used,cpsat_status,peak_mem_mib,note
+tiny,5,2,8,80,0.3,construction_curve_maxit800,42,OK,0.0634,5,0,5,6,False,1,0.0633,0.0,2.44,False,,,
+small,25,4,8,160,0.3,construction_curve_maxit800,42,OK,1.2519,23,2,21,800,True,1,1.2515,0.0,10.26,False,,,
+normal,80,8,8,320,0.3,construction_curve_maxit800,42,OK,8.7122,76,4,75,800,True,1,8.7085,0.0,59.26,False,,,
+large,250,16,8,640,0.3,construction_curve_maxit800,42,OK,45.4117,231,19,217,800,True,1,45.4022,6.79,286.02,False,,,
+very_large,600,30,8,1200,0.3,construction_curve_maxit800,42,TIMEOUT_KILLED,60.02,,,,,,,,,,,,,hard-killed at 60s
+pathological,1200,40,8,1600,0.3,construction_curve_maxit800,42,TIMEOUT_KILLED,60.02,,,,,,,,,,,,,hard-killed at 60s
+tiny,5,2,8,80,0.1,single_restart_prod,42,OK,0.3632,5,0,5,6,False,1,0.3618,0.0,-0.04,False,,,
+tiny,5,2,8,80,0.3,single_restart_prod,42,OK,0.1992,5,0,5,6,False,1,0.2025,0.0,2.44,False,,,
+tiny,5,2,8,80,0.5,single_restart_prod,42,OK,0.0741,5,0,5,6,False,1,0.0822,0.0,0.94,False,,,
+tiny,5,2,8,80,0.7,single_restart_prod,42,OK,0.092,4,1,4,1622,False,1,0.0937,0.0,20.78,False,,,
+small,25,4,8,160,0.1,single_restart_prod,42,OK,3.2334,25,0,25,26,False,1,3.2238,0.0,6.3,False,,,
+small,25,4,8,160,0.3,single_restart_prod,42,OK,5.7966,23,2,21,100000,True,1,5.81,0.0,6.74,False,,,
+small,25,4,8,160,0.5,single_restart_prod,42,OK,7.0505,21,4,19,100000,True,1,7.0503,-0.02,3.38,False,,,
+small,25,4,8,160,0.7,single_restart_prod,42,OK,4.7394,20,5,17,100000,True,1,4.7365,-0.02,13.31,False,,,
+normal,80,8,8,320,0.1,single_restart_prod,42,OK,25.9875,76,4,75,100000,True,1,25.9916,-0.02,24.5,False,,,
+normal,80,8,8,320,0.3,single_restart_prod,42,OK,25.3893,76,4,75,100000,True,1,25.386,0.0,22.6,False,,,
+normal,80,8,8,320,0.5,single_restart_prod,42,OK,45.3544,75,5,69,100000,True,1,45.3539,8.35,126.64,False,,,
+normal,80,8,8,320,0.7,single_restart_prod,42,OK,24.9108,61,19,51,100000,True,1,24.9061,5.14,18.98,False,,,
+large,250,16,8,640,0.1,single_restart_prod,42,OK,30.7922,229,21,224,100000,True,1,30.7857,0.32,216.64,False,,,
+large,250,16,8,640,0.5,single_restart_prod,42,OK,28.6658,222,28,207,100000,True,1,28.6671,10.83,272.2,False,,,
+large,250,16,8,640,0.7,single_restart_prod,42,OK,25.9779,193,57,167,100000,True,1,25.9517,47.7,386.78,False,,,
+very_large,600,30,8,1200,0.3,single_restart_prod,42,TIMEOUT_KILLED,55.02,,,,,,,,,,,,,hard-killed at 55s
+small,25,4,8,160,0.3,cpsat_deep_tl5,42,OK,11.1692,25,0,23,100000,True,1,11.1702,0.0,52.6,True,Feasible,,
+normal,80,8,8,320,0.3,cpsat_deep_tl5,42,OK,24.3473,75,5,74,100000,True,1,24.3332,0.0,22.48,False,,,
+small,25,4,8,160,0.3,determinism_rep1,42,OK,4.6241,23,2,21,100000,True,1,4.6237,0.0,7.76,False,,,
+small,25,4,8,160,0.3,determinism_rep2,42,OK,3.8753,23,2,21,100000,True,1,3.8762,0.0,6.92,False,,,
+infeasible_oversub,120,,,,0.0,workflow_infeasible,7,OK,33.5868,14,106,14,100000,True,5,33.4553,0.0,-0.24,False,,,
+barely_normal_d0.9,80,,,,0.9,optimizer_barely,11,OK,5.1692,52,28,36,100000,True,1,5.1607,46.64,151.12,False,,,
+small,25,4,8,160,0.3,memory_tracemalloc,42,OK,22.7936,23,2,21,100000,True,1,22.7789,0.0,6.52,False,,6.94,
+normal,80,8,8,320,0.3,memory_tracemalloc,42,OK,38.1797,76,4,75,100000,True,1,38.1603,0.0,59.26,False,,7.82,
+large,250,16,8,640,0.3,memory_tracemalloc,42,TIMEOUT_KILLED,70.01,,,,,,,,,,,,,hard-killed at 70s
