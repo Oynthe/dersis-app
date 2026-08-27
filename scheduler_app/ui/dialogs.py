@@ -4393,6 +4393,12 @@ class RescheduleDialog(QDialog):
         std_btn.setStyleSheet(
             "background: #1D4ED8; color: white; font-weight: bold; "
             "padding: 8px 20px; font-size: 10pt;")
+        # "normally the same timetable", not "the same timetable": the
+        # production budget is multi_start_time_limit=120 s, and when that cap
+        # fires the search is truncated and summary['deterministic'] goes False
+        # — on an 80-class instance it measurably does. The result toast says so
+        # when it happens (_reproducibility_note); the tooltip must not promise
+        # more than the engine delivers.
         std_btn.setToolTip(
             tr("optimization.lns_tooltip")
             + "\n(" + tr("optimization.recommended") + ")")

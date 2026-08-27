@@ -457,3 +457,53 @@ def test_the_counter_is_never_quieter_than_the_grid():
         get_placed_classes(s)
     with pytest.raises(KeyError):
         schedule_counts(s)
+
+
+@pytest.mark.ui
+def test_the_bar_renders_pinned_as_a_subset_and_names_off_grid_lessons(make_app):
+    """ST-UI-002, the RENDERING half — the counter is only half the finding.
+
+    Everything above tests ``schedule_counts``. But the status bar could be
+    reverted to its pre-Phase-4 form — pinned as a peer segment, no off-grid
+    line — with the whole rest of the suite still green, because nothing
+    asserted on the string the user actually reads.
+
+    A failure means the bar is back to reading as a partition
+    ("4 sabit + 8 yerleşti + 2 yerleşmedi" over 10 classes), or that the only
+    surface naming an orphaned lesson has gone silent — leaving a placed count
+    higher than the grid draws with nothing on screen to explain the difference.
+    """
+    s = _state()
+    _add(s, "PIN", pinned=True)
+    _add(s, "OK", placed=True, slot="10:00")
+    ghost = _add(s, "GHOST", placed=True, slot="11:00")
+    ghost["placed_time"] = "23:00"      # hour deleted in Setup, .egu reopened
+    _add(s, "FREE")
+
+    counts = schedule_counts(s)
+    assert counts == {"total": 4, "scheduled": 3, "pinned_of_scheduled": 1,
+                      "protected_of_scheduled": 0, "off_grid_of_scheduled": 1,
+                      "unscheduled": 1}, counts
+
+    app = make_app()
+    try:
+        app.state_data = s
+        app._update_status()
+        bar = app.status_label.text()
+    finally:
+        app.close()
+
+    # The pinned subset is rendered as an annotation, not as its own segment.
+    assert tr("status.pinned_subset").format(n=1) in bar, (
+        f"pinned is not annotated as a subset: {bar!r}"
+    )
+    # The orphan is named, or the placed count silently exceeds the grid.
+    assert tr("status.off_grid_subset").format(n=1) in bar, (
+        f"an off-grid lesson is invisible on the status bar: {bar!r}"
+    )
+    # And the segments still read as a partition of the total: exactly one
+    # occurrence each of the scheduled and unscheduled figures beside the total.
+    assert f"{counts['total']} " in bar
+    assert tr("status.pinned") not in bar, (
+        "the old peer-segment label is back, so the numbers no longer add up"
+    )

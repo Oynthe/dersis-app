@@ -601,3 +601,46 @@ def test_a_genuinely_refused_placement_is_still_an_error(make_app):
 
     named = [(t, k) for t, k in entries if "Ders 12" in t]
     assert len(named) == 1 and named[0][1] == "error", entries
+
+
+def test_the_promised_slot_count_is_one_the_move_would_actually_free():
+    """ST-UI-015 — "frees N slot(s)" must be a promise the app can keep.
+
+    Blockers were counted per candidate cell, so a cell obstructed by TWO
+    lessons credited the full benefit to BOTH — even though moving either one
+    frees nothing, because the other still occupies it. A user follows the
+    advice, disrupts a class, and the lesson still does not fit.
+
+    A blocker is now credited only for cells where it is the SOLE obstacle, so
+    the number is achievable by definition.
+
+    A failure means the panel promises more than the move delivers, which is
+    worse than saying nothing: the user pays a real cost for no result.
+    """
+    s = _state(rooms=("R001",))
+    s["days"] = ["monday"]
+    s["slots"] = ["09:00", "10:00"]
+    # 09:00 is blocked by TWO lessons at once (same room AND same lecturer as
+    # the victim); 10:00 by exactly one. Moving SOLO frees 10:00 and nothing
+    # else, because BOTH of the 09:00 pair would have to move.
+    a = _add(s, "PAIR-A", placed_at=("monday", "09:00"), lecturer="Lect-01")
+    b = _add(s, "PAIR-B", placed_at=("monday", "09:00"), lecturer="Lect-02")
+    b["targets"] = [{"year": "Year-1", "branch": "A"}]
+    _add(s, "SOLO", placed_at=("monday", "10:00"), lecturer="Lect-01")
+    victim = _add(s, "VICTIM", lecturer="Lect-01")
+    assert find_valid_options(s, victim) == []
+
+    report = ConstraintNegotiator(s).negotiate_class(victim)
+    moves = {sg["details"]["blocker_name"]: sg["details"]["freed_slots"]
+             for sg in report["suggestions"]
+             if sg.get("type") == "move_conflicting"}
+
+    assert moves, "no blocker named at all"
+    # Anti-vacuity: the sole blocker IS still offered, with a real count.
+    assert moves.get("SOLO") == 1, moves
+    # And neither half of the contested pair claims the cell it cannot free.
+    for name in ("PAIR-A", "PAIR-B"):
+        assert moves.get(name, 0) == 0, (
+            f"{name} was credited with freeing a cell that its partner also "
+            f"blocks: {moves}"
+        )

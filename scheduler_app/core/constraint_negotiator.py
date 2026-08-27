@@ -715,8 +715,11 @@ class RelaxationSuggester:
         placed_classes = get_placed_classes(self.state)
 
         # Find which placed classes are blocking the most candidates
-        blocker_counts = defaultdict(int)
-        blocker_slots = defaultdict(set)
+        # Cell -> the classes blocking it. Counting per-blocker directly
+        # OVERSTATES the benefit: if a cell is blocked by two lessons,
+        # moving either one frees nothing, yet both were credited with it.
+        # A blocker is credited only where it is the SOLE obstacle.
+        cell_blockers = defaultdict(set)
 
         for day in days:
             for slot in times:
@@ -729,8 +732,12 @@ class RelaxationSuggester:
                         continue
                     slots_list = self.state["slots"][si:si + td]
                     for existing in placed_classes:
-                        if existing["pinned"] or existing.get("protection") == "locked":
-                            continue
+                        # Immovable lessons are still RECORDED: they occupy
+                        # the cell, so a movable lesson sharing it is not the
+                        # sole obstacle and moving it would free nothing.
+                        # They are filtered out of the SUGGESTIONS below,
+                        # which is a different thing from pretending they are
+                        # not there.
                         ex_day = existing.get("placed_day")
                         if ex_day != day:
                             continue
@@ -769,13 +776,19 @@ class RelaxationSuggester:
                                 break
 
                         if blocked:
-                            ex_key = cls_key(existing)
-                            blocker_counts[ex_key] += 1
-                            blocker_slots[ex_key].add((day, slot, room))
+                            cell_blockers[(day, slot, room)].add(
+                                cls_key(existing))
 
         # Generate suggestions for top blockers.
         # Keyed by cls_key on BOTH sides -- see the docstring.
         id_to_cls = {cls_key(c): c for c in placed_classes}
+        # Sole-obstacle counting: a cell contested by two lessons is credited
+        # to neither, because moving one of them frees nothing. This is what
+        # makes "frees N slot(s)" a promise the app can keep.
+        blocker_counts = defaultdict(int)
+        for _cell, blockers in cell_blockers.items():
+            if len(blockers) == 1:
+                blocker_counts[next(iter(blockers))] += 1
         sorted_blockers = sorted(blocker_counts.items(), key=lambda x: -x[1])
 
         for cls_id, count in sorted_blockers[:5]:
