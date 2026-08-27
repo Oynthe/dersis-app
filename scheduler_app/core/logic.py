@@ -103,24 +103,13 @@ def build_virtual_classroom_day_layout(state, filter_fn):
             "bg_color": lighten_color(base_color, 0.45),
         })
 
+    # One lane count per DAY: this view exists for the online/office filter,
+    # where concurrency is the normal case, so a stable day-wide subcolumn
+    # count is what the user wants. The default filtered view uses
+    # assign_component_lanes instead, which splits only contested rows.
     lane_counts = {}
     for day in days:
-        ordered = sorted(
-            day_entries[day],
-            key=lambda entry: (entry["row"], -entry["span"], entry["order"]),
-        )
-        active = []
-        peak_lane_count = 0
-        for entry in ordered:
-            active = [item for item in active if item["end_row"] > entry["row"]]
-            used_lanes = {item["lane"] for item in active}
-            lane = 0
-            while lane in used_lanes:
-                lane += 1
-            entry["lane"] = lane
-            active.append(entry)
-            peak_lane_count = max(peak_lane_count, lane + 1)
-        lane_counts[day] = max(1, peak_lane_count)
+        lane_counts[day] = max(1, _sweep_lanes(day_entries[day]))
 
     day_groups = []
     subcolumn_start = 0
@@ -407,6 +396,177 @@ def find_conflicting_classes(state, candidate, day, start_slot, classroom):
     if cls_key(candidate) in conflicting and candidate not in result:
         result.append(candidate)
     return result
+
+
+def find_schedule_conflicts(state):
+    """Every hard occupancy conflict in the timetable **as it stands**.
+
+    ST-UI-001. ``find_conflicting_classes`` answers "would this candidate clash
+    if I put it here?". This answers "what is already double-booked?" — the
+    question the grid, the warning log and the exports need, and the only one an
+    engine that deliberately commits an infeasible pin (ST-SCHED-002) can be
+    asked without re-solving.
+
+    Returns a list of dicts, ordered deterministically::
+
+        {"a": cls, "b": cls, "day": day, "slot": slot, "kinds": (...)}
+
+    ``(a, b)`` is ordered by ``cls_key`` so a pair is reported once, ``day``/
+    ``slot`` is the first contested cell, and ``kinds`` is a sorted tuple drawn
+    from ``'room'`` / ``'lecturer'`` / ``'target'``.
+
+    The occupancy rules follow ``_detect_occupancy_conflicts``: a room clash
+    only between two lessons that both need a physical room — two online
+    lessons sharing an hour is normal and must not be reported — lecturer by
+    name, and targets per slot offset via ``_active_targets``, so a non-joint
+    class only blocks the group whose sub-block covers that hour.
+
+    Four deliberate divergences from ``find_conflicting_classes``, each because
+    that function answers "may I put this candidate here?" and this one answers
+    "what is already wrong?":
+
+    1. **No lecturer-availability sentinel.** That function lists a class as its
+       own conflict partner when its lecturer is unavailable. This returns
+       *pairs*, and "the lecturer is not available" is not a pair; it is
+       reported by the negotiator and by the validator's reasons.
+    2. **A blank lecturer is not a lecturer clash, and a blank room is not a
+       room clash.** ``_detect_occupancy_conflicts`` compares
+       ``existing["lecturer"] == candidate["lecturer"]`` with no truthiness
+       guard, so two lessons that have *no* lecturer match each other. That is
+       harmless when screening one candidate and wrong when reporting a defect
+       to the user.
+    3. **A block that overruns the end of the day is still scanned**, for the
+       hours it does cover. ``find_conflicting_classes`` returns ``[]`` outright
+       when ``slots_fit`` fails. A lesson can end up overrunning after the user
+       shortens the day in Setup, and it really does occupy — and double-book —
+       the hours that remain.
+    4. **A placement on a day the grid does not have is skipped.** It occupies
+       no cell anyone can see, so reporting it would put a red conflict in the
+       warning log for two lessons that are drawn nowhere. Those are reported
+       as orphans by ``models.find_off_grid_placements`` instead, which is the
+       one oracle for "not on the grid".
+    """
+    days = state.get("days", [])
+    cells = {}
+    for cls in get_placed_classes(state):
+        # Divergence 4. occupied_slots_of deliberately does not filter by day
+        # (an off-grid day still consumes real hours, which the CSV export must
+        # keep reporting), so the day check belongs here.
+        if effective_day(cls) not in days:
+            continue
+        room = display_room(cls)
+        phys = needs_physical_room(cls)
+        # occupied_slots_of slices state["slots"], so the enumerate index IS the
+        # offset into the class's own block, and a block overrunning the end of
+        # the day is simply shorter (divergence 3). A placement whose start slot
+        # is off-grid yields [] and contributes nothing.
+        for offset, (day, slot) in enumerate(occupied_slots_of(state, cls)):
+            cells.setdefault((day, slot), []).append(
+                (cls, room, phys, _active_targets(cls, offset)))
+
+    pairs = {}
+    for (day, slot), claims in cells.items():
+        if len(claims) < 2:
+            continue
+        for i in range(len(claims)):
+            cls_a, room_a, phys_a, tgt_a = claims[i]
+            for j in range(i + 1, len(claims)):
+                cls_b, room_b, phys_b, tgt_b = claims[j]
+                kinds = set()
+                if phys_a and phys_b and room_a and room_a == room_b:
+                    kinds.add("room")
+                if cls_a["lecturer"] and cls_a["lecturer"] == cls_b["lecturer"]:
+                    kinds.add("lecturer")
+                if targets_overlap(tgt_a, tgt_b):
+                    kinds.add("target")
+                if not kinds:
+                    continue
+                ka, kb = cls_key(cls_a), cls_key(cls_b)
+                first, second = ((cls_a, cls_b) if ka <= kb else (cls_b, cls_a))
+                key = (ka, kb) if ka <= kb else (kb, ka)
+                rec = pairs.get(key)
+                if rec is None:
+                    pairs[key] = {"a": first, "b": second, "day": day,
+                                  "slot": slot, "kinds": kinds}
+                else:
+                    rec["kinds"] |= kinds
+
+    out = list(pairs.values())
+    for rec in out:
+        rec["kinds"] = tuple(sorted(rec["kinds"]))
+    out.sort(key=lambda r: (
+        days.index(r["day"]), r["slot"], cls_key(r["a"]), cls_key(r["b"])))
+    return out
+
+
+def conflict_partner_index(conflicts):
+    """``{cls_key: frozenset(cls_key, ...)}`` from *conflicts*.
+
+    The renderer needs "is this lesson in any conflict, and with what?" per
+    block; recomputing that from the pair list once per block would be
+    quadratic in a view that already draws every lesson.
+    """
+    index = {}
+    for rec in conflicts:
+        ka, kb = cls_key(rec["a"]), cls_key(rec["b"])
+        index.setdefault(ka, set()).add(kb)
+        index.setdefault(kb, set()).add(ka)
+    return {k: frozenset(v) for k, v in index.items()}
+
+
+def _sweep_lanes(entries):
+    """Greedy interval-graph lane assignment. Sets ``entry['lane']``; returns peak.
+
+    Entries need ``row``, ``end_row``, ``span`` and ``order``. Lifted verbatim
+    out of :func:`build_virtual_classroom_day_layout` so the default filtered
+    view can reuse the *algorithm* without inheriting that function's day-wide
+    subcolumn packaging.
+    """
+    ordered = sorted(entries, key=lambda e: (e["row"], -e["span"], e["order"]))
+    active = []
+    peak = 0
+    for entry in ordered:
+        active = [item for item in active if item["end_row"] > entry["row"]]
+        used_lanes = {item["lane"] for item in active}
+        lane = 0
+        while lane in used_lanes:
+            lane += 1
+        entry["lane"] = lane
+        active.append(entry)
+        peak = max(peak, lane + 1)
+    return peak
+
+
+def assign_component_lanes(entries):
+    """Lane each connected run of overlapping *entries* independently.
+
+    Sets ``lane`` and ``lane_count`` in place.
+
+    The difference from :func:`build_virtual_classroom_day_layout` is the whole
+    point. That function gives a whole DAY one lane count, which is right for
+    the online view — concurrency is normal there and the user expects wide
+    days — and wrong for a room timetable, where one collision at Monday 09:00
+    would halve the width of every other Monday hour and put a second empty
+    drop target in each of them. Here only the rows that are actually contested
+    are split; an uncontested lesson keeps the full column.
+    """
+    if not entries:
+        return
+    _sweep_lanes(entries)
+    ordered = sorted(entries, key=lambda e: (e["row"], -e["span"], e["order"]))
+    component, comp_end, components = [], -1, []
+    for entry in ordered:
+        if component and entry["row"] >= comp_end:
+            components.append(component)
+            component = []
+        component.append(entry)
+        comp_end = max(comp_end, entry["end_row"])
+    if component:
+        components.append(component)
+    for group in components:
+        n = max(e["lane"] for e in group) + 1
+        for e in group:
+            e["lane_count"] = n
 
 
 def _unplace(cls):

@@ -22,12 +22,13 @@ except ImportError:
 from scheduler_app.logic import (
     get_placed_classes, occupied_slots_of, classroom_of, total_duration,
     get_year_color, lighten_color, build_virtual_classroom_day_layout,
+    find_schedule_conflicts, conflict_partner_index,
 )
 from scheduler_app.models import (
     get_classroom_export_labels,
     get_protection_label,
     effective_day, effective_time,
-    slot_offset_for_target,
+    slot_offset_for_target, cls_key, find_off_grid_placements,
 )
 from scheduler_app.translations import tr
 from scheduler_app.ui.badge_formatter import get_badge
@@ -403,10 +404,15 @@ def _export_csv(schedule: FinalSchedule, filepath: str):
 # ── PDF export (optional) ───────────────────────────────────────────────────
 
 
-def _pdf_rich_paragraph(cls, cell_style, include_room=False, include_targets=False):
-    """Build a color-coded Paragraph for a class in a PDF cell."""
-    from reportlab.platypus import Paragraph
+def _pdf_rich_markup(cls, include_room=False, include_targets=False):
+    """The colour-coded markup for one class, without wrapping it in a Paragraph.
 
+    Split out from :func:`_pdf_rich_paragraph` so a contested cell can join
+    several classes' markup into ONE Paragraph (ST-UI-001). reportlab's ``SPAN``
+    merges rows, not columns, so a PDF cell cannot be split into lanes the way
+    the screen is — stacking every claimant into the cell is the shape the XLSX
+    writer already uses, and it is what makes the two agree.
+    """
     parts = []
     code = cls.get("class_code", "")
     if code:
@@ -428,7 +434,40 @@ def _pdf_rich_paragraph(cls, cell_style, include_room=False, include_targets=Fal
     if emoji:
         parts.append(
             f'<font color="{b_color}" size="6"><b>{label}</b></font>')
-    return Paragraph("<br/>".join(parts), cell_style)
+    return "<br/>".join(parts)
+
+
+def _pdf_rich_paragraph(cls, cell_style, include_room=False, include_targets=False):
+    """Build a color-coded Paragraph for a class in a PDF cell."""
+    from reportlab.platypus import Paragraph
+
+    return Paragraph(
+        _pdf_rich_markup(cls, include_room=include_room,
+                         include_targets=include_targets),
+        cell_style)
+
+
+def _pdf_conflict_paragraph(classes, cell_style, conflicted,
+                            include_room=False, include_targets=False):
+    """One Paragraph holding every class that claims a contested PDF cell.
+
+    ST-UI-001. ``_build_filtered_table`` used to ``continue`` past any class
+    whose start cell was already taken — keeping the FIRST claimant, where the
+    screen kept the LAST. So a user who checked the timetable on screen and
+    then printed it got two different, both-incomplete documents. Every
+    claimant is now stacked into the cell, and *conflicted* (a validator
+    verdict, not "there are two of them here") adds the ÇAKIŞMA marker.
+    """
+    from reportlab.platypus import Paragraph
+
+    blocks = [_pdf_rich_markup(c, include_room=include_room,
+                               include_targets=include_targets)
+              for c in classes]
+    markup = '<br/><font color="#DC2626">---</font><br/>'.join(blocks)
+    if conflicted:
+        markup = (f'<font color="#DC2626" size="7"><b>'
+                  f'{tr("badges.conflict")}</b></font><br/>' + markup)
+    return Paragraph(markup, cell_style)
 
 
 def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"):
@@ -456,6 +495,10 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     placed = schedule.placed_classes()
     days = schedule.days
     slots = schedule.slots
+    # ST-UI-001: one scan for the whole document, so every page marks the
+    # same clashes and the printout agrees with the screen.
+    conflicts = find_schedule_conflicts(state)
+    conflict_partners = conflict_partner_index(conflicts)
 
     page_size = landscape(A3)
     doc = SimpleDocTemplate(
@@ -520,8 +563,21 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             header.append(Paragraph(tr(f"weekdays.{day}"), hdr_style))
 
         # Build occupancy map: (slot_index, day) -> (cls, span) or "covered"
-        occupied_start = {}
-        covered = set()
+        #
+        # ST-UI-001. This used to `continue` past any class whose start cell
+        # was already claimed, keeping the FIRST claimant — while the screen's
+        # dict-overwrite kept the LAST. A user who checked the timetable on
+        # screen and then printed it therefore got two different, both-
+        # incomplete documents, each missing a lesson the other showed.
+        #
+        # reportlab's SPAN merges rows, not columns, so a PDF cell cannot be
+        # split into lanes the way the grid is. Instead every claimant is
+        # stacked into each covered cell and the merge is dropped — which is
+        # exactly what ui/app.py::_write_filtered_sheet already does for XLSX,
+        # so this makes the three surfaces agree rather than inventing a fourth
+        # behaviour.
+        entries = []
+        claims = {}
         for cls in placed:
             if not filter_fn(cls):
                 continue
@@ -533,12 +589,28 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             span = min(total_duration(cls), len(slots) - start_si)
             if span <= 0:
                 continue
-            key = (start_si, c_day)
-            if key in occupied_start:
-                continue
-            occupied_start[key] = (cls, span)
+            entry = {"cls": cls, "day": c_day, "start_si": start_si,
+                     "span": span}
+            entries.append(entry)
             for off in range(span):
-                covered.add((start_si + off, c_day))
+                claims.setdefault((start_si + off, c_day), []).append(entry)
+
+        overlapping = {id(e["cls"]) for cells in claims.values()
+                       if len(cells) > 1 for e in cells}
+
+        occupied_start = {}
+        covered = set()
+        overlap_cells = {}
+        for entry in entries:
+            if id(entry["cls"]) in overlapping:
+                for off in range(entry["span"]):
+                    overlap_cells.setdefault(
+                        (entry["start_si"] + off, entry["day"]), []).append(entry)
+                continue
+            occupied_start[(entry["start_si"], entry["day"])] = (
+                entry["cls"], entry["span"])
+            for off in range(entry["span"]):
+                covered.add((entry["start_si"] + off, entry["day"]))
 
         table_data = [header]
         style_cmds = [
@@ -586,6 +658,22 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                                  (col_idx, data_row_idx + off),
                                  (col_idx, data_row_idx + off),
                                  rl_colors.HexColor(light)))
+                elif key in overlap_cells:
+                    claimants = [e["cls"] for e in overlap_cells[key]]
+                    keys = {cls_key(c) for c in claimants}
+                    conflicted = any(
+                        conflict_partners.get(cls_key(c), frozenset())
+                        & (keys - {cls_key(c)})
+                        for c in claimants)
+                    row.append(_pdf_conflict_paragraph(
+                        claimants, cell_style, conflicted,
+                        include_room=include_room,
+                        include_targets=include_targets))
+                    cell_bg_cmds.append(
+                        ("BACKGROUND", (col_idx, data_row_idx),
+                         (col_idx, data_row_idx),
+                         rl_colors.HexColor(
+                             "#FEE2E2" if conflicted else "#F1F5F9")))
                 elif key in covered:
                     row.append("")
                 else:
@@ -891,6 +979,64 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
     if not elements:
         elements.append(Paragraph(tr("warnings.no_schedule_data"), title_style))
+
+    # ── Appendix: everything the grid could not say ───────────────────
+    #
+    # ST-FUNC-013 + ST-UI-001. Two different ways a lesson goes missing from a
+    # printed timetable, one page:
+    #
+    #   * a placement on a day or hour the user has since deleted has no cell
+    #     to be drawn in, so every grid-shaped page simply omits it;
+    #   * a double-booking is now stacked into its cell rather than dropped,
+    #     but a stacked cell is easy to miss on a dense page.
+    #
+    # export_schedule() already raises a Python warning per orphan, which the
+    # GUI surfaces — but the *printout* said nothing, and the printout is what
+    # gets pinned to a noticeboard. Silence is the dangerous outcome precisely
+    # because the paper looks complete.
+    #
+    # Placed AFTER the `if not elements` check on purpose: appending first
+    # would make `elements` non-empty and silently delete the "no schedule
+    # data" page that the empty-export test pins.
+    appendix_rows = []
+    for cls, _reason in find_off_grid_placements(state):
+        appendix_rows.append((
+            tr("export.appendix_offgrid"),
+            cls.get("class_code", ""),
+            cls.get("name", ""),
+            cls.get("lecturer", ""),
+            f"{display_day(effective_day(cls))} {effective_time(cls) or ''}",
+        ))
+    for rec in conflicts:
+        a, b = rec["a"], rec["b"]
+        appendix_rows.append((
+            tr("export.appendix_conflict"),
+            f'{a.get("class_code", "")} / {b.get("class_code", "")}',
+            f'{a.get("name", "")}  /  {b.get("name", "")}',
+            f'{a.get("lecturer", "")}  /  {b.get("lecturer", "")}',
+            f'{display_day(rec["day"])} {rec["slot"]}',
+        ))
+
+    if appendix_rows:
+        elements.append(PageBreak())
+        elements.append(Paragraph(tr("export.appendix_title"), title_style))
+        head = [Paragraph(h, branch_hdr_style) for h in (
+            tr("labels.type"), tr("labels.class_code"), tr("labels.class_name"),
+            tr("labels.lecturer"), tr("labels.day"))]
+        data = [head] + [[Paragraph(str(v), cell_style) for v in row]
+                         for row in appendix_rows]
+        appendix = Table(
+            data,
+            colWidths=[avail_w * f for f in (0.20, 0.15, 0.33, 0.20, 0.12)],
+            repeatRows=1)
+        appendix.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, COL_GRID),
+            ("BACKGROUND", (0, 0), (-1, 0), COL_DAY_HDR),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        elements.append(appendix)
 
     doc.build(elements)
 

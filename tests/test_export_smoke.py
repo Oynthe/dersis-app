@@ -762,14 +762,19 @@ def _state_with_offgrid_day():
     return state
 
 
+# ST-FUNC-013 closed in Phase 4. The strict xfail that used to pin this is gone
+# because the defect is: `_export_pdf` now ends with an appendix table listing
+# every off-grid placement (and every conflict) by class code, so the *printout*
+# says what it could not draw.
+#
+# Worth recording why the pin survived Phase 1, which did fix the underlying
+# omission: `export_schedule` has warned about every orphan since then, for PDF
+# too. But the warning interpolates `cls["name"]` and the *localized* day, while
+# this test looks for `"D001"` (the class CODE) or the English `"saturday"` — so
+# a warning was raised on every run and the test could not see it. Adjusting the
+# needle would have been pinning-by-adjustment; the appendix is the real fix,
+# and it satisfies the test's own first branch.
 @pytest.mark.pdf
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-FUNC-013 — exporter.py:521/750 `continue` past any placement "
-           "whose day/slot is not in the current grid, with no warning; fix "
-           "belongs with the grid-reconciliation work "
-           "(ST-DATA-004 / ST-SCHED-003, Phase 1)",
-)
 @pytest.mark.parametrize("mode", MODES)
 def test_pdf_does_not_silently_drop_offgrid_placements(
         tmp_path, reportlab_mod, mode):

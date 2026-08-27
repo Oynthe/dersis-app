@@ -60,6 +60,7 @@ from scheduler_app.logic import (
     get_placed_classes,
     occupied_slots_of, classroom_of, total_duration,
     build_virtual_classroom_day_layout,
+    find_schedule_conflicts, conflict_partner_index,
     find_valid_options,
     get_year_color, lighten_color,
     apply_negotiation_suggestion,
@@ -849,6 +850,8 @@ class SchedulerApp(QMainWindow):
         self._selected_cells = []        # selected graphics items
         self._selection_anchor = None    # anchor graphics item for Shift+Click
         self._selected_empty_slot = None
+        self._conflicts = []             # ST-UI-001, refreshed per repaint
+        self._conflict_partners = {}
 
         # Drag-and-drop state
         self._dragging_cls = None
@@ -2210,6 +2213,13 @@ class SchedulerApp(QMainWindow):
         self._update_filters()
         self._update_status()
 
+        # ST-UI-001: one sweep per repaint feeds all four timetable tabs and
+        # the warning log, so the grid and the log cannot disagree about what
+        # clashes. Measured at ~1.5 ms on a fully-placed 250-class grid, against
+        # the 306-563 ms repaint ST-UI-009 was about, so it is not memoised.
+        self._conflicts = find_schedule_conflicts(self.state_data)
+        self._conflict_partners = conflict_partner_index(self._conflicts)
+
         tab_idx = self.notebook.currentIndex()
         if tab_idx == 0:
             self._render_grid(
@@ -2272,13 +2282,17 @@ class SchedulerApp(QMainWindow):
     def _render_grid(self, view, filter_fn, mode=FILTER_MODE_DEFAULT):
         """Build a filtered timetable in the given TimetableView."""
         scene = TimetableScene()
-        scene.build_filtered(self.state_data, filter_fn, self, mode=mode)
+        scene.build_filtered(
+            self.state_data, filter_fn, self, mode=mode,
+            conflict_partners=getattr(self, "_conflict_partners", None))
         view.setScene(scene)
 
     def _render_everything(self, view):
         """Build the 'Show Everything' matrix in the given TimetableView."""
         scene = TimetableScene()
-        scene.build_everything(self.state_data, self)
+        scene.build_everything(
+            self.state_data, self,
+            conflict_partners=getattr(self, "_conflict_partners", None))
         view.setScene(scene)
 
     # ══════════════════════════════════════════════════════════════════════
@@ -3391,7 +3405,52 @@ class SchedulerApp(QMainWindow):
         # Auto-negotiation: analyze unplaced classes and collect suggestions.
         # It can mutate state (auto-apply), so publish AFTER it returns.
         derived.extend(self._run_auto_negotiation())
+
+        # ST-UI-001. Recomputed here rather than reused from
+        # _render_current_tab because _run_auto_negotiation can move classes.
+        # Appended last so a conflict becomes the panel's headline (set_derived
+        # shows the final entry), and capped because the panel re-renders its
+        # whole document from this list: the pathological preset reaches five
+        # figures of pairs, several times the 1656 entries ST-PERF-003 was
+        # about. The CAP IS ON THE LOG, NOT ON DETECTION — every conflicted
+        # lesson is still marked in the grid.
+        derived.extend(self._conflict_log_entries())
+
         self.warning_log.set_derived(derived)
+
+    _MAX_CONFLICT_LOG_ENTRIES = 25
+
+    _CONFLICT_KIND_KEYS = {
+        "room": "conflicts.room",
+        "lecturer": "conflicts.lecturer",
+        "target": "conflicts.student_group",
+    }
+
+    @staticmethod
+    def _conflict_label(cls):
+        code = cls.get("class_code", "")
+        return f"[{code}] {cls['name']}" if code else cls["name"]
+
+    def _conflict_log_entries(self):
+        """Warning-log lines for the conflicts found this refresh."""
+        conflicts = self._conflicts = find_schedule_conflicts(self.state_data)
+        self._conflict_partners = conflict_partner_index(conflicts)
+        entries = []
+        for rec in conflicts[:self._MAX_CONFLICT_LOG_ENTRIES]:
+            kinds = ", ".join(
+                tr(self._CONFLICT_KIND_KEYS[k]) for k in rec["kinds"]
+                if k in self._CONFLICT_KIND_KEYS)
+            entries.append((
+                tr("conflicts.cell_pair").format(
+                    day=day_label(rec["day"]), slot=rec["slot"],
+                    a=self._conflict_label(rec["a"]),
+                    b=self._conflict_label(rec["b"]),
+                    kinds=kinds),
+                "error"))
+        extra = len(conflicts) - self._MAX_CONFLICT_LOG_ENTRIES
+        if extra > 0:
+            entries.append((tr("conflicts.more").format(n=extra), "error"))
+        return entries
 
     def _run_auto_negotiation(self):
         """Analyze unplaced/constrained classes; RETURN the messages to show.
@@ -4379,6 +4438,9 @@ class SchedulerApp(QMainWindow):
         placed = get_placed_classes(s)
         days = s["days"]
         slots = s["slots"]
+        # ST-UI-001: one scan for the whole workbook, so every sheet marks the
+        # same clashes and the file agrees with the screen and the PDF.
+        conflict_partners = conflict_partner_index(find_schedule_conflicts(s))
 
         wb = openpyxl.Workbook()
         wb.remove(wb.active)
@@ -4590,6 +4652,16 @@ class SchedulerApp(QMainWindow):
                         )
                         data_cell = ws.cell(row=row, column=col)
                         _apply_lesson_cell(data_cell, classes[0], rich)
+                        # ST-UI-001: stacking already kept both lessons here --
+                        # what was missing is saying that they clash. A shared
+                        # cell that is NOT a conflict (two online lessons) keeps
+                        # its normal year colour.
+                        keys = {cls_key(x) for x in classes}
+                        if any(conflict_partners.get(cls_key(x), frozenset())
+                               & (keys - {cls_key(x)}) for x in classes):
+                            data_cell.fill = PatternFill(
+                                start_color="FEE2E2", end_color="FEE2E2",
+                                fill_type="solid")
                     elif key in covered:
                         ws.cell(row=row, column=col).border = cell_border
                     else:
@@ -4778,6 +4850,7 @@ class SchedulerApp(QMainWindow):
                         bc.alignment = center_nowrap
 
                 occupied = {}
+                claims = {}
                 for c in placed:
                     c_day = effective_day(c)
                     c_start = effective_time(c)
@@ -4803,11 +4876,27 @@ class SchedulerApp(QMainWindow):
                             if si >= len(slots):
                                 break
                             okey = (si, d_idx, b_idx)
+                            claims.setdefault(okey, []).append(c)
                             if d_off == 0:
                                 span = min(dur, len(slots) - actual_start)
                                 occupied[okey] = ("start", c, span)
                             else:
                                 occupied[okey] = ("span", None, 0)
+
+                # ST-UI-001. The dict above keeps the LAST writer, so a second
+                # lesson claiming a cell used to erase the first from this
+                # sheet -- while the filtered sheets in the SAME workbook
+                # already stacked both. Pull every contested claimant out and
+                # stack them, exactly as _write_filtered_sheet does.
+                overlapping = {id(c) for cs in claims.values() if len(cs) > 1
+                               for c in cs}
+                overlap_cells = {}
+                for okey, cs in claims.items():
+                    keep = [c for c in cs if id(c) in overlapping]
+                    if keep:
+                        overlap_cells[okey] = keep
+                for okey in overlap_cells:
+                    occupied.pop(okey, None)
 
                 for si, slot in enumerate(slots):
                     erow = si + 3
@@ -4827,7 +4916,24 @@ class SchedulerApp(QMainWindow):
                         for b_idx in range(n_branches):
                             col = 3 + d_idx * n_branches + b_idx
                             okey = (si, d_idx, b_idx)
-                            if okey in occupied:
+                            if okey in overlap_cells:
+                                claimants = overlap_cells[okey]
+                                keys = {cls_key(x) for x in claimants}
+                                conflicted = any(
+                                    conflict_partners.get(cls_key(x), frozenset())
+                                    & (keys - {cls_key(x)})
+                                    for x in claimants)
+                                rich = _build_stacked_rich_cell(
+                                    claimants, include_room=True,
+                                    include_targets=False)
+                                dc = ws.cell(row=erow, column=col, value=rich)
+                                fill_hex = "FEE2E2" if conflicted else "F1F5F9"
+                                dc.fill = PatternFill(
+                                    start_color=fill_hex, end_color=fill_hex,
+                                    fill_type="solid")
+                                dc.border = cell_border
+                                dc.alignment = center_wrap
+                            elif okey in occupied:
                                 kind, cls, span = occupied[okey]
                                 if kind == "span":
                                     ws.cell(row=erow, column=col).border = cell_border
