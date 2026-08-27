@@ -393,6 +393,20 @@ def _filtered_block_width(block, mode):
     return (COL_DAY_W - (n - 1) * GRID_GAP) / n
 
 
+def _paint_selection_ring(painter, rect):
+    """A black ring just inside the border, for a lesson whose border is red.
+
+    ST-UI-001. Selection used to be signalled by widening the border by 1 px in
+    the same colour. On a conflicted lesson that colour is already red and
+    already 3 px, so selecting one was very nearly invisible -- the two states
+    competed for a single channel. The conflict border now has a constant width
+    and selection draws its own ring.
+    """
+    painter.setPen(QPen(QColor("#000000"), 1, Qt.PenStyle.DashLine))
+    painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+    painter.drawRoundedRect(rect.adjusted(5, 5, -5, -5), 4, 4)
+
+
 CONFLICT_BORDER = "#DC2626"
 
 
@@ -549,13 +563,19 @@ class LessonItem(QGraphicsRectItem):
         # ST-UI-001: last, so it is never painted over by the cell's own text.
         if self._conflict:
             _paint_conflict_pill(painter, self.rect())
+            if self._selected:
+                _paint_selection_ring(painter, self.rect())
 
     def _paint_joint(self, painter):
         rect = self.rect()
         if self._conflict:
             # ST-UI-001: a conflicted lesson is red whichever tab it is on,
-            # including tabs where the other half of the clash is not visible.
-            bw = 4 if self._selected else 3
+            # including tabs where the other half of the clash is not
+            # visible. Width is CONSTANT: selection gets its own black ring
+            # below, because a 1 px width change in the same red was the
+            # only thing distinguishing a selected conflicted lesson from an
+            # unselected one -- two signals competing for one channel.
+            bw = 3
             bc = QColor(CONFLICT_BORDER)
         else:
             bw = 3 if self._selected else 2
@@ -630,8 +650,12 @@ class LessonItem(QGraphicsRectItem):
         n = len(cls["targets"])
         if self._conflict:
             # ST-UI-001: a conflicted lesson is red whichever tab it is on,
-            # including tabs where the other half of the clash is not visible.
-            bw = 4 if self._selected else 3
+            # including tabs where the other half of the clash is not
+            # visible. Width is CONSTANT: selection gets its own black ring
+            # below, because a 1 px width change in the same red was the
+            # only thing distinguishing a selected conflicted lesson from an
+            # unselected one -- two signals competing for one channel.
+            bw = 3
             bc = QColor(CONFLICT_BORDER)
         else:
             bw = 3 if self._selected else 2
@@ -872,7 +896,7 @@ class MatrixLessonItem(QGraphicsRectItem):
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         rect = self.rect()
         if self._conflict:
-            bw = 4 if self._selected else 3       # ST-UI-001
+            bw = 3                                # ST-UI-001, constant
             bc = QColor(CONFLICT_BORDER)
         else:
             bw = 3 if self._selected else 2
@@ -937,6 +961,8 @@ class MatrixLessonItem(QGraphicsRectItem):
         # ST-UI-001: last, so the cell's own text never paints over it.
         if self._conflict:
             _paint_conflict_pill(painter, rect)
+            if self._selected:
+                _paint_selection_ring(painter, rect)
 
     # ── interaction ──────────────────────────────────────────────
 

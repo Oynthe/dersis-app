@@ -2239,10 +2239,17 @@ class SchedulerApp(QMainWindow):
         self._update_filters()
         self._update_status()
 
-        # ST-UI-001: one sweep per repaint feeds all four timetable tabs and
-        # the warning log, so the grid and the log cannot disagree about what
-        # clashes. Measured at ~1.5 ms on a fully-placed 250-class grid, against
-        # the 306-563 ms repaint ST-UI-009 was about, so it is not memoised.
+        # ST-UI-001: this sweep feeds whichever timetable tab is being drawn.
+        # The warning log runs its OWN sweep in `_conflict_log_entries`, on
+        # purpose — `_run_auto_negotiation` can move classes between the two,
+        # so reusing this result there would describe a timetable that no
+        # longer exists. (An earlier version of this comment claimed one sweep
+        # served both and therefore guaranteed they agree. There are two, and
+        # the second one is why they agree.)
+        #
+        # Measured at ~1.5 ms on a fully-placed 250-class grid and 9 ms at 600,
+        # against the 306-563 ms repaint ST-UI-009 was about, so neither is
+        # memoised.
         self._conflicts = find_schedule_conflicts(self.state_data)
         self._conflict_partners = conflict_partner_index(self._conflicts)
 
@@ -4878,6 +4885,19 @@ class SchedulerApp(QMainWindow):
                             )
                         data_cell = ws.cell(row=row, column=col)
                         _apply_lesson_cell(data_cell, block["cls"], rich)
+                        # ST-UI-001. This sheet lanes concurrent lessons rather
+                        # than stacking them, so it never had an "overlap"
+                        # branch to hang the marker on -- and marked no clashes
+                        # at all, while the physical sheets in the same
+                        # workbook did. The rule is the same non-geometric one
+                        # the renderer uses: a lesson is marked if the VALIDATOR
+                        # says it cannot coexist with something, not if two
+                        # blocks happen to share a cell (two online lessons at
+                        # one hour is normal and must stay unmarked).
+                        if conflict_partners.get(cls_key(block["cls"])):
+                            data_cell.fill = PatternFill(
+                                start_color="FEE2E2", end_color="FEE2E2",
+                                fill_type="solid")
                         for rr in range(row, row + span):
                             ws.cell(row=rr, column=col).border = cell_border
                     elif key in covered:

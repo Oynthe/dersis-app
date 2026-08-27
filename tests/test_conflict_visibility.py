@@ -960,3 +960,38 @@ def test_a_duplicate_target_class_is_not_stacked_against_itself(
         f"the duplicate-target class lost its 2-hour merge; merges present: "
         f"{sorted(duplicate[2])}"
     )
+
+
+@pytest.mark.pdf
+def test_a_class_name_with_markup_characters_survives_the_pdf(tmp_path):
+    """ST-UI-007 family — user text reaches reportlab's markup parser.
+
+    Every PDF cell interpolates the class name, lecturer and room into markup.
+    Unescaped, reportlab reads ``<Vekil>`` as an unknown TAG and drops it
+    silently, so the printed timetable shows " Dersi" with the name gone.
+
+    Measured both ways: escaped -> "Vekil" present; unescaped -> absent. A bare
+    ``&`` is TOLERATED, so "Fizik & Kimya" renders either way — asserting on it
+    would pin nothing, which is what a first version of this test did.
+
+    Deliberately a CLEAN schedule with one lesson: on a conflicted one the
+    appendix lists the same names through its own (separately escaped) path and
+    keeps the needle alive no matter what the grid cell does.
+    """
+    pytest.importorskip("reportlab")
+    from scheduler_app.data_io.exporter import export_schedule
+
+    s = _state()
+    only = _add(s, "AAA111", "09:00", "R001", lecturer="Lect-01")
+    only["name"] = "<Vekil> Dersi"
+    assert find_schedule_conflicts(s) == [], "fixture must not build an appendix"
+
+    out = tmp_path / "markup.pdf"
+    export_schedule(s, "pdf", str(out), mode="classroom")   # must not raise
+    text = _pdf_text(out)
+
+    assert b"AAA111" in text, "the lesson vanished entirely"
+    assert b"Vekil" in text, (
+        "'<Vekil> Dersi' lost its name — reportlab parsed the angle brackets "
+        "as a tag and dropped the text"
+    )

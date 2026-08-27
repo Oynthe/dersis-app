@@ -5,6 +5,7 @@ Does not modify scheduling logic or internal data.
 """
 
 import csv
+import html
 import warnings
 import os
 from typing import Any
@@ -413,27 +414,37 @@ def _pdf_rich_markup(cls, include_room=False, include_targets=False):
     the screen is — stacking every claimant into the cell is the shape the XLSX
     writer already uses, and it is what makes the two agree.
     """
+    # reportlab parses this as markup, so every interpolated value is USER
+    # TEXT and must be escaped: a class named "Fizik & Kimya" or a lecturer
+    # called "<Vekil>" otherwise mangles the cell or raises out of the whole
+    # export. Only the data is escaped, never the template.
+    esc = html.escape
     parts = []
     code = cls.get("class_code", "")
     if code:
-        parts.append(f'<font color="#1D4ED8" size="7"><b>{code}</b></font>')
-    parts.append(f'<font color="#1E293B" size="8"><b>{cls["name"]}</b></font>')
+        parts.append(
+            f'<font color="#1D4ED8" size="7"><b>{esc(str(code))}</b></font>')
+    parts.append(
+        f'<font color="#1E293B" size="8"><b>{esc(str(cls["name"]))}</b></font>')
     if cls.get("lecturer"):
-        parts.append(f'<font color="#475569" size="7">{cls["lecturer"]}</font>')
+        parts.append(
+            f'<font color="#475569" size="7">{esc(str(cls["lecturer"]))}</font>')
     if include_room:
         room = classroom_of(cls)
         if room:
-            parts.append(f'<font color="#16A34A" size="7">{room}</font>')
+            parts.append(
+                f'<font color="#16A34A" size="7">{esc(str(room))}</font>')
     if include_targets:
         groups = ", ".join(
             f"{t['year']}/{t['branch']}" for t in cls.get("targets", []))
         if groups:
-            parts.append(f'<font color="#6D28D9" size="6">{groups}</font>')
+            parts.append(
+                f'<font color="#6D28D9" size="6">{esc(groups)}</font>')
     # Protection badge
     emoji, label, b_color = get_badge(cls)
     if emoji:
         parts.append(
-            f'<font color="{b_color}" size="6"><b>{label}</b></font>')
+            f'<font color="{b_color}" size="6"><b>{esc(str(label))}</b></font>')
     return "<br/>".join(parts)
 
 
@@ -466,7 +477,8 @@ def _pdf_conflict_paragraph(classes, cell_style, conflicted,
     markup = '<br/><font color="#DC2626">---</font><br/>'.join(blocks)
     if conflicted:
         markup = (f'<font color="#DC2626" size="7"><b>'
-                  f'{tr("badges.conflict")}</b></font><br/>' + markup)
+                  f'{html.escape(tr("badges.conflict"))}</b></font><br/>'
+                  + markup)
     return Paragraph(markup, cell_style)
 
 
@@ -1092,7 +1104,10 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
         head = [Paragraph(h, branch_hdr_style) for h in (
             tr("labels.type"), tr("labels.class_code"), tr("labels.class_name"),
             tr("labels.lecturer"), tr("labels.day"))]
-        data = [head] + [[Paragraph(str(v), cell_style) for v in row]
+        # Escaped: these rows carry class and lecturer names straight from the
+        # user's file into reportlab's markup parser.
+        data = [head] + [[Paragraph(html.escape(str(v)), cell_style)
+                          for v in row]
                          for row in appendix_rows]
         appendix = Table(
             data,
