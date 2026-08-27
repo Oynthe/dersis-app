@@ -29,11 +29,12 @@ Documents/Dersis/settings/negotiation_settings.egu).
 from collections import defaultdict
 
 from scheduler_app.logic import (
-    slot_index, slots_fit, total_duration, get_placed_classes, classroom_of,
+    slot_index, find_slot_index, slots_fit, total_duration,
+    get_placed_classes, classroom_of,
     _active_targets, targets_overlap,
 )
 from scheduler_app.models import (
-    cls_key,
+    cls_key, find_off_grid_placements,
     room_fits_class, get_room_capacity, get_physical_room_candidates,
 )
 from scheduler_app.constraint_validator import ConstraintValidator
@@ -464,8 +465,12 @@ class RelaxationSuggester:
         # Try removing excluded constraints
         suggestions.extend(self._suggest_remove_exclusions(cls))
 
-        # Try moving conflicting classes
-        suggestions.extend(self._suggest_move_conflicts(cls))
+        # Try moving conflicting classes. This also reports how many placed
+        # lessons it had to skip as off-grid (ST-DATA-003); stash it so
+        # build_class_report can surface the count rather than swallowing it.
+        move_suggestions, off_grid = self._suggest_move_conflicts(cls)
+        suggestions.extend(move_suggestions)
+        self.last_off_grid_blockers = off_grid
 
         # Sort: primary by impact (desc), secondary by disruption (asc)
         suggestions.sort(key=lambda s: (-s["impact"], s["disruption"]))
@@ -678,11 +683,34 @@ class RelaxationSuggester:
         return suggestions
 
     def _suggest_move_conflicts(self, cls):
-        """Suggest moving specific conflicting classes to free up slots."""
+        """Suggest moving specific conflicting classes to free up slots.
+
+        ST-UI-015. This returned nothing at all, on every instance, for the
+        whole life of the feature: blockers were accumulated under
+        ``id(existing)`` -- a CPython object address -- and then resolved
+        through ``{cls_key(c): c}``, whose keys are uuid strings. The lookup
+        could never hit, so ``blocker`` was always None and the loop always
+        skipped. Measured before the fix: 0 suggestions of this type against 4
+        total on `small` and 4 on `normal`.
+
+        It matters out of proportion to its size. The commonest unplaced reason
+        is "all remaining candidate slots are occupied", and the only advice
+        that helps a user act on it is "move Ders 6 out of Wednesday 12:00 and
+        16 slots open up" -- which is precisely this function's job.
+
+        Returns ``(suggestions, off_grid_blockers)``: the second value is the
+        number of placed lessons skipped because they sit on a day or hour the
+        grid no longer has. Skipping them is correct --
+        ``ConstraintValidator.add_placement`` returns early on the identical
+        condition, so such a lesson occupies no cell and blocks nothing, and
+        counting it would contradict the validator that decides
+        ``check_placement``. Returning the count is what keeps that from being
+        a silent drop: those lessons are otherwise mentioned nowhere in the UI.
+        """
         suggestions = []
         days, times, rooms = self.generator.get_search_space(cls)
         if not days or not times or not rooms:
-            return suggestions
+            return suggestions, 0
 
         td = total_duration(cls)
         placed_classes = get_placed_classes(self.state)
@@ -697,7 +725,9 @@ class RelaxationSuggester:
                     if self.validator.check_placement(cls, day, slot, room):
                         continue
                     # Find blockers
-                    si = slot_index(self.state, slot)
+                    si = find_slot_index(self.state, slot)
+                    if si is None:
+                        continue
                     slots_list = self.state["slots"][si:si + td]
                     for existing in placed_classes:
                         if existing["pinned"] or existing.get("protection") == "locked":
@@ -707,7 +737,14 @@ class RelaxationSuggester:
                             continue
                         ex_room = classroom_of(existing)
                         ex_start = existing.get("placed_time")
-                        ex_si = slot_index(self.state, ex_start)
+                        # A STORED slot: logic.slot_index raises on one the user
+                        # has deleted, and its own docstring forbids reading
+                        # stored data with it (ST-SCHED-004). Before this,
+                        # a single orphaned lesson killed 3 of 4 negotiate_class
+                        # calls with ValueError: '20:00' is not in list.
+                        ex_si = find_slot_index(self.state, ex_start)
+                        if ex_si is None or ex_day not in self.state["days"]:
+                            continue
                         ex_td = total_duration(existing)
                         ex_slots = set(self.state["slots"][ex_si:ex_si + ex_td])
 
@@ -733,10 +770,12 @@ class RelaxationSuggester:
                                 break
 
                         if blocked:
-                            blocker_counts[id(existing)] += 1
-                            blocker_slots[id(existing)].add((day, slot, room))
+                            ex_key = cls_key(existing)
+                            blocker_counts[ex_key] += 1
+                            blocker_slots[ex_key].add((day, slot, room))
 
-        # Generate suggestions for top blockers
+        # Generate suggestions for top blockers.
+        # Keyed by cls_key on BOTH sides -- see the docstring.
         id_to_cls = {cls_key(c): c for c in placed_classes}
         sorted_blockers = sorted(blocker_counts.items(), key=lambda x: -x[1])
 
@@ -748,8 +787,12 @@ class RelaxationSuggester:
             blocker_time = blocker.get("placed_time", "")
             suggestions.append({
                 "type": "move_conflicting",
+                # day_label, not the raw key: this sentence is shown to a user,
+                # and "monday" in a Turkish sentence is the ST-FUNC-006 family
+                # of defect (internal keys leaking into localized text).
                 "description": tr("negotiation.move_blocker").format(
-                    blocker=blocker["name"], day=blocker_day,
+                    blocker=blocker["name"],
+                    day=day_label(blocker_day) if blocker_day else "",
                     time=blocker_time, n=count, name=cls["name"]),
                 "impact": count,
                 "disruption": 0.5,  # Medium: affects another class
@@ -762,7 +805,14 @@ class RelaxationSuggester:
                 },
             })
 
-        return suggestions
+        # Counted from models.find_off_grid_placements -- the codebase's one
+        # oracle for "not on the grid", already used by the exporter warning
+        # and the PDF appendix -- rather than from what this loop happened to
+        # skip. The loop's own day filter (`ex_day != day`) runs BEFORE the
+        # guard above, so a lesson orphaned by a deleted DAY never reaches it:
+        # deriving the count here would silently report only the deleted-HOUR
+        # half. Re-deriving the rule would also make a third copy of it.
+        return suggestions, len(find_off_grid_placements(self.state))
 
     def _estimate_day_impact(self, cls, day, is_exclusion_removal=False):
         """Estimate how many valid slots would open if a day were allowed.
@@ -874,7 +924,8 @@ class NegotiationReportBuilder:
     structured reports for UI display.
     """
 
-    def build_class_report(self, analysis, suggestions):
+    def build_class_report(self, analysis, suggestions,
+                           off_grid_blockers=0):
         """Build a complete negotiation report for one class.
 
         Args:
@@ -889,6 +940,10 @@ class NegotiationReportBuilder:
                 blocking_reasons: list of str
                 suggestions: list of formatted suggestion dicts
                 priority: int (lower = more urgent)
+                off_grid_blockers: int -- placed lessons skipped because
+                    they sit on a day or hour the grid no longer has
+                    (ST-DATA-003). Reported rather than swallowed: they are
+                    mentioned nowhere else in the UI.
         """
         if analysis["is_infeasible"]:
             status = "infeasible"
@@ -926,6 +981,7 @@ class NegotiationReportBuilder:
             "valid_slots": analysis["valid_slots"],
             "total_search_space": analysis["total_search_space"],
             "priority": priority,
+            "off_grid_blockers": off_grid_blockers,
         }
 
     def build_diagnostic_summary(self, state, analyses, conflict_graph=None,
@@ -1203,7 +1259,10 @@ class ConstraintNegotiator:
         """
         analysis = self.analyzer.analyze_class(cls)
         suggestions = self.suggester.suggest_for_class(cls, analysis)
-        return self.report_builder.build_class_report(analysis, suggestions)
+        return self.report_builder.build_class_report(
+            analysis, suggestions,
+            off_grid_blockers=getattr(
+                self.suggester, "last_off_grid_blockers", 0))
 
     def negotiate_unplaced(self):
         """Run negotiation for all unplaced classes.

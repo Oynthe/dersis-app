@@ -2603,16 +2603,30 @@ class PlaceClassDialog(QDialog):
         layout.addLayout(sel_row)
         _install_select_all_shortcut(self, self.tree)
 
+        # ST-UI-015. The dialog used to dead-end on its most important case:
+        # "0 gecerli yerlestirme bulundu" over an empty table, with the
+        # "Yerlestir" button still ENABLED -- and pressing it said "select a
+        # placement option first", instructing the user to pick a row from a
+        # table with no rows. This panel says why, and what to change.
+        self._explain_label = QLabel("")
+        self._explain_label.setWordWrap(True)
+        self._explain_label.setTextFormat(Qt.TextFormat.RichText)
+        self._explain_label.setStyleSheet(
+            "background: #FEF3C7; color: #92400E; padding: 8px; "
+            "border: 1px solid #F59E0B; border-radius: 4px; font-size: 9pt;")
+        self._explain_label.setVisible(False)
+        layout.addWidget(self._explain_label)
+
         # Bottom
         bottom = QHBoxLayout()
         self.info_label = QLabel(tr("dialogs.place.select_class_above"))
         bottom.addWidget(self.info_label)
         bottom.addStretch()
-        place_btn = QPushButton(tr("buttons.place"))
-        place_btn.clicked.connect(self._place)
+        self._place_btn = QPushButton(tr("buttons.place"))
+        self._place_btn.clicked.connect(self._place)
         cancel_btn = QPushButton(tr("buttons.cancel"))
         cancel_btn.clicked.connect(self.reject)
-        bottom.addWidget(place_btn)
+        bottom.addWidget(self._place_btn)
         bottom.addWidget(cancel_btn)
         layout.addLayout(bottom)
 
@@ -2637,6 +2651,61 @@ class PlaceClassDialog(QDialog):
             item.setData(2, Qt.ItemDataRole.UserRole, room)
 
         self.info_label.setText(f"{len(options)} {tr('dialogs.place.valid_found')}")
+
+        # A button that cannot succeed must not invite a click -- but disabling
+        # it ALONE would just convert a loud dead end into a quiet one, so the
+        # reason goes on screen at the same time.
+        self._place_btn.setEnabled(bool(options))
+        if options:
+            self._explain_label.setVisible(False)
+            self._explain_label.clear()
+        else:
+            self._explain_label.setText(self._explain_unplaceable(candidate))
+            self._explain_label.setVisible(True)
+
+    def _explain_unplaceable(self, candidate):
+        """Why this class has no valid placement, and what would change it.
+
+        Uses the per-class negotiator entry point, not the full report:
+        `negotiate_class` costs 0.3 ms (small) to 11 ms (large) and does not
+        build the conflict graph, while `full_diagnostic` is 18 ms to 2.3 s --
+        the ST-PERF-007 number. This runs on every combo change, so the
+        difference is the whole reason the panel is affordable.
+        """
+        from scheduler_app.constraint_negotiator import ConstraintNegotiator
+
+        try:
+            report = ConstraintNegotiator(self.state).negotiate_class(candidate)
+        except Exception:
+            # Never let the explanation be the thing that breaks the dialog.
+            return f"<b>{tr('dialogs.place.no_options_title')}</b>"
+
+        parts = [f"<b>{tr('dialogs.place.no_options_title')}</b>"]
+        for reason in report.get("blocking_reasons", [])[:3]:
+            parts.append(f"&nbsp;&nbsp;• {reason}")
+        suggestions = report.get("suggestions", [])
+        if suggestions:
+            parts.append(f"<b>{tr('dialogs.place.what_to_change')}</b>")
+            for sug in suggestions[:3]:
+                # The impact is already inside `description` for the
+                # move_conflicting type ("...frees 3 slots"), so appending
+                # impact_label there reads as a stutter.
+                if sug.get("type") == "move_conflicting":
+                    parts.append(f"&nbsp;&nbsp;→ {sug['description']}")
+                else:
+                    parts.append(
+                        f"&nbsp;&nbsp;→ {sug['description']} "
+                        f"<i>({sug['impact_label']})</i>")
+        n_off_grid = report.get("off_grid_blockers", 0)
+        if n_off_grid:
+            # ST-DATA-003: these lessons are skipped when counting blockers
+            # because they occupy no cell -- and they are mentioned nowhere
+            # else in the UI, so saying nothing here would hide them a third
+            # time.
+            parts.append(
+                f"&nbsp;&nbsp;⚠ "
+                + tr("dialogs.place.off_grid_note").format(n=n_off_grid))
+        return "<br>".join(parts)
 
     def _place(self):
         selected = self.tree.selectedItems()
@@ -3787,7 +3856,8 @@ class BulkResultsDialog(QDialog):
 
     def __init__(self, parent, placed, unplaced, rescheduled=False,
                  analytics=None, reschedule_explanation=None,
-                 negotiation_result=None, negotiation_source=None):
+                 negotiation_result=None, negotiation_source=None,
+                 infeasibility=None):
         super().__init__(parent)
         self.setStyleSheet(DIALOG_STYLESHEET())
         self.setWindowTitle("\U0001F4CB  " + tr("dialogs.bulk_results.title"))
@@ -3842,6 +3912,30 @@ class BulkResultsDialog(QDialog):
         summary.setWordWrap(True)
         layout.addWidget(summary)
 
+        # ST-SCHED-014. The global bottleneck, above the per-class list and
+        # visually distinct from it, because it answers a different question.
+        # A list of unplaced classes says which lessons did not fit; this says
+        # the instance CANNOT be built -- 'you are asking for 14 class-hours
+        # and the building offers 8 room-hours' -- which is arithmetic rather
+        # than search, and is the only kind of problem that no amount of
+        # rearranging can fix. Told 'all candidate slots are occupied' forty
+        # times instead, a user starts adding rooms at random.
+        #
+        # diagnose_infeasibility is deliberately one-sided: it reports only
+        # what it can PROVE, and passing its checks does NOT mean the instance
+        # is satisfiable. The wording must not promise the converse.
+        if infeasibility and infeasibility.get("message"):
+            bottleneck = QLabel(
+                f"<b>{tr('dialogs.bulk_results.impossible_title')}</b><br>"
+                f"{infeasibility['message']}")
+            bottleneck.setWordWrap(True)
+            bottleneck.setStyleSheet(
+                "background: #FEE2E2; color: #991B1B; padding: 8px; "
+                "border: 1px solid #DC2626; border-radius: 4px; "
+                "font-size: 9pt;")
+            layout.addWidget(bottleneck)
+            self._bottleneck_label = bottleneck
+
         tabs = QTabWidget()
         layout.addWidget(tabs)
 
@@ -3873,8 +3967,13 @@ class BulkResultsDialog(QDialog):
             for cls, reason in unplaced:
                 code = cls.get("class_code", "")
                 display_name = f"[{code}] {cls['name']}" if code else cls["name"]
-                QTreeWidgetItem(unplaced_tree, [
+                item = QTreeWidgetItem(unplaced_tree, [
                     display_name, cls["lecturer"], reason])
+                # ST-UI-015: the reason is ELIDED by Qt, not truncated -- the
+                # full text is present but unreachable (measured: 163 chars
+                # needing 1956 px in a 224 px column, with no tooltip). The
+                # data was always there; nothing surfaced it.
+                item.setToolTip(2, reason)
             tabs.addTab(unplaced_tree,
                         f"{tr('labels.unplaced')} ({len(unplaced)})")
 

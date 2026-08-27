@@ -3044,17 +3044,35 @@ class SchedulerApp(QMainWindow):
         self._end_solve_ui()
 
         # Show results with analytics
+        # ST-SCHED-014. `summary` is available BEFORE the dialog (unlike
+        # apply_reschedule's rejected list, which cannot exist until after the
+        # modal returns), so the one sentence that names WHY the whole instance
+        # cannot be built goes on the dialog itself. It answers a different
+        # question from the per-class reasons beside it: "you are asking for 14
+        # class-hours and the building has 8 room-hours" is something no list of
+        # unplaced classes can ever say, and it is the only kind of problem that
+        # rearranging lessons cannot fix.
+        summary = result.summary or {}
+        infeasibility = summary.get("infeasibility")
         results_dlg = BulkResultsDialog(
             self, result.placed, result.unplaced, bool(result.changes),
             analytics=result.analytics,
             reschedule_explanation=result.explanation,
-            negotiation_source=lambda: result.negotiation_result)
+            negotiation_source=lambda: result.negotiation_result,
+            infeasibility=infeasibility)
         accepted = (results_dlg.exec() == BulkResultsDialog.DialogCode.Accepted
                     and results_dlg.result)
 
         if accepted:
             self._push_undo(tr("actions.reschedule"))
-            self._workflow.apply_reschedule(result)
+            # ST-SCHED-001. This return value was discarded. Each entry is a
+            # placement the optimizer proposed and the COMMIT step refused --
+            # a different category from result.unplaced, which the solver knew
+            # it could not place. A rejection here means the state changed
+            # between optimizing and applying, so the user asked for a
+            # timetable and silently got a different one.
+            rejected = self._workflow.apply_reschedule(result)
+            self._report_rejected_placements(rejected)
             self._clear_impact_flags()
 
             moved = len(result.changes)
@@ -3440,6 +3458,32 @@ class SchedulerApp(QMainWindow):
         derived.extend(self._conflict_log_entries())
 
         self.warning_log.set_derived(derived)
+
+    def _report_rejected_placements(self, rejected):
+        """Say so when the commit step refused a placement the solver proposed.
+
+        ST-SCHED-001. `apply_reschedule` screens the whole proposal through
+        `screen_placements` -- the same rule the optimizer checks itself
+        against -- so an entry here means the state changed between optimizing
+        and applying. That is nearly always a race or a defect, NOT a normal
+        "this class did not fit": those are in `result.unplaced` and are
+        reported by the results dialog with their own reasons.
+
+        So it is deliberately louder than an unplaced class, and worded as
+        something that happened TO the user's schedule rather than as a
+        property of their data.
+        """
+        if not rejected:
+            return
+        for entry in rejected:
+            self.warning_log.log(
+                tr("status.placement_refused").format(
+                    name=entry.get("name", "?"),
+                    reason=entry.get("reason", "")),
+                "error")
+        self._show_toast(
+            tr("status.placements_refused_toast").format(n=len(rejected)),
+            "warning")
 
     _MAX_CONFLICT_LOG_ENTRIES = 25
 
