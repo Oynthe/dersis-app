@@ -5,7 +5,7 @@ Provides a global quality score, per-entity breakdowns, and
 actionable insights about the current timetable state.
 """
 
-from scheduler_app.logic import slot_index, total_duration, _active_targets
+from scheduler_app.logic import find_slot_index, total_duration, _active_targets
 from scheduler_app.models import get_effective_room_resource_for_class
 from scheduler_app.translations import tr
 
@@ -43,7 +43,17 @@ class ScheduleAnalytics:
         day_loads = {}   # day -> total_slots_used
 
         for cls, day, slot, room in placements:
-            si = slot_index(self.state, slot)
+            # ST-DATA-003. `slot_index` raises by design, and this loop used to
+            # let it: one placement left pointing at an hour the user has since
+            # deleted took the whole report down, and the dashboard's bare
+            # `except` turned that into a 0/100 "Zayıf" verdict on a schedule
+            # that had not changed. `TimetableScorer.score_detailed` already
+            # skips such a placement; the analyser was the odd one out. Guarding
+            # here rather than at one caller protects the live one too —
+            # `workflow.analyze_schedule(state, placed)` passes its own list.
+            si = find_slot_index(self.state, slot)
+            if si is None or day not in self.state.get("days", []):
+                continue  # off-grid placement scores nothing (ST-DATA-003)
             td = total_duration(cls)
             effective_room = get_effective_room_resource_for_class(
                 cls, room_override=room)

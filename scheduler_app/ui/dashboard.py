@@ -13,7 +13,7 @@ from PyQt6.QtCore import Qt, QRectF
 from PyQt6.QtGui import QColor, QPainter, QFont, QPen, QBrush
 
 from scheduler_app.translations import tr
-from scheduler_app.models import effective_day, effective_time
+from scheduler_app.models import effective_day, effective_time, effective_room
 from scheduler_app.ui.day_keys import day_label
 from scheduler_app.analytics import compute_all_metrics
 from scheduler_app.timetable_scorer import TimetableScorer
@@ -438,7 +438,15 @@ class DashboardWidget(QWidget):
             day = effective_day(cls)
             slot = effective_time(cls)
             if day and slot:
-                room = cls.get("room", "")
+                # ST-UI-003. This used to be `cls.get("room", "")`. No class
+                # dict has a "room" key, so every tuple carried "" — and ""
+                # is not the _ROOM_UNSET sentinel, so it won as a
+                # room_override and *overrode* the correct placed_classroom /
+                # pinned_classroom fallback. Every room-derived number
+                # downstream collapsed to zero. `effective_room` is the same
+                # currency logic.analyze_schedule and apply_reschedule use, so
+                # this screen now scores the timetable the rest of the app does.
+                room = effective_room(cls)
                 placements.append((cls, day, slot, room))
 
         if not placements:
