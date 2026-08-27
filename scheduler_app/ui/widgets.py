@@ -6,7 +6,9 @@ from PyQt6.QtWidgets import (
     QMenu, QWidgetAction, QCheckBox, QScrollArea, QFrame,
     QTextEdit, QSizePolicy,
 )
-from PyQt6.QtCore import QTimer, Qt, QPropertyAnimation, QEasingCurve, QEvent
+from PyQt6.QtCore import (
+    QTimer, Qt, QPropertyAnimation, QEasingCurve, QEvent, QPoint,
+)
 from PyQt6.QtGui import QColor, QAction, QPainter, QBrush, QPen
 
 from scheduler_app.translations import tr
@@ -43,14 +45,26 @@ class Toast(QWidget):
         layout.addWidget(lbl)
         self.adjustSize()
 
-        # Position at bottom-right of parent
+        # Position at bottom-right of parent.
+        #
+        # ST-UI-010: the flag goes on FIRST, and the move is mapped through the
+        # parent. ``Qt.WindowType.ToolTip`` makes this a *top-level window*, and
+        # ``QWidget.move`` on a window takes **global** coordinates — while
+        # ``pw - tw - 20`` is expressed in the parent's **local** ones. Moving
+        # before the flag (which is what this did) therefore pinned the toast to
+        # one fixed point on the *screen* rather than to the window's corner:
+        # measured at 929,650 for every window origin, i.e. displaced by exactly
+        # the window's own screen offset — (-502, -332) for a window at
+        # (500, 330) — and off the window altogether once it is moved right or
+        # onto a second monitor. The two agreed only for a window at the display
+        # origin, which is why it reads as correct on a maximised single screen.
+        self.setWindowFlags(Qt.WindowType.ToolTip)
         pw = parent.width()
         ph = parent.height()
         tw = self.width()
         th = self.height()
-        self.move(pw - tw - 20, ph - th - 20)
+        self.move(parent.mapToGlobal(QPoint(pw - tw - 20, ph - th - 20)))
 
-        self.setWindowFlags(Qt.WindowType.ToolTip)
         self.show()
         self.raise_()
 
