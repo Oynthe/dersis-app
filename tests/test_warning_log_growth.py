@@ -673,6 +673,12 @@ def test_settings_failure_is_reported_once_and_survives_the_rebuild(
 
     for _ in range(_REFRESHES):
         window.refresh_grid()
+        # ST-PERF-002 coalesced autosave behind a debounce timer, so a refresh
+        # only REQUESTS a write. Flushing here keeps this test doing what its
+        # name says — _REFRESHES genuinely attempted, genuinely failing saves — which is
+        # what makes the count discriminating: 0 means a rebuild wiped the
+        # notice, 2 means two channels, _REFRESHES means the rate limit was lost.
+        window.flush_auto_save()
 
     stored = _stored(window.warning_log)
     hits = [m for m in stored if _SENTINEL in m]
