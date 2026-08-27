@@ -626,6 +626,10 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
         ]
         cell_bg_cmds = []
         row_heights = [24]  # header row
+        # Rows holding a stacked contested cell need more than MIN_ROW_H:
+        # reportlab does NOT grow a fixed-height row to fit its content, it
+        # overprints the neighbours. Measured per cell below.
+        tall_rows = {}
 
         for si, slot in enumerate(slots):
             data_row_idx = si + 1
@@ -665,10 +669,20 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                         conflict_partners.get(cls_key(c), frozenset())
                         & (keys - {cls_key(c)})
                         for c in claimants)
-                    row.append(_pdf_conflict_paragraph(
+                    stack_para = _pdf_conflict_paragraph(
                         claimants, cell_style, conflicted,
                         include_room=include_room,
-                        include_targets=include_targets))
+                        include_targets=include_targets)
+                    row.append(stack_para)
+                    # Two or more lessons in one cell is taller than one, and
+                    # rowHeights is FIXED -- an unmeasured stack silently
+                    # overprints the hours above and below it, which on a
+                    # printed timetable is worse than the drop it replaced.
+                    # day_w - 4 because LEFTPADDING and RIGHTPADDING are both
+                    # 2; + 6 for TOPPADDING + BOTTOMPADDING.
+                    _w, _h = stack_para.wrap(day_w - 4, 1e6)
+                    tall_rows[data_row_idx] = max(
+                        tall_rows.get(data_row_idx, MIN_ROW_H), _h + 6)
                     cell_bg_cmds.append(
                         ("BACKGROUND", (col_idx, data_row_idx),
                          (col_idx, data_row_idx),
@@ -683,6 +697,9 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                          (col_idx, data_row_idx), COL_EMPTY))
             table_data.append(row)
             row_heights.append(MIN_ROW_H)
+
+        for _ri, _h in tall_rows.items():
+            row_heights[_ri] = _h
 
         # Default empty bg first, then override with lesson colors
         style_cmds.extend(cell_bg_cmds)
@@ -837,7 +854,14 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                     ("BACKGROUND", (c, 1), (c, 1), COL_BRANCH_HDR))
 
         # Build occupancy map: (slot_idx, day_idx, branch_idx) -> (kind, cls, span)
-        occupied = {}
+        #
+        # ST-UI-001. This was a plain dict assignment, so a second claimant of a
+        # cell overwrote the first and printed nowhere -- the same defect the
+        # filtered PDF tables had, left behind when they were fixed. Every
+        # claimant is collected first, and any ENTRY that shares a cell is
+        # routed to the stacked branch.
+        entries = []
+        claims = {}
         for c in placed:
             c_day = effective_day(c)
             c_start = effective_time(c)
@@ -853,19 +877,43 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                 t_idx = c["targets"].index(t)
                 slot_off = slot_offset_for_target(c, t_idx)
                 actual_start = start_si + slot_off
-                for d_off in range(dur):
-                    si = actual_start + d_off
-                    if si >= len(slots):
-                        break
-                    okey = (si, d_idx, b_idx)
-                    if d_off == 0:
-                        span = min(dur, len(slots) - actual_start)
-                        occupied[okey] = ("start", c, span)
-                    else:
-                        occupied[okey] = ("span", None, 0)
+                if actual_start >= len(slots):
+                    continue
+                span = min(dur, len(slots) - actual_start)
+                if span <= 0:
+                    continue
+                entry = {"cls": c, "start_si": actual_start, "span": span,
+                         "d_idx": d_idx, "b_idx": b_idx}
+                entries.append(entry)
+                for off in range(span):
+                    okey = (actual_start + off, d_idx, b_idx)
+                    bucket = claims.setdefault(okey, [])
+                    # Identity on the ENTRY, not on the class: a joint class
+                    # contested in Year-1/A must keep rendering normally in the
+                    # Year-1/B column, where nothing contests it.
+                    if all(x is not entry for x in bucket):
+                        bucket.append(entry)
+
+        overlapping = {id(e) for cells in claims.values() if len(cells) > 1
+                       for e in cells}
+        occupied = {}
+        overlap_cells = {}
+        for entry in entries:
+            if id(entry) in overlapping:
+                for off in range(entry["span"]):
+                    overlap_cells.setdefault(
+                        (entry["start_si"] + off, entry["d_idx"],
+                         entry["b_idx"]), []).append(entry)
+                continue
+            base = (entry["start_si"], entry["d_idx"], entry["b_idx"])
+            occupied[base] = ("start", entry["cls"], entry["span"])
+            for off in range(1, entry["span"]):
+                occupied[(entry["start_si"] + off, entry["d_idx"],
+                          entry["b_idx"])] = ("span", None, 0)
 
         cell_bg_cmds = []
         row_heights = [24, 18]  # header rows
+        tall_rows = {}
 
         for si, slot in enumerate(slots):
             data_row = si + 2  # after 2 header rows
@@ -882,7 +930,25 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                 for b_idx in range(n_branches):
                     col = 2 + d_idx * n_branches + b_idx
                     okey = (si, d_idx, b_idx)
-                    if okey in occupied:
+                    if okey in overlap_cells:
+                        claimants = [e["cls"] for e in overlap_cells[okey]]
+                        ckeys = {cls_key(x) for x in claimants}
+                        conflicted = any(
+                            conflict_partners.get(cls_key(x), frozenset())
+                            & (ckeys - {cls_key(x)})
+                            for x in claimants)
+                        stack_para = _pdf_conflict_paragraph(
+                            claimants, cell_style, conflicted,
+                            include_room=True, include_targets=False)
+                        row.append(stack_para)
+                        _w, _h = stack_para.wrap(data_col_w - 4, 1e6)
+                        tall_rows[data_row] = max(
+                            tall_rows.get(data_row, MIN_ROW_H), _h + 6)
+                        cell_bg_cmds.append(
+                            ("BACKGROUND", (col, data_row), (col, data_row),
+                             rl_colors.HexColor(
+                                 "#FEE2E2" if conflicted else "#F1F5F9")))
+                    elif okey in occupied:
                         kind, cls, span = occupied[okey]
                         if kind == "span":
                             row.append("")
@@ -913,6 +979,9 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
             table_data.append(row)
             row_heights.append(MIN_ROW_H)
+
+        for _ri, _h in tall_rows.items():
+            row_heights[_ri] = _h
 
         style_cmds.extend(cell_bg_cmds)
 

@@ -4993,7 +4993,18 @@ class SchedulerApp(QMainWindow):
                             if si >= len(slots):
                                 break
                             okey = (si, d_idx, b_idx)
-                            claims.setdefault(okey, []).append(c)
+                            # Identity, not equality, and not a plain append:
+                            # this runs inside `for t in c["targets"]`, so a
+                            # class carrying two IDENTICAL target dicts (a user
+                            # typing "A, B, A" as a year's branches) claimed the
+                            # same cell twice and was then found "overlapping"
+                            # with ITSELF -- pulled out of occupied_start and
+                            # stacked against its own duplicate, losing its
+                            # merge and its year colour. `is not` because two
+                            # distinct classes can compare equal by value.
+                            bucket = claims.setdefault(okey, [])
+                            if all(x is not c for x in bucket):
+                                bucket.append(c)
                             if d_off == 0:
                                 span = min(dur, len(slots) - actual_start)
                                 occupied[okey] = ("start", c, span)

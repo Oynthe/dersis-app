@@ -815,3 +815,148 @@ def test_a_clean_lesson_carries_no_conflict_mark_in_either_mode(qapp):
         for code, item in items.items():
             assert item._conflict is False, (code, mode)
             assert tr("conflicts.tooltip_header") not in item.toolTip()
+
+
+@pytest.mark.pdf
+def test_the_pdf_everything_matrix_shows_both_lessons_of_a_contested_cell(
+        tmp_path):
+    """ST-UI-001 — the everything matrix was the last builder still dropping one.
+
+    The filtered PDF tables were fixed to stack claimants; `_build_everything_table`
+    kept its plain `occupied[okey] = ...` dict assignment, so a second claimant
+    of a (slot, day, branch) cell overwrote the first and printed nowhere. The
+    everything view is the one a head of department prints.
+
+    A failure means the year-by-branch printout is missing a lesson that the
+    per-classroom printout of the same file shows.
+    """
+    pytest.importorskip("reportlab")
+    from scheduler_app.data_io.exporter import export_schedule
+
+    s = _state()
+    _add(s, "AAA111", "09:00", "R001", lecturer="Lect-01")
+    _add(s, "ZZZ999", "09:00", "R002", lecturer="Lect-02")   # same branch A
+
+    out = tmp_path / "everything.pdf"
+    export_schedule(s, "pdf", str(out), mode="everything")
+    text = _pdf_text(out)
+
+    # Counting, not membership: the conflict APPENDIX lists both codes too, so
+    # `code in text` passes even when the grid drops one. Each code appears
+    # once in the grid cell and once in the appendix, so the grid contributes
+    # the second occurrence.
+    # Measured, not guessed: 4 occurrences when the grid stacks both, 2 when it
+    # drops one (appendix only). The threshold sits between them, not at the
+    # broken value -- `>= 2` passes on the defect.
+    for code in ("AAA111", "ZZZ999"):
+        assert text.count(code.encode()) >= 3, (
+            f"{code} shares a (slot, day, branch) cell and appears "
+            f"{text.count(code.encode())} time(s) — it is in the appendix but "
+            f"was dropped from the everything grid"
+        )
+
+
+@pytest.mark.pdf
+def test_a_contested_pdf_row_is_taller_than_an_uncontested_one(tmp_path):
+    """ST-UI-001 — a stacked cell must not overprint the hours around it.
+
+    `rowHeights` is FIXED in these tables: reportlab does not grow a row to fit
+    its content, it draws over the neighbours. Stacking two lessons into a cell
+    without re-measuring turns a silent drop into an unreadable smear, which on
+    a printed timetable is worse.
+
+    A failure means the contested row is still MIN_ROW_H and its text runs into
+    the lessons above and below.
+    """
+    pytest.importorskip("reportlab")
+    from scheduler_app.data_io import exporter
+
+    s = _state()
+    _add(s, "AAA111", "09:00", "R001", lecturer="Lect-01")
+    _add(s, "ZZZ999", "09:00", "R001", lecturer="Lect-02", branch="B")
+    _add(s, "SOLO01", "11:00", "R001", lecturer="Lect-01")
+
+    captured = {}
+    out = tmp_path / "heights.pdf"
+    # Capture the row heights the filtered table actually asks for.
+    import reportlab.platypus as platypus
+    orig = platypus.Table
+
+    class SpyTable(orig):
+        def __init__(self, data, colWidths=None, rowHeights=None, **kw):
+            if rowHeights and len(rowHeights) > 3:
+                captured.setdefault("rows", list(rowHeights))
+            super().__init__(data, colWidths=colWidths,
+                             rowHeights=rowHeights, **kw)
+
+    platypus.Table = SpyTable
+    try:
+        exporter.export_schedule(s, "pdf", str(out), mode="classroom")
+    finally:
+        platypus.Table = orig
+
+    rows = captured.get("rows")
+    assert rows, "no table with data rows was built"
+    # row 0 is the header; data rows follow the slot order 09:00, 10:00, 11:00.
+    contested, uncontested = rows[1], rows[3]
+    assert contested > uncontested, (
+        f"the contested row ({contested}) is no taller than an ordinary one "
+        f"({uncontested}) — the stack will overprint its neighbours"
+    )
+
+
+@pytest.mark.excel
+@pytest.mark.ui
+def test_a_duplicate_target_class_is_not_stacked_against_itself(
+        make_app, tmp_path):
+    """ST-UI-001 regression — one lesson must not contest its own cell.
+
+    The XLSX everything-matrix collects claimants inside ``for t in
+    c["targets"]``, so a class carrying two IDENTICAL target dicts — which a
+    user creates by typing "A, B, A" as a year's branches — claimed the same
+    cell twice and was then found to be "overlapping" with *itself*. It was
+    pulled out of ``occupied_start`` and rendered through the stacked-conflict
+    branch: no merge, no year colour, its own name printed twice.
+
+    A failure means an ordinary lesson is drawn as if it were double-booked.
+    Asserted on the rendered cell's VALUE, FILL and MERGE RANGE against an
+    identical single-target control — "the class code appears somewhere in the
+    workbook" would pass on the broken code.
+    """
+    openpyxl = pytest.importorskip("openpyxl")
+
+    def _book(branches, targets):
+        s = _state()
+        s["years"] = {"Year-1": branches}
+        cls = _add(s, "DUP001", "09:00", "R001", lecturer="Lect-01", duration=2)
+        cls["targets"] = targets
+        app = make_app()
+        app.state_data = s
+        out = tmp_path / f"dup_{len(targets)}.xlsx"
+        app._write_excel(str(out), mode="everything")
+        wb = openpyxl.load_workbook(out)
+        ws = wb[wb.sheetnames[0]]
+        cell = ws.cell(row=3, column=3)
+        merged = {str(r) for r in ws.merged_cells.ranges}
+        return str(cell.value), (cell.fill.start_color.rgb if cell.fill else None), merged
+
+    control = _book(["A"], [{"year": "Year-1", "branch": "A"}])
+    duplicate = _book(["A", "B"], [{"year": "Year-1", "branch": "A"},
+                                   {"year": "Year-1", "branch": "A"}])
+
+    assert duplicate[0] == control[0], (
+        f"the duplicate-target class rendered differently: "
+        f"{duplicate[0]!r} vs control {control[0]!r}"
+    )
+    assert duplicate[1] == control[1], (
+        f"the duplicate-target class lost its year colour: "
+        f"{duplicate[1]} vs control {control[1]}"
+    )
+    # Only the LESSON's own merge is comparable: a two-branch year adds header
+    # spans (C1:D1, E1:F1) that the one-branch control cannot have.
+    lesson_merge = "C3:C4"
+    assert lesson_merge in control[2], "control lost its merge — test is broken"
+    assert lesson_merge in duplicate[2], (
+        f"the duplicate-target class lost its 2-hour merge; merges present: "
+        f"{sorted(duplicate[2])}"
+    )
