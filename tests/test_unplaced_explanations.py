@@ -536,3 +536,68 @@ def test_diagnosing_two_classes_does_not_leak_a_count_between_them():
     second = neg.negotiate_class(normal)
 
     assert first["off_grid_blockers"] == second["off_grid_blockers"] == 1
+
+
+@pytest.mark.ui
+def test_a_clashing_pin_is_not_reported_as_a_failure(make_app):
+    """ST-SCHED-002 — a pin sitting where the user put it did not "fail".
+
+    ``apply_reschedule`` reports two different events through one list. A
+    pinned or locked class that clashes IS committed, because the pin is the
+    user's instruction — nothing failed. On the project's own dataset generator
+    13 of 13 rejections are this kind, and the first version of this reporter
+    called every one an error reading "could not be committed where the planner
+    put it", about a lesson sitting exactly where the user pinned it, after a
+    reschedule that went fine.
+
+    A failure means the app cries wolf on ordinary input, which is how a user
+    learns to ignore the line that reports a real refusal.
+    """
+    state, _victim = _saturated()
+    app = make_app()
+    try:
+        app.state_data = state
+        before = len(app.warning_log._sticky)
+        app._report_rejected_placements([
+            {"name": "PIN-B", "class_uid": "u1", "committed": True,
+             "reason": "Room 'R001' occupied at Monday 09:00",
+             "reasons": ["Room 'R001' occupied at Monday 09:00"]},
+        ])
+        entries = app.warning_log._sticky[before:]
+    finally:
+        app.close()
+
+    kinds = {k for _t, k in entries}
+    assert "error" not in kinds, (
+        f"a committed pin was reported as a failure: {entries}"
+    )
+    assert any("PIN-B" in t for t, _k in entries), "the pin was not mentioned"
+    # And no toast: the grid already headlines a clash in red (ST-UI-001).
+    assert not any("uyar" in t.lower() or "see the warning log" in t.lower()
+                   for t, _k in entries if "PIN-B" not in t), entries
+
+
+@pytest.mark.ui
+def test_a_genuinely_refused_placement_is_still_an_error(make_app):
+    """ST-SCHED-001 — the real case must stay loud.
+
+    A failure means the split above silenced the event it was meant to
+    preserve: a placement the optimizer proposed and the commit step refused,
+    which means the state changed underneath the user.
+    """
+    state, _victim = _saturated()
+    app = make_app()
+    try:
+        app.state_data = state
+        before = len(app.warning_log._sticky)
+        app._report_rejected_placements([
+            {"name": "Ders 12", "class_uid": "u2", "committed": False,
+             "reason": "Room 'R001' occupied at Monday 09:00",
+             "reasons": ["Room 'R001' occupied at Monday 09:00"]},
+        ])
+        entries = app.warning_log._sticky[before:]
+    finally:
+        app.close()
+
+    named = [(t, k) for t, k in entries if "Ders 12" in t]
+    assert len(named) == 1 and named[0][1] == "error", entries

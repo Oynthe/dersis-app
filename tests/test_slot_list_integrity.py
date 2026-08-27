@@ -7,9 +7,14 @@ finding. The real source is ``09-ui-ux-audit.md``'s SetupDialog section: the
 time slots are a free-text box with no uniqueness check, while the whole engine
 indexes rows by ``slots.index()``.
 
-(ST-UI-014's *second* clause does turn out to be load-bearing here, though —
-``edit_setup`` never pushes an undo snapshot, so anything this path clears is
-irreversible. See section 4.)
+(ST-UI-014's *second* clause is load-bearing here and remains OPEN.
+``edit_setup`` pushes no undo snapshot, so everything ``_reconcile_after_setup``
+clears is irreversible. Phase 4 tried to fix it by snapshotting before the
+dialog; adversarial verification showed that made things worse — ``_push_undo``
+deep-copies ``state["classes"]`` and nothing else, while Setup rewrites the
+axis lists, so "Undo: setup change" restored placements onto hours the grid no
+longer has. Real undo here needs full-state snapshots: ST-ARCH-012, Phase 6.
+Nothing in this module tests undo, because there is nothing to test.)
 
 What the grid actually requires — proved, not assumed
 -----------------------------------------------------
@@ -58,7 +63,7 @@ import pytest
 
 from scheduler_app.core.logic import (
     parse_slot_lines, slot_meaning_changes, get_consecutive_slots,
-    find_valid_options, SLOT_ERROR_DUPLICATE, SLOT_ERROR_BLANK,
+    find_valid_options, SLOT_ERROR_DUPLICATE,
 )
 from scheduler_app.core.models import new_state, new_class, mark_placed
 from scheduler_app.core.workflow import SchedulingWorkflow
@@ -164,7 +169,9 @@ def test_a_whitespace_only_line_is_ignored_not_committed():
     """
     slots, problems = parse_slot_lines("08:00\n\n   \n09:00")
     assert slots == ["08:00", "09:00"]
-    assert all(p[1] != SLOT_ERROR_DUPLICATE for p in problems)
+    # Skipped silently rather than reported: there is nothing for the user to
+    # fix and nothing is lost.
+    assert problems == []
 
 
 def test_the_measured_cost_of_a_duplicate():

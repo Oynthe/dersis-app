@@ -700,8 +700,11 @@ class RelaxationSuggester:
         blocks nothing, and counting it would contradict the validator that
         decides ``check_placement``. What keeps that from being a silent drop
         is that ``ConstraintNegotiator.negotiate_class`` reports how many
-        there are; the count is a property of the STATE, not of this search,
-        so it is not threaded back through here.
+        there are, next to the diagnosis of the class that cannot be placed;
+        the count is a property of the STATE, not of this search, so it is
+        not threaded back through here. (Phase 4 also surfaces them in the
+        PDF appendix and the status bar, so this is one of three places --
+        not, as an earlier draft of this comment claimed, the only one.)
         """
         suggestions = []
         days, times, rooms = self.generator.get_search_space(cls)

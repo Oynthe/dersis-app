@@ -2092,8 +2092,11 @@ class SchedulerApp(QMainWindow):
         count whenever a pin was also placed — ``4 sabit + 77 yerleşti + 3
         yerleşmedi`` against 80 — and to a negative unplaced count when enough
         of them were. Pinned is a subset annotation now, because that is what it
-        is, and the count comes from the same function the dashboard card and
-        the results dialog call.
+        is, and the count comes from the same function the dashboard card
+        calls. (`BulkResultsDialog` deliberately does NOT: it reports the
+        OPERATION — "this run placed 56 of the 60 you asked for" — and is shown
+        BEFORE the user accepts, so a state trio rendered there would describe
+        the pre-solve timetable.)
         """
         s = self.state_data
         counts = schedule_counts(s)
@@ -3512,28 +3515,48 @@ class SchedulerApp(QMainWindow):
     def _report_rejected_placements(self, rejected):
         """Say so when the commit step refused a placement the solver proposed.
 
-        ST-SCHED-001. `apply_reschedule` screens the whole proposal through
-        `screen_placements` -- the same rule the optimizer checks itself
-        against -- so an entry here means the state changed between optimizing
-        and applying. That is nearly always a race or a defect, NOT a normal
-        "this class did not fit": those are in `result.unplaced` and are
-        reported by the results dialog with their own reasons.
+        ST-SCHED-001 / ST-SCHED-002. `apply_reschedule` reports TWO different
+        events through one list, and telling a user the wrong one is worse than
+        telling them nothing:
 
-        So it is deliberately louder than an unplaced class, and worded as
-        something that happened TO the user's schedule rather than as a
-        property of their data.
+        * ``committed=True`` -- a pinned or locked class that clashes where the
+          USER put it. It is committed, because the pin is their instruction.
+          Nothing failed. On the project's own dataset generator 13 of 13
+          rejections are this kind, and the first version of this method
+          reported every one as an error reading "could not be committed where
+          the planner put it" -- about a lesson sitting exactly where the user
+          pinned it, after a reschedule that went fine.
+        * ``committed=False`` -- the commit step refused a placement the
+          optimizer proposed, i.e. the state changed between optimizing and
+          applying. That is nearly always a race or a defect, and is a
+          different category from `result.unplaced`: the solver knew about
+          those and the results dialog explains them.
+
+        Only the second is an error, and only the second gets a toast. The
+        first is a warning, and the grid already headlines it in red
+        (ST-UI-001) -- which is the right surface for it.
         """
         if not rejected:
             return
-        for entry in rejected:
+        refused = [e for e in rejected if not e.get("committed")]
+        clashing_pins = [e for e in rejected if e.get("committed")]
+
+        for entry in clashing_pins:
+            self.warning_log.log(
+                tr("status.pinned_clash").format(
+                    name=entry.get("name", "?"),
+                    reason=entry.get("reason", "")),
+                "warning")
+        for entry in refused:
             self.warning_log.log(
                 tr("status.placement_refused").format(
                     name=entry.get("name", "?"),
                     reason=entry.get("reason", "")),
                 "error")
-        self._show_toast(
-            tr("status.placements_refused_toast").format(n=len(rejected)),
-            "warning")
+        if refused:
+            self._show_toast(
+                tr("status.placements_refused_toast").format(n=len(refused)),
+                "warning")
 
     _MAX_CONFLICT_LOG_ENTRIES = 25
 

@@ -28,7 +28,7 @@ from scheduler_app.logic import (
     find_valid_options, get_placed_classes,
     occupied_slots_of, classroom_of, batch_schedule,
     parse_slot_lines, slot_meaning_changes,
-    SLOT_ERROR_DUPLICATE, SLOT_ERROR_BLANK,
+    SLOT_ERROR_DUPLICATE,
 )
 from scheduler_app.widgets import MultiSelectButton
 from scheduler_app.ui.day_keys import DAY_KEYS, day_label, normalize_day_list, normalize_day_value

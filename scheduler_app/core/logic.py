@@ -230,21 +230,34 @@ def schedule_counts(state):
     ``scheduled + unscheduled == total`` hold for **any** input, including a
     state that violates the invariant.
 
-    Bracket access on ``classes``/``placed``/``pinned`` is deliberate: it makes
-    the failure mode byte-identical to ``get_placed_classes``. Reading them with
-    ``.get`` would turn a malformed class dict from a loud KeyError in one
-    function into a silent miscount in another, which is the Phase 1 lesson
-    ("making a reader total converts a crash into a silent drop") in a place
-    where a crash is the honest outcome. ``protection`` is the one tolerant
-    read, because that key genuinely has a default.
+    Bracket access on ``classes``/``placed``/``pinned`` is deliberate, and both
+    flags are read *unconditionally*: the property is **never quieter than the
+    grid**. A malformed class dict must not raise in ``get_placed_classes`` —
+    which the renderer iterates — while being counted silently here, because
+    that is the Phase 1 lesson ("making a reader total converts a crash into a
+    silent drop") in a place where the crash is the honest outcome.
+
+    Not "byte-identical to ``get_placed_classes``", which is unachievable and
+    was claimed here in error: this function legitimately needs ``pinned`` even
+    when ``placed`` is truthy, and needs the effective day and slot, none of
+    which that function reads. ``protection`` is the one tolerant read, because
+    that key genuinely has a default.
     """
     days = set(state.get("days") or [])
     slots = set(state.get("slots") or [])
     total = scheduled = pinned_of = protected_of = off_grid_of = 0
     for cls in state["classes"]:
         total += 1
+        # BOTH read unconditionally. `cls["pinned"] or cls["placed"]` would
+        # short-circuit on a pinned class and never touch "placed", so a class
+        # dict missing that key would raise in get_placed_classes — which the
+        # grid iterates — and be counted silently here. The property that
+        # matters is not "identical to get_placed_classes" (unachievable: this
+        # function legitimately needs `pinned` and the effective day/slot,
+        # which that one never reads) but NEVER QUIETER THAN THE GRID.
+        is_placed = cls["placed"]
         is_pinned = cls["pinned"]
-        if not (is_pinned or cls["placed"]):
+        if not (is_placed or is_pinned):
             continue
         scheduled += 1
         if is_pinned:
@@ -607,7 +620,6 @@ def conflict_partner_index(conflicts):
 
 
 SLOT_ERROR_DUPLICATE = "duplicate"
-SLOT_ERROR_BLANK = "blank"
 
 
 def parse_slot_lines(text):
@@ -642,8 +654,10 @@ def parse_slot_lines(text):
     for lineno, raw in enumerate(text.split("\n"), start=1):
         value = raw.strip()
         if not value:
-            if raw and not raw.isspace():
-                problems.append((lineno, SLOT_ERROR_BLANK, raw))
+            # A line that is empty after stripping is simply skipped. The
+            # branch that used to report SLOT_ERROR_BLANK here was
+            # unreachable: `not value` means `raw` is empty or all
+            # whitespace, and `raw and not raw.isspace()` is false for both.
             continue
         if value in seen:
             problems.append((lineno, SLOT_ERROR_DUPLICATE, value))

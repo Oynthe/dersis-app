@@ -429,3 +429,31 @@ def test_the_pinned_annotation_survives_a_language_change(make_app):
     assert "status.pinned_subset" not in en_title
     assert "1" in tr_title and "1" in en_title
     assert tr_title != en_title, "the annotation did not follow the language"
+
+
+def test_the_counter_is_never_quieter_than_the_grid():
+    """ST-UI-002 — a malformed class must not be silently counted.
+
+    ``get_placed_classes`` — which the renderer iterates — reads ``c["placed"]``
+    first, so a class dict missing that key raises there. If this counter
+    short-circuits on ``pinned`` it never touches ``placed``, and the same
+    corrupt file gives one loud failure and one confident number.
+
+    That is Phase 1's lesson in the direction where the crash is the honest
+    outcome. The achievable property is not "identical to get_placed_classes"
+    (this function legitimately reads keys that one never does) but "never
+    quieter than it".
+
+    A failure means the status bar reports a total for a file the grid cannot
+    draw.
+    """
+    s = _state()
+    _add(s, "OK", placed=True)
+    # A PINNED class missing 'placed' — the case a short-circuit hides.
+    broken = _add(s, "BROKEN", pinned=True, slot="10:00")
+    del broken["placed"]
+
+    with pytest.raises(KeyError):
+        get_placed_classes(s)
+    with pytest.raises(KeyError):
+        schedule_counts(s)
