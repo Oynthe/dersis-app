@@ -423,7 +423,7 @@ def test_the_full_unplaced_reason_is_reachable(qapp):
 
 
 @pytest.mark.ui
-def test_a_refused_commit_is_reported_not_discarded(qapp, dersis_home):
+def test_a_refused_commit_is_reported_not_discarded(make_app):
     """ST-SCHED-001 — apply_reschedule's return value was thrown away.
 
     Each entry is a placement the optimizer proposed and the COMMIT step
@@ -434,10 +434,8 @@ def test_a_refused_commit_is_reported_not_discarded(qapp, dersis_home):
 
     A failure means that happens with nothing on screen at all.
     """
-    from scheduler_app.ui.app import SchedulerApp
-
     state, victim = _saturated()
-    app = SchedulerApp()
+    app = make_app()
     try:
         app.state_data = state
         before = len(app.warning_log._sticky)
@@ -460,16 +458,14 @@ def test_a_refused_commit_is_reported_not_discarded(qapp, dersis_home):
 
 
 @pytest.mark.ui
-def test_nothing_is_reported_when_every_placement_committed(qapp, dersis_home):
+def test_nothing_is_reported_when_every_placement_committed(make_app):
     """ST-SCHED-001 — the normal case must stay silent.
 
     A failure means every successful reschedule adds noise to the warning log,
     which is how users learn to stop reading it (ST-PERF-003's lesson).
     """
-    from scheduler_app.ui.app import SchedulerApp
-
     state, _victim = _saturated()
-    app = SchedulerApp()
+    app = make_app()
     try:
         app.state_data = state
         before = len(app.warning_log._sticky)

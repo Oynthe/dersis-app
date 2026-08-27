@@ -330,8 +330,7 @@ pytestmark_ui = pytest.mark.ui
 
 
 @pytest.mark.ui
-def test_the_status_bar_and_the_dashboard_card_report_the_same_number(
-        qapp, dersis_home):
+def test_the_status_bar_and_the_dashboard_card_report_the_same_number(make_app):
     """ST-UI-002 — the two surfaces that describe the state must not disagree.
 
     A failure means the user sees "73 yerleşmiş" in the status bar and
@@ -339,7 +338,6 @@ def test_the_status_bar_and_the_dashboard_card_report_the_same_number(
     timetable — the disagreement this finding is named for. Measured before the
     fix on ``make_preset("normal", seed=7)``: exactly 73 against 77.
     """
-    from scheduler_app.ui.app import SchedulerApp
     from scheduler_app.core.analytics import compute_all_metrics
 
     s = _state()
@@ -349,7 +347,7 @@ def test_the_status_bar_and_the_dashboard_card_report_the_same_number(
     _add(s, "FREE1")
     _add(s, "FREE2")
 
-    app = SchedulerApp()
+    app = make_app()
     try:
         app.state_data = s
         app._update_status()
@@ -371,15 +369,13 @@ def test_the_status_bar_and_the_dashboard_card_report_the_same_number(
 
 
 @pytest.mark.ui
-def test_the_status_bar_never_renders_a_negative_count(qapp, dersis_home):
+def test_the_status_bar_never_renders_a_negative_count(make_app):
     """ST-UI-002 — the headline symptom: "-5 yerleşmemiş" on screen.
 
     A failure means the user is shown an impossible number of unplaced lessons.
     The state below is the one a legacy ``.egu`` can carry: nothing in the load
     path repairs a class that is both pinned and placed.
     """
-    from scheduler_app.ui.app import SchedulerApp
-
     s = _state()
     for i in range(3):
         _add(s, f"BOTH{i}", pinned=True, placed=True, slot=SLOTS[i])
@@ -388,7 +384,7 @@ def test_the_status_bar_never_renders_a_negative_count(qapp, dersis_home):
     raw, _clamped = _old_status_bar_formula(s)
     assert raw < 0, "fixture does not reproduce the negative count"
 
-    app = SchedulerApp()
+    app = make_app()
     try:
         app.state_data = s
         app._update_status()
@@ -403,14 +399,13 @@ def test_the_status_bar_never_renders_a_negative_count(qapp, dersis_home):
 
 
 @pytest.mark.ui
-def test_the_pinned_annotation_survives_a_language_change(qapp, dersis_home):
+def test_the_pinned_annotation_survives_a_language_change(make_app):
     """ST-UI-002 — the subset annotation is translated, not hardcoded.
 
     A failure means the pinned note stays in the previous language after the
     user switches, or shows a raw translation key — reopening ST-UI-011 on a
     string that is on screen at all times.
     """
-    from scheduler_app.ui.app import SchedulerApp
     from scheduler_app.translations import set_language, get_language
 
     s = _state()
@@ -418,7 +413,7 @@ def test_the_pinned_annotation_survives_a_language_change(qapp, dersis_home):
     _add(s, "PLACED", placed=True, slot="10:00")
 
     original = get_language()
-    app = SchedulerApp()
+    app = make_app()
     try:
         app.state_data = s
         app.dashboard_widget.refresh(s)

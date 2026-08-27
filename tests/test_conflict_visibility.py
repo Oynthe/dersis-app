@@ -682,7 +682,7 @@ def test_a_clean_timetable_gets_no_appendix(tmp_path):
 @pytest.mark.ui
 @pytest.mark.parametrize("mode", ["classroom", "everything"])
 def test_the_workbook_shows_both_lessons_of_a_contested_cell(
-        qapp, dersis_home, tmp_path, mode):
+        make_app, tmp_path, mode):
     """ST-UI-001 — the user-facing Excel export must keep both lessons.
 
     Note this is ``ui/app.py::_write_excel``, NOT
@@ -696,13 +696,11 @@ def test_the_workbook_shows_both_lessons_of_a_contested_cell(
     timetable is missing a lesson that the sheet next to it shows.
     """
     openpyxl = pytest.importorskip("openpyxl")
-    from scheduler_app.ui.app import SchedulerApp
-
     s = _state()
     _add(s, "AAA111", "09:00", "R001", lecturer="Lect-01")
     _add(s, "ZZZ999", "09:00", "R001", lecturer="Lect-02", branch="B")
 
-    app = SchedulerApp()
+    app = make_app()
     try:
         app.state_data = s
         out = tmp_path / f"conflict_{mode}.xlsx"

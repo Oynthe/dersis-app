@@ -3099,6 +3099,12 @@ class SchedulerApp(QMainWindow):
                     cpsat_st = result.summary.get("cpsat_status_label") or result.summary.get("cpsat_status", "")
                     engine_info += f" + CP-SAT ({cpsat_st})"
                 msg += f"\n({engine_info}, {elapsed:.1f}s)"
+                # ST-SCHED-013: say so when this timetable cannot be
+                # regenerated from the same settings, rather than letting the
+                # silence imply that it can.
+                note = self._reproducibility_note(result.summary)
+                if note:
+                    msg += f"\n⚠ {note}"
 
             if result.analytics:
                 msg += f"\n{tr('analytics.schedule_quality')}: {result.analytics['global_score']:.0f}/100 ({tr('labels.grade')}: {result.analytics['grade']})"
@@ -3468,6 +3474,29 @@ class SchedulerApp(QMainWindow):
         derived.extend(self._conflict_log_entries())
 
         self.warning_log.set_derived(derived)
+
+    @staticmethod
+    def _reproducibility_note(summary):
+        """A line for the result toast when the solve cannot be reproduced.
+
+        ST-SCHED-013. `summary['deterministic']` is
+        `(not clock_capped) and (not cpsat_used)`, so it is False whenever the
+        Thorough mode ran OR the time budget truncated the search. The second
+        case matters most: the user did not choose it, and nothing else on
+        screen distinguishes a timetable they can regenerate from one they
+        cannot.
+
+        Phase 1 was careful that the ENGINE never claims a reproducibility it
+        cannot deliver, and then nothing surfaced the flag -- so the UI made the
+        claim on its behalf by staying quiet.
+
+        Silent on the normal case: a note that appears every time is a note
+        nobody reads. A missing key is treated as reproducible, so an older or
+        partial summary does not raise a false alarm.
+        """
+        if not summary or summary.get("deterministic", True):
+            return ""
+        return tr("status.not_reproducible_note")
 
     def _report_rejected_placements(self, rejected):
         """Say so when the commit step refused a placement the solver proposed.

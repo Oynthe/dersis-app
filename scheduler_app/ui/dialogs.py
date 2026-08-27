@@ -4373,11 +4373,22 @@ class RescheduleDialog(QDialog):
         bottom = QHBoxLayout()
         bottom.addStretch()
 
+        # Task 6. The two modes used to be equally-primary buttons labelled
+        # "Standart" and "Derin (CP-SAT)", with tooltips reading "Multi-start
+        # LNS optimization" and "Deep optimization with constraint solver".
+        # A school administrator cannot choose between two acronyms, and
+        # neither label said what the choice costs. They now say what the user
+        # GETS, and Quick is marked as the recommended default so a first
+        # reschedule does not require an engine decision.
         std_btn = QPushButton(tr("optimization.standard"))
         std_btn.setStyleSheet(
             "background: #1D4ED8; color: white; font-weight: bold; "
             "padding: 8px 20px; font-size: 10pt;")
-        std_btn.setToolTip(tr("optimization.lns_tooltip"))
+        std_btn.setToolTip(
+            tr("optimization.lns_tooltip")
+            + "\n(" + tr("optimization.recommended") + ")")
+        std_btn.setDefault(True)
+        std_btn.setAutoDefault(True)
         std_btn.clicked.connect(lambda: self._accept_mode("standard"))
         bottom.addWidget(std_btn)
 
@@ -4386,9 +4397,25 @@ class RescheduleDialog(QDialog):
             deep_btn.setStyleSheet(
                 "background: #7C3AED; color: white; font-weight: bold; "
                 "padding: 8px 20px; font-size: 10pt;")
-            deep_btn.setToolTip(tr("optimization.cpsat_tooltip"))
+            # ST-SCHED-013. summary['deterministic'] is
+            # `(not clock_capped) and (not cpsat_used)`, so pressing this
+            # button ALWAYS forfeits reproducibility. Phase 1 was careful the
+            # engine never claims a reproducibility it cannot deliver; saying
+            # nothing here would let the UI make the claim on its behalf.
+            deep_btn.setToolTip(
+                tr("optimization.cpsat_tooltip")
+                + "\n⚠ " + tr("optimization.not_reproducible"))
+            deep_btn.setDefault(False)
             deep_btn.clicked.connect(lambda: self._accept_mode("deep"))
             bottom.addWidget(deep_btn)
+        else:
+            # Without OR-Tools the button simply was not rendered, so a user
+            # following a colleague's instructions saw a dialog that did not
+            # match the description and was told nothing.
+            note = QLabel(tr("optimization.deep_unavailable"))
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #64748B; font-size: 8pt; padding: 4px;")
+            layout.addWidget(note)
 
         cancel_btn = QPushButton(tr("buttons.cancel"))
         cancel_btn.clicked.connect(self.reject)
