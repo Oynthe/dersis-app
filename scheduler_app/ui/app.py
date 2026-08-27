@@ -54,6 +54,7 @@ from scheduler_app.models import (
     get_classroom_export_labels,
     effective_day, effective_time, mark_placed, mark_unplaced,
     needs_physical_room,
+    get_effective_room_resource_for_class,
     cls_key,
 )
 from scheduler_app.logic import (
@@ -3339,19 +3340,30 @@ class SchedulerApp(QMainWindow):
 
         if selected_cls is not None:
             # Contextual mode: use find_valid_options for the selected class
-            valid_options = find_valid_options(s, selected_cls)
-            valid_set = set()
-            for day, slot, room in valid_options:
-                valid_set.add((day, slot, room if room else ""))
-
-            # Group valid slots by day
+            # ST-ARCH-004 / ST-UI-017. Iterate the options themselves; never
+            # re-key them through state["classrooms"].
+            #
+            # `get_room_candidates` answers ``[None]`` for a lesson that needs
+            # no physical room, so an online option is ``(day, slot, None)``.
+            # Mapping that to ``""`` and then testing membership against the
+            # classroom list could never match: ``""`` is not a classroom. So
+            # this panel told **every online lesson it had nowhere to go**,
+            # while `PlaceClassDialog` — same `find_valid_options`, same state —
+            # listed its slots. Measured on a 2-day/3-slot grid: 6 valid
+            # options, 0 rows drawn, and the panel rendered
+            # "no valid placements".
+            #
+            # This is the same `None`-room sentinel Phase 3 taught the drag path
+            # to read (ST-ARCH-004, `find_drop_classroom` returning None for an
+            # online lesson is a sentinel, not a failure). One surface was
+            # missed.
             free_by_day = {}
-            for day in s["days"]:
-                for slot in s["slots"]:
-                    for room in s["classrooms"]:
-                        if (day, slot, room) in valid_set:
-                            free_by_day.setdefault(day, []).append(
-                                (slot, room))
+            for day, slot, room in find_valid_options(s, selected_cls):
+                free_by_day.setdefault(day, []).append((slot, room))
+            for entries in free_by_day.values():
+                entries.sort(key=lambda p: (
+                    s["slots"].index(p[0]) if p[0] in s["slots"] else 0,
+                    p[1] or ""))
 
             self._open_slots_filter_hint.setText(
                 f"\u25C9 {tr('panels.filtered_for')}: {selected_cls['name']}")
@@ -3423,7 +3435,14 @@ class SchedulerApp(QMainWindow):
 
                 row_layout.addStretch()
 
-                room_label = QLabel(room)
+                # A None room is the "needs no classroom" sentinel, not a
+                # missing value: render it as the resource the rest of the app
+                # names it by ("Çevrimiçi", "Ofis (Öğr. Elem.)"), which is what
+                # the classroom filter and the cell already show.
+                room_label = QLabel(
+                    get_effective_room_resource_for_class(
+                        selected_cls, room_override=room)
+                    if selected_cls is not None and not room else (room or ""))
                 room_label.setStyleSheet(
                     "QLabel { font-size: 7.5pt; color: %s;"
                     "  background: transparent; }" % OPEN_SLOTS_FG_ROOM)
@@ -4277,6 +4296,51 @@ class SchedulerApp(QMainWindow):
         if self._selected_class:
             self._remove_classes([self._selected_class])
 
+    def _place_at_requested_cell(self, cls, day, slot):
+        """Try to place *cls* in the cell the user actually pointed at.
+
+        ``_add_class_at`` took ``day`` and ``slot`` and **discarded both**: it
+        went straight to ``_auto_place_and_apply``, which puts the class
+        wherever the placer likes. The user double-clicks an empty Wednesday
+        10:00, or picks "Ders ekle" from a context menu *headed by*
+        "📅 Çarşamba 10:00", and the lesson silently lands somewhere else.
+
+        The sibling action in that same menu —
+        ``_place_unplaced_class_at_slot`` — honours the cell, so one menu had
+        two commands that disagreed about whether its own title meant anything.
+
+        Placement goes through ``find_valid_options`` filtered to the requested
+        cell, which is the unified validator path Phase 3 established
+        (ST-ARCH-004): the keyboard, the drag and this all reach one verdict.
+        A ``None`` room is kept as-is — it is ``get_room_candidates``' "needs no
+        classroom" sentinel for an online lesson, not a failure.
+
+        Returns True when the requested cell was used. False means the cell
+        cannot legally hold this class, and the caller falls back to automatic
+        placement rather than refusing outright.
+        """
+        if not day or not slot:
+            return False
+        options = [opt for opt in find_valid_options(self.state_data, cls)
+                   if opt[0] == day and opt[1] == slot]
+        if not options:
+            return False
+
+        # Prefer the room the user is currently looking at, exactly as
+        # _place_unplaced_class_at_slot does, so the lesson appears on the tab
+        # they are on rather than on a different one.
+        chosen = options[0]
+        if self.notebook.currentIndex() == 0:
+            kind, value = _decode_classroom_filter_value(
+                self.classroom_filter.currentData())
+            if kind == "room":
+                for opt in options:
+                    if opt[2] == value:
+                        chosen = opt
+                        break
+        mark_placed(cls, chosen[0], chosen[1], chosen[2])
+        return True
+
     def _add_class_at(self, day, slot):
         """Add a class via double-click on empty slot — uses automatic placement."""
         if not self.state_data["years"]:
@@ -4301,7 +4365,10 @@ class SchedulerApp(QMainWindow):
         for sc in split_classes:
             self.state_data["classes"].append(sc)
 
-            if self._auto_place_and_apply(sc):
+            if self._place_at_requested_cell(sc, day, slot):
+                self._show_toast(tr("status.class_placed"), "success")
+                added_any = True
+            elif self._auto_place_and_apply(sc):
                 self._show_toast(tr("status.class_placed"), "success")
                 added_any = True
             else:

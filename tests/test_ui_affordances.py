@@ -133,3 +133,198 @@ def test_toast_is_a_top_level_window_so_the_coordinate_space_matters(qapp):
         parent.close()
         parent.deleteLater()
         qapp.processEvents()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  The app must honour the cell it is pointing at
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Two defects with one shape: a surface names a specific day/hour/room and then
+# does not use it. Neither is in the findings register; both were found while
+# measuring Phase 5.
+#
+# ST-ARCH-004 (the open-slots panel) · ``app.py`` ``_refresh_open_slots``
+#     ``find_valid_options`` returns ``(day, slot, None)`` for a lesson that
+#     needs no physical room — ``get_room_candidates``' sentinel, which Phase 3
+#     already taught the drag path to read. This panel re-keyed ``None`` to
+#     ``""`` and then tested membership against ``state["classrooms"]``, which
+#     can never contain ``""``. So it reported "no valid placements" for **every
+#     online lesson**, while ``PlaceClassDialog`` — same function, same state —
+#     listed them. Measured on a 2-day × 3-slot grid: 6 options, 0 rows drawn.
+#
+# ``_add_class_at`` · ``app.py``
+#     Took ``day`` and ``slot`` and discarded both, going straight to automatic
+#     placement. Reached from a double-click on an empty cell and from a context
+#     menu **headed by that cell's own name** ("📅 Çarşamba 10:00") — whose other
+#     command, ``_place_unplaced_class_at_slot``, does honour it. One menu, two
+#     commands, disagreeing about whether its title meant anything.
+
+import pytest  # noqa: E402,F811
+
+from scheduler_app.core.models import (  # noqa: E402
+    new_state, new_class, LOCATION_ONLINE,
+)
+from scheduler_app.core.logic import find_valid_options  # noqa: E402
+
+
+def _online_state():
+    state = new_state()
+    state["days"] = ["monday", "tuesday"]
+    state["slots"] = ["09:00", "10:00", "11:00"]
+    state["classrooms"] = ["R001", "R002"]
+    state["years"] = {"Year-1": ["A"]}
+    state["lecturers"] = ["L1"]
+
+    cls = new_class()
+    cls["name"] = "Uzaktan Fizik"
+    cls["lecturer"] = "L1"
+    cls["location_type"] = LOCATION_ONLINE
+    cls["targets"] = [{"year": "Year-1", "branch": "A"}]
+    state["classes"] = [cls]
+    return state, cls
+
+
+def test_an_online_lesson_has_somewhere_to_go_and_the_panel_says_so(
+        qapp, dersis_home, make_app):
+    """ST-ARCH-004 — the open-slots panel must not contradict the placer.
+
+    A failure means a user with an online class is told, in the panel built to
+    answer "where can this go?", that it can go nowhere — while the placement
+    dialog on the same class offers a full grid.
+    """
+    from tests.test_warning_log_growth import _open_slot_rows
+
+    state, cls = _online_state()
+    options = find_valid_options(state, cls)
+    assert options, "fixture is wrong: the class has no valid options at all"
+    assert all(opt[2] is None for opt in options), (
+        "fixture is wrong: an online lesson's options should carry the None "
+        "room sentinel, got %r" % (options[:3],))
+
+    window = make_app()
+    window.state_data = state
+    window._selected_cells = []
+    window.unplaced_list.clear()
+    window.unplaced_list.addItem(cls["name"])
+    window._unplaced_indices = [0]
+    window.unplaced_list.setCurrentRow(0)
+    window._switch_sidebar_tab(1)
+    window._open_slots_fp = None
+    window._refresh_open_slots()
+
+    rows = _open_slot_rows(window)
+    assert len(rows) == len(options), (
+        "the panel drew %d rows for a class with %d valid placements"
+        % (len(rows), len(options)))
+
+
+def test_the_panel_names_the_online_resource_instead_of_an_empty_room(
+        qapp, dersis_home, make_app):
+    """ST-ARCH-004 — a None room is a resource, not a missing value."""
+    from tests.test_warning_log_growth import _open_slot_rows
+    from scheduler_app.core.models import get_effective_room_resource_for_class
+
+    state, cls = _online_state()
+    window = make_app()
+    window.state_data = state
+    window.unplaced_list.clear()
+    window.unplaced_list.addItem(cls["name"])
+    window._unplaced_indices = [0]
+    window.unplaced_list.setCurrentRow(0)
+    window._switch_sidebar_tab(1)
+    window._open_slots_fp = None
+    window._refresh_open_slots()
+
+    expected = get_effective_room_resource_for_class(cls, room_override=None)
+    rows = _open_slot_rows(window)
+    assert rows, "no rows to inspect"
+    assert all(room == expected for _day, _time, room in rows), (
+        "expected every row to name %r, got %r" % (expected, rows[:3]))
+    assert all(room.strip() for _d, _t, room in rows), (
+        "a row rendered an empty room label")
+
+
+def test_adding_a_class_on_a_chosen_cell_puts_it_on_that_cell(
+        qapp, dersis_home, make_app):
+    """The cell in the menu title is the cell the lesson lands on.
+
+    Exercises ``_place_at_requested_cell`` directly — the branch
+    ``_add_class_at`` consults before falling back to automatic placement —
+    because driving it through ``_add_class_at`` would need a modal
+    ``AddClassDialog``.
+    """
+    state, cls = _online_state()
+    state["classes"] = []
+    window = make_app()
+    window.state_data = state
+
+    state["classes"].append(cls)
+    placed = window._place_at_requested_cell(cls, "tuesday", "11:00")
+
+    assert placed is True, "the requested cell was legal but was not used"
+    assert (cls["placed_day"], cls["placed_time"]) == ("tuesday", "11:00"), (
+        "class landed on %r, not the requested tuesday/11:00"
+        % ((cls["placed_day"], cls["placed_time"]),))
+
+
+def test_add_class_at_actually_consults_the_requested_cell(
+        qapp, dersis_home, make_app, monkeypatch):
+    """The helper existing is not enough — ``_add_class_at`` must call it.
+
+    Without this, deleting the call leaves every other test in this section
+    green: they exercise ``_place_at_requested_cell`` directly. Measured — that
+    is exactly what happened on the first writing, so the wiring is pinned
+    separately from the behaviour.
+
+    ``AddClassDialog`` is replaced rather than driven: it is modal, and what is
+    under test is where the class lands afterwards.
+    """
+    from scheduler_app.ui import app as app_module
+
+    state, cls = _online_state()
+    state["classes"] = []
+    window = make_app()
+    window.state_data = state
+
+    class _StubDialog:
+        DialogCode = app_module.AddClassDialog.DialogCode
+
+        def __init__(self, *a, **kw):
+            self.result = cls
+
+        def exec(self):
+            return self.DialogCode.Accepted
+
+    monkeypatch.setattr(app_module, "AddClassDialog", _StubDialog)
+    monkeypatch.setattr(window, "_show_toast", lambda *a, **kw: None)
+
+    window._add_class_at("tuesday", "11:00")
+
+    placed = [c for c in state["classes"] if c.get("placed")]
+    assert placed, "_add_class_at placed nothing at all"
+    assert (placed[0]["placed_day"], placed[0]["placed_time"]) == (
+        "tuesday", "11:00"), (
+        "_add_class_at ignored the cell it was given and placed the lesson at "
+        "%r instead" % ((placed[0]["placed_day"], placed[0]["placed_time"]),))
+
+
+def test_an_illegal_cell_is_declined_rather_than_forced(
+        qapp, dersis_home, make_app):
+    """Anti-regression: honouring the cell must not bypass the validator.
+
+    Phase 3's rule is that every placement path reaches one verdict
+    (ST-ARCH-004). ``_place_at_requested_cell`` therefore filters
+    ``find_valid_options`` rather than calling ``mark_placed`` outright — it
+    returns False for a cell the drag path would also refuse, and the caller
+    falls back to automatic placement.
+    """
+    state, cls = _online_state()
+    window = make_app()
+    window.state_data = state
+
+    assert window._place_at_requested_cell(cls, "friday", "09:00") is False, (
+        "a day that is not on the grid was accepted")
+    assert cls["placed"] is False
+    assert window._place_at_requested_cell(cls, "monday", "23:00") is False, (
+        "an hour that is not on the grid was accepted")
+    assert cls["placed"] is False
