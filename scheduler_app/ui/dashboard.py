@@ -248,6 +248,7 @@ class DashboardWidget(QWidget):
         # ── Summary cards row ──
         cards_row = QHBoxLayout()
         cards_row.setSpacing(10)
+        self._pinned_of_scheduled = 0        # ST-UI-002 subset annotation
         self._card_placed = MetricCard(tr("labels.placed"), "0", "#10B981")
         self._card_unplaced = MetricCard(tr("labels.unplaced"), "0", "#EF4444")
         self._card_rooms = MetricCard(tr("dashboard.avg_room_use"), "0%", "#3B82F6")
@@ -363,7 +364,8 @@ class DashboardWidget(QWidget):
         """Recompute metrics from current state and update all panels."""
         self._state = state
         if not state or not state.get("classes"):
-            self._card_placed.set_value("—")
+            self._pinned_of_scheduled = 0
+            self._card_placed.set_value("—", title=self._placed_card_title())
             self._card_unplaced.set_value("—")
             self._card_rooms.set_value("—")
             self._card_gaps.set_value("—")
@@ -372,7 +374,12 @@ class DashboardWidget(QWidget):
         m = compute_all_metrics(state)
 
         # ── Summary cards ──
-        self._card_placed.set_value(m["placed_count"])
+        # ST-UI-002: same trio as the status bar, and the pinned subset is an
+        # annotation on the card title rather than a card of its own -- a pin is
+        # one lesson, counted once.
+        self._pinned_of_scheduled = m.get("pinned_count", 0)
+        self._card_placed.set_value(m["placed_count"],
+                                    title=self._placed_card_title())
         self._card_unplaced.set_value(m["unplaced_count"])
         utils = m["room_utilization"]
         avg_util = round(sum(utils.values()) / len(utils), 1) if utils else 0
@@ -429,6 +436,14 @@ class DashboardWidget(QWidget):
 
         # ── Schedule quality score ──
         self._refresh_quality(state)
+
+    def _placed_card_title(self):
+        """"Yerlesti", plus the pinned subset when there is one (ST-UI-002)."""
+        title = tr("labels.placed")
+        if getattr(self, "_pinned_of_scheduled", 0):
+            title += "  " + tr("status.pinned_subset").format(
+                n=self._pinned_of_scheduled)
+        return title
 
     def _refresh_quality(self, state):
         """Compute and display the schedule quality score."""
@@ -503,7 +518,7 @@ class DashboardWidget(QWidget):
         """Update all translatable text (called when language changes)."""
         self._header.setText("\U0001F4CA  " + tr("dashboard.title"))
         self._card_placed.set_value(self._card_placed._value.text(),
-                                     title=tr("labels.placed"))
+                                     title=self._placed_card_title())
         self._card_unplaced.set_value(self._card_unplaced._value.text(),
                                        title=tr("labels.unplaced"))
         self._card_rooms.set_value(self._card_rooms._value.text(),

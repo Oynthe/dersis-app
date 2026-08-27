@@ -3,6 +3,7 @@
 from scheduler_app.constants import YEAR_COLORS
 from scheduler_app.models import (
     DEFAULT_OPTIMIZER_SEED,
+    PROTECTION_NONE,
     room_fits_class, lecturer_available_at, needs_physical_room, display_room,
     get_room_candidates, get_physical_room_candidates,
     effective_day, effective_time, effective_room,
@@ -169,6 +170,97 @@ def get_consecutive_slots(state, start_slot, duration):
 
 def get_placed_classes(state):
     return [c for c in state["classes"] if c["placed"] or c["pinned"]]
+
+
+def schedule_counts(state):
+    """The one placement vocabulary. Every counter a user sees comes from here.
+
+    ST-UI-002. Three definitions of "placed" used to be on screen at once — the
+    status bar counted ``placed`` only, the dashboard counted ``placed or
+    pinned``, and the results dialog counted its own event list — and the status
+    bar's ``total - pinned - placed`` could render a NEGATIVE number, because a
+    class that is both pinned and ``placed=True`` was subtracted twice.
+
+    **The register's own recommendation — "clamp/assert non-negative" — is the
+    worst available fix.** On a state with 80 classes, 4 pins that also carry
+    ``placed=True``, and 3 genuinely unplaced lessons, the old formula gives −1
+    and the clamp gives **0**, while the truth is **3** — and those 3 are listed
+    in the unplaced sidebar on the same screen. The clamp replaces an impossible
+    number with a confidently wrong one. An ``assert`` is no better: it crashes
+    the repaint on a file the grid can still draw.
+
+    So the buckets are disjoint **by construction** rather than by trusting the
+    "pinned implies not placed" invariant. That invariant is real but is held by
+    caller convention at nine ``mark_placed`` sites and enforced nowhere, and no
+    loader repairs a state that breaks it, so a ``.egu`` carrying it would
+    render a negative forever.
+
+    ``scheduled``               has a cell on the timetable: ``pinned or
+                                placed`` — the same set as
+                                :func:`get_placed_classes`. A pin carries its
+                                position in ``pinned_*`` and ``apply_reschedule``
+                                deliberately never calls ``mark_placed`` on one
+                                (ST-SCHED-002), so pinned *is* scheduled. A pin
+                                that clashes is scheduled too: it is committed
+                                and it occupies the cell. Its problem is a
+                                conflict to render (ST-UI-001), not a smaller
+                                number.
+    ``pinned_of_scheduled``     a SUBSET annotation, never a bucket of its own.
+                                Rendering it as a peer segment is the other half
+                                of the finding: ``4 sabit + 77 yerleşti + 3
+                                yerleşmedi`` sums to 84 against 80 classes, and
+                                users read a status bar as a partition.
+    ``protected_of_scheduled``  the other subset annotation — a movement policy,
+                                orthogonal to placement.
+    ``off_grid_of_scheduled``   scheduled, but at a day or hour the grid no
+                                longer has. Counted separately because it is the
+                                one case where ``scheduled`` genuinely does not
+                                equal what the grid draws: such a lesson is
+                                drawn by nothing AND absent from the unplaced
+                                panel, so without this the user reads "77
+                                yerleşmiş" over a grid showing 75. It stays
+                                inside ``scheduled`` — the user did place it,
+                                and Phase 1 deliberately does not unplace
+                                orphans at load — but it is now sayable.
+    ``unscheduled``             ``total - scheduled``; identical to the
+                                ``not placed and not pinned`` predicate the
+                                unplaced panel and ``PlaceClassDialog`` use.
+
+    ``0 <= unscheduled <= total``, ``pinned_of_scheduled <= scheduled`` and
+    ``scheduled + unscheduled == total`` hold for **any** input, including a
+    state that violates the invariant.
+
+    Bracket access on ``classes``/``placed``/``pinned`` is deliberate: it makes
+    the failure mode byte-identical to ``get_placed_classes``. Reading them with
+    ``.get`` would turn a malformed class dict from a loud KeyError in one
+    function into a silent miscount in another, which is the Phase 1 lesson
+    ("making a reader total converts a crash into a silent drop") in a place
+    where a crash is the honest outcome. ``protection`` is the one tolerant
+    read, because that key genuinely has a default.
+    """
+    days = set(state.get("days") or [])
+    slots = set(state.get("slots") or [])
+    total = scheduled = pinned_of = protected_of = off_grid_of = 0
+    for cls in state["classes"]:
+        total += 1
+        is_pinned = cls["pinned"]
+        if not (is_pinned or cls["placed"]):
+            continue
+        scheduled += 1
+        if is_pinned:
+            pinned_of += 1
+        elif cls.get("protection", PROTECTION_NONE) != PROTECTION_NONE:
+            protected_of += 1
+        if effective_day(cls) not in days or effective_time(cls) not in slots:
+            off_grid_of += 1
+    return {
+        "total": total,
+        "scheduled": scheduled,
+        "pinned_of_scheduled": pinned_of,
+        "protected_of_scheduled": protected_of,
+        "off_grid_of_scheduled": off_grid_of,
+        "unscheduled": total - scheduled,
+    }
 
 
 def occupied_slots_of(state, cls):

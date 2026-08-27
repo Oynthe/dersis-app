@@ -61,6 +61,7 @@ from scheduler_app.logic import (
     occupied_slots_of, classroom_of, total_duration,
     build_virtual_classroom_day_layout,
     find_schedule_conflicts, conflict_partner_index,
+    schedule_counts,
     find_valid_options,
     get_year_color, lighten_color,
     apply_negotiation_suggestion,
@@ -2083,23 +2084,45 @@ class SchedulerApp(QMainWindow):
         return ok
 
     def _update_status(self):
+        """Render the status bar from the one placement vocabulary (ST-UI-002).
+
+        This used to compute ``n_unplaced = n_total - n_pinned - n_placed``,
+        which double-subtracts a class carrying both flags, and to render pinned
+        as a segment BESIDE placed. So its numbers summed to more than the class
+        count whenever a pin was also placed — ``4 sabit + 77 yerleşti + 3
+        yerleşmedi`` against 80 — and to a negative unplaced count when enough
+        of them were. Pinned is a subset annotation now, because that is what it
+        is, and the count comes from the same function the dashboard card and
+        the results dialog call.
+        """
         s = self.state_data
-        n_total = len(s["classes"])
-        n_pinned = sum(1 for c in s["classes"] if c["pinned"])
-        n_placed = sum(1 for c in s["classes"] if c["placed"])
-        n_protected = sum(1 for c in s["classes"]
-                          if c.get("protection", "none") != "none"
-                          and not c["pinned"])
-        n_unplaced = n_total - n_pinned - n_placed
+        counts = schedule_counts(s)
         fname = os.path.basename(self.current_file) if self.current_file else tr("app.untitled")
+        placed_txt = f"{counts['scheduled']} {tr('status.placed')}"
+        if counts["pinned_of_scheduled"]:
+            placed_txt += (
+                f"  \U0001F4CC "
+                + tr("status.pinned_subset").format(
+                    n=counts["pinned_of_scheduled"]))
         status = (
             f"\U0001F4C4 {fname}   \u2502   "
-            f"\U0001F4DA {n_total} {tr('status.classes')}   \u2502   "
-            f"\U0001F4CC {n_pinned} {tr('status.pinned')}   \u2502   "
-            f"\u2705 {n_placed} {tr('status.placed')}   \u2502   "
-            f"\u23F3 {n_unplaced} {tr('status.unplaced')}")
-        if n_protected > 0:
-            status += f"   \u2502   \U0001F6E1 {n_protected} {tr('labels.protected')}"
+            f"\U0001F4DA {counts['total']} {tr('status.classes')}   \u2502   "
+            f"\u2705 {placed_txt}   \u2502   "
+            f"\u23F3 {counts['unscheduled']} {tr('status.unplaced')}")
+        if counts["protected_of_scheduled"]:
+            status += (
+                f"   \u2502   \U0001F6E1 {counts['protected_of_scheduled']} "
+                f"{tr('labels.protected')}")
+        if counts["off_grid_of_scheduled"]:
+            # ST-DATA-003. These are scheduled but drawn nowhere, and the
+            # unplaced panel excludes them too (same `not placed and not
+            # pinned` predicate), so without this line the user reads a placed
+            # count higher than the number of lessons on the grid and has no
+            # way to find the difference.
+            status += (
+                f"   \u2502   \u26A0 "
+                + tr("status.off_grid_subset").format(
+                    n=counts["off_grid_of_scheduled"]))
         self.status_label.setText(status)
 
     # ── Filter updates ────────────────────────────────────────────────────

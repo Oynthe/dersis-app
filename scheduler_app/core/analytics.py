@@ -12,7 +12,7 @@ Computes metrics from the current timetable state:
 from scheduler_app.logic import (
     find_slot_index,
     get_placed_classes, occupied_slots_of, classroom_of, slot_index,
-    total_duration,
+    total_duration, schedule_counts,
 )
 from scheduler_app.models import effective_day, effective_time
 
@@ -219,10 +219,17 @@ def compute_all_metrics(state):
     placed = get_placed_classes(state)
     lec_gaps_per_day, lec_gaps_total = lecturer_gap_distribution(state)
     stu_gaps_per_day, stu_gaps_total = student_idle_distribution(state)
+    counts = schedule_counts(state)
     return {
-        "placed_count": len(placed),
-        "unplaced_count": len([c for c in state["classes"] if not c["placed"] and not c["pinned"]]),
-        "total_classes": len(state["classes"]),
+        # ST-UI-002. These keep their historical names — they are
+        # `scheduled`/`unscheduled` and always were — but now come from the same
+        # function the status bar and the results dialog call, so the dashboard
+        # card and the status bar cannot disagree again.
+        "placed_count": counts["scheduled"],
+        "unplaced_count": counts["unscheduled"],
+        "pinned_count": counts["pinned_of_scheduled"],
+        "off_grid_count": counts["off_grid_of_scheduled"],
+        "total_classes": counts["total"],
         "lec_gaps_per_day": lec_gaps_per_day,
         "lec_gaps_total": lec_gaps_total,
         "student_gaps_per_day": stu_gaps_per_day,
