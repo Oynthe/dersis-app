@@ -249,6 +249,53 @@ have permanently certified a bulk-unplace as correct.
   every later check. Reachable now that `screen_placements` excludes every class
   it is about to test.
 
+### What the adversarial verification caught after the code had landed
+
+The five verifier agents ran against a tree that kept moving under them. Four of
+their findings were things the implementer had already fixed independently
+(including the two fatal ones: an unsatisfiable locked-class test and a test that
+`AttributeError`s the moment the deletion it documents lands). Four more were
+real and are fixed in a follow-up commit:
+
+1. **The deadline bounded the search but not the return.** When a stop fired,
+   `enter()` returned False and the driver then popped one frame at a time while
+   `advance()` re-applied and re-removed every untried candidate of every frame
+   still on the stack — genuine occupancy work, O(depth x candidates) of it, done
+   past the deadline, counted by nothing and consulting no clock. It now unwinds
+   directly. (The same shape existed in the original recursive code, so this is
+   not a regression — but a clock bound that keeps working after it fires is not
+   a clock bound.)
+2. **A stop before the first leaf threw the whole partial descent away.**
+   `best_solution` is only written at a leaf, so a run capped early returned
+   `[None] * n` and the resync then dutifully stripped every placement the search
+   had already made. The stop now offers the current `solution` to the incumbent
+   first — mid-descent it is a complete, internally consistent partial answer.
+3. **Only one of the three `_greedy_construct` call sites had a deadline.** The
+   other two are `optimized_auto_place` and `optimized_batch_schedule` — the
+   "add a class" and "place batch" buttons — so ST-PERF-008's user-visible
+   symptom survived on exactly the interactive paths, where there is no progress
+   dialog to explain the wait.
+4. **The one test carrying ST-PERF-008 was vacuous.** It passed against a greedy
+   phase that returns `[None] * n` and sets `_clock_capped` (measured: 1.35 s,
+   PASSED) — its two stated anti-vacuity guards checked the flag, not the search.
+   It now asserts the search visited nodes and placed something beyond the
+   instance's 24 pinned classes; mutation-tested against that exact stub.
+
+A fifth was a stale scoreboard: `test_bounding_does_not_cost_placements` kept
+floors set from pre-fix measurements on the expectation that the fix would move
+`raw_placed` DOWN. It did not — it moved `raw_clean` and `committed` UP to meet
+`raw_placed`, which did not move — so `normal`'s clean floor of 39 against an
+actual 76 tolerated a 49 % regression in proposal cleanliness. Re-based to 72/72
+and 20/20.
+
+The verification also found the occupancy module's headline invariant was
+**count-blind** (`set(cell)` discards the refcount, and a doubly-claimed cell
+still refuses `check_placement`), so the plausible wrong fix — re-adding
+`best_solution` without releasing the stale claim, which is idempotent on sets
+and permanent on ref-counted cells — would have passed all ten of its tests and
+the whole invariants spine. `test_greedy_holds_exactly_one_claim_per_placement_it_returns`
+closes that, and is mutation-proven to be the only test in the module that does.
+
 ### Known gaps left behind
 
 1. **`changes[]` still omits protected classes** (`schedule_optimizer.py`, the

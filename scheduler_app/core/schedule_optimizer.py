@@ -774,6 +774,10 @@ class ScheduleOptimizer:
         # See the stopping condition in enter() below.
         stale_leaves = [0]
         no_improve_limit = max(500, 4 * n)
+        # Set when the search stops for a reason other than exhausting the
+        # tree. The driver then unwinds directly instead of continuing to try
+        # options it has already decided not to explore — see `_stop()`.
+        aborted = [False]
 
         # Use propagator for add/remove if available (keeps caches in sync)
         def _add(cls, day, slot, room):
@@ -845,6 +849,27 @@ class ScheduleOptimizer:
         #              child fails.
         stack = []
 
+        def _record_incumbent():
+            """Offer the current `solution` to the incumbent.
+
+            Normally only leaves do this. A stop can fire mid-descent, and at
+            that moment `solution` is a complete, internally consistent partial
+            answer — every `_add` so far is matched by an entry in it. Without
+            this, a stop before the first leaf leaves `best_solution` all-None
+            and the resync below dutifully strips every placement the search had
+            already made: the run returns nothing rather than what it had.
+            """
+            placed_count = sum(1 for a in solution if a is not None)
+            if placed_count > best_count[0]:
+                best_count[0] = placed_count
+                best_solution[:] = list(solution)
+
+        def _stop():
+            """Abandon the search, keeping the best answer found so far."""
+            _record_incumbent()
+            aborted[0] = True
+            return ('ret', False)
+
         def enter(idx):
             """Emulate entering ``solve(idx)``.
 
@@ -855,7 +880,7 @@ class ScheduleOptimizer:
                 if _cancel_token is not None:
                     _cancel_token.raise_if_cancelled()
                 if iterations[0] >= self.max_iterations:
-                    return ('ret', False)
+                    return _stop()
                 # ── ST-PERF-004: stop when the search stops finding anything ──
                 #
                 # The DFS tries every candidate for a class and then tries
@@ -878,7 +903,7 @@ class ScheduleOptimizer:
                 # Scaled by n because a bigger instance needs more leaves before
                 # the same conclusion is safe.
                 if stale_leaves[0] >= no_improve_limit:
-                    return ('ret', False)
+                    return _stop()
                 # ST-PERF-008: the greedy phase had no wall-clock bound at all.
                 # `multi_start_time_limit` was only consulted between runs and
                 # inside LNS, so a single construction could overrun the whole
@@ -900,7 +925,7 @@ class ScheduleOptimizer:
                 # the same contract the LNS emergency cap already follows.
                 if deadline is not None and time.time() >= deadline:
                     self._clock_capped = True
-                    return ('ret', False)
+                    return _stop()
                 iterations[0] += 1
 
                 if idx == n:
@@ -989,6 +1014,15 @@ class ScheduleOptimizer:
                 _remove(flexible[frame["idx"]], *frame["applied"])
                 solution[frame["idx"]] = None
                 frame["applied"] = None
+            if aborted[0]:
+                # ST-PERF-008. Without this the deadline bounded the search but
+                # not the return: `advance()` would go on re-applying and
+                # re-removing every untried candidate of every frame still on
+                # the stack, one `enter()` short-circuit at a time. That is real
+                # occupancy work, O(depth x candidates) of it, done entirely
+                # past the deadline and counted by nothing. Unwind instead.
+                stack.pop()
+                continue
             action, value = advance()
 
         # ── ST-SCHED-001: resynchronise occupancy with the answer ──────────
@@ -1033,7 +1067,8 @@ class ScheduleOptimizer:
             "budget_exhausted": iterations[0] >= self.max_iterations,
             # True when the search ended because it had stopped finding better
             # solutions — a real stopping condition rather than a timeout.
-            "converged": stale_leaves[0] >= no_improve_limit,
+            "converged": (aborted[0]
+                          and stale_leaves[0] >= no_improve_limit),
             "no_improve_limit": no_improve_limit,
             "warm_started": len(warm_placed),
         }
@@ -1404,9 +1439,14 @@ class ScheduleOptimizer:
         preferred = {cls_key(c): (c["placed_day"], c["placed_time"],
                                  c["placed_classroom"]) for c in existing_flexible}
 
+        # ST-PERF-008: this is `optimized_auto_place`, i.e. the user adding one
+        # class and waiting. It shares `multi_start_time_limit` with the full
+        # reschedule because it is the same search; without a deadline here the
+        # bound only ever applied to the Generate button.
         solution, _ = self._greedy_construct(
             combined, validator, generator, scorer,
-            improve_only_scores=improve_only_scores)
+            improve_only_scores=improve_only_scores,
+            deadline=time.time() + self.multi_start_time_limit)
 
         # Find new class result
         if not new_cls["pinned"]:

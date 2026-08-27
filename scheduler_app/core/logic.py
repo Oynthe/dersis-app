@@ -1111,10 +1111,15 @@ def optimized_batch_schedule(state, new_classes, weights=None):
     generator2 = CandidateGenerator(state, validator=validator2)
     scorer2 = PlacementScorer(state, validator2, weights=weights)
 
-    # Greedy with backtracking via optimizer
+    # Greedy with backtracking via optimizer.
+    # ST-PERF-008: bounded like every other greedy phase. This one is reached
+    # from the "add classes" and "place batch" buttons, so an unbounded search
+    # here is a frozen window with no progress dialog behind it.
+    import time as _time
     optimizer = ScheduleOptimizer(state, weights=weights)
     solution, _greedy_stats = optimizer._greedy_construct(
-        combined, validator2, generator2, scorer2)
+        combined, validator2, generator2, scorer2,
+        deadline=_time.time() + optimizer.multi_start_time_limit)
 
     for i, cls in enumerate(combined):
         if solution[i] is not None:

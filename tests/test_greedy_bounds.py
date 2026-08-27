@@ -118,16 +118,20 @@ more broken.
 
 Runtime (measured, this machine, ``.venv-audit``)
 -------------------------------------------------
-``pytest tests/test_greedy_bounds.py -m "not slow"``   ~11 s
-``pytest tests/test_greedy_bounds.py``                 ~450-600 s
+Re-measured on the fixed tree (the figures that were here before were taken
+before the Phase 3 bounds landed and were stale by 2x to 20x):
 
-The slow half is the two shipped-workflow runs (``small`` ~30-40 s, ``normal``
-~140-190 s — the latter clock-capped at 120 s by ``optimized_reschedule_all``'s
-``multi_start_time_limit=120.0``), the ``pathological`` solve (~115 s when it
-crashes, ~125-190 s when it completes) and the wall-clock pin (65-150 s while
-the bound is broken, 125-290 s at HEAD, ~7 s once it is real). The wide bands
-are machine load, not variance in the code: these were timed on a box also
-running other pytest sessions. CI runs ``-m "not slow"`` and sees none of it.
+``pytest tests/test_greedy_bounds.py -m "not slow"``   ~5 s
+``pytest tests/test_greedy_bounds.py``                 ~135 s
+
+The slow half is `test_bounding_does_not_cost_placements` (``small`` ~7 s,
+``normal`` ~123 s — the latter still clock-capped at 120 s by
+``optimized_reschedule_all``'s ``multi_start_time_limit=120.0``) and
+``test_pathological_preset_does_not_exhaust_the_stack`` (~90 s; it raised
+RecursionError at HEAD). The wall-clock pin is now ~5-6 s against its 5 s
+budget, down from 125-291 s at HEAD — it is in the non-slow lane for that
+reason. The bands are machine load, not variance in the code. CI runs
+``-m "not slow"``.
 """
 import sys
 import time
@@ -555,11 +559,35 @@ def test_greedy_phase_respects_the_wall_clock_budget():
         "so rarely that the interval between looks is itself unbounded.")
 
     # Trap A, first half: the optimizer really did process this instance.
+    #
+    # `accounted` alone does NOT establish that — placed + unplaced sums to the
+    # class count no matter what the search did, so a _greedy_construct that
+    # returned [None] * n and set _clock_capped would satisfy every other
+    # assertion here (measured: 1.35 s, PASSED). The two below measure the
+    # search itself:
+    #   * it visited a non-trivial number of nodes before the budget bit, and
+    #   * it placed something the greedy phase actually found, not just the
+    #     pinned classes it inherited for free. `very_large` ships 24 pinned
+    #     classes, so `placed == 24` is exactly what an absent greedy phase
+    #     produces.
     accounted = summary["classes_placed"] + summary["classes_unplaced"]
     assert accounted == len(state["classes"]), (
         f"the run accounted for {accounted} of {len(state['classes'])} classes "
         "— it did not actually solve this instance, so its elapsed time says "
         "nothing")
+
+    nodes = summary["greedy_stats"]["iterations_used"]
+    assert nodes >= 50, (
+        f"the greedy phase visited only {nodes} search nodes before stopping. "
+        "A bound that fires before the search does any work makes the timing "
+        "assertion above vacuous — it would pass against a phase that returns "
+        "nothing at all.")
+
+    n_pinned = sum(1 for c in state["classes"] if c.get("pinned"))
+    assert len(_placed) > n_pinned, (
+        f"the solve returned {len(_placed)} placements against {n_pinned} "
+        "pinned classes, i.e. the greedy phase contributed nothing. The "
+        "budget is supposed to truncate the search, not replace it.")
 
     # Trap A, second half: the budget is what stopped it. Without this, a run
     # that finished early would satisfy the ceiling above for free.
@@ -623,15 +651,26 @@ def shipped_run():
 # (`normal` reports deterministic=False — it is clock-capped at 120 s — and
 # still landed on the same numbers every time).
 #
-# The floors sit below those with headroom for the ST-SCHED-001 fix (Trap D),
-# which is expected to move `raw_placed` DOWN (LNS stops repairing against a
-# stale, near-empty occupancy map, so it proposes fewer placements) and
-# `raw_clean` / `committed` UP (`rejected` should reach 0 once the proposal is
-# valid, so committed converges on raw_placed). `normal`'s raw_clean floor is
-# left at the measured 39 precisely because that number should improve sharply.
+# Those were the pre-fix numbers, and the floors below them were set expecting
+# the ST-SCHED-001 fix to move `raw_placed` DOWN (LNS was thought to be
+# proposing extra placements it could only make against a stale, near-empty
+# occupancy map). It did not: the fix moved `raw_clean` and `committed` UP to
+# meet `raw_placed`, which did not move at all.
+#
+#   small   raw_placed=21  raw_clean=21  rejected=0  committed=21  (of 25)
+#   normal  raw_placed=76  raw_clean=76  rejected=0  committed=76  (of 80)
+#
+# So the floors are re-based on the fixed tree, keeping a small margin for the
+# LNS acceptance RNG. The old `normal` clean_floor of 39 tolerated a 49 %
+# regression in proposal cleanliness — against a phase whose whole point is
+# that the proposal is clean, it was a guard that could not fail.
+#
+# Re-record these only alongside a deliberate, explained quality change. A
+# `raw_clean` below `raw_placed` means the optimizer is proposing invalid
+# placements again, which is ST-SCHED-001 reopening.
 _PLACEMENT_FLOORS = [
-    ("small", 18, 18),
-    ("normal", 55, 39),
+    ("small", 20, 20),
+    ("normal", 72, 72),
 ]
 
 
