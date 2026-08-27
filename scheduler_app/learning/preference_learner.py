@@ -48,6 +48,8 @@ class PreferenceLearner:
         self._velocity = {}
         # Number of training iterations completed
         self.train_count = 0
+        self._learned_through = 0
+        self._learned_size = 0
 
         self._load_weights()
 
@@ -61,16 +63,39 @@ class PreferenceLearner:
         return weights
 
     def learn(self):
-        """Run a learning pass over all available feedback.
+        """Learn from feedback not already learned from.
 
-        Reads the feedback log, extracts preference signals, and
-        updates weight deltas accordingly.
+        ST-PERF-005: this used to re-read the whole log and re-apply every entry
+        on every call — and it is called after every manual move, after every
+        accepted reschedule, and at every launch. Cost grew with the user's
+        entire history (16.9 ms at 100 entries, 78 ms at 2000), and repeating
+        the same signals kept nudging the weights for feedback the user gave
+        once.
+
+        The cursor is a record COUNT, not a byte offset, so the one-time
+        conversion of a legacy log does not invalidate it, and it is persisted
+        alongside the weights so a restart does not re-learn the history.
 
         Returns:
             Number of signals processed.
         """
-        entries = self.feedback_logger.get_entries()
-        if len(entries) < self.MIN_ENTRIES_TO_LEARN:
+        # The cheapest possible gate first: if the log has not grown by a
+        # single byte since the last pass, there is provably nothing new, and
+        # this costs one stat call rather than a walk over the whole history.
+        size = self.feedback_logger.log_size()
+        if size and size == self._learned_size:
+            return 0
+
+        total = self.feedback_logger.entry_count()
+        if total < self.MIN_ENTRIES_TO_LEARN:
+            # Guarded on the TOTAL, not on the tail: a long log must keep
+            # learning from single new entries.
+            return 0
+        if self._learned_through >= total:
+            return 0  # nothing new; costs one stat call, no decryption
+
+        entries = self.feedback_logger.get_entries_since(self._learned_through)
+        if not entries:
             return 0
 
         signals_processed = 0
@@ -89,9 +114,13 @@ class PreferenceLearner:
             elif event in ("reschedule_accepted", "reschedule_rejected"):
                 signals_processed += self._learn_from_reschedule(entry)
 
+        self._learned_through = total
+        self._learned_size = self.feedback_logger.log_size()
         if signals_processed > 0:
             self.train_count += 1
-            self._save_weights()
+        # Saved even when nothing was learned, so an entry carrying no signal is
+        # not re-read on every future pass.
+        self._save_weights()
 
         return signals_processed
 
@@ -268,6 +297,8 @@ class PreferenceLearner:
             "weight_deltas": self.weight_deltas,
             "velocity": self._velocity,
             "train_count": self.train_count,
+            "learned_through": self._learned_through,
+            "learned_size": self._learned_size,
         }
         try:
             storage.save_encrypted(data, self.weights_path)
@@ -283,6 +314,12 @@ class PreferenceLearner:
             self.weight_deltas = data.get("weight_deltas", {})
             self._velocity = data.get("velocity", {})
             self.train_count = data.get("train_count", 0)
+            # Absent in files written before this change: reads back as 0, so
+            # the first pass after upgrading re-learns the log once and then
+            # settles. That is the right back-compat behaviour, and needs no
+            # migration.
+            self._learned_through = data.get("learned_through", 0)
+            self._learned_size = data.get("learned_size", 0)
         except Exception:
             pass
 

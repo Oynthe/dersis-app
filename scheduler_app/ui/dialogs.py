@@ -3787,13 +3787,19 @@ class BulkResultsDialog(QDialog):
 
     def __init__(self, parent, placed, unplaced, rescheduled=False,
                  analytics=None, reschedule_explanation=None,
-                 negotiation_result=None):
+                 negotiation_result=None, negotiation_source=None):
         super().__init__(parent)
         self.setStyleSheet(DIALOG_STYLESHEET())
         self.setWindowTitle("\U0001F4CB  " + tr("dialogs.bulk_results.title"))
         self.setMinimumSize(700, 500)
         self.result = True  # Accept by default
+        # `negotiation_source` is a zero-argument callable producing the report
+        # (ST-PERF-007); `negotiation_result` stays accepted so existing callers
+        # keep working unchanged.
+        self._negotiation_source = negotiation_source
         self._negotiation_result = negotiation_result
+        self._negotiation_built = False
+        self._negotiation_tab_index = None
 
         layout = QVBoxLayout(self)
 
@@ -3937,6 +3943,52 @@ class BulkResultsDialog(QDialog):
             scroll.setWidgetResizable(True)
             tabs.addTab(scroll, tr("analytics.insights"))
 
+        # Negotiation tab — contents built on first selection, not here
+        # (ST-PERF-007). The label needs only len(unplaced), already known.
+        if unplaced and (self._negotiation_source is not None
+                         or self._negotiation_result):
+            self._negotiation_container = QWidget()
+            self._negotiation_layout = QVBoxLayout(self._negotiation_container)
+            self._negotiation_layout.setContentsMargins(8, 8, 8, 8)
+            self._tabs = tabs
+            self._negotiation_tab_index = tabs.addTab(
+                self._negotiation_container,
+                f"{tr('buttons.negotiate')} ({len(unplaced)})")
+            tabs.currentChanged.connect(self._on_results_tab_changed)
+
+        # Bottom
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        if placed:
+            ok_btn = QPushButton(tr("buttons.accept_results"))
+            ok_btn.setStyleSheet(
+                "background: #16A34A; color: white; font-weight: bold; padding: 6px 16px;")
+            ok_btn.clicked.connect(self.accept)
+            bottom.addWidget(ok_btn)
+        cancel_btn = QPushButton(tr("buttons.discard_all"))
+        cancel_btn.clicked.connect(self._discard)
+        bottom.addWidget(cancel_btn)
+        layout.addLayout(bottom)
+
+    def _on_results_tab_changed(self, index):
+        if index == self._negotiation_tab_index:
+            self._build_negotiation_tab()
+
+    def _build_negotiation_tab(self):
+        """Populate the negotiation tab. Runs once, on first selection.
+
+        ST-PERF-007: producing this report costs about as much as the solve
+        itself (measured at ~727 ms on 250 classes, ~5.8 s on 600), and this
+        dialog is constructed after EVERY reschedule. Reading it in
+        __init__ would move that cost a few lines inside the same frozen
+        stretch, and the user would feel no difference at all.
+        """
+        if self._negotiation_built:
+            return
+        self._negotiation_built = True
+        if (self._negotiation_result is None
+                and self._negotiation_source is not None):
+            self._negotiation_result = self._negotiation_source()
         # Negotiation tab (when unplaced classes have suggestions)
         if self._negotiation_result:
             neg_reports = self._negotiation_result.get("class_reports", [])
@@ -3980,22 +4032,11 @@ class BulkResultsDialog(QDialog):
                 neg_scroll = QScrollArea()
                 neg_scroll.setWidget(neg_widget)
                 neg_scroll.setWidgetResizable(True)
-                tabs.addTab(neg_scroll,
-                            f"{tr('buttons.negotiate')} ({len(neg_reports)})")
+                self._negotiation_layout.addWidget(neg_scroll)
+                self._tabs.setTabText(
+                    self._negotiation_tab_index,
+                    f"{tr('buttons.negotiate')} ({len(neg_reports)})")
 
-        # Bottom
-        bottom = QHBoxLayout()
-        bottom.addStretch()
-        if placed:
-            ok_btn = QPushButton(tr("buttons.accept_results"))
-            ok_btn.setStyleSheet(
-                "background: #16A34A; color: white; font-weight: bold; padding: 6px 16px;")
-            ok_btn.clicked.connect(self.accept)
-            bottom.addWidget(ok_btn)
-        cancel_btn = QPushButton(tr("buttons.discard_all"))
-        cancel_btn.clicked.connect(self._discard)
-        bottom.addWidget(cancel_btn)
-        layout.addLayout(bottom)
 
     def _discard(self):
         self.result = False

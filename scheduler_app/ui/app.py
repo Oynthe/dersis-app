@@ -3010,7 +3010,7 @@ class SchedulerApp(QMainWindow):
             self, result.placed, result.unplaced, bool(result.changes),
             analytics=result.analytics,
             reschedule_explanation=result.explanation,
-            negotiation_result=result.negotiation_result)
+            negotiation_source=lambda: result.negotiation_result)
         accepted = (results_dlg.exec() == BulkResultsDialog.DialogCode.Accepted
                     and results_dlg.result)
 

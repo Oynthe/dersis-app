@@ -8,6 +8,7 @@ imports, no dialog references, no widget manipulation.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -63,16 +64,50 @@ class PlaceBatchResult:
     unplaced: list = field(default_factory=list)
 
 
+# Distinct from None on purpose: None is a legitimate cached value, meaning
+# "nothing was unplaced, so there is nothing to report".
+_UNSET = object()
+
+
 @dataclass
 class RescheduleResult:
-    """Result of a full reschedule operation."""
+    """Result of a full reschedule operation.
+
+    ST-PERF-007: ``negotiation_result`` is a lazily computed, memoised property
+    rather than a field. The negotiation pass costs roughly as much as the solve
+    itself (measured at ~10 s of wrapper overhead on a 25-class instance) and
+    ran unconditionally whenever anything was unplaced, whether or not anyone
+    ever looked at it.
+
+    NOTE the field is *deleted*, not shadowed. Leaving the annotation in the
+    dataclass body while adding the property makes the generated ``__init__``
+    run ``self.negotiation_result = None``, which goes through the setter and
+    permanently poisons the cache with None — every later read returns None and
+    the negotiation tab silently disappears.
+    """
     placed: list = field(default_factory=list)
     unplaced: list = field(default_factory=list)
     changes: list = field(default_factory=list)
     summary: Optional[dict] = None
     analytics: Optional[dict] = None
     explanation: Optional[dict] = None
-    negotiation_result: Optional[dict] = None
+    _negotiation_factory: Optional[Callable] = field(default=None, repr=False)
+    _negotiation_cache: Any = field(default=_UNSET, repr=False)
+
+    @property
+    def negotiation_result(self):
+        """The negotiation report, computed on first read and then cached."""
+        if self._negotiation_cache is _UNSET:
+            self._negotiation_cache = (
+                self._negotiation_factory() if self._negotiation_factory
+                else None)
+        return self._negotiation_cache
+
+    @negotiation_result.setter
+    def negotiation_result(self, value):
+        # Kept so the attribute still behaves like a plain one for callers
+        # that assign to it.
+        self._negotiation_cache = value
 
 
 @dataclass
@@ -425,10 +460,24 @@ class SchedulingWorkflow:
                        if summary else None)
         analytics = analyze_schedule(self.state, placed) if placed else None
 
-        negotiation_result = None
+        # ST-PERF-007: deferred, and pinned to the state as of NOW. ui/app.py
+        # reads this on both sides of apply_reschedule(); analysing the live
+        # state at read time would give the results dialog and the warning log
+        # different answers for the same reschedule. The snapshot is also what
+        # keeps the negotiator's mutate-and-restore estimators (ST-DATA-011)
+        # away from the live timetable during a UI repaint.
+        # Measured deepcopy cost: 0.49 ms at 25 classes, 3.06 ms at 250 —
+        # against the 727 ms / 5.8 s pass it defers.
+        negotiation_factory = None
         if unplaced:
-            negotiation_result = negotiate_after_optimization(
-                self.state, placed, unplaced)
+            frozen_state = copy.deepcopy(self.state)
+            by_uid = {cls_key(c): c for c in frozen_state["classes"]}
+            frozen_unplaced = [(by_uid.get(cls_key(c), c), r)
+                               for c, r in unplaced]
+
+            def negotiation_factory():
+                return negotiate_after_optimization(
+                    frozen_state, [], frozen_unplaced)
 
         return RescheduleResult(
             placed=placed,
@@ -437,7 +486,7 @@ class SchedulingWorkflow:
             summary=summary,
             analytics=analytics,
             explanation=explanation,
-            negotiation_result=negotiation_result,
+            _negotiation_factory=negotiation_factory,
         )
 
     def apply_reschedule(self, result: RescheduleResult):

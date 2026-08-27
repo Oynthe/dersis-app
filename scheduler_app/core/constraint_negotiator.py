@@ -1281,19 +1281,21 @@ class ConstraintNegotiator:
         if not unplaced_list:
             return None
 
-        class_reports = []
-        for cls, reason in unplaced_list:
-            analysis = self.analyzer.analyze_class(cls)
-            suggestions = self.suggester.suggest_for_class(cls, analysis)
-            report = self.report_builder.build_class_report(
-                analysis, suggestions)
-            class_reports.append(report)
+        # ST-PERF-007: every unplaced class used to be analysed TWICE — once
+        # here and again below to build the identical `all_analyses` list.
+        # Built before the sort on purpose: the diagnostic summary expects them
+        # in unplaced_list order, not in report-priority order.
+        analyses = [self.analyzer.analyze_class(cls) for cls, _ in unplaced_list]
+        class_reports = [
+            self.report_builder.build_class_report(
+                analysis, self.suggester.suggest_for_class(cls, analysis))
+            for (cls, _reason), analysis in zip(unplaced_list, analyses)
+        ]
 
         class_reports.sort(key=lambda r: r["priority"])
 
         self._ensure_conflict_graph()
-        all_analyses = [self.analyzer.analyze_class(cls)
-                        for cls, _ in unplaced_list]
+        all_analyses = analyses
         diagnostic_summary = self.report_builder.build_diagnostic_summary(
             self.state, all_analyses,
             conflict_graph=self._conflict_graph,

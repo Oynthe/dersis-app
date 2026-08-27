@@ -288,27 +288,27 @@ accordingly.
 - **Evidence** `tests/scheduler_benchmark.py` → `evidence/scheduler_benchmark.csv`. Single-restart production path (density 0.3): fit `t ≈ 0.0135·n^1.77`. Measured wall seconds: tiny 0.2 s; small(25) 5.8 s; normal(80) 25.4 s; large(250) ~30 s single-restart (full multi-start default: normal 121.7 s, large 132.6 s). Construction-only curve times out (>60 s) at 600 classes. Memory is modest (normal peak 7.8 MiB) — the cliff is **CPU time**, not memory.
 - **Root cause** Multi-start × LNS × per-candidate scoring with several O(n)-per-candidate scans (e.g. `PlacementScorer._lecturer_switches_room`), all synchronous on the Qt main thread with `processEvents` pumping and no cancellation.
 - **User impact** At a realistic 80-class department the UI freezes for 25–120 s per generate; at institution scale (250+) it is effectively unusable, and the window cannot be cancelled or closed cleanly mid-run.
-- **Recommendation** Move solving to a worker (QThread/process) with progress + cancel; bound the greedy phase (ST-PERF-008); reduce per-candidate O(n) scans with incremental occupancy indexes. **Effort** L · **Related** ST-PERF-004, ST-PERF-008, ST-ARCH-005 · **Status** Open
+- **Recommendation** Move solving to a worker (QThread/process) with progress + cancel; bound the greedy phase (ST-PERF-008); reduce per-candidate O(n) scans with incremental occupancy indexes. **Effort** L · **Related** ST-PERF-004, ST-PERF-008, ST-ARCH-005 · **Status** **Fixed** (Phase 2, branch `fix/phase-2-performance`)
 
 <a id="st-perf-002"></a>
 ### ST-PERF-002 — Full encrypted state rewrite on every refresh
 - **Severity** High · **OBSERVED** · `app.py:1963-1967, 1835-1851`
 - **Evidence** `refresh_grid` calls `_auto_save`, which decrypts + re-encrypts + rewrites the whole settings container each time. Single `_auto_save`: 16.8 ms (80 cls / 74 KB egu) → 33.6 ms (250 cls / 232 KB). `refresh_grid` total: 0.65 s (80) → 2.5–4.7 s (250), dominated by the warnings pass (ST-PERF-003/006). Probe: `tests/probe_autosave_and_refresh_perf.py, tests/probe_undo_and_drag_integrity.py, tests/probe_excel_import_and_clipboard_crash.py`.
-- **Recommendation** Debounce/defer autosave; save deltas or on explicit action, not every render. **Effort** M · **Related** ST-PERF-003, ST-DATA-005 · **Status** Open
+- **Recommendation** Debounce/defer autosave; save deltas or on explicit action, not every render. **Effort** M · **Related** ST-PERF-003, ST-DATA-005 · **Status** **Fixed** (Phase 2, branch `fix/phase-2-performance`)
 
 <a id="st-perf-003"></a>
 ### ST-PERF-003 — Warning-log memory leak + O(n²) HTML rebuild
 - **Severity** High · **OBSERVED** · `app.py:2964-3001`, `widgets.py:213-239`
 - **Evidence** 12 successive `refresh_grid` on the large state: refresh time 2081 ms → 4816 ms (2.3×); `warning_log._messages` grew 138 → 1656 (+138/refresh, never cleared); process RSS grew 662 MB → 1142 MB (**+480 MB**); the egu on disk stayed constant (231 793 B), confirming the growth is in-memory. Probe: `tests/probe_autosave_and_refresh_perf.py, tests/probe_undo_and_drag_integrity.py, tests/probe_excel_import_and_clipboard_crash.py` rapid-refresh loop.
 - **Root cause** The warnings list is appended to (never reset) and the panel rebuilds full HTML from the whole list each refresh.
-- **Recommendation** Clear/rebuild warnings from current state each refresh; render incrementally. **Effort** M · **Related** ST-PERF-002, ST-PERF-006 · **Status** Open
+- **Recommendation** Clear/rebuild warnings from current state each refresh; render incrementally. **Effort** M · **Related** ST-PERF-002, ST-PERF-006 · **Status** **Fixed** (Phase 2, branch `fix/phase-2-performance`)
 
 <a id="st-perf-005"></a>
 ### ST-PERF-005 — O(n²) feedback logging
 - **Severity** Medium · **OBSERVED** · `learning/preference_learner.py:72`, feedback logger append path
 - **Evidence** Per-append time grows linearly (2.55 ms@1 → 99.9 ms@2000); cumulative 2000 appends = **108.4 s**; a 2000-entry log is 905 KB. `PreferenceLearner.learn()` re-reads and retrains on the full log every call (16.9 ms@100 → 78 ms@2000). Probe: `dataio/probe_04_feedback_log_perf_and_corruption.py`.
 - **Root cause** Each append rewrites the whole encrypted log; each learn re-reads it.
-- **Recommendation** Append-only log format (or cap + rotate); incremental learning. **Effort** M · **Status** Open
+- **Recommendation** Append-only log format (or cap + rotate); incremental learning. **Effort** M · **Status** **Fixed** (Phase 2, branch `fix/phase-2-performance`)
 
 <a id="st-data-001"></a>
 ### ST-DATA-001 — Truncated key.bin silently regenerated → all saves orphaned

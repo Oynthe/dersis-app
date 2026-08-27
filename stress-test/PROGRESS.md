@@ -9,9 +9,92 @@ what has changed since. Per-finding state also lives in the
 |---|---|---|
 | **0 — Critical stabilisation & test scaffold** | ✅ Complete | `fix/phase-0-test-scaffold` |
 | **1 — Data & correctness** | ✅ Complete | `fix/phase-1-data-correctness` |
+| **2 — Performance foundations** | ✅ Complete | `fix/phase-2-performance` |
 | 2 — Performance foundations | Not started | — |
 | 3 — Scheduling engine hardening | Not started | — |
 | 4–7 | Not started | — |
+
+---
+
+## Phase 2 — complete
+
+**Suite: 339 tests — 307 pass, 32 known-defect pins, 0 failures.** The non-slow
+lane was run three times to confirm stability (299 pass / 28 pins each time).
+
+**All six Criticals from the audit are now closed.** ST-PERF-001 was the last.
+
+### Findings closed
+
+| ID | Sev | What changed |
+|---|---|---|
+| [ST-PERF-001](12-findings-register.md#st-perf-001) | 🔴 Critical | The solve runs on a worker thread with real progress and a working Cancel. |
+| [ST-PERF-002](12-findings-register.md#st-perf-002) | 🟠 High | Autosave is coalesced behind a 1.5 s debounce and skipped entirely when a hash of the payload matches disk. |
+| [ST-PERF-003](12-findings-register.md#st-perf-003) | 🟠 High | The warning log separates sticky history from derived findings; derived ones are replaced, not appended. |
+| [ST-PERF-005](12-findings-register.md#st-perf-005) | 🟡 Medium | New EGL1 append-only log format; one append is O(1) in bytes written *and* read. Learning is incremental. |
+| [ST-PERF-006](12-findings-register.md) | 🟡 Medium | The open-slots panel is skipped when nothing it displays has changed. |
+| [ST-PERF-007](12-findings-register.md) | 🟡 Medium | The negotiation pass is lazy, memoised, and pinned to the reschedule-time state. |
+| [ST-UI-009](12-findings-register.md) | 🟡 Medium | Re-selecting what is already selected does no work. |
+
+### Where the plans were not enough
+
+As in Phase 1, each of these was **proved by building the wrong version and
+watching it fail**, not argued:
+
+1. **A lazy negotiation property saves nothing on its own.** `BulkResultsDialog`
+   is constructed after *every* reschedule and built its negotiation tab inside
+   `__init__`, so the first read happened immediately and always. Deferring the
+   computation moved ~727 ms (250 classes) a few lines later inside the same
+   frozen stretch. The tab is now a placeholder populated on first selection.
+2. **Cheap autosave fingerprints all pass the tests and all lose data.** Class
+   names, the class count, and `state["classes"]` alone each passed the whole
+   module — and each silently drops real edits: a drag mutates one class dict in
+   place (same count, same names), and a Setup room change touches
+   `state["classrooms"]` and nothing else. The fingerprint hashes the whole
+   payload.
+3. **A grid-shape-only fingerprint freezes the open-slots panel.** Days, slots
+   and classrooms are stable for an entire editing session, so the panel would be
+   built once and then show occupied slots as free. Occupancy and the selection
+   are both in the fingerprint.
+4. **Counting log records must not read them.** The incremental learner's
+   early-return still read the entire log to find out how many entries there
+   were, so a no-op pass cost 1.6 MB on an 800-entry log. Counting now seeks over
+   the framing, and a size check gates the pass before even that.
+
+### A crash this surfaced
+
+The full suite began segfaulting in an unrelated module's teardown, inside a
+lambda in `app.py`. The deferred settings modal was connected to its timer as
+`lambda: QMessageBox.warning(self, ...)`. **PyQt disconnects a bound-method slot
+when its QObject is destroyed; a lambda capturing `self` is just a callable,
+stays connected, and fires into a half-destroyed window** — an access violation,
+not an exception. It had been latent since Phase 1 and only became reachable
+once the off-thread solve started pumping the event loop hard.
+
+The plan's proposed fix for it, `QTimer.singleShot(0, self, lambda: ...)`, **does
+not compile under PyQt6** — the context-object overload is not exposed. A real
+`QTimer` parented to the window is the equivalent that works.
+
+### Behaviour changes worth knowing
+
+- `refresh_grid` used to normalize `state_data` synchronously as a side effect of
+  autosaving. That now happens up to 1.5 s later, or on close. Every load path
+  still normalizes, so the exposure is an in-session mutation read by something
+  else inside the debounce window.
+- `multi_start_time_limit` raised 120 s → 3600 s. That cap existed to bound a
+  freeze the user could not escape; now that the solve is cancellable, truncating
+  the search is the wrong trade, and a cap that fires costs reproducibility
+  outright.
+- The feedback log is written in a new EGL1 format. Logs written by older builds
+  are converted once, on the next append, and still load either way.
+
+### Known gap, deliberately left
+
+**The re-entrancy guard is only half-covered.** `SolverTask.start()` is
+idempotent and that *is* pinned; that `SchedulerApp` disables Generate / undo /
+import while a solve runs is **not**, because pinning it means driving the real
+window through a complete solve. Two solves sharing one state dict and one
+`apply_reschedule` is the most plausible way this change could corrupt a
+timetable. Verified by reading, not by test — it deserves hardening.
 
 ---
 
