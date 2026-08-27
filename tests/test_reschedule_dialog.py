@@ -174,9 +174,11 @@ def test_the_quick_mode_is_the_visually_primary_one(qapp):
     try:
         quick = _button(dlg, tr("optimization.standard"))
         deep = _button(dlg, tr("optimization.deep_cpsat"))
-        assert quick.isDefault() or not deep.isDefault(), (
-            "neither mode is presented as the recommended one"
-        )
+        # NOT `quick.isDefault() or not deep.isDefault()`: that disjunction is
+        # TRUE when neither is default, which is precisely the state the
+        # failure message describes. Assert both halves.
+        assert quick.isDefault(), "the recommended mode is not the default"
+        assert not deep.isDefault(), "the slower mode is presented as default"
     finally:
         dlg.deleteLater()
 

@@ -465,12 +465,8 @@ class RelaxationSuggester:
         # Try removing excluded constraints
         suggestions.extend(self._suggest_remove_exclusions(cls))
 
-        # Try moving conflicting classes. This also reports how many placed
-        # lessons it had to skip as off-grid (ST-DATA-003); stash it so
-        # build_class_report can surface the count rather than swallowing it.
-        move_suggestions, off_grid = self._suggest_move_conflicts(cls)
-        suggestions.extend(move_suggestions)
-        self.last_off_grid_blockers = off_grid
+        # Try moving conflicting classes
+        suggestions.extend(self._suggest_move_conflicts(cls))
 
         # Sort: primary by impact (desc), secondary by disruption (asc)
         suggestions.sort(key=lambda s: (-s["impact"], s["disruption"]))
@@ -698,19 +694,19 @@ class RelaxationSuggester:
         that helps a user act on it is "move Ders 6 out of Wednesday 12:00 and
         16 slots open up" -- which is precisely this function's job.
 
-        Returns ``(suggestions, off_grid_blockers)``: the second value is the
-        number of placed lessons skipped because they sit on a day or hour the
-        grid no longer has. Skipping them is correct --
-        ``ConstraintValidator.add_placement`` returns early on the identical
-        condition, so such a lesson occupies no cell and blocks nothing, and
-        counting it would contradict the validator that decides
-        ``check_placement``. Returning the count is what keeps that from being
-        a silent drop: those lessons are otherwise mentioned nowhere in the UI.
+        Lessons sitting on a day or hour the grid no longer has are skipped.
+        That is correct -- ``ConstraintValidator.add_placement`` returns early
+        on the identical condition, so such a lesson occupies no cell and
+        blocks nothing, and counting it would contradict the validator that
+        decides ``check_placement``. What keeps that from being a silent drop
+        is that ``ConstraintNegotiator.negotiate_class`` reports how many
+        there are; the count is a property of the STATE, not of this search,
+        so it is not threaded back through here.
         """
         suggestions = []
         days, times, rooms = self.generator.get_search_space(cls)
         if not days or not times or not rooms:
-            return suggestions, 0
+            return suggestions
 
         td = total_duration(cls)
         placed_classes = get_placed_classes(self.state)
@@ -805,14 +801,7 @@ class RelaxationSuggester:
                 },
             })
 
-        # Counted from models.find_off_grid_placements -- the codebase's one
-        # oracle for "not on the grid", already used by the exporter warning
-        # and the PDF appendix -- rather than from what this loop happened to
-        # skip. The loop's own day filter (`ex_day != day`) runs BEFORE the
-        # guard above, so a lesson orphaned by a deleted DAY never reaches it:
-        # deriving the count here would silently report only the deleted-HOUR
-        # half. Re-deriving the rule would also make a third copy of it.
-        return suggestions, len(find_off_grid_placements(self.state))
+        return suggestions
 
     def _estimate_day_impact(self, cls, day, is_exclusion_removal=False):
         """Estimate how many valid slots would open if a day were allowed.
@@ -1259,10 +1248,18 @@ class ConstraintNegotiator:
         """
         analysis = self.analyzer.analyze_class(cls)
         suggestions = self.suggester.suggest_for_class(cls, analysis)
+        # ST-DATA-003. Counted here, from models.find_off_grid_placements --
+        # the codebase's one oracle for "not on the grid", already used by the
+        # exporter warning and the PDF appendix. It is a property of the
+        # STATE, not of this class's search, so threading it back out of
+        # _suggest_move_conflicts was both wrong (it returned 0 on every early
+        # return -- a class with no candidate rooms, no allowed days, or
+        # participants exceeding every room, which are the commonest "cannot
+        # place" causes there are) and a shared-mutable-state hazard on the
+        # suggester instance.
         return self.report_builder.build_class_report(
             analysis, suggestions,
-            off_grid_blockers=getattr(
-                self.suggester, "last_off_grid_blockers", 0))
+            off_grid_blockers=len(find_off_grid_placements(self.state)))
 
     def negotiate_unplaced(self):
         """Run negotiation for all unplaced classes.

@@ -110,10 +110,20 @@ def make_app(qapp, dersis_home, monkeypatch):
 
     monkeypatch.setattr(FirstRunController, "start", lambda self: None)
 
+    # These names are load-bearing and were wrong on first writing: the guard
+    # was `hasattr(...)`, so three misspelled names silently snapshotted and
+    # restored NOTHING while looking like isolation. Kept in one tuple, matching
+    # the list test_settings_recovery.make_window uses, and asserted non-empty
+    # below so a rename cannot make this quietly do nothing again.
+    registry_names = ("_gated_widgets", "_gated_actions", "_on_tier_changed",
+                      "_export_submenu_refreshers")
+
     enforcer = TierEnforcement.instance()
-    registries = [n for n in ("_registered_widgets", "_registered_actions",
-                              "_registered_labels")
-                  if hasattr(enforcer, n)]
+    registries = [n for n in registry_names if hasattr(enforcer, n)]
+    assert registries, (
+        "TierEnforcement exposes none of %r — this fixture is restoring "
+        "nothing. Update registry_names." % (registry_names,)
+    )
     saved = {n: list(getattr(enforcer, n)) for n in registries}
 
     built = []

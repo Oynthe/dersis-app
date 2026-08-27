@@ -1295,9 +1295,19 @@ class TimetableScene(QGraphicsScene):
             x = group["x"] + b["lane"] * (COL_DAY_W + g)
             y = row_y[b["row"]]
             h = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
+            # ST-UI-001. `filtered_layout` stamps the conflict flags on BOTH
+            # modes' blocks; this branch used to drop them on the floor, so the
+            # Online / Lecturer-office tab drew a genuine clash — the same
+            # lecturer twice, or one student group twice — with a normal
+            # year-coloured border and a tooltip that said nothing, while every
+            # other tab painted it red. Labelling is view-independent by
+            # design; this was the one view that did not honour it.
             item = LessonItem(
                 b["cls"], state, b["base_color"], b["bg_color"],
-                QRectF(x, y, COL_DAY_W, h), app, b["day"], b["slot"])
+                QRectF(x, y, COL_DAY_W, h), app, b["day"], b["slot"],
+                conflict=b.get("conflict", False),
+                conflict_partners=b.get("conflict_partners", ()),
+                conflict_labels=b.get("conflict_labels", ()))
             self.addItem(item)
             self.lesson_items.append(item)
 

@@ -1,5 +1,6 @@
 """All dialog windows: Setup, AddClass, PlaceClass, SelectClass, Warnings, OpenSlots, PostAdd, BulkAdd."""
 
+import html
 import os
 
 from PyQt6.QtWidgets import (
@@ -791,6 +792,13 @@ class SetupDialog(QDialog):
         self._slots_status.setStyleSheet("font-size: 8pt; padding: 2px;")
         slot_layout.addWidget(self._slots_status)
         self.slots_text.textChanged.connect(self._refresh_slot_status)
+        # `setPlainText` above ran BEFORE that connection, so nothing evaluated
+        # the text the dialog opens with. Without this call the strip is blank
+        # until the user types — and the case it exists for is precisely a
+        # saved file that ALREADY contains a duplicate, where the user has no
+        # reason to touch the box at all and would meet the problem as a modal
+        # after making ten other edits.
+        self._refresh_slot_status()
 
         slots_io = QHBoxLayout()
         slots_io.addStretch()
@@ -2783,7 +2791,7 @@ class PlaceClassDialog(QDialog):
 
         parts = [f"<b>{tr('dialogs.place.no_options_title')}</b>"]
         for reason in report.get("blocking_reasons", [])[:3]:
-            parts.append(f"&nbsp;&nbsp;• {reason}")
+            parts.append(f"&nbsp;&nbsp;• {html.escape(str(reason))}")
         suggestions = report.get("suggestions", [])
         if suggestions:
             parts.append(f"<b>{tr('dialogs.place.what_to_change')}</b>")
@@ -2792,11 +2800,12 @@ class PlaceClassDialog(QDialog):
                 # move_conflicting type ("...frees 3 slots"), so appending
                 # impact_label there reads as a stutter.
                 if sug.get("type") == "move_conflicting":
-                    parts.append(f"&nbsp;&nbsp;→ {sug['description']}")
+                    parts.append(
+                        f"&nbsp;&nbsp;→ {html.escape(str(sug['description']))}")
                 else:
                     parts.append(
-                        f"&nbsp;&nbsp;→ {sug['description']} "
-                        f"<i>({sug['impact_label']})</i>")
+                        f"&nbsp;&nbsp;→ {html.escape(str(sug['description']))} "
+                        f"<i>({html.escape(str(sug['impact_label']))})</i>")
         n_off_grid = report.get("off_grid_blockers", 0)
         if n_off_grid:
             # ST-DATA-003: these lessons are skipped when counting blockers
@@ -4028,7 +4037,7 @@ class BulkResultsDialog(QDialog):
         if infeasibility and infeasibility.get("message"):
             bottleneck = QLabel(
                 f"<b>{tr('dialogs.bulk_results.impossible_title')}</b><br>"
-                f"{infeasibility['message']}")
+                f"{html.escape(str(infeasibility['message']))}")
             bottleneck.setWordWrap(True)
             bottleneck.setStyleSheet(
                 "background: #FEE2E2; color: #991B1B; padding: 8px; "

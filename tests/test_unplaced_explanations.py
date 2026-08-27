@@ -473,3 +473,66 @@ def test_nothing_is_reported_when_every_placement_committed(make_app):
         assert len(app.warning_log._sticky) == before
     finally:
         app.close()
+
+
+def test_the_off_grid_count_survives_an_empty_search_space():
+    """ST-DATA-003 — the count must not vanish on the commonest failure modes.
+
+    Phase 4 first threaded this count out of ``_suggest_move_conflicts``, which
+    returns early — before ever counting anything — whenever the class has no
+    candidate days, times or rooms. That early return covers the commonest
+    "cannot place" causes there are: a required room that was deleted, every day
+    excluded, a block longer than the remaining grid, and above all a class
+    whose participants exceed every room's capacity. So the note disappeared on
+    exactly the classes most likely to need it.
+
+    The count is a property of the STATE, not of one class's search, so it is
+    read from ``models.find_off_grid_placements`` at report time.
+
+    A failure means a user diagnosing an unplaceable lesson is not told that
+    other lessons are sitting on hours the timetable no longer has.
+    """
+    s = _state()
+    s["days"] = ["monday"]
+    ghost = _add(s, "GHOST", placed_at=("monday", "09:00"))
+    ghost["placed_time"] = "23:00"
+    # A class requiring a room the user has since deleted: get_room_candidates
+    # returns [], the suggester's search space collapses, and it returns before
+    # it counts anything. This is the handoff's own "known gap #4" scenario.
+    victim = _add(s, "ORPHANED", required_rooms=["R999"])
+
+    report = ConstraintNegotiator(s).negotiate_class(victim)
+
+    assert report["off_grid_blockers"] == 1, (
+        "the off-grid note vanished on a class whose search space is empty"
+    )
+    # Anti-vacuity: the search space really did collapse, so this exercises the
+    # early return rather than the normal path.
+    from scheduler_app.core.candidate_generator import CandidateGenerator
+    _days, _times, rooms = CandidateGenerator(s).get_search_space(victim)
+    assert not rooms, "fixture does not collapse the search space"
+
+
+def test_diagnosing_two_classes_does_not_leak_a_count_between_them():
+    """ST-DATA-003 — the count must belong to the state, not to a shared object.
+
+    The first implementation stashed it on the *suggester instance* and read it
+    back in ``negotiate_class``. That is a shared-mutable-state channel between
+    two calls: a report could carry a number computed for a different class.
+
+    A failure means the panel shows one lesson's diagnosis with another's count.
+    """
+    s = _state()
+    s["days"] = ["monday"]
+    ghost = _add(s, "GHOST", placed_at=("monday", "09:00"))
+    ghost["placed_time"] = "23:00"
+    for i, slot in enumerate(SLOTS[1:]):
+        _add(s, f"SITTING{i}", placed_at=("monday", slot))
+    normal = _add(s, "NORMAL")
+    collapsed = _add(s, "TOOBIG", participants=9999)
+
+    neg = ConstraintNegotiator(s)
+    first = neg.negotiate_class(collapsed)
+    second = neg.negotiate_class(normal)
+
+    assert first["off_grid_blockers"] == second["off_grid_blockers"] == 1

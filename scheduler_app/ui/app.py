@@ -3212,18 +3212,29 @@ class SchedulerApp(QMainWindow):
     def edit_setup(self):
         snap_before = capture_snapshot(self.state_data)
         is_initial = not self._has_baseline
-        # ST-UI-014 (second clause) / ST-UI-021. Setup OK can unplace lessons --
-        # `_reconcile_after_setup` clears every placement pointing at a day,
-        # hour, room or lecturer that no longer exists -- and this path pushed
-        # no undo snapshot at all, so that was irreversible. It matters more now
-        # that the slot-list gate can let a user knowingly commit an edit that
-        # moves lessons: "continue" must be recoverable from.
-        self._push_undo(tr("actions.setup"))
+        # ST-UI-014's second clause ("setup edits are irreversible") is real,
+        # and it CANNOT be fixed here. Phase 4 tried: it pushed an undo
+        # snapshot before the dialog and popped it again on cancel. Adversarial
+        # verification showed that made things worse in three ways, so it was
+        # withdrawn.
+        #
+        # `_push_undo` deep-copies `state_data["classes"]` and nothing else,
+        # while Setup rewrites days, slots, classrooms, lecturers and years. So
+        # undoing a Setup change restores the classes WITH THEIR OLD
+        # PLACEMENTS onto the NEW grid — resurrecting exactly the orphans
+        # ST-DATA-003 is about, from a button labelled "Undo: setup change".
+        # A half-transaction undo is not a partial fix; it is a data-corruption
+        # bug wearing a safety label.
+        #
+        # It also clears the redo stack (so Setup+Cancel silently destroyed
+        # redo even though nothing changed) and, at the 50-step cap, evicted
+        # the oldest undo step that popping could not put back.
+        #
+        # Making this genuinely undoable needs full-state snapshots — that is
+        # ST-ARCH-012, Phase 6. Until then Setup stays un-undoable, which is at
+        # least honest.
         dlg = SetupDialog(self, self.state_data)
         dlg.exec()
-        if not dlg.result and self._undo_stack:
-            # Nothing changed -- do not leave a no-op step on the stack.
-            self._undo_stack.pop()
         if dlg.result:
             self._reconcile_after_setup()
         self.refresh_grid()

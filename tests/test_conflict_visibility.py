@@ -48,6 +48,7 @@ Fail-now / pass-after: ST-UI-001 is fixed in Phase 4, so nothing here is
 """
 import pytest
 
+from scheduler_app.translations import tr
 from scheduler_app.core.logic import (
     find_schedule_conflicts, conflict_partner_index,
     assign_component_lanes, _sweep_lanes,
@@ -644,12 +645,16 @@ def test_the_pdf_appendix_names_a_conflict(tmp_path):
     export_schedule(s, "pdf", str(out), mode="classroom")
     text = _pdf_text(out)
 
-    # The appendix header is drawn as text; a Latin-1-only base font mangles
-    # non-ASCII, so key on the ASCII class codes and the row label's ASCII run.
-    assert b"AAA111" in text and b"ZZZ999" in text
-    assert tr("export.appendix_conflict") != "export.appendix_conflict", (
-        "the appendix label has no translation"
+    # `b"AAA111" in text` alone passes with the entire appendix stubbed out --
+    # both codes are in the stacked GRID cell too. The discriminating needle is
+    # the appendix TITLE, which appears nowhere else; its sibling test
+    # `test_a_clean_timetable_gets_no_appendix` asserts the same needle is
+    # ABSENT on a clean schedule, so the pair brackets the behaviour.
+    title_needle = tr("export.appendix_title").split()[0].encode()
+    assert title_needle in text, (
+        "the appendix page was not emitted for a conflicted timetable"
     )
+    assert b"AAA111" in text and b"ZZZ999" in text
 
 
 @pytest.mark.pdf
@@ -720,3 +725,93 @@ def test_the_workbook_shows_both_lessons_of_a_contested_cell(
             f"{code} is on the timetable but missing from the mode={mode} "
             f"workbook"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  5. The mark must survive all the way into the scene
+# ══════════════════════════════════════════════════════════════════════
+#
+# Everything above asserts on the ADAPTER's blocks. That is one layer short:
+# the adapter stamped the flags correctly for both render modes, and the
+# virtual-classroom scene builder silently dropped them when constructing its
+# LessonItems — so the Online / Lecturer-office tab drew a genuine clash with a
+# normal border and a silent tooltip while every other tab painted it red.
+# Nothing caught it, because no test in the repository built a TimetableScene.
+
+def _scene_items(qapp, state, filter_fn, mode):
+    """``(scene, {class_code: LessonItem})``.
+
+    The scene is returned, not discarded: dropping the last Python reference
+    lets Qt delete the C++ objects, and every item access then raises
+    ``RuntimeError: wrapped C/C++ object of type LessonItem has been deleted``.
+    """
+    from scheduler_app.ui.renderer import TimetableScene
+    scene = TimetableScene()
+    scene.build_filtered(state, filter_fn, None, mode=mode)
+    return scene, {it.cls["class_code"]: it for it in scene.lesson_items}
+
+
+@pytest.mark.ui
+def test_the_conflict_mark_reaches_the_items_in_every_render_mode(qapp):
+    """ST-UI-001 — a clash must be red on the tab the user is actually on.
+
+    A failure means the conflict is computed, stamped onto the block, and then
+    thrown away when the graphics item is built — so the lesson renders as
+    ordinary. The Online view is the one a user opens *specifically* to inspect
+    online teaching, and it was the one view that did not honour the mark.
+
+    Two online lessons sharing a lecturer is a real clash: they consume no room,
+    so the room axis says nothing, but one person cannot teach both.
+    """
+    from scheduler_app.ui.renderer import (
+        FILTER_MODE_DEFAULT, FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP)
+    from scheduler_app.core.models import LOCATION_ONLINE
+
+    s = _state()
+    _add(s, "AAA", "09:00", None, lecturer="Lect-01",
+         location_type=LOCATION_ONLINE)
+    _add(s, "BBB", "09:00", None, lecturer="Lect-01", branch="B",
+         location_type=LOCATION_ONLINE)
+
+    # Anti-vacuity: the engine really does call this a clash.
+    assert [r["kinds"] for r in find_schedule_conflicts(s)] == [("lecturer",)]
+
+    online = lambda c: c.get("location_type") == LOCATION_ONLINE
+    for mode in (FILTER_MODE_DEFAULT, FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP):
+        scene, items = _scene_items(qapp, s, online, mode)
+        assert set(items) == {"AAA", "BBB"}, (mode, sorted(items))
+        for code, item in items.items():
+            assert item._conflict is True, (
+                f"{code} lost its conflict mark in mode={mode}"
+            )
+            assert item._conflict_labels, (
+                f"{code} has no partner name to show in mode={mode}"
+            )
+            assert tr("conflicts.tooltip_header") in item.toolTip(), (
+                f"{code}'s tooltip says nothing about the clash in mode={mode}"
+            )
+
+
+@pytest.mark.ui
+def test_a_clean_lesson_carries_no_conflict_mark_in_either_mode(qapp):
+    """ST-UI-001 — the mark must not be permanently on.
+
+    A failure means every lesson is red, which is the same as none being red.
+    """
+    from scheduler_app.ui.renderer import (
+        FILTER_MODE_DEFAULT, FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP)
+    from scheduler_app.core.models import LOCATION_ONLINE
+
+    s = _state()
+    _add(s, "AAA", "09:00", None, lecturer="Lect-01",
+         location_type=LOCATION_ONLINE)
+    _add(s, "BBB", "09:00", None, lecturer="Lect-02", branch="B",
+         location_type=LOCATION_ONLINE)
+    assert find_schedule_conflicts(s) == []
+
+    online = lambda c: c.get("location_type") == LOCATION_ONLINE
+    for mode in (FILTER_MODE_DEFAULT, FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP):
+        scene, items = _scene_items(qapp, s, online, mode)
+        for code, item in items.items():
+            assert item._conflict is False, (code, mode)
+            assert tr("conflicts.tooltip_header") not in item.toolTip()
