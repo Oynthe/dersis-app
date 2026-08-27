@@ -27,6 +27,21 @@ throwaway temp directory at conftest-import time, before pytest collects anythin
   test its own `Documents/Dersis` tree and clears the process-wide cached master key
   on both sides.
 
+## Modules
+
+| Module | Guards |
+|---|---|
+| `test_scheduler_invariants.py` | the correctness spine — the independent oracle against the production optimizer |
+| `test_optimizer_occupancy.py` | ST-SCHED-001/010 — the greedy/LNS seam, ref-counted occupancy |
+| `test_validator_unification.py` | ST-ARCH-004/007/009 — every path reaches one verdict |
+| `test_cpsat_semantics.py` | ST-SCHED-005/006 — availability across duration, all protection levels |
+| `test_greedy_bounds.py` | ST-PERF-004/008, ST-SCHED-012 — bounds, convergence, no recursion |
+| `test_unplaced_diagnostics.py` | ST-SCHED-014/015 — dropped classes, global infeasibility |
+| `test_storage_roundtrip.py` · `test_import_roundtrip.py` · `test_export_smoke.py` | persistence and I/O |
+| `test_grid_integrity.py` · `test_setup_reconcile.py` · `test_state_transactions.py` | ST-DATA family |
+| `test_solver_worker.py` · `test_refresh_cost.py` · `test_reschedule_overhead.py` · `test_warning_log_growth.py` · `test_feedback_log_scaling.py` | ST-PERF family |
+| `test_smoke_environment.py` | the harness itself — proves HOME is sandboxed |
+
 ## Fixtures
 
 | Fixture | Scope | What it gives you |

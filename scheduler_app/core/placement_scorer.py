@@ -35,7 +35,6 @@ DEFAULT_WEIGHTS = {
     "end_of_day_penalty":   0.6,   # Penalty for using last slots of the day
     "midday_bonus":         0.2,   # Mild preference for mid-morning slots
     "lookahead_penalty":    3.0,   # Per-class difficulty increase from this placement
-    "neighbor_impact_penalty": 4.0,  # Penalty for constraining conflict-graph neighbors
     "stability_penalty":    2.0,   # Penalty for moving a class from its current position
 }
 
@@ -257,12 +256,6 @@ class PlacementScorer:
                     if reduction > 0:
                         penalty += reduction * w["lookahead_penalty"]
 
-            # Focused neighbor impact: check graph neighbors that are
-            # still unscheduled (already temporarily placed above)
-            if self.conflict_graph is not None:
-                remaining_ids = {cls_key(rc) for rc in remaining_classes}
-                penalty += self._neighbor_impact(
-                    cls, generator, remaining_ids, before_counts)
         finally:
             # Revert temporary placement
             if prop is not None:
@@ -271,51 +264,6 @@ class PlacementScorer:
                 self.validator.remove_placement(cls, day, slot, room)
 
         return immediate + penalty
-
-    def _neighbor_impact(self, cls, generator, remaining_ids, before_counts):
-        """Calculate impact of current temporary placement on graph neighbors.
-
-        Called while the class is temporarily placed in the validator.
-        Only examines graph neighbors that are still in remaining_ids,
-        avoiding redundant work for classes already checked by the
-        generic lookahead.
-
-        Returns:
-            float: penalty score (>= 0).
-        """
-        graph = self.conflict_graph
-        idx = graph.get_index(cls)
-        if idx is None:
-            return 0.0
-
-        w = self.weights
-        penalty = 0.0
-
-        for nbr_idx in graph.neighbors(idx):
-            nbr_cls = graph.nodes[nbr_idx]
-            nbr_id = cls_key(nbr_cls)
-            if nbr_id not in remaining_ids:
-                continue
-            # Skip if already counted in the generic lookahead
-            if nbr_id in before_counts:
-                continue
-
-            if self.propagator is not None:
-                before = self.propagator.get_valid_count_fast(nbr_cls)
-            else:
-                before = self._count_valid_fast(nbr_cls, generator)
-            # We need a baseline — but the class is already temporarily
-            # placed, so 'before' here is actually 'after'. We approximate
-            # by using the neighbor's degree as a severity multiplier.
-            edge_weight = sum(
-                ew for nn, _, ew in graph.adjacency.get(nbr_idx, [])
-                if nn == idx)
-            if before == 0:
-                penalty += w["neighbor_impact_penalty"] * 5.0 * edge_weight
-            elif before <= 3:
-                penalty += w["neighbor_impact_penalty"] * 2.0 * edge_weight
-
-        return penalty
 
     def score_candidates(self, cls, candidates):
         """Score and sort a list of (day, slot, room) candidates.

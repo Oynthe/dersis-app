@@ -36,6 +36,7 @@ _SHIM_MAP = {
     "scheduler_app.schedule_analytics":   "scheduler_app.core.schedule_analytics",
     "scheduler_app.schedule_impact_analyzer": "scheduler_app.core.schedule_impact_analyzer",
     "scheduler_app.explanation_engine":   "scheduler_app.core.explanation_engine",
+    "scheduler_app.infeasibility":        "scheduler_app.core.infeasibility",
     "scheduler_app.parallel_scorer":      "scheduler_app.core.parallel_scorer",
     "scheduler_app.placement_scorer":     "scheduler_app.core.placement_scorer",
     "scheduler_app.timetable_scorer":     "scheduler_app.core.timetable_scorer",

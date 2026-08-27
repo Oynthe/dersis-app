@@ -53,6 +53,7 @@ from scheduler_app.models import (
     normalize_state_classes,
     get_classroom_export_labels,
     effective_day, effective_time, mark_placed, mark_unplaced,
+    needs_physical_room,
     cls_key,
 )
 from scheduler_app.logic import (
@@ -3877,11 +3878,18 @@ class SchedulerApp(QMainWindow):
         return preferred
 
     def _get_drop_classroom(self, cls, day, slot):
-        """Determine the classroom for a drop via workflow."""
+        """Determine the classroom for a drop via workflow.
+
+        ST-ARCH-004: ``room is None`` is now the *correct* answer for an online
+        or lecturer-office lesson — ``get_room_candidates`` yields the None
+        sentinel for anything that needs no room — so it can no longer be read
+        as "no compatible classroom". Only a lesson that actually needs a room
+        fails when it does not get one.
+        """
         preferred = self._get_preferred_rooms(cls)
         room, conflicts = SchedulingWorkflow.find_drop_classroom(
             self.state_data, cls, day, slot, preferred_rooms=preferred)
-        if room is None:
+        if room is None and needs_physical_room(cls):
             return None, [tr("errors.no_compatible_classrooms")]
         return room, conflicts
 
@@ -3930,9 +3938,10 @@ class SchedulerApp(QMainWindow):
                 + "\n\n" + "\n".join(f"  - {r}" for r in reasons))
             return
 
-        # Phase 2: find classroom
+        # Phase 2: find classroom. None is a valid outcome for a lesson that
+        # needs no room (ST-ARCH-004) — only a face-to-face one has failed.
         room, conflicts = self._get_drop_classroom(cls, day, slot)
-        if room is None:
+        if room is None and needs_physical_room(cls):
             QMessageBox.warning(
                 self, tr("dialogs.move_rejected.title"),
                 tr("errors.cannot_move_to").format(
@@ -4021,6 +4030,13 @@ class SchedulerApp(QMainWindow):
             elif kind == "classroom_capacity":
                 formatted.append(tr("errors.classroom_capacity").format(
                     r=r[1], c=r[2], p=r[3]))
+            elif kind == "lecturer_unavailable":
+                # ST-ARCH-004: the drag path now checks lecturer availability
+                # across the whole block, so this reason can reach the dialog.
+                formatted.append(tr("validation.lecturer_unavailable").format(
+                    r[1], day_label(r[2]), r[3]))
+            elif kind == "placement_invalid":
+                formatted.append(tr("validation.placement_invalid"))
             else:
                 formatted.append(str(r))
         return formatted

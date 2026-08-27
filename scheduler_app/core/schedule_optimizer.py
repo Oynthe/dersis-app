@@ -29,7 +29,11 @@ from scheduler_app.logic import (
     slot_index, total_duration, get_placed_classes, classroom_of,
 )
 from scheduler_app.models import cls_key, DEFAULT_OPTIMIZER_SEED
+# Used by the unplaced-reason fallback below. Was missing, so the
+# `generator is None` branch raised NameError instead of reporting.
+from scheduler_app.translations import tr
 from scheduler_app.core.solver_worker import SolveCancelled
+from scheduler_app.core.infeasibility import diagnose_infeasibility
 
 # The shipped search budget. Named because the progress UI needs the same
 # denominators the optimizer actually runs (ST-PERF-001): a second copy of
@@ -37,7 +41,9 @@ from scheduler_app.core.solver_worker import SolveCancelled
 # early, the moment the two drift.
 DEFAULT_MULTI_START_RUNS = 5
 DEFAULT_LNS_ITERATIONS = 200
-from scheduler_app.constraint_validator import ConstraintValidator
+from scheduler_app.constraint_validator import (
+    ConstraintValidator, screen_placements,
+)
 from scheduler_app.candidate_generator import CandidateGenerator
 from scheduler_app.placement_scorer import PlacementScorer
 from scheduler_app.timetable_scorer import TimetableScorer
@@ -290,8 +296,10 @@ class ScheduleOptimizer:
         for c in flexible:
             if c.get("protection") == PROTECTION_SAME_DAY and c["placed"]:
                 same_day_map[cls_key(c)] = c["placed_day"]
-        # Build improve-only baseline scores: class can only move to
-        # a placement with equal or better (lower) score
+        # improve_only baselines: a class may only move to a placement that
+        # scores at least as well. Rebound per run once `scorer` exists (see
+        # below); initialised here so a run that never executes still leaves a
+        # defined name.
         improve_only_scores = {}
         flexible_placed = [c for c in flexible if c["placed"]]
         flexible_unplaced = [c for c in flexible if not c["placed"]]
@@ -320,13 +328,12 @@ class ScheduleOptimizer:
             # Score the initial timetable before optimization
             tt_scorer = TimetableScorer(self.state, weights=self.weights)
 
-            # Compute baseline scores for improve_only classes
-            for c in flexible:
-                if (c.get("protection") == PROTECTION_IMPROVE_ONLY
-                        and c["placed"]):
-                    improve_only_scores[cls_key(c)] = tt_scorer.placement_score(
-                        c, c["placed_day"], c["placed_time"],
-                        c["placed_classroom"])
+            # improve_only baselines are computed per run, below, against that
+            # run's PlacementScorer — see the comment there for why.
+            improve_only_classes = [
+                c for c in flexible
+                if c.get("protection") == PROTECTION_IMPROVE_ONLY and c["placed"]
+            ]
 
             before_placements = []
             for cls in pinned:
@@ -383,8 +390,15 @@ class ScheduleOptimizer:
                     self._clock_capped = True
                     break
 
-                # Build fresh validator for each run
-                exclude_ids = {cls_key(c) for c in all_flexible}
+                # Build fresh validator for each run.
+                # ST-SCHED-010: `locked` and `protected` classes are `placed`,
+                # so build_occupancy() already counts them. They must be
+                # excluded there or the explicit add loop below claims their
+                # cells a second time, and with ref-counted occupancy a cell
+                # claimed twice needs two releases to free — which nothing does.
+                exclude_ids = ({cls_key(c) for c in all_flexible}
+                               | {cls_key(c) for c in locked}
+                               | {cls_key(c) for c in protected})
                 validator = ConstraintValidator(self.state,
                                                exclude_ids=exclude_ids)
                 for cls in locked:
@@ -409,6 +423,39 @@ class ScheduleOptimizer:
                                          parallel_pool=parallel_pool,
                                          previous_placements=old_placements)
 
+                # ── improve_only baselines, in the right currency ───────────
+                #
+                # ST-SCHED-006. "Move this class only somewhere at least as
+                # good" is enforced in `_greedy_construct` and in
+                # `RepairStrategy` as `candidate_score <= baseline`, where the
+                # candidate scores come from PlacementScorer. The baseline used
+                # to come from TimetableScorer.placement_score — a different
+                # function on a different scale. Measured over ten placed
+                # classes on the `normal` preset: TimetableScorer spans
+                # -0.20..0.60 while PlacementScorer spans -3.67..8.34, and the
+                # mismatched comparison kept 15 of 71 candidates against 22 for
+                # a same-currency one.
+                #
+                # The damaging half is not the count. For four of those ten
+                # classes the old gate kept ZERO candidates — including the
+                # class's own current placement, which by definition is not
+                # worse than itself. An improve_only class could therefore be
+                # forced UNPLACED by the very protection meant to keep it safe.
+                # Scoring both sides with `scorer` makes "stay where you are"
+                # always admissible.
+                #
+                # Per run, not once up front: `scorer` is bound to this run's
+                # validator, whose occupancy already excludes every flexible
+                # class, so the baseline measures the placement against the
+                # fixed part of the timetable — the same footing the candidates
+                # are scored on.
+                improve_only_scores = {
+                    cls_key(c): scorer.score(c, c["placed_day"],
+                                             c["placed_time"],
+                                             c["placed_classroom"])
+                    for c in improve_only_classes
+                }
+
                 # Graph-enhanced ordering: first run uses conflict-graph
                 # difficulty, subsequent runs shuffle with controlled
                 # randomization
@@ -424,7 +471,8 @@ class ScheduleOptimizer:
                     ordered, validator, generator, scorer,
                     propagator=propagator,
                     improve_only_scores=improve_only_scores,
-                    warm_start=ws)
+                    warm_start=ws, same_day_map=same_day_map,
+                    deadline=global_start + self.multi_start_time_limit)
 
                 # Remaining time budget for this run's LNS. Under a
                 # deterministic budget there is none: LNS stops on iteration count,
@@ -542,6 +590,37 @@ class ScheduleOptimizer:
                         # Rebuild solution/ordered from cpsat result
                         # for change tracking below
 
+            # ── ST-SCHED-001: assert and repair before proposing ───────────
+            #
+            # A proposal that breaks a hard constraint is a solver bug, not a
+            # thing to hand to the commit step and let it quietly prune. This
+            # screens the whole proposal through the same rule
+            # apply_reschedule uses (ST-ARCH-004), so anything that gets past
+            # here is committable as-is.
+            #
+            # It is a safety net, not the fix — with the greedy occupancy
+            # resync above, `repaired_conflicts` should be 0 on any instance
+            # whose own pins are satisfiable. A non-zero count in the summary
+            # means the engine produced something it should not have, and is
+            # worth reporting rather than hiding.
+            screened, screen_conflicts = screen_placements(
+                self.state, heuristic_placed, immovable_ids=immovable_ids)
+            screened_keys = {cls_key(c) for c, _, _, _ in screened}
+            # Pinned/locked clashes are reported but still committed — the pin
+            # is the user's instruction (ST-SCHED-002). Only genuinely dropped
+            # placements carry a repair reason.
+            repair_reasons = {
+                cls_key(c): reasons
+                for c, _d, _s, _r, reasons in screen_conflicts
+                if cls_key(c) not in screened_keys
+            }
+            infeasible_fixed = [
+                c.get("name", "?")
+                for c, _d, _s, _r, _reasons in screen_conflicts
+                if cls_key(c) in screened_keys
+            ]
+            heuristic_placed = screened
+
             # Build final results with change tracking
             placed_list = []
             unplaced_list = []
@@ -571,8 +650,15 @@ class ScheduleOptimizer:
 
             for cls in all_flexible:
                 if cls_key(cls) not in placed_set:
-                    reason = (generator.unplaced_reason(cls)
-                              if generator else tr("negotiation.no_valid_placement"))
+                    # A class the repair pass had to drop knows exactly why it
+                    # was dropped; do not overwrite that with the generator's
+                    # generic "all slots occupied" guess.
+                    repaired = repair_reasons.get(cls_key(cls))
+                    if repaired:
+                        reason = "; ".join(repaired)
+                    else:
+                        reason = (generator.unplaced_reason(cls)
+                                  if generator else tr("negotiation.no_valid_placement"))
                     unplaced_list.append((cls, reason))
 
             # Build after-optimization quality breakdown
@@ -604,6 +690,26 @@ class ScheduleOptimizer:
                 # or CP-SAT ran (its budget is still wall-clock — Phase 3).
                 "seed": self.seed,
                 "deterministic": (not self._clock_capped) and (not cpsat_used),
+                # ST-SCHED-001. How many of its own placements the optimizer
+                # had to withdraw because they broke a hard constraint. Any
+                # value above zero is an engine defect, not a property of the
+                # instance, and the caller should say so rather than let the
+                # classes quietly disappear.
+                "repaired_conflicts": len(repair_reasons),
+                "repaired_classes": sorted(
+                    c.get("name", "?") for c, _d, _s, _r, _rs in screen_conflicts
+                    if cls_key(c) not in screened_keys),
+                # ST-SCHED-002. Pinned or locked classes whose fixed position
+                # clashes with another fixed position. These are committed
+                # anyway — the pin is what the user asked for — so the only
+                # correct response is to name them.
+                "infeasible_fixed": sorted(infeasible_fixed),
+                # ST-SCHED-014. The global constraint that makes this instance
+                # impossible, or None. Always present so callers can read it
+                # without guessing. This is arithmetic, not search: it names
+                # what no amount of rearranging could fix, which is the one
+                # thing a list of unplaced classes can never say.
+                "infeasibility": diagnose_infeasibility(self.state),
             }
 
             return placed_list, unplaced_list, changes, summary
@@ -635,7 +741,7 @@ class ScheduleOptimizer:
 
     def _greedy_construct(self, flexible, validator, generator, scorer,
                           propagator=None, improve_only_scores=None,
-                          warm_start=None):
+                          warm_start=None, deadline=None, same_day_map=None):
         """Greedy phase with look-ahead scoring and difficulty ordering.
 
         Places each class in its best-scored valid slot, using look-ahead
@@ -645,14 +751,33 @@ class ScheduleOptimizer:
         If warm_start is provided (dict cls_key -> (day, slot, room)),
         valid previous placements are pre-populated before the greedy
         loop, reducing churn.
+
+        ``deadline`` is an absolute ``time.time()`` value at which the search
+        gives up and returns the best solution found so far (ST-PERF-008).
+        It is an *emergency* cap, not a routine bound: reaching it means the
+        answer depended on how fast this machine is, so it sets
+        ``_clock_capped`` and the run stops claiming reproducibility.
+
+        Returns (best_solution, greedy_stats). On return the validator's
+        occupancy maps describe exactly ``best_solution`` — see the resync at
+        the end of this method (ST-SCHED-001).
         """
         improve_only_scores = improve_only_scores or {}
+        same_day_map = same_day_map or {}
         warm_start = warm_start or {}
         n = len(flexible)
         solution = [None] * n
         best_solution = [None] * n
         best_count = [0]
         iterations = [0]
+        # ST-PERF-004: leaves visited since the incumbent last improved.
+        # See the stopping condition in enter() below.
+        stale_leaves = [0]
+        no_improve_limit = max(500, 4 * n)
+        # Set when the search stops for a reason other than exhausting the
+        # tree. The driver then unwinds directly instead of continuing to try
+        # options it has already decided not to explore — see `_stop()`.
+        aborted = [False]
 
         # Use propagator for add/remove if available (keeps caches in sync)
         def _add(cls, day, slot, room):
@@ -693,65 +818,258 @@ class ScheduleOptimizer:
                     solution[i] = ws
                     _add(cls, ws[0], ws[1], ws[2])
                     warm_placed.add(i)
+        # Seed the incumbent with the warm start. Without this, a run whose
+        # iteration budget expires before the search reaches its first leaf
+        # returns the empty `best_solution` and silently throws away placements
+        # the user already had — and, since the resync below trusts
+        # `best_solution`, would then unplace them in the occupancy maps too.
+        if warm_placed:
+            best_solution[:] = list(solution)
+            best_count[0] = len(warm_placed)
 
         _cancel_token = self.cancel_token
 
-        def solve(idx):
-            if _cancel_token is not None:
-                _cancel_token.raise_if_cancelled()
-            if iterations[0] >= self.max_iterations:
-                return False
-            iterations[0] += 1
+        # ── ST-SCHED-012: an explicit stack, not Python recursion ──────────
+        #
+        # `solve(idx)` used to recurse once per class (plus a second, tail
+        # recursion for the "skip this class" branch), so the interpreter stack
+        # grew to one frame per flexible class. At ~1000 classes that hits
+        # CPython's recursion limit; the 1200-class `pathological` preset died
+        # outright. The loop below is an exact translation of that recursion —
+        # same visit order, same iteration accounting, same return values — so
+        # the answer for any instance that used to fit on the stack is
+        # unchanged, and depth is now bounded by the heap instead.
+        #
+        # A frame is {idx, scored, k, applied}:
+        #   k        - index of the next option to try. k == len(scored) is the
+        #              "leave this class unplaced" branch; k > len(scored) means
+        #              the frame is exhausted.
+        #   applied  - the placement this frame currently has in the occupancy
+        #              maps, or None. Exactly what has to be undone when a
+        #              child fails.
+        stack = []
 
-            if idx == n:
-                placed_count = sum(1 for a in solution if a is not None)
-                if placed_count > best_count[0]:
-                    best_count[0] = placed_count
-                    best_solution[:] = list(solution)
-                return placed_count == n
+        def _record_incumbent():
+            """Offer the current `solution` to the incumbent.
 
-            # Skip warm-started classes (already placed)
-            if idx in warm_placed:
-                return solve(idx + 1)
+            Normally only leaves do this. A stop can fire mid-descent, and at
+            that moment `solution` is a complete, internally consistent partial
+            answer — every `_add` so far is matched by an entry in it. Without
+            this, a stop before the first leaf leaves `best_solution` all-None
+            and the resync below dutifully strips every placement the search had
+            already made: the run returns nothing rather than what it had.
+            """
+            placed_count = sum(1 for a in solution if a is not None)
+            if placed_count > best_count[0]:
+                best_count[0] = placed_count
+                best_solution[:] = list(solution)
 
-            cls = flexible[idx]
-            candidates = generator.generate(cls)
+        def _stop():
+            """Abandon the search, keeping the best answer found so far."""
+            _record_incumbent()
+            aborted[0] = True
+            return ('ret', False)
 
-            # Score with adaptive look-ahead for the next few classes
-            remaining = [flexible[j] for j in range(idx + 1, min(idx + 1 + lookahead_depth, n))]
-            if remaining and len(candidates) > 1:
-                scored = scorer.score_candidates_with_lookahead(
-                    cls, candidates, remaining, generator)
-            else:
-                scored = scorer.score_candidates(cls, candidates)
+        def enter(idx):
+            """Emulate entering ``solve(idx)``.
 
-            # Enforce improve_only: skip candidates worse than baseline
-            baseline = improve_only_scores.get(cls_key(cls))
-            if baseline is not None:
-                scored = [(d, s, r, sc) for d, s, r, sc in scored
-                          if sc <= baseline]
+            Returns ``('ret', bool)`` when the call completes without branching,
+            or ``('push', None)`` when it pushed a frame to branch on.
+            """
+            while True:
+                if _cancel_token is not None:
+                    _cancel_token.raise_if_cancelled()
+                if iterations[0] >= self.max_iterations:
+                    return _stop()
+                # ── ST-PERF-004: stop when the search stops finding anything ──
+                #
+                # The DFS tries every candidate for a class and then tries
+                # skipping it, so the tree is exponential and has no natural
+                # end: it ran until `max_iterations` ran out, every time, at
+                # every scale. `budget_exhausted` was True on 100 % of measured
+                # runs from 25 classes upward — the optimizer's own admission
+                # that it stopped because the clock ran out rather than because
+                # it was done.
+                #
+                # And it bought nothing. Placements are IDENTICAL at every
+                # budget from 100 to 100 000 iterations: `small` 21, `normal`
+                # 76, `large` 231 (from 500 up). What the budget did buy was
+                # wall clock — the full shipped pipeline on `normal` measured
+                # 257 s at 100 000 against 175 s at 2 000, and `small` 43.8 s
+                # against 10.3 s, for the same answer.
+                #
+                # The incumbent only ever changes at a leaf, so "leaves since
+                # the last improvement" is the honest measure of progress.
+                # Scaled by n because a bigger instance needs more leaves before
+                # the same conclusion is safe.
+                if stale_leaves[0] >= no_improve_limit:
+                    return _stop()
+                # ST-PERF-008: the greedy phase had no wall-clock bound at all.
+                # `multi_start_time_limit` was only consulted between runs and
+                # inside LNS, so a single construction could overrun the whole
+                # budget on its own — measured at 125-291 s against a 5 s budget
+                # on `very_large`.
+                #
+                # Checked on EVERY node, not on a sampled subset. Sampling every
+                # Nth node bounds the number of nodes between two looks at the
+                # clock, which is not the quantity that matters: one node calls
+                # generator.generate() (days x slots x rooms) and then scores
+                # every candidate against the look-ahead window, so its cost
+                # grows with the instance and the interval between two samples
+                # is unbounded in seconds. Sampling every 512 nodes still
+                # overran a 5 s budget to 65-168 s. time.time() costs tens of
+                # nanoseconds against a node costing microseconds to
+                # milliseconds, so the honest check is also the cheap one.
+                #
+                # Firing costs reproducibility, so it says so (ST-SCHED-013) —
+                # the same contract the LNS emergency cap already follows.
+                if deadline is not None and time.time() >= deadline:
+                    self._clock_capped = True
+                    return _stop()
+                iterations[0] += 1
 
-            for day, slot, room, _ in scored:
+                if idx == n:
+                    placed_count = sum(1 for a in solution if a is not None)
+                    if placed_count > best_count[0]:
+                        best_count[0] = placed_count
+                        best_solution[:] = list(solution)
+                        stale_leaves[0] = 0
+                    else:
+                        stale_leaves[0] += 1
+                    return ('ret', placed_count == n)
+
+                # Skip warm-started classes (already placed). This was
+                # `return solve(idx + 1)` — a tail call, so it needs no frame.
+                if idx in warm_placed:
+                    idx += 1
+                    continue
+
+                cls = flexible[idx]
+                candidates = generator.generate(cls)
+
+                # ST-SCHED-006: honour `same_day` here, not only in LNS repair.
+                # RepairStrategy has always filtered its candidates this way,
+                # but greedy construction did not, so a `same_day` class the
+                # greedy put on the wrong day stayed there unless LNS happened
+                # to destroy and repair it — the protection level silently held
+                # or not depending on the search.
+                fixed_day = same_day_map.get(cls_key(cls))
+                if fixed_day is not None:
+                    candidates = [c for c in candidates if c[0] == fixed_day]
+
+                # Score with adaptive look-ahead for the next few classes
+                remaining = [flexible[j] for j in range(idx + 1, min(idx + 1 + lookahead_depth, n))]
+                if remaining and len(candidates) > 1:
+                    scored = scorer.score_candidates_with_lookahead(
+                        cls, candidates, remaining, generator)
+                else:
+                    scored = scorer.score_candidates(cls, candidates)
+
+                # Enforce improve_only: skip candidates worse than baseline
+                baseline = improve_only_scores.get(cls_key(cls))
+                if baseline is not None:
+                    scored = [(d, s, r, sc) for d, s, r, sc in scored
+                              if sc <= baseline]
+
+                stack.append({"idx": idx, "scored": scored, "k": 0,
+                              "applied": None})
+                return ('push', None)
+
+        def advance():
+            """Try the top frame's next option, or retire the frame."""
+            frame = stack[-1]
+            idx = frame["idx"]
+            scored = frame["scored"]
+            k = frame["k"]
+            frame["k"] = k + 1
+            if k < len(scored):
+                day, slot, room, _score = scored[k]
                 solution[idx] = (day, slot, room)
-                _add(cls, day, slot, room)
+                _add(flexible[idx], day, slot, room)
+                frame["applied"] = (day, slot, room)
+                return enter(idx + 1)
+            if k == len(scored):
+                # "Try skipping this class" — nothing placed, nothing to undo.
+                frame["applied"] = None
+                return enter(idx + 1)
+            stack.pop()
+            return ('ret', False)
 
-                if solve(idx + 1):
-                    return True
+        action, value = enter(0)
+        while True:
+            if action == 'push':
+                action, value = advance()
+                continue
+            # action == 'ret'
+            if not stack:
+                break
+            if value:
+                # The child succeeded. The recursion did `return True` WITHOUT
+                # undoing its placement, so this frame's `applied` stays in the
+                # occupancy maps; just propagate.
+                stack.pop()
+                continue
+            frame = stack[-1]
+            if frame["applied"] is not None:
+                _remove(flexible[frame["idx"]], *frame["applied"])
+                solution[frame["idx"]] = None
+                frame["applied"] = None
+            if aborted[0]:
+                # ST-PERF-008. Without this the deadline bounded the search but
+                # not the return: `advance()` would go on re-applying and
+                # re-removing every untried candidate of every frame still on
+                # the stack, one `enter()` short-circuit at a time. That is real
+                # occupancy work, O(depth x candidates) of it, done entirely
+                # past the deadline and counted by nothing. Unwind instead.
+                stack.pop()
+                continue
+            action, value = advance()
 
-                _remove(cls, day, slot, room)
-                solution[idx] = None
+        # ── ST-SCHED-001: resynchronise occupancy with the answer ──────────
+        #
+        # This is the defect that made the raw optimizer output invalid.
+        # `solve()` records its answer as a SNAPSHOT (`best_solution`) taken at
+        # a leaf, but keeps mutating `solution` and the occupancy maps as the
+        # search continues. There are two exits:
+        #
+        #   * Full success — every class placed. `solve` returns True and each
+        #     frame returns True without running its matching `_remove`, so the
+        #     occupancy maps still describe the answer. (This is why the `tiny`
+        #     preset was always clean: 5/5 classes placed.)
+        #   * Anything else — a partial best, or the iteration budget running
+        #     out. Every frame falls through to `_remove` and the stack unwinds
+        #     completely, emptying the occupancy maps back to the baseline —
+        #     while `best_solution` still claims a full set of placements.
+        #
+        # In the second case the caller was handed a solution and a validator
+        # that disagreed about every cell in it. Measured on the 25-class
+        # `small` preset: 20 placements returned, 0 of them known to the
+        # validator. `_lns_improve` then ran its whole repair loop against a
+        # near-empty grid and stacked classes on top of each other, which is
+        # exactly the 18 room/lecturer/group double-books the oracle reported.
+        #
+        # `solution` is a faithful mirror of what the occupancy maps hold at
+        # this point (every `_add` in the loop above is paired with an assignment
+        # to `solution[idx]`, and every `_remove` with clearing it), so the two
+        # can be reconciled index by index.
+        for i in range(n):
+            if solution[i] == best_solution[i]:
+                continue
+            if solution[i] is not None:
+                _remove(flexible[i], *solution[i])
+            if best_solution[i] is not None:
+                _add(flexible[i], *best_solution[i])
+            solution[i] = best_solution[i]
 
-            # Try skipping this class
-            if solve(idx + 1):
-                return True
-
-            return False
-
-        solve(0)
         greedy_stats = {
             "iterations_used": iterations[0],
             "max_iterations": self.max_iterations,
             "budget_exhausted": iterations[0] >= self.max_iterations,
+            # True when the search ended because it had stopped finding better
+            # solutions — a real stopping condition rather than a timeout.
+            "converged": (aborted[0]
+                          and stale_leaves[0] >= no_improve_limit),
+            "no_improve_limit": no_improve_limit,
             "warm_started": len(warm_placed),
         }
         return best_solution, greedy_stats
@@ -1121,9 +1439,14 @@ class ScheduleOptimizer:
         preferred = {cls_key(c): (c["placed_day"], c["placed_time"],
                                  c["placed_classroom"]) for c in existing_flexible}
 
+        # ST-PERF-008: this is `optimized_auto_place`, i.e. the user adding one
+        # class and waiting. It shares `multi_start_time_limit` with the full
+        # reschedule because it is the same search; without a deadline here the
+        # bound only ever applied to the Generate button.
         solution, _ = self._greedy_construct(
             combined, validator, generator, scorer,
-            improve_only_scores=improve_only_scores)
+            improve_only_scores=improve_only_scores,
+            deadline=time.time() + self.multi_start_time_limit)
 
         # Find new class result
         if not new_cls["pinned"]:

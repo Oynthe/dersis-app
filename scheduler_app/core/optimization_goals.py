@@ -124,9 +124,13 @@ _GOAL_WEIGHT_MAP = {
         "day_overload":         (1.5,   1.0),
         "day_spread":           (0.05,  1.0),
     },
+    # ST-SCHED-015: this slider used to drive two weights, but the second fed
+    # PlacementScorer._neighbor_impact, which measured 0.0 on every one of 3307
+    # calls across the `small` and `normal` presets and has been removed. The
+    # half left here is the half that ever did anything, so the slider behaves
+    # exactly as before.
     "minimal_disruption": {
         "lookahead_penalty":    (3.0,   1.0),
-        "neighbor_impact_penalty": (4.0, 1.0),
     },
     "early_hour_preference": {
         "early_slot_bonus":     (0.3,   1.0),

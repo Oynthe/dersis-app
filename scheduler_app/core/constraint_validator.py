@@ -11,10 +11,11 @@ from scheduler_app.logic import (
     find_slot_index,
     slot_index, slots_fit, total_duration, get_consecutive_slots,
     get_placed_classes, classroom_of, _active_targets, targets_overlap,
-    build_occupancy,
+    build_occupancy, occ_claim, occ_release,
 )
 from scheduler_app.translations import tr
 from scheduler_app.models import (
+    cls_key,
     room_fits_class, lecturer_available_at, needs_physical_room,
     get_room_candidates, effective_day, effective_time,
     filter_class_days, filter_class_times,
@@ -33,9 +34,14 @@ class ConstraintValidator:
     def __init__(self, state, exclude_ids=None):
         self.state = state
         self.exclude_ids = exclude_ids or set()
-        self.room_occ = {}    # (day, slot) -> set of room names
-        self.lect_occ = {}    # (day, slot) -> set of lecturer names
-        self.group_occ = {}   # (day, slot) -> set of (year, branch) tuples
+        # (day, slot) -> {entity: refcount}. Ref-counted rather than a set so
+        # that removing one of two classes claiming the same cell does not
+        # erase the other's claim (ST-SCHED-010). Reads are unaffected: every
+        # consumer does `entity in occ.get(key, set())`, `set(cell)` or
+        # `bool(cell)`, which behave identically on a dict.
+        self.room_occ = {}    # (day, slot) -> {room name: refcount}
+        self.lect_occ = {}    # (day, slot) -> {lecturer name: refcount}
+        self.group_occ = {}   # (day, slot) -> {(year, branch): refcount}
         self._build_occupancy()
 
     def _build_occupancy(self):
@@ -169,9 +175,17 @@ class ConstraintValidator:
 
         # Temporarily remove class's current placement from occupancy maps
         # to avoid self-conflicts when re-validating an already-placed class.
+        #
+        # Only when it is actually IN those maps. A class in `exclude_ids` was
+        # deliberately left out of `build_occupancy`, so the remove below finds
+        # nothing to release — but the restore in the `finally` would then add a
+        # claim that never existed, permanently marking a free cell occupied for
+        # every later check. Screening a proposed schedule (`screen_placements`)
+        # excludes every class it is about to test, so this path is ordinary.
         cur_day = effective_day(cls)
         cur_time = effective_time(cls)
-        already_placed = cur_day is not None and cur_time is not None
+        already_placed = (cur_day is not None and cur_time is not None
+                          and cls_key(cls) not in self.exclude_ids)
         if already_placed:
             cur_room = cls.get("pinned_classroom") if cls.get("pinned") else cls.get("placed_classroom")
             self.remove_placement(cls, cur_day, cur_time, cur_room)
@@ -205,7 +219,16 @@ class ConstraintValidator:
         return len(reasons) == 0, reasons
 
     def find_conflicts(self, cls, day, start_slot, room):
-        """Return a list of human-readable conflict descriptions."""
+        """Return a list of human-readable conflict descriptions.
+
+        ST-SCHED-009: this list is guaranteed non-empty whenever
+        ``check_placement`` rejects the same placement. It used to be possible
+        for the two to disagree — a duration-2 class whose lecturer was free at
+        09:00 but not at 10:00 was rejected by ``check_placement`` while
+        ``find_conflicts`` returned ``[]``, because it only tested availability
+        at the *start* slot. The drag-and-drop UI then refused the drop and had
+        nothing to tell the user about why.
+        """
         conflicts = []
         td = total_duration(cls)
         display_day_value = display_day(day)
@@ -240,16 +263,18 @@ class ConstraintValidator:
                     conflicts.append(
                         tr("validation.room_capacity").format(
                             room, cap, cls.get('participants', 0)))
-        # Lecturer availability
-        lecturer = cls.get("lecturer", "")
-        if lecturer and not lecturer_available_at(self.state, lecturer, day, start_slot):
-            conflicts.append(
-                tr("validation.lecturer_unavailable").format(
-                    lecturer, display_day_value, start_slot))
         check_room = needs_physical_room(cls) and room is not None
         slots_list = self.state["slots"][si:si + td]
+        lecturer = cls.get("lecturer", "")
         for off, s in enumerate(slots_list):
             key = (day, s)
+            # Availability over the WHOLE block, not just the start slot —
+            # this is the ST-SCHED-009 gap, and it matches what
+            # respects_constraints() has always enforced.
+            if lecturer and not lecturer_available_at(self.state, lecturer, day, s):
+                conflicts.append(
+                    tr("validation.lecturer_unavailable").format(
+                        lecturer, display_day_value, s))
             if check_room and room in self.room_occ.get(key, set()):
                 conflicts.append(tr("validation.room_occupied").format(room, display_day_value, s))
             if cls["lecturer"] in self.lect_occ.get(key, set()):
@@ -261,10 +286,21 @@ class ConstraintValidator:
                     conflicts.append(
                         tr("validation.group_busy").format(
                             t['year'], t['branch'], display_day_value, s))
+
+        # Backstop. Everything above enumerates a *known* reason; if some future
+        # rule makes check_placement stricter than this enumeration, an empty
+        # list would silently reopen ST-SCHED-009 — a rejection the UI cannot
+        # explain. Better a generic sentence than no sentence.
+        if not conflicts and not self.check_placement(cls, day, start_slot, room):
+            conflicts.append(tr("validation.placement_invalid"))
         return conflicts
 
     def add_placement(self, cls, day, start_slot, room):
-        """Register a placement in the occupancy maps."""
+        """Register a placement in the occupancy maps.
+
+        ST-SCHED-010: claims are ref-counted, so registering the same cell
+        twice takes two removals to free it. See ``logic.occ_claim``.
+        """
         td = total_duration(cls)
         si = find_slot_index(self.state, start_slot)
         if si is None or day not in self.state["days"]:
@@ -274,14 +310,17 @@ class ConstraintValidator:
         for off, s in enumerate(slots_list):
             key = (day, s)
             if track_room:
-                self.room_occ.setdefault(key, set()).add(room)
-            self.lect_occ.setdefault(key, set()).add(cls["lecturer"])
+                occ_claim(self.room_occ, key, room)
+            occ_claim(self.lect_occ, key, cls["lecturer"])
             for t in _active_targets(cls, off):
-                self.group_occ.setdefault(key, set()).add(
-                    (t["year"], t["branch"]))
+                occ_claim(self.group_occ, key, (t["year"], t["branch"]))
 
     def remove_placement(self, cls, day, start_slot, room):
-        """Remove a placement from the occupancy maps."""
+        """Remove a placement from the occupancy maps.
+
+        Releases one ref-count per cell; a cell stays occupied while another
+        class still claims it (ST-SCHED-010).
+        """
         td = total_duration(cls)
         si = find_slot_index(self.state, start_slot)
         if si is None or day not in self.state["days"]:
@@ -291,11 +330,10 @@ class ConstraintValidator:
         for off, s in enumerate(slots_list):
             key = (day, s)
             if track_room:
-                self.room_occ.get(key, set()).discard(room)
-            self.lect_occ.get(key, set()).discard(cls["lecturer"])
+                occ_release(self.room_occ, key, room)
+            occ_release(self.lect_occ, key, cls["lecturer"])
             for t in _active_targets(cls, off):
-                self.group_occ.get(key, set()).discard(
-                    (t["year"], t["branch"]))
+                occ_release(self.group_occ, key, (t["year"], t["branch"]))
 
     def _get_constrained_search_space(self, cls):
         """Return (days, times, rooms) filtered by class + lecturer constraints.
@@ -377,3 +415,89 @@ class ConstraintValidator:
         Returns a new list sorted by scheduling difficulty (ascending).
         """
         return sorted(classes, key=lambda c: self.scheduling_difficulty(c))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  THE COMMIT RULE  (ST-ARCH-004, ST-SCHED-001, ST-SCHED-002)
+# ══════════════════════════════════════════════════════════════════════════
+
+def screen_placements(state, placements, immovable_ids=None):
+    """Decide which of *placements* may be committed **together**.
+
+    Validating placements one at a time answers the wrong question: each may be
+    individually legal while the set of them double-books a room. This walks the
+    proposal in precedence order, registering each accepted placement in the
+    occupancy maps so the next one is judged against it.
+
+    Precedence, highest first:
+
+    1. **Pinned.** Screened at their pin position, never dropped. A pin is an
+       instruction the user typed, so an infeasible one is *reported* and still
+       registered — clearing it would destroy their intent, and pretending the
+       cell is free would steer flexible classes straight into it (ST-SCHED-002).
+    2. **Immovable** (``protection="locked"``, plus anything the caller names).
+       Same treatment: reported, never dropped. Unplacing a locked class is
+       itself a violation of the guarantee its protection level makes.
+    3. **Everything else**, in the order given. A placement that cannot stand
+       alongside what has already been accepted is rejected.
+
+    Both the optimizer's self-check and ``SchedulingWorkflow.apply_reschedule``
+    go through here, so "which schedules are legal" has exactly one answer
+    (ST-ARCH-004). This function is pure — it never touches the class dicts.
+
+    Parameters
+    ----------
+    state : dict
+    placements : iterable of ``(cls, day, slot, room)``
+    immovable_ids : set of ``cls_key`` values to treat as rank 2.
+
+    Returns
+    -------
+    (accepted, rejected)
+        ``accepted`` -- ``[(cls, day, slot, room)]``, room normalised to None
+        for classes that need no physical room.
+        ``rejected`` -- ``[(cls, day, slot, room, reasons)]``. ``reasons`` is
+        never empty (ST-SCHED-009). A *reported* pin or locked class appears in
+        ``rejected`` **and** in ``accepted``: the caller must commit it, and
+        must also tell the user it clashes.
+    """
+    immovable_ids = immovable_ids or set()
+    entries = [(c, d, s, r) for c, d, s, r in placements]
+    placed_keys = {cls_key(c) for c, _, _, _ in entries}
+    validator = ConstraintValidator(state, exclude_ids=placed_keys)
+
+    def rank(cls):
+        if cls.get("pinned"):
+            return 0
+        if cls_key(cls) in immovable_ids:
+            return 1
+        return 2
+
+    accepted = []
+    rejected = []
+    # Stable: `sorted` keeps the caller's order within each rank, so a
+    # deterministic proposal screens deterministically.
+    for cls, day, slot, room in sorted(entries, key=lambda e: rank(e[0])):
+        if cls.get("pinned"):
+            # Read the pin off the class, not off the proposal: the pin is the
+            # authority on where a pinned class goes.
+            day = cls.get("pinned_day")
+            slot = cls.get("pinned_time")
+            room = cls.get("pinned_classroom")
+        room = room if needs_physical_room(cls) else None
+        if validator.check_placement(cls, day, slot, room):
+            validator.add_placement(cls, day, slot, room)
+            accepted.append((cls, day, slot, room))
+            continue
+
+        reasons = validator.find_conflicts(cls, day, slot, room)
+        if rank(cls) < 2:
+            # Reported, not dropped — and still registered, so nothing else is
+            # steered into the cell it occupies. add_placement is a no-op for an
+            # off-grid day/slot, which is exactly right: such a placement
+            # occupies no real cell and blocks nothing.
+            validator.add_placement(cls, day, slot, room)
+            accepted.append((cls, day, slot, room))
+        rejected.append((cls, day, slot, room, reasons))
+
+    return accepted, rejected
