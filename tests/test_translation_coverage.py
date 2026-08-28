@@ -74,14 +74,16 @@ EN = TRANSLATIONS["en"]
 # These are ratchets: the numbers may go DOWN freely. They may not go up
 # without a deliberate edit here, which is the review point.
 #
-# 2408 was the figure before this phase. Phase 5 adds four keys to en+tr —
-# `labels.targets`, `errors.duration_required`, and the two
-# `explanation.component.stability.*` — each of which is then absent from the
-# other 20 locales, so the bound moves by exactly 4 x 20 = 80. The ratchet
-# caught that on the very commit that introduced it, which is the behaviour
-# wanted: adding an English string is normal work, and the test asks for an
-# explicit acknowledgement rather than failing the build.
-MAX_MISSING_LOCALE_KEY_PAIRS = 2488
+# 2408 was the figure before this phase. Phase 5 adds five keys to en+tr —
+# `labels.targets`, `errors.duration_required`, the two
+# `explanation.component.stability.*`, and `a11y.lane_position` for the
+# ST-UI-004 cursor announcement — each of which is then absent from the other
+# 20 locales, so the bound moves by exactly 5 x 20 = 100.
+#
+# The ratchet caught both additions on the very commits that introduced them,
+# which is the behaviour wanted: adding an English string is normal work, and
+# the test asks for an explicit acknowledgement rather than failing the build.
+MAX_MISSING_LOCALE_KEY_PAIRS = 2508
 MAX_PLACEHOLDER_SUBSETS = 1
 
 

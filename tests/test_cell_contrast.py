@@ -235,9 +235,16 @@ def test_the_palette_has_one_source_for_all_three_surfaces():
                 line = src[:m.start()].count("\n") + 1
                 text = src.splitlines()[line - 1]
                 # renderer.py keeps one #1D4ED8 as the EmptySlotItem selection
-                # *border* — a UI-component boundary, not text, and governed by
-                # WCAG 1.4.11's 3:1 rather than 4.5:1.
+                # *border*, and another as the ST-UI-004 focus ring — both are
+                # UI-component boundaries, not text, governed by WCAG 1.4.11's
+                # 3:1 rather than 4.5:1.
                 if "QPen(" in text:
+                    continue
+                # A hex in prose paints nothing. The retired values are named in
+                # comments on purpose — saying which colour a line replaced is
+                # how the next reader learns why — and a guard that forbids
+                # that just teaches people to delete the explanation.
+                if text.lstrip().startswith("#"):
                     continue
                 offenders.append("%s:%d  %s (%s)"
                                  % (module.__name__, line, text.strip(), role))
