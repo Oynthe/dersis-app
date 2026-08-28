@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QUrl, QUrlQuery
 from PyQt6.QtGui import QColor, QPainter, QPen, QCursor, QDesktopServices
 
+from scheduler_app.core.text_safety import redact_user_paths
 from scheduler_app.translations import tr
 from scheduler_app._version import __version__ as APP_VERSION
 
@@ -164,7 +165,16 @@ def _open_mailto(subject, body, parent=None):
     Returns True if a mail client was launched. If none is available, the
     body is copied to the clipboard and a friendly dialog tells the user
     which address to write to. Nothing is sent automatically.
+
+    ST-SEC-008: this is the **only** function in DERSİS that puts text on a
+    path off the machine, so it is the only place the account name has to be
+    removed. One call covers both dialogs, the ``mailto:`` URL, and the
+    clipboard fallback below. The crash log on disk and the ``log_path`` the
+    crash dialog displays are deliberately left raw — they never leave the
+    machine, and they are the only unredacted copy a local maintainer has.
     """
+    body = redact_user_paths(body)
+
     url = QUrl(f"mailto:{BUG_REPORT_EMAIL}")
     query = QUrlQuery()
     query.addQueryItem("subject", subject)
