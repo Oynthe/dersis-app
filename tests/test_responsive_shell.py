@@ -463,3 +463,119 @@ def test_no_language_pays_for_a_tab_it_could_have_reached(make_app, qapp):
                                "\n  ".join(hiding)))
     finally:
         _restore_language(win, qapp)
+
+
+# ── 3. The decision is re-taken whenever the grid's width changes ───────────
+#
+# The two tests below are about the half of ST-UI-013 the first implementation
+# left out. ``_apply_sidebar_intent`` ran from ``resizeEvent``,
+# ``_init_splitter_sizes`` and ``_set_language`` — every trigger it had was a
+# change to the *window*. But the quantity on the other side of the comparison
+# is the *content*: the scene the current tab draws. Opening a file with two
+# more days, or clicking the tab that draws every group at once, moves the
+# threshold by hundreds of pixels while the window never moves at all, and the
+# sidebar went on holding its 314 px in exactly the state the feature exists to
+# get out of.
+
+def test_a_wider_timetable_takes_the_sidebar_s_room_with_no_resize(
+        make_app, qapp, make_state):
+    """Opening a file with more days re-takes the decision. Nothing resizes.
+
+    Both thresholds are measured off this same window, one after the other,
+    with the sidebar open for both, so what is asserted is that the app agrees
+    with a comparison between two of its own numbers — not that either number
+    has any particular value on this platform.
+    """
+    win = _shown(make_app, qapp)
+    # "Show everything" draws every group side by side, so its scene is the one
+    # that beats the tab bar's size hint offscreen as well as natively; on the
+    # filtered tabs the tab bar is the wider of the two and the day count never
+    # reaches the comparison at all.
+    win.notebook.setCurrentIndex(3)
+    qapp.processEvents()
+    win._sidebar_expand_btn.click()
+    qapp.processEvents()
+    assert not win._sidebar_is_collapsed
+
+    narrow = make_state(n_days=4, n_slots=8, n_classes=24, seed=7)
+    wide = make_state(n_days=7, n_slots=10, n_classes=42, seed=7)
+
+    _load(win, qapp, wide)
+    wide_needs = _width_the_sidebar_costs(win)
+    _load(win, qapp, narrow)
+    narrow_needs = _width_the_sidebar_costs(win)
+    assert wide_needs - narrow_needs > 200, (
+        "three more days moved the threshold by only %d px; there is no band "
+        "between them for this test to sit in"
+        % (wide_needs - narrow_needs))
+
+    # A window that fits the four-day timetable and its sidebar, and cannot fit
+    # the seven-day one alongside it.
+    win._sidebar_intent = "auto"          # nobody has decided anything
+    _set_splitter_width(win, qapp, (narrow_needs + wide_needs) // 2)
+    _assert_really_laid_out(win)
+    room = win.splitter.width()
+    assert narrow_needs <= room < wide_needs, (
+        "the window settled at %d px, outside the %d..%d band this test needs"
+        % (room, narrow_needs, wide_needs))
+    assert not win._sidebar_is_collapsed, (
+        "the sidebar yielded in a window that has room for it (%d px against "
+        "%d needed)" % (room, narrow_needs))
+
+    # The user opens a file with three more days in it. The window does not
+    # move; only what it has to draw does.
+    _load(win, qapp, wide)
+    assert win.splitter.width() == room, (
+        "the window moved between the two measurements (%d -> %d); nothing "
+        "compared across them means anything"
+        % (room, win.splitter.width()))
+    assert win._sidebar_is_collapsed, (
+        "a %d px window is drawing a timetable that needs %d and the sidebar "
+        "is still open; the decision was only ever re-taken on a resize"
+        % (room, wide_needs))
+
+
+def test_switching_to_a_wider_tab_takes_the_sidebar_s_room(
+        make_app, qapp, make_state):
+    """Clicking a tab changes the content width without touching the window.
+
+    ``notebook.currentChanged`` goes straight to ``_render_current_tab`` and
+    never reaches ``refresh_grid``, so a fix hung off the latter alone would
+    leave this path exactly as it was.
+    """
+    win = _shown(make_app, qapp)
+    win._sidebar_expand_btn.click()
+    qapp.processEvents()
+    _load(win, qapp, make_state(n_days=7, n_slots=10, n_classes=42, seed=7))
+
+    win.notebook.setCurrentIndex(0)
+    qapp.processEvents()
+    filtered_needs = _width_the_sidebar_costs(win)
+    win.notebook.setCurrentIndex(3)
+    qapp.processEvents()
+    everything_needs = _width_the_sidebar_costs(win)
+    assert everything_needs - filtered_needs > 200, (
+        "the two tabs want widths %d px apart; there is no band between them"
+        % (everything_needs - filtered_needs))
+
+    win.notebook.setCurrentIndex(0)
+    qapp.processEvents()
+    win._sidebar_intent = "auto"
+    _set_splitter_width(win, qapp, (filtered_needs + everything_needs) // 2)
+    _assert_really_laid_out(win)
+    room = win.splitter.width()
+    assert filtered_needs <= room < everything_needs, (
+        "the window settled at %d px, outside the %d..%d band this test needs"
+        % (room, filtered_needs, everything_needs))
+    assert not win._sidebar_is_collapsed, (
+        "the sidebar yielded on the filtered tab, which fits (%d px against "
+        "%d needed)" % (room, filtered_needs))
+
+    win.notebook.setCurrentIndex(3)       # the user clicks "Show everything"
+    qapp.processEvents()
+    assert win.splitter.width() == room, (
+        "the window moved when the tab changed (%d -> %d)"
+        % (room, win.splitter.width()))
+    assert win._sidebar_is_collapsed, (
+        "switching to a tab that needs %d px left the sidebar open in a %d px "
+        "window" % (everything_needs, room))

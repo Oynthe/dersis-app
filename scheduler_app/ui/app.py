@@ -2402,6 +2402,24 @@ class SchedulerApp(QMainWindow):
         elif tab_idx == 4:
             self.dashboard_widget.refresh(self.state_data)
 
+        # ST-UI-013: the threshold has two sides and only one of them is the
+        # window. Every other trigger — resizeEvent, _init_splitter_sizes,
+        # _set_language — fires when the *window* changes, so a schedule that
+        # grew two days, a freshly opened file, or a click on "Show everything"
+        # moved the *content* side by hundreds of pixels with the decision from
+        # startup still standing. Measured on 6x10 Turkish at 1366x768: the
+        # sidebar kept 314 px the sixth day needed, and only a 1 px nudge of
+        # the window would hand them over.
+        #
+        # Here rather than in `refresh_grid`, because `notebook.currentChanged`
+        # connects straight to this method and never reaches `refresh_grid`.
+        # The hasattr mirrors `resizeEvent`'s guard: the filter combo boxes
+        # this method returns on exist earlier in `_build_main` than the
+        # sidebar state does. No re-render can come back through here — the
+        # collapse only moves splitter sizes, and no view defines resizeEvent.
+        if hasattr(self, '_sidebar_intent'):
+            self._apply_sidebar_intent()
+
     def _update_side_panels(self):
         """Update unplaced panel, open slots, and warnings."""
         if not hasattr(self, 'lecturer_filter'):
