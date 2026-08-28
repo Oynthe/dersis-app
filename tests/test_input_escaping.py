@@ -219,13 +219,24 @@ def test_csv_prefix_is_only_ever_used_where_nothing_reads_it_back():
     from scheduler_app.data_io import exporter
 
     src = inspect.getsource(exporter)
-    for marker in ("def _rich_cell", "def _export_excel", "def _export_csv"):
+    for marker in ("def _export_excel", "def _export_csv"):
         assert marker in src, "exporter.py no longer defines %r" % marker
 
-    # The Excel writers only. `_export_csv` sits between `_export_excel` and
+    # The Excel writer only. `_export_csv` sits between `_export_excel` and
     # `_export_pdf`, so bounding this region at `_export_pdf` would sweep the
     # CSV writer in and fail on the one place `csv_safe` is *correct*.
-    excel_region = src[src.index("def _rich_cell"):src.index("def _export_csv")]
+    #
+    # The region used to open at `def _rich_cell`, a module-level formatter
+    # ST-ARCH-011 deleted along with `_cell_text` and `_entry_bg_color`: they
+    # were the residue of the second Excel engine ST-ARCH-003 removed and had
+    # no caller. Nothing between `_sheet_name_for_export` and `_export_excel`
+    # is Excel-only any more, so the region opens at the writer itself and
+    # covers the same live code it did before.
+    excel_region = src[src.index("def _export_excel"):src.index("def _export_csv")]
+    assert "_build_rich_cell" in excel_region, (
+        "the Excel writer no longer builds its cells in this region, so the "
+        "csv_safe check below is scanning the wrong code"
+    )
     assert "csv_safe" not in excel_region, (
         "csv_safe reached an XLSX writer; a literal apostrophe there is "
         "re-imported as part of the name (see the module docstring)"

@@ -120,49 +120,6 @@ def _strip_hash(color):
     return color.lstrip("#")
 
 
-def _cell_text(entry):
-    """Format a schedule entry for a grid cell (plain text fallback)."""
-    return plain_cell_text(entry)
-
-
-def _rich_cell(entry):
-    """Build a CellRichText with color-coded lines matching the app view."""
-    blocks = []
-    code = entry.get("class_code", "")
-    if code:
-        blocks.append(TextBlock(
-            InlineFont(b=True, sz=9, color=_strip_hash(CELL_FG_CODE)), code + "\n"))
-    blocks.append(TextBlock(
-        InlineFont(b=True, sz=10, color=_strip_hash(CELL_FG_NAME)), entry["name"] + "\n"))
-    if entry["lecturer"]:
-        blocks.append(TextBlock(
-            InlineFont(sz=9, color=_strip_hash(CELL_FG_LECTURER)), entry["lecturer"] + "\n"))
-    if entry["room"]:
-        blocks.append(TextBlock(
-            InlineFont(sz=9, color=_strip_hash(CELL_FG_ROOM)), entry["room"]))
-
-    cls = entry.get("cls", {})
-    emoji, label, color = get_badge(cls)
-    if emoji:
-        blocks.append(TextBlock(
-            InlineFont(b=True, sz=8, color=_strip_hash(color)),
-            "\n" + f"{emoji} {label}"))
-
-    return CellRichText(*blocks)
-
-
-def _entry_bg_color(entry, state):
-    """Return the lightened background hex for a lesson cell."""
-    cls = entry.get("cls", {})
-    yr_name = ""
-    targets = cls.get("targets", [])
-    if targets:
-        yr_name = targets[0].get("year", "")
-    base = get_year_color(state, yr_name)
-    light = lighten_color(base, 0.45)
-    return _strip_hash(light)
-
-
 def _sheet_name_for_export(base, used):
     invalid = set("[]:*?/\\")
     default_sheet = tr("labels.sheet")
