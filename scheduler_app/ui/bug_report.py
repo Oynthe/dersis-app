@@ -158,6 +158,35 @@ def _make_subheading(text):
     return lbl
 
 
+def _percent_encoded(text):
+    r"""Encode *text* for a ``QUrlQuery`` value.
+
+    ``QUrlQuery.addQueryItem`` documents its value as **already** percent-
+    encoded, and DERSİS was handing it the reporter's raw prose. Turkish writes
+    every percentage as ``%50``, so the reporter's own sentence routinely
+    contains a percent sign followed by two characters that read as hex — and
+    Qt decoded them. Measured on the real dialog with the language set to
+    ``tr``:
+
+        'Ders yuku %20 artinca…'   -> 'Ders yuku   artinca…'
+        'Doluluk %50 iken…'        -> 'Doluluk P iken…'
+        'Basari orani %85…'        -> a byte that is not valid UTF-8
+
+    The damage happened inside ``addQueryItem``, before the URL was handed to
+    the mail client, so nothing downstream could undo it. The clipboard
+    fallback below writes the unencoded ``body`` and was always faithful, which
+    is how the same click could deliver two different reports.
+
+    Qt's own encoder rather than ``urllib.parse.quote``: ``urllib`` is on the
+    egress blacklist ``tests/test_offline_guarantee.py`` enforces over the whole
+    package, and importing it here would trade a corrupted bug report for a
+    broken offline guarantee. ``toPercentEncoding`` leaves only the unreserved
+    set alone, so ``&`` and ``=`` (which would split the value) and ``+``
+    (which half the mailto handlers in the wild read as a space) all go too.
+    """
+    return QUrl.toPercentEncoding(str(text)).data().decode("ascii")
+
+
 def _open_mailto(subject, body, parent=None):
     """Open the user's default email client with a prefilled message.
 
@@ -176,8 +205,8 @@ def _open_mailto(subject, body, parent=None):
 
     url = QUrl(f"mailto:{BUG_REPORT_EMAIL}")
     query = QUrlQuery()
-    query.addQueryItem("subject", subject)
-    query.addQueryItem("body", body)
+    query.addQueryItem("subject", _percent_encoded(subject))
+    query.addQueryItem("body", _percent_encoded(body))
     url.setQuery(query)
 
     if QDesktopServices.openUrl(url):
@@ -190,10 +219,8 @@ def _open_mailto(subject, body, parent=None):
         pass
     QMessageBox.information(
         parent,
-        BUG_REPORT_SUBJECT,
-        "Could not open your email app automatically.\n\n"
-        f"Please email your report to:\n{BUG_REPORT_EMAIL}\n\n"
-        "The report text has been copied to your clipboard.",
+        tr('bug_report.title'),
+        tr('bug_report.no_mail_client', email=BUG_REPORT_EMAIL),
     )
     return False
 

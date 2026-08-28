@@ -334,3 +334,231 @@ def test_the_crash_log_on_disk_keeps_the_full_path(
     assert SENTINEL in written, (
         "redaction reached the on-disk crash log; that copy never leaves the "
         "machine and it is the only unredacted one a local maintainer has")
+
+
+# ══ 4. The redaction must not damage what it is protecting ═════════════════
+
+
+def _home_env(monkeypatch, home):
+    drive, tail = os.path.splitdrive(home)
+    monkeypatch.setenv("USERPROFILE", home)
+    monkeypatch.setenv("HOME", home)
+    monkeypatch.setenv("HOMEDRIVE", drive)
+    monkeypatch.setenv("HOMEPATH", tail)
+    assert os.path.expanduser("~") == home
+    return home
+
+
+# Every row is a home directory whose account name is a strict *prefix* of some
+# other profile's account name, and the text that other profile appears in.
+# Measured before the boundary guard existed: the home needle matched inside
+# the longer name, ate the ``X:\Users\`` anchor the second pass needs, and left
+# the remainder of the neighbour's account name in the report —
+# ``C:\Users\Ahmet\...`` came out as ``~hmet\...``.
+_PREFIX_SHAPES = [
+    (r"C:\Users\a",
+     r"OSError: cannot open C:\Users\Ahmet\Documents\Dersis\9A.egu",
+     r"OSError: cannot open C:\Users\<user>\Documents\Dersis\9A.egu"),
+    (r"C:\Users\Test",
+     r"C:\Users\TestOgretmen\Documents\Dersis",
+     r"C:\Users\<user>\Documents\Dersis"),
+    (r"C:\Users\os",
+     r"C:\Users\osman\Documents\Dersis",
+     r"C:\Users\<user>\Documents\Dersis"),
+    (r"C:\Users\emre",
+     r"C:\Users\emreu\Documents\Dersis",
+     r"C:\Users\<user>\Documents\Dersis"),
+    (r"C:\Users\a",
+     r"C:\Users\All Users\Dersis",
+     r"C:\Users\<user>\Dersis"),
+    # The one that matters most: the neighbour's *surname* is what survives.
+    (r"C:\Users\Ayse",
+     r"C:\Users\Ayse Yilmaz\Documents\Dersis",
+     r"C:\Users\<user>\Documents\Dersis"),
+]
+
+
+@pytest.mark.parametrize("home,text,expected", _PREFIX_SHAPES,
+                         ids=[s[0].rsplit("\\", 1)[-1].replace(" ", "-")
+                              + "-vs-" + s[1].split("\\")[2].replace(" ", "-")
+                              for s in _PREFIX_SHAPES])
+def test_a_home_that_prefixes_another_account_does_not_leak_that_account(
+        monkeypatch, home, text, expected):
+    r"""The home needle may only match at a path-segment boundary.
+
+    ``re.sub(re.escape(home), "~", …)`` with no boundary is a *substring*
+    replace, not the prefix replace the code claims to be. For a reporter
+    called ``a``, ``os`` or ``Ayse`` it fires inside a colleague's account name
+    and destroys the ``X:\Users\`` anchor that the second pass would have used
+    to redact it properly.
+    """
+    from scheduler_app.core.text_safety import redact_user_paths
+
+    _home_env(monkeypatch, home)
+    cleaned = redact_user_paths(text)
+
+    assert cleaned == expected, (
+        "home %r left part of another profile's account name in the report"
+        % (home,))
+
+
+def test_the_two_passes_agree_on_one_traceback(monkeypatch):
+    r"""The interaction, not each pass alone.
+
+    One report carrying both this user's own home and a neighbour's profile
+    whose name starts with it. The home pass must collapse the first to ``~``
+    and must *not* touch the second, which belongs to the anchored pass.
+    """
+    from scheduler_app.core.text_safety import redact_user_paths
+
+    _home_env(monkeypatch, r"C:\Users\Test")
+    report = "\n".join([
+        r'  File "C:\Users\Test\AppData\Local\Programs\Dersis\gui.py", line 12',
+        r"PermissionError: 'C:\Users\TestOgretmen\Documents\Dersis\9A.egu'",
+        r"also tried C:/Users/Test/Documents and C:/Users/TestOgretmen/Documents",
+    ])
+
+    assert redact_user_paths(report) == "\n".join([
+        r'  File "~\AppData\Local\Programs\Dersis\gui.py", line 12',
+        r"PermissionError: 'C:\Users\<user>\Documents\Dersis\9A.egu'",
+        r"also tried ~/Documents and C:/Users/<user>/Documents",
+    ])
+
+
+def test_a_space_is_not_a_path_segment_boundary(sentinel_home):
+    r"""Pins the recommendation this module deliberately did **not** adopt.
+
+    Excluding the space from ``_USER_PROFILE_SEGMENT`` would stop the anchored
+    pass eating the rest of a hand-typed line — and would publish the second
+    half of every account name that contains a space. Windows hands those out
+    freely (``All Users``, ``Ayse Yilmaz``, and the suite's own
+    ``ZZ Long User Name ZZ``).
+
+    The cost of keeping the space is over-redaction, which is the fail-safe
+    direction and leaves a visible ``<user>`` marker; it cannot cross a
+    newline, so it costs one line and never the report.
+    """
+    from scheduler_app.core.text_safety import redact_user_paths
+
+    assert (redact_user_paths(r"C:\Users\Ayse Yilmaz\Documents\Dersis")
+            == r"C:\Users\<user>\Documents\Dersis")
+    assert (redact_user_paths(r"C:\Users\ZZ Long User Name ZZ\Documents")
+            == r"C:\Users\<user>\Documents")
+    assert (redact_user_paths("Dosyayi C:\\Users\\ayse konumuna kaydedemiyorum")
+            == r"Dosyayi C:\Users\<user>")
+
+
+# ══ 5. What the mail client actually receives ══════════════════════════════
+
+# Turkish writes a percentage as ``%50``, so the reporter's own prose routinely
+# contains a percent sign followed by two characters that read as hex. Handed
+# raw to ``QUrlQuery.addQueryItem`` — which documents its value as *already*
+# percent-encoded — ``%50`` decoded to ``P``, ``%20`` to a space, ``%2A`` to
+# ``*``, and ``%85`` to a byte that is not valid UTF-8.
+_PERCENT_BODY = (
+    "Ders yuku %20 artinca cizelge bozuluyor.\n"
+    "Doluluk %50 iken hata veriyor.\n"
+    "Basari orani %85 olarak gorunuyor.\n"
+    "Kar payi %100 & %2A olarak hesaplaniyor.\n"
+    "Sinif: 9-A Şubesi, öğretmen: Çağrı Öz."
+)
+
+
+@pytest.mark.ui
+def test_the_reporters_own_percentages_reach_the_mail_client(
+        qapp, sentinel_home, monkeypatch):
+    """The body must arrive byte-for-byte as the reporter typed it.
+
+    Asserted through the real ``QUrl`` the app hands to
+    ``QDesktopServices.openUrl``, decoded the way a mail client decodes it.
+    """
+    from PyQt6.QtCore import QUrl, QUrlQuery
+    from scheduler_app.ui import bug_report
+
+    opened = []
+    monkeypatch.setattr(
+        bug_report.QDesktopServices, "openUrl",
+        staticmethod(lambda url: (opened.append(QUrl(url)), True)[1]))
+
+    bug_report._open_mailto(bug_report.BUG_REPORT_SUBJECT, _PERCENT_BODY)
+
+    assert opened, "no mailto: URL was produced"
+    decoded = QUrl.ComponentFormattingOption.FullyDecoded
+    query = QUrlQuery(opened[0])
+    assert query.queryItemValue("body", decoded) == _PERCENT_BODY
+    assert query.queryItemValue("subject", decoded) == \
+        bug_report.BUG_REPORT_SUBJECT
+
+
+@pytest.mark.ui
+def test_the_url_and_the_clipboard_carry_the_same_report(
+        qapp, sentinel_home, monkeypatch):
+    """The two exits must not disagree.
+
+    ``setText(body)`` was always faithful; the URL was not, so the fallback and
+    the primary path delivered different text from the same click.
+    """
+    from PyQt6.QtCore import QUrl, QUrlQuery
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from scheduler_app.ui import bug_report
+
+    opened = []
+    monkeypatch.setattr(
+        bug_report.QDesktopServices, "openUrl",
+        staticmethod(lambda url: (opened.append(QUrl(url)), False)[1]))
+    clip = _FakeClipboard()
+    monkeypatch.setattr(QApplication, "clipboard", staticmethod(lambda: clip))
+    monkeypatch.setattr(QMessageBox, "information",
+                        staticmethod(lambda *a, **k: None))
+
+    bug_report._open_mailto(bug_report.BUG_REPORT_SUBJECT, _PERCENT_BODY)
+
+    decoded = QUrl.ComponentFormattingOption.FullyDecoded
+    assert QUrlQuery(opened[0]).queryItemValue("body", decoded) == clip.value
+
+
+# ══ 6. The fallback dialog speaks the user's language ══════════════════════
+
+
+@pytest.mark.ui
+def test_the_no_mail_client_dialog_is_translated(qapp, sentinel_home,
+                                                 monkeypatch):
+    """The one hardcoded English message box left in ``scheduler_app/ui``.
+
+    A Turkish teacher on a lab PC with no mail handler got three English
+    sentences and an English title. Both are compared across two languages
+    rather than against a literal, so this stays true when the wording changes.
+    """
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from scheduler_app.i18n import translations
+    from scheduler_app.ui import bug_report
+
+    monkeypatch.setattr(bug_report.QDesktopServices, "openUrl",
+                        staticmethod(lambda url: False))
+    monkeypatch.setattr(QApplication, "clipboard", staticmethod(_FakeClipboard))
+    shown = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda parent, title, text, *a, **k:
+                     shown.append((title, text))))
+
+    seen = {}
+    for lang in ("en", "tr"):
+        monkeypatch.setattr(translations, "_current_lang", lang)
+        shown.clear()
+        bug_report._open_mailto("subject", "body")
+        assert shown, "the fallback dialog did not open for %r" % lang
+        seen[lang] = shown[0]
+
+    for lang, (title, text) in seen.items():
+        assert bug_report.BUG_REPORT_EMAIL in text, (
+            "%r lost the address the whole dialog exists to give" % lang)
+        assert "bug_report." not in text and "bug_report." not in title, (
+            "%r shows a raw translation key" % lang)
+
+    assert seen["tr"][1] != seen["en"][1], (
+        "the fallback body is the same string in Turkish and English, so it "
+        "never went through tr()")
+    assert seen["tr"][0] != seen["en"][0], (
+        "the fallback title is the same string in Turkish and English; "
+        "BUG_REPORT_SUBJECT is an untranslated constant")

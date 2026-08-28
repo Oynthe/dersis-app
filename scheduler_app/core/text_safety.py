@@ -121,11 +121,43 @@ def csv_safe(value):
 # handed an uppercased path bakes an uppercased `co_filename` into the frame.
 #
 # The excluded characters are the ones that cannot appear *inside* a single
-# path segment, so a match stops at the next separator, quote or angle bracket
-# instead of eating the rest of the line.
+# path segment, so a match stops at the next separator, quote, colon or angle
+# bracket. A space is **not** one of them: Windows hands out account names with
+# spaces freely (``All Users``, ``Ayse Yilmaz``), and a class that ended a
+# segment at the first space would turn ``C:\Users\Ayse Yilmaz\Documents`` into
+# ``C:\Users\<user> Yilmaz\Documents`` — publishing a second teacher's surname
+# in the one channel this code exists to protect. Measured, and it is why the
+# obvious "stop eating the line" fix is rejected.
+#
+# The consequence, stated honestly because the comment here used to deny it:
+# a segment that is *not* terminated by a separator is redacted to the end of
+# the line, so ``Dosyayi C:\Users\ayse konumuna kaydedemiyorum`` loses the
+# reporter's own sentence. That is over-redaction — the fail-safe direction, it
+# leaves a visible ``<user>``, and `\r\n` are excluded so it can never cost
+# more than the one line. In free text ``C:\Users\ayse konumuna`` is genuinely
+# ambiguous: the account could be ``ayse`` or ``ayse konumuna``, and a redactor
+# has to resolve that toward removing too much.
 _USER_PROFILE_SEGMENT = re.compile(
     r"""(?i)([A-Za-z]:(?:\\\\|\\|/)Users(?:\\\\|\\|/))([^\\/'"<>|:\r\n]+)"""
 )
+
+# The home needle may only match where the account name *ends* — the next
+# character has to be one that cannot continue a path segment, or end of text.
+# Without this the literal pass is a substring replace, not the prefix replace
+# the docstring below claims, and a home that is a strict prefix of a
+# neighbour's account name eats the ``X:\Users\`` anchor the second pass needs:
+# measured, home ``C:\Users\a`` turned ``C:\Users\Ahmet\Documents\Dersis`` into
+# ``~hmet\Documents\Dersis``, home ``C:\Users\os`` turned ``C:\Users\osman\…``
+# into ``~man\…``, and home ``C:\Users\Ayse`` turned
+# ``C:\Users\Ayse Yilmaz\…`` into ``~ Yilmaz\…``.
+#
+# Same character class as ``_USER_PROFILE_SEGMENT``, for the same reason: a
+# space continues a segment. So a report that spells this user's own home and
+# then continues in prose (``C:\Users\ayse konumuna kaydedemiyorum``) no longer
+# collapses to ``~`` — it falls through to the anchored pass and comes out as
+# ``C:\Users\<user>``. Less readable, still redacted; the alternative was a
+# leak.
+_SEGMENT_ENDS_HERE = r"""(?![^\\/'"<>|:\r\n])"""
 
 
 def _short_path(path: str) -> Optional[str]:
@@ -223,14 +255,24 @@ def redact_user_paths(text: str) -> str:
     ``File "<frozen os>"`` becomes ``File "<frozen <user>>"``. A traceback
     corrupted into unreadability is not a privacy win.
 
+    The home pass is a **prefix** replace, not a substring one: the needle only
+    matches where the account name ends (see ``_SEGMENT_ENDS_HERE``). Drop that
+    guard and a reporter called ``a``, ``os`` or ``Ayse`` publishes the tail of
+    a colleague's account name — ``C:\Users\Ahmet\...`` came out as
+    ``~hmet\...`` — because the rewritten text no longer carries the
+    ``X:\Users\`` anchor the second pass needs.
+
     Residual, by design: the *basename* survives, so an OSError over
     ``...\saves\9-A Sinifi Ders Programi.egu`` still names a class. Removing it
     would gut the diagnostic; saying what the report contains is the other half
-    of that answer.
+    of that answer. Also by design, a profile segment that no separator
+    terminates is redacted to end of line rather than to the next space,
+    because a Windows account name may contain spaces.
     """
     out = "" if text is None else str(text)
     if not out:
         return out
     for needle in _home_needles():
-        out = re.sub(re.escape(needle), "~", out, flags=re.IGNORECASE)
+        out = re.sub(re.escape(needle) + _SEGMENT_ENDS_HERE, "~", out,
+                     flags=re.IGNORECASE)
     return _USER_PROFILE_SEGMENT.sub(r"\1<user>", out)
