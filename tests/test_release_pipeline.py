@@ -932,3 +932,113 @@ def test_download_release_falls_back_to_the_published_sha256_asset(tmp_path, mon
         server.shutdown()
 
     assert dest.read_bytes() == payload
+
+
+def _status_sink(recorder, routes):
+    """Serve `{path: (status, body)}`, recording every path that was fetched."""
+    class Sink(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_GET(self):
+            recorder.append(self.path)
+            status, body = routes.get(self.path, routes["*"])
+            self.send_response(status)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    return Sink
+
+
+def test_download_release_refuses_before_it_transfers_an_unverifiable_asset(
+    tmp_path, monkeypatch
+):
+    """The refusal is decided before the first byte, not after the last one.
+
+    ``main`` computes the expected digest, then downloads anyway; the refusal
+    sat past the transfer loop, so the whole installer streamed to disk, the
+    progress bar reached 100%, and ``_discard`` deleted it one line later. The
+    live release asset is 118,902,541 bytes. Everything needed to refuse is
+    known before the connection opens.
+    """
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    module = _download_release()
+
+    payload = b"pretend installer bytes"
+    fetched = []
+    port = _free_port()
+    server = _serve(port, _status_sink(fetched, {"*": (200, payload)}))
+    dest = tmp_path / "Dersis_Setup_v9.9.9.exe"
+    asset = {
+        "name": "Dersis_Setup_v9.9.9.exe",
+        "size": len(payload),
+        "browser_download_url": "http://127.0.0.1:%d/asset.exe" % port,
+    }
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            module.download_asset(asset, str(dest))
+    finally:
+        server.shutdown()
+
+    assert "verif" in str(excinfo.value).lower()
+    assert fetched == [], (
+        "the asset was transferred before the refusal (%d request(s): %s). "
+        "Nothing about the decision depends on the bytes." % (len(fetched), fetched)
+    )
+    assert not dest.exists(), "an unverified download must not be left on disk"
+
+
+def test_download_release_tells_a_missing_sidecar_apart_from_an_unreachable_one(
+    monkeypatch
+):
+    """"The release publishes no ``.sha256``" has to be true when it is said.
+
+    ``_sha256_from_sibling`` caught ``URLError`` — which ``HTTPError``
+    subclasses — and returned ``None``, so a sidecar that is listed in the
+    release JSON but answers 503 was reported identically to one that was never
+    published. The user is told to go and look for a file that is right there.
+    """
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    module = _download_release()
+
+    name = "Dersis_Setup_v9.9.9.exe"
+    payload = b"pretend installer bytes"
+    port = _free_port()
+    server = _serve(port, _status_sink([], {
+        "/asset.exe": (200, payload),
+        "*": (503, b"Service Unavailable"),
+    }))
+    asset = {
+        "name": name,
+        "size": len(payload),
+        "browser_download_url": "http://127.0.0.1:%d/asset.exe" % port,
+    }
+    sidecar = {
+        "name": name + ".sha256",
+        "size": 70,
+        "browser_download_url": "http://127.0.0.1:%d/asset.exe.sha256" % port,
+    }
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            module.expected_sha256({"assets": [asset, sidecar]}, asset)
+
+        # A release that genuinely publishes none must still take the other
+        # path — the fix is to tell the two apart, not to raise on both.
+        assert module.expected_sha256({"assets": [asset]}, asset) is None
+    finally:
+        server.shutdown()
+
+    message = str(excinfo.value)
+    assert name + ".sha256" in message, (
+        "the failure must name the sidecar it could not read; got %r" % message
+    )
+    assert "503" in message, (
+        "the failure must say the sidecar was unreachable rather than absent; "
+        "got %r" % message
+    )
