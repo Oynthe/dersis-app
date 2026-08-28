@@ -231,13 +231,15 @@ jobs:
       #                                  the strict-xfail on the shipped
       #                                  80-class configuration
       #
-      # Budget, measured. This job's pytest step ran 206 s over the last CI
-      # runs against a 25-minute timeout. Local times on the audit machine are
-      # 260 s / 110 s / 149 s for the three added modules; ubuntu-latest runs
-      # this workload 1.87x faster (measured over 11 runs), so the step lands
-      # near 8 minutes. There is no wall-clock assertion anywhere in it: runner
-      # variance on identical code is 1.36-1.49x, which no useful threshold
-      # survives. The gates are counts, and counts are bit-exact.
+      # Budget, measured end to end rather than summed: this exact command runs
+      # 47 passed + 1 xfailed in 633 s on the audit machine. ubuntu-latest runs
+      # this workload 1.87x faster (measured over 11 runs), so the step should
+      # land near 6 minutes; the step it replaces ran 206 s. Against a 25-minute
+      # timeout that is roughly 3 added minutes of 21.6 minutes spare.
+      #
+      # There is no wall-clock assertion anywhere in it. Runner variance on
+      # identical code is 1.36-1.49x, which no useful threshold survives. The
+      # gates are counts, and counts measured 1.000.
       - name: Run the invariant oracle and the engine gates (including slow presets)
         run: |
           pytest \

@@ -30,8 +30,10 @@ the suite's 19 `slow` tests executed in no CI job at all** — including
 which had been written for exactly that purpose. Seven still do
 (`test_optimizer_occupancy.py`'s two `_on_small` twins, whose fast versions run
 in Validate; `test_reschedule_overhead.py` ×2; `test_warning_log_growth.py` ×2,
-which need Qt; `test_cpsat_subprocess_boundary.py` ×1). Measured budget for the
-second job: ~8 min against a 25-minute timeout.
+which need Qt; `test_cpsat_subprocess_boundary.py` ×1). Measured budget: that
+command is 47 passed + 1 xfailed in **633 s** on the audit machine, and
+`ubuntu-latest` runs this workload 1.87x faster — ~6 min against a 25-minute
+timeout.
 
 **If you add a `slow` test, name the job that will run it.** A `slow` marker with
 no job behind it is a test that exists and never executes.
