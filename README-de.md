@@ -154,7 +154,7 @@ alle, die überschneidungsfreie Wochenpläne benötigen.
 - **Export** des fertigen Plans nach **Excel** (farbcodiert, mehrere Blätter), **CSV** und
   **PDF**.
 
-### Bedienung und Datenschutz
+### Bedienung und Umgang mit Ihren Daten
 - **Mehrsprachige Oberfläche** – mehr als 20 Sprachen, beim ersten Start über eine
   flaggenbasierte Auswahl gewählt (22 Flaggenoptionen), einschließlich Rechts-nach-links-
   Unterstützung für Arabisch und Persisch.
@@ -164,7 +164,13 @@ alle, die überschneidungsfreie Wochenpläne benötigen.
   freigeschaltet.
 - **Verschlüsselte lokale Speicherung** – Pläne werden in einem verschlüsselten
   `.egu`-Dateiformat (AES-256-GCM) im Ordner `Documents/Dersis/` gespeichert, mit
-  automatischer Speicherung.
+  automatischer Speicherung. Das bringt Ihnen Unversehrtheit und Unlesbarkeit: eine
+  beschädigte oder nachträglich veränderte Datei wird erkannt statt stillschweigend geladen,
+  und die Speicherstände lassen sich in keinem Texteditor lesen. Ein **Schloss ist es
+  nicht**. Der Schlüssel liegt direkt neben den Speicherständen, in
+  `Documents/Dersis/keys/key.bin` – wer diesen Ordner öffnen kann, kann die Pläne also lesen.
+  Wenn Sie andere aussperren müssen, nutzen Sie die Konto- und Ordnerrechte Ihres
+  Betriebssystems.
 - **Fehlermeldung in der App** – ein eingebautes Formular bereitet eine E-Mail für Sie vor
   (siehe [Fehler melden](#fehler-melden)); die App selbst sendet niemals etwas.
 
@@ -289,7 +295,7 @@ nachbilden – möchten, finden Sie hier, woraus DERSİS besteht und wie die Tei
 | Heuristische Suche | Eigene Heuristik + Large Neighborhood Search | Simulated Annealing, genetische Algorithmen, Tabu-Suche |
 | Tabellen-Ein-/Ausgabe | openpyxl + pandas | xlsxwriter, nur das csv-Modul |
 | PDF-Ausgabe | reportlab | WeasyPrint, fpdf2 |
-| Verschlüsselung im Ruhezustand | `cryptography` (AES-256-GCM) | SQLCipher, Schlüsselbund des Betriebssystems |
+| Verschleierung im Ruhezustand + Integrität | `cryptography` (AES-256-GCM), Schlüssel liegt neben den Daten | SQLCipher, Schlüsselbund des Betriebssystems |
 | Windows-Paketierung | Einbettbares Python + Inno Setup | PyInstaller, Nuitka, MSIX |
 
 **Architektonischer Ansatz zum Nachbau**

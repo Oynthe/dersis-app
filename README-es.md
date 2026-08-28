@@ -153,7 +153,7 @@ sin conflictos.
 - **Exportación** del horario terminado a **Excel** (con colores, varias hojas), **CSV** y
   **PDF**.
 
-### Experiencia y privacidad
+### Experiencia y tratamiento de los datos
 - **Interfaz multilingüe** — más de 20 idiomas, elegidos en el primer arranque desde un
   selector con banderas (22 opciones de bandera), incluida la compatibilidad de derecha a
   izquierda para árabe y persa.
@@ -161,7 +161,13 @@ sin conflictos.
 - **Totalmente sin conexión** — sin ningún tipo de llamada de red; todas las funciones están
   desbloqueadas de forma local.
 - **Almacenamiento local cifrado** — los horarios se guardan en un formato de archivo `.egu`
-  cifrado (AES-256-GCM) dentro de su carpeta `Documents/Dersis/`, con guardado automático.
+  cifrado (AES-256-GCM) dentro de su carpeta `Documents/Dersis/`, con guardado automático. Lo
+  que eso le aporta es integridad y opacidad: un archivo dañado o modificado a mano se
+  detecta en lugar de cargarse en silencio, y los guardados no se pueden leer en un editor de
+  texto. **No es un candado.** La clave se guarda junto a los archivos, en
+  `Documents/Dersis/keys/key.bin`, así que cualquiera que pueda abrir esa carpeta puede leer
+  los horarios. Si necesita dejar fuera a otras personas, use los permisos de cuenta y de
+  carpeta de su sistema operativo.
 - **Informe de errores dentro de la app** — un formulario integrado prepara un correo por
   usted (consulte [Informar de errores](#informar-de-errores)); la aplicación en sí nunca
   transmite nada.
@@ -286,7 +292,7 @@ piezas.
 | Búsqueda heurística | Heurística propia + Búsqueda por Vecindario Amplio | Recocido simulado, algoritmos genéticos, búsqueda tabú |
 | Lectura/escritura de hojas | openpyxl + pandas | xlsxwriter, solo el módulo csv |
 | Salida en PDF | reportlab | WeasyPrint, fpdf2 |
-| Cifrado en reposo | `cryptography` (AES-256-GCM) | SQLCipher, llavero del sistema operativo |
+| Ofuscación en reposo + integridad | `cryptography` (AES-256-GCM), la clave se guarda junto a los datos | SQLCipher, llavero del sistema operativo |
 | Empaquetado en Windows | Python integrable + Inno Setup | PyInstaller, Nuitka, MSIX |
 
 **Enfoque arquitectónico para reproducirlo**

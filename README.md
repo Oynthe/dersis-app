@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <sub>Windows yükleyicisi · macOS <code>.dmg</code> · komut satırı için <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
+  <sub>Windows yükleyicisi · komut satırı için <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
 </p>
 
 ---
@@ -53,14 +53,13 @@ edinebilirsiniz.
 | İşletim sistemi | İndirilecek dosya |
 |-----------------|-------------------|
 | **Windows** | `Dersis_Setup_v<sürüm>.exe` |
-| **macOS — Apple Silicon** (M1/M2/M3/M4) | `Dersis-<sürüm>-mac-arm64.dmg` |
-| **macOS — Intel** | `Dersis-<sürüm>-mac-x64.dmg` |
+| **macOS / Linux** | Hazır dosya yok — kaynaktan derlenir |
 
-> **macOS notu:** DERSİS şu anda Mac App Store dışında dağıtıldığı ve henüz
-> Apple tarafından noter onaylı (notarized) olmadığı için, macOS ilk açılışta
-> bir güvenlik uyarısı gösterebilir. Uygulamayı **Sistem Ayarları → Gizlilik ve
-> Güvenlik** üzerinden ya da uygulamaya **sağ tıklayıp “Aç”** diyerek
-> açabilirsiniz. Ayrıntılar: [`docs/MACOS.md`](docs/MACOS.md).
+> **macOS ve Linux notu:** yayımlanan sürümlerde yalnızca Windows kurulum dosyası
+> bulunur; bugüne kadar hiçbir sürüme Mac ya da Linux paketi eklenmemiştir. macOS
+> derlemesi çalışır durumdadır ve bir Mac üzerinde kaynaktan üretilebilir:
+> [`docs/MACOS.md`](docs/MACOS.md) ve dilinizin README dosyasındaki “Kaynak Koddan
+> Çalıştırma” bölümüne bakın.
 
 Komut satırını tercih edenler için, depodaki bağımlılık gerektirmeyen indirici en son sürümü
 çözümler, indirir ve SHA-256 sağlamasını doğrular:
