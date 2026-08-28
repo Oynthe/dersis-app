@@ -320,10 +320,9 @@ def _cell_text_colours(path):
     return found
 
 
-@pytest.mark.ui
 @pytest.mark.excel
 @pytest.mark.parametrize("mode", ["classroom", "lecturer", "group"])
-def test_the_exported_workbook_is_legible(make_app, tmp_path, mode):
+def test_the_exported_workbook_is_legible(tmp_path, mode):
     """ST-ARCH-003 / ST-UI-005 — the printed timetable must clear AA too.
 
     A failure means a school exported its timetable to Excel, printed it, and
@@ -331,12 +330,10 @@ def test_the_exported_workbook_is_legible(make_app, tmp_path, mode):
     on screen and in the PDF is fine.
     """
     pytest.importorskip("openpyxl")
-    app = make_app()
-    app.state_data.update(_one_class_state())
-    app._workflow.state = app.state_data
+    from scheduler_app.data_io.exporter import export_schedule
 
     out = tmp_path / ("book_%s.xlsx" % mode)
-    app._write_excel(str(out), mode=mode)
+    export_schedule(_one_class_state(), "xlsx", str(out), mode=mode)
 
     painted = _cell_text_colours(out)
     assert painted, "the workbook has no rich-text cells to check"
@@ -353,25 +350,23 @@ def test_the_exported_workbook_is_legible(make_app, tmp_path, mode):
         + "\n  ".join(failures))
 
 
-@pytest.mark.ui
 @pytest.mark.excel
-def test_the_workbook_paints_the_same_palette_as_the_screen(make_app, tmp_path):
+def test_the_workbook_paints_the_same_palette_as_the_screen(tmp_path):
     """ST-ARCH-003 — legible is not enough; it must be the SAME source.
 
     Without this, the writer could keep its own private hexes and simply darken
     them, which is how the three surfaces drifted apart in the first place.
     """
     pytest.importorskip("openpyxl")
-    app = make_app()
-    app.state_data.update(_one_class_state())
-    app._workflow.state = app.state_data
+    from scheduler_app.data_io.exporter import export_schedule
 
+    state = _one_class_state()
     out = tmp_path / "palette.xlsx"
-    app._write_excel(str(out), mode="lecturer")
+    export_schedule(state, "xlsx", str(out), mode="lecturer")
     painted = {c.upper() for c in _cell_text_colours(out)}
 
     from scheduler_app.ui.badge_formatter import get_badge
-    expected_badge = get_badge(app.state_data["classes"][0])[2]
+    expected_badge = get_badge(state["classes"][0])[2]
     for role, colour in (("class code", CELL_FG_CODE),
                          ("class name", CELL_FG_NAME),
                          ("lecturer", CELL_FG_LECTURER),
