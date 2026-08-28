@@ -583,3 +583,141 @@ def test_the_budget_constants_are_what_the_optimizer_is_built_with():
         f"{seen['multi_start_time_limit']}, but core/constants.py says "
         f"{constants.DEFAULT_MULTI_START_TIME_LIMIT}. ui/dialogs.py quotes the "
         "constant to the user as the production budget.")
+
+
+# ===========================================================================
+# 6. THE BUDGET BOUNDS THE WHOLE SOLVE, NOT EACH PHASE (ST-PERF-008)
+# ===========================================================================
+def _capture_lns_calls(preset, budget):
+    """Run the production reschedule, recording every ``_lns_improve`` call.
+
+    Returns ``(solve_start, captured, summary)`` where each entry of
+    ``captured`` is ``(optimizer, args, kwargs, entered_at)``.
+    """
+    import time
+
+    from scheduler_app.core import facade
+    from scheduler_app.core.schedule_optimizer import ScheduleOptimizer
+
+    captured = []
+    original = ScheduleOptimizer._lns_improve
+
+    def spy(self, *args, **kwargs):
+        captured.append((self, args, dict(kwargs), time.time()))
+        return original(self, *args, **kwargs)
+
+    state = make_preset(preset, seed=42)
+    ScheduleOptimizer._lns_improve = spy
+    try:
+        solve_start = time.time()
+        *_rest, summary = facade.optimized_reschedule_all(
+            state, weights={}, multi_start_time_limit=budget)
+    finally:
+        ScheduleOptimizer._lns_improve = original
+    return solve_start, captured, summary, original
+
+
+@pytest.mark.engine
+def test_the_lns_phase_stops_at_the_solve_wide_deadline():
+    """ST-PERF-008's remaining half — a capped solve must not overrun its budget.
+
+    ``multi_start_time_limit`` is documented as "Total time limit across all
+    runs", and PROGRESS recorded the shape of this bug once already in Phase 3:
+    a wall-clock bound sampled every N nodes is not a wall-clock bound. The
+    greedy phase was fixed then and receives an absolute ``deadline``. The LNS
+    phase was not: its emergency check compared ``time.time() - start_time``,
+    a stopwatch started at the top of *that phase*, against
+    ``multi_start_time_limit``, the budget for the *whole solve* — so every
+    phase was entitled to spend the entire budget again.
+
+    Measured through ``optimized_reschedule_all``, the exact signature
+    ``workflow.reschedule`` calls, before the fix:
+
+        normal / 8 s budget    LNS entered at 1.58 s, ran to 9.71 s (1.22x)
+        normal / 21 s budget   LNS entered at 21.01 s, i.e. after the deadline
+        small / 5 s budget     ran to 6.12 s (1.22x)
+
+    and the reporting verifier measured 34.97 s against a 21 s budget (1.66x)
+    on a loaded box. Worst case is ~2x: reach the deadline, then start one more
+    phase and give it the whole budget over again. After the fix the same four
+    configurations overran by 0.00-0.40 s.
+
+    **Why this asserts no number of seconds.** A wall-clock ceiling here would
+    be a gate whose threshold is a property of the runner: ubuntu-latest is
+    1.87x faster than the machine any threshold would be calibrated on and
+    runner variance on identical code is 1.36-1.49x. The two things that are
+    *not* runner-dependent are asserted instead — that the phase is handed the
+    solve-wide deadline, and that it stops when that deadline has passed.
+    """
+    import time
+
+    budget = 4.0
+    solve_start, captured, _summary, real_lns = _capture_lns_calls(
+        "small", budget)
+
+    assert captured, (
+        "the LNS phase never ran on this instance, so it says nothing about "
+        "whether LNS respects the budget")
+
+    # ── 1. The phase is handed the deadline, and it is the SOLVE's ──
+    for i, (_opt, _args, kwargs, _entered) in enumerate(captured):
+        assert kwargs.get("deadline") is not None, (
+            f"LNS phase {i} was started with no `deadline` "
+            f"(kwargs: {sorted(kwargs)}). It can therefore only compare its "
+            "own stopwatch against the whole solve's budget, which is how a "
+            "phase entered one second before the deadline goes on to spend "
+            "the entire budget again.")
+
+    deadlines = {kwargs["deadline"] for _o, _a, kwargs, _e in captured}
+    assert len(deadlines) == 1, (
+        f"the {len(captured)} LNS phases were given {len(deadlines)} different "
+        "deadlines. `multi_start_time_limit` is documented as the total across "
+        "all runs; a per-phase deadline is the defect wearing the fix's name.")
+
+    deadline = deadlines.pop()
+    first_entry = captured[0][3]
+    assert solve_start + budget <= deadline <= first_entry + budget, (
+        f"the deadline is {deadline - solve_start:.2f}s after the solve "
+        f"started, against a {budget}s budget. It must be the solve's own "
+        "start plus the budget — measured between the call into the facade "
+        f"({solve_start - solve_start:.2f}s) and the first LNS phase "
+        f"({first_entry - solve_start:.2f}s).")
+
+    # ── 2. The phase stops when that deadline has passed ──
+    #
+    # Replayed with the arguments the first real phase was given, so this
+    # exercises the shipped call shape rather than a hand-built one. An expired
+    # deadline is checked at the top of the loop, before any occupancy is
+    # touched, so replaying costs nothing and mutates nothing.
+    opt, args, kwargs, _entered = captured[0]
+    opt._clock_capped = False
+    started = time.perf_counter()
+    _solution, stats = real_lns(
+        opt, *args, **{**kwargs, "deadline": time.time() - 1.0})
+    replayed = time.perf_counter() - started
+
+    assert stats["strategy_stats"], (
+        "the replayed phase returned before reaching its loop at all (fewer "
+        "than 3 placements to work with), so this replay proves nothing about "
+        "the deadline")
+    uses = sum(s["uses"] for s in stats["strategy_stats"])
+    assert uses == 0, (
+        f"handed a deadline that passed a second ago, the LNS phase still ran "
+        f"{uses} destroy-repair iterations in {replayed:.2f}s. The budget does "
+        "not bound it.")
+    assert opt._clock_capped is True, (
+        "the LNS phase stopped at the deadline without setting `_clock_capped`, "
+        "so summary['deterministic'] stays True and a truncated, "
+        "machine-speed-dependent timetable claims to be reproducible "
+        "(ST-SCHED-013).")
+
+    # ── 3. Anti-vacuity: it is the deadline that stopped it, not the replay ──
+    opt._clock_capped = False
+    opt.lns_iterations = 3
+    _solution2, stats2 = real_lns(
+        opt, *args, **{**kwargs, "deadline": time.time() + 3600.0})
+    uses2 = sum(s["uses"] for s in stats2["strategy_stats"])
+    assert uses2 > 0, (
+        "the same replayed call does no work with an hour of budget either, so "
+        "the zero above was not the deadline stopping the search — this test "
+        "would pass against an LNS phase that had been stubbed out")

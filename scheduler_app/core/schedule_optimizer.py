@@ -508,7 +508,8 @@ class ScheduleOptimizer:
                     run_number=run, total_runs=n_runs,
                     conflict_graph=conflict_graph, analyzer=analyzer,
                     propagator=propagator, same_day_map=same_day_map,
-                    improve_only_scores=improve_only_scores)
+                    improve_only_scores=improve_only_scores,
+                    deadline=global_start + self.multi_start_time_limit)
 
                 # Evaluate this run's quality
                 run_placements = []
@@ -1097,11 +1098,21 @@ class ScheduleOptimizer:
                      run_number=0, total_runs=1,
                      conflict_graph=None, analyzer=None,
                      propagator=None, same_day_map=None,
-                     improve_only_scores=None):
+                     improve_only_scores=None, deadline=None):
         """LNS improvement phase with adaptive strategy selection.
 
         Uses AdaptiveStrategySelector to learn which destroy strategies
         produce better improvements and adjust selection probabilities.
+
+        ``deadline`` is the absolute ``time.time()`` at which the *whole solve*
+        must stop — ``global_start + multi_start_time_limit``, the same value
+        ``_greedy_construct`` already receives. It is not the same thing as
+        ``time_limit_override``, which is a duration for this phase alone.
+        Passing the duration and comparing it against a clock started at the top
+        of this method is what let a capped solve overrun its budget: measured
+        through ``optimized_reschedule_all(make_preset('normal'), 8.0)``, the
+        run-0 LNS phase was entered at t=1.58 s and ran to t=9.71 s, 1.71 s past
+        a deadline it had no way to see.
         """
         placed_indices = [i for i, s in enumerate(solution) if s is not None]
         if len(placed_indices) < 3:
@@ -1159,10 +1170,22 @@ class ScheduleOptimizer:
         for iteration in range(self.lns_iterations):
             self._check_cancelled()
             elapsed = time.time() - start_time
+            # The solve-wide emergency cap, checked against the absolute
+            # deadline rather than this phase's own stopwatch. `elapsed` below
+            # measures only how long THIS phase has run; comparing it to
+            # `multi_start_time_limit`, the budget for the entire solve, let
+            # each phase spend the whole budget over again. Same shape as the
+            # greedy phase's check.
+            if deadline is not None and time.time() >= deadline:
+                self._clock_capped = True
+                break
             if deterministic_loop:
                 # Iteration-bounded: only the emergency cap can cut this short,
                 # and doing so costs reproducibility (reported in the summary).
-                if elapsed >= self.multi_start_time_limit:
+                # With no absolute deadline supplied -- a direct caller rather
+                # than optimize() -- fall back to the phase-local stopwatch so
+                # the cap still exists at all.
+                if deadline is None and elapsed >= self.multi_start_time_limit:
                     self._clock_capped = True
                     break
             elif elapsed >= time_limit:
