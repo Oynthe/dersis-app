@@ -13,6 +13,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QCursor, QShortcut, QKeySequence
 
 from scheduler_app.core.text_safety import escape_qt_rich
+from scheduler_app.data_io.schema import is_lecturer_name_header
 from scheduler_app.translations import TRANSLATIONS, tr
 from scheduler_app.models import (
     new_class, new_lecturer_availability, needs_physical_room, LOCATION_TYPES,
@@ -153,42 +154,6 @@ _CLASS_IO_FIELDS = [
 
 def _trim_label(text):
     return str(text or "").strip().rstrip(":").strip()
-
-
-#: Column-header keys that mean "this column holds a member of staff's name".
-#: ``_export_lecturers_to_excel`` writes ``labels.lecturer``; the File ▸ Import
-#: Excel template writes ``import.columns.teacher_name`` on its Teachers sheet.
-#: Both are accepted, in every shipped language, so a workbook stays readable
-#: after a language change and either export round-trips. Deliberately *not*
-#: including a generic "Name": the point is to tell a roster from a budget.
-_LECTURER_NAME_HEADER_KEYS = (
-    "labels.lecturer",
-    "import.columns.teacher_name",
-    "labels.teachers",
-    "setup.lecturers",
-)
-
-
-def _is_lecturer_name_header(label):
-    """True when a spreadsheet's first column header names staff, not something else.
-
-    Setup ▸ Lecturers ▸ Import Excel used to read sheet 0 column 0 as names with
-    no recognition of any kind, so a budget spreadsheet ("Kalem"/"Tutar")
-    reported "3 Öğretim Elemanları" imported and put its line items in the
-    roster, where they are indistinguishable from real staff — the lecturer
-    list is keyed by display name. This is the same class of defect
-    ST-FUNC-011 closed on File ▸ Import Excel, through a different door.
-    """
-    candidate = _trim_label(label).casefold()
-    if not candidate:
-        return False
-    for key in _LECTURER_NAME_HEADER_KEYS:
-        if candidate == _trim_label(tr(key)).casefold():
-            return True
-        for lang_dict in TRANSLATIONS.values():
-            if candidate == _trim_label(lang_dict.get(key, "")).casefold():
-                return True
-    return False
 
 
 def _excel_file_filter(include_legacy=False):
@@ -1753,15 +1718,16 @@ class SetupDialog(QDialog):
             if df.empty:
                 QMessageBox.information(self, tr("dialogs.import.excel_title"), tr("warnings.no_data_found"))
                 return
+            # A non-empty frame has at least one column, so cols[0] exists.
             cols = list(df.columns)
-            if not cols or not _is_lecturer_name_header(cols[0]):
+            if not is_lecturer_name_header(cols[0]):
                 QMessageBox.warning(
                     self, tr("status.import_failed"),
                     tr("errors.missing_columns").format(cols=tr("labels.lecturer")))
                 return
             count = 0
             for _, row in df.iterrows():
-                name = str(row[cols[0]]).strip() if len(cols) > 0 else ""
+                name = str(row[cols[0]]).strip()
                 if not name:
                     continue
                 # Parse availability from comma-separated strings

@@ -123,6 +123,43 @@ def get_workbook_sheet_reverse_header_map(sheet_id):
     return reverse
 
 
+#: Column-header keys that mean "this column holds a member of staff's name".
+#: ``SetupDialog._export_lecturers_to_excel`` writes ``labels.lecturer``; the
+#: File ▸ Import Excel template writes ``import.columns.teacher_name`` on its
+#: Teachers sheet. Both are accepted, so either export round-trips.
+#: Deliberately *not* including a generic "Name": the job is to tell a roster
+#: from a budget.
+LECTURER_NAME_HEADER_KEYS = (
+    "labels.lecturer",
+    "import.columns.teacher_name",
+    "labels.teachers",
+    "setup.lecturers",
+)
+
+
+def is_lecturer_name_header(label):
+    """True when a spreadsheet column header names staff, in any language.
+
+    Setup ▸ Lecturers ▸ Import Excel read sheet 0, column 0 as names with no
+    recognition of any kind, so a budget spreadsheet ("Kalem"/"Tutar") reported
+    three lecturers imported and put its line items in the roster, where they
+    are indistinguishable from real staff — the lecturer list is keyed by
+    display name. Same class of defect as ST-FUNC-011, through another door.
+    Every catalogue is consulted, not just the active one, so a roster exported
+    before a language change still imports afterwards.
+    """
+    candidate = _normalize_label(label).casefold()
+    if not candidate:
+        return False
+    for key in LECTURER_NAME_HEADER_KEYS:
+        if candidate == _normalize_label(tr(key)).casefold():
+            return True
+        for lang_dict in TRANSLATIONS.values():
+            if candidate == _normalize_label(lang_dict.get(key, "")).casefold():
+                return True
+    return False
+
+
 def get_workbook_sheet_titles(sheet_id):
     """Every title the app has ever written for one sheet, in any language."""
     spec = WORKBOOK_SHEETS[sheet_id]
