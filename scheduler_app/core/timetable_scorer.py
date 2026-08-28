@@ -14,7 +14,7 @@ Scoring priorities:
   7. Time-of-day quality
 """
 
-from scheduler_app.logic import slot_index, total_duration, _active_targets, find_slot_index
+from scheduler_app.logic import slot_index, total_duration, find_slot_index
 from scheduler_app.models import get_effective_room_resource_for_class
 from scheduler_app.placement_scorer import DEFAULT_WEIGHTS
 

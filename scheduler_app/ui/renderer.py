@@ -16,21 +16,18 @@ TimetableView        — QGraphicsView with scroll and drop support
 """
 
 from PyQt6.QtWidgets import (
-    QGraphicsView, QGraphicsScene, QGraphicsRectItem,
-    QGraphicsItem, QMenu, QApplication, QLabel,
+    QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsItem, QMenu,
+    QApplication,
 )
-from PyQt6.QtCore import Qt, QRectF, QPointF, QMimeData, QPoint
-from PyQt6.QtGui import (
-    QColor, QPen, QBrush, QFont, QPainter, QDrag, QPixmap, QTransform,
-)
+from PyQt6.QtCore import Qt, QRectF, QPointF
+from PyQt6.QtGui import QColor, QPen, QBrush, QFont, QPainter, QTransform
 
 from scheduler_app.constants import (
     MIN_CELL_W, MIN_CELL_H, EMPTY_BG, HEADER_BG_DARK, TIME_BG, CORNER_BG,
     MATRIX_BORDER, MATRIX_DAY_BG, MATRIX_DAY_FG, MATRIX_BRANCH_BG,
-    MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CELL_FG,
-    MATRIX_CORNER_BG,
-    CELL_FG_CODE, CELL_FG_NAME, CELL_FG_LECTURER, CELL_FG_ROOM,
-    CELL_FG_BRANCH, CELL_FG_SEQUENTIAL,
+    MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CORNER_BG,
+    CELL_FG_CODE, CELL_FG_NAME, CELL_FG_LECTURER, CELL_FG_ROOM, CELL_FG_BRANCH,
+    CELL_FG_SEQUENTIAL,
 )
 from scheduler_app.translations import tr
 from scheduler_app.logic import (

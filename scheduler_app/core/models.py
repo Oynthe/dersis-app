@@ -1,7 +1,7 @@
 """Data model: schedule state and class structure."""
 
 import uuid
-from typing import Any, Optional, TypedDict
+from typing import Optional, TypedDict
 
 from scheduler_app.translations import TRANSLATIONS, tr
 

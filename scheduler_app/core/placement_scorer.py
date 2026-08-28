@@ -16,7 +16,7 @@ its future impact on unscheduled classes. A placement that restricts
 future options incurs a difficulty penalty.
 """
 
-from scheduler_app.logic import slot_index, total_duration, _active_targets
+from scheduler_app.logic import slot_index, total_duration
 from scheduler_app.models import get_effective_room_resource_for_class, effective_day, cls_key
 
 

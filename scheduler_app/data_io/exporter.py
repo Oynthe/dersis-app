@@ -8,7 +8,6 @@ import csv
 import html
 import warnings
 import os
-from typing import Any
 
 try:
     import openpyxl
@@ -39,9 +38,7 @@ from scheduler_app.constants import (
 from scheduler_app.core.text_safety import escape_pdf_markup, csv_safe
 from scheduler_app.data_io.spreadsheet_safety import neutralize_formula_cells
 from scheduler_app.models import (
-    get_classroom_export_labels,
-    get_protection_label,
-    effective_day, effective_time,
+    get_classroom_export_labels, effective_day, effective_time,
     slot_offset_for_target, cls_key, find_off_grid_placements,
 )
 from scheduler_app.translations import tr

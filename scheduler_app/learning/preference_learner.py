@@ -13,9 +13,7 @@ Uses a simple online gradient approach: for each preference signal
 score(A) < score(B) (since lower is better).
 """
 
-import json
 import os
-import math
 
 from scheduler_app.placement_scorer import DEFAULT_WEIGHTS
 from scheduler_app.translations import tr

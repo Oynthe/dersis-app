@@ -1,13 +1,9 @@
 """Reusable PyQt6 widgets: Toast, MultiSelectButton, WarningLogPanel."""
 from PyQt6.QtWidgets import (
-    QLabel, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
-    QMenu, QWidgetAction, QCheckBox, QScrollArea, QFrame,
-    QTextEdit, QSizePolicy,
+    QLabel, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QMenu,
+    QWidgetAction, QCheckBox, QFrame, QTextEdit, QSizePolicy,
 )
-from PyQt6.QtCore import (
-    QTimer, Qt, QPropertyAnimation, QEasingCurve, QEvent, QPoint,
-)
-from PyQt6.QtGui import QColor, QAction, QPainter, QBrush, QPen
+from PyQt6.QtCore import QTimer, Qt, QEvent, QPoint
 
 from scheduler_app.core.text_safety import escape_qt_rich
 from scheduler_app.translations import tr

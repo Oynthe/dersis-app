@@ -24,12 +24,7 @@ from scheduler_app.models import (
 # deliberately NOT imported here any more. They are the deprecated, weaker pair
 # — neither checks grid membership or lecturer availability — and every
 # decision in this module now goes through ConstraintValidator instead.
-from scheduler_app.logic import (
-    find_slot_index,
-    slots_fit, total_duration,
-    find_valid_options,
-    get_placed_classes,
-)
+from scheduler_app.logic import find_slot_index, slots_fit, total_duration
 # ST-ARCH-010: the `optimized_*` entry points moved out of `logic.py` into
 # `core/facade.py` so that `logic` could stop importing the engine from inside
 # function bodies. This module is the only one under `core` allowed to import

@@ -9,9 +9,8 @@ import tempfile
 
 from PyQt6.QtGui import (
     QPixmap, QPainter, QColor, QFont, QPen, QBrush, QIcon, QPolygonF,
-    QPainterPath,
 )
-from PyQt6.QtCore import Qt, QRect, QRectF, QPointF
+from PyQt6.QtCore import Qt, QRect, QPointF
 
 # ── PNG flag icon loader ─────────────────────────────────────────────────
 

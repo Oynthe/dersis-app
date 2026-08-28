@@ -6,25 +6,21 @@ import json
 import csv
 import hashlib
 import os
-import sys
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QComboBox, QLabel, QPushButton, QFrame, QScrollArea,
-    QGridLayout, QMenu, QMenuBar, QToolBar, QStatusBar, QFileDialog,
-    QMessageBox, QListWidget, QSplitter, QSizePolicy, QToolButton, QDialog,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QAbstractItemView,
-    QSlider, QWidgetAction, QStackedWidget,
+    QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
+    QComboBox, QLabel, QPushButton, QFrame, QScrollArea, QMenu, QToolBar,
+    QFileDialog, QMessageBox, QListWidget, QSplitter, QSizePolicy, QToolButton,
+    QDialog, QAbstractItemView, QSlider, QWidgetAction, QStackedWidget,
 )
 from PyQt6.QtCore import Qt, QPoint, QMimeData, QTimer, QSize
 from PyQt6.QtGui import (
-    QAction, QKeySequence, QColor, QPainter, QDrag, QFont, QCursor,
-    QShortcut, QIcon,
+    QAction, QKeySequence, QColor, QPainter, QDrag, QCursor, QShortcut, QIcon,
 )
 
 from scheduler_app.renderer import (
-    TimetableView, TimetableScene, LessonItem,
-    FILTER_MODE_DEFAULT, FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP,
+    TimetableView, TimetableScene, FILTER_MODE_DEFAULT,
+    FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP,
 )
 from scheduler_app.dashboard import DashboardWidget
 
@@ -37,36 +33,23 @@ try:
 except ImportError:
     openpyxl = None
 
-from scheduler_app.constants import (
-    MIN_CELL_W, MIN_CELL_H, EMPTY_BG, HEADER_BG_DARK, TIME_BG, CORNER_BG,
-    MATRIX_BORDER, MATRIX_DAY_BG, MATRIX_DAY_FG, MATRIX_BRANCH_BG,
-    MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CELL_FG,
-    MATRIX_CORNER_BG, OPEN_SLOTS_FG_ROOM,
-)
+from scheduler_app.constants import OPEN_SLOTS_FG_ROOM
 from scheduler_app.translations import tr, get_language, set_language, is_rtl
 from scheduler_app.core.text_safety import csv_safe
 from scheduler_app.i18n.day_keys import (
     normalize_state_day_keys, day_label, display_day, format_day_time,
 )
 from scheduler_app.models import (
-    new_state, split_non_joint,
-    LOCATION_FACE_TO_FACE, LOCATION_ONLINE, LOCATION_LECTURER_OFFICE,
-    get_location_label, is_virtual_location_type,
-    normalize_state_classes,
-    get_classroom_export_labels,
-    effective_day, effective_time, mark_placed, mark_unplaced,
-    needs_physical_room,
-    get_effective_room_resource_for_class,
+    new_state, split_non_joint, LOCATION_FACE_TO_FACE, LOCATION_ONLINE,
+    LOCATION_LECTURER_OFFICE, get_location_label, is_virtual_location_type,
+    normalize_state_classes, effective_day, effective_time, mark_placed,
+    mark_unplaced, needs_physical_room, get_effective_room_resource_for_class,
     cls_key,
 )
 from scheduler_app.logic import (
-    get_placed_classes,
-    occupied_slots_of, classroom_of, total_duration,
-    build_virtual_classroom_day_layout,
-    find_schedule_conflicts, conflict_partner_index,
-    schedule_counts,
+    get_placed_classes, occupied_slots_of, classroom_of,
+    find_schedule_conflicts, conflict_partner_index, schedule_counts,
     find_valid_options,
-    get_year_color, lighten_color,
 )
 # ST-ARCH-010: moved out of `logic.py` with the rest of the optimization
 # bridge; see `scheduler_app/core/facade.py`.

@@ -5,9 +5,8 @@ No external plotting libraries required.
 """
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea,
-    QGridLayout, QFrame, QSizePolicy, QTableWidget, QTableWidgetItem,
-    QHeaderView, QTabWidget,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame,
+    QSizePolicy, QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget,
 )
 from PyQt6.QtCore import Qt, QRectF
 from PyQt6.QtGui import QColor, QPainter, QFont, QPen, QBrush

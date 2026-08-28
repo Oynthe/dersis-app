@@ -3,12 +3,11 @@
 import os
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
-    QLabel, QLineEdit, QPushButton, QComboBox, QSpinBox, QCheckBox,
-    QTextEdit, QTabWidget, QTreeWidget, QTreeWidgetItem, QGroupBox,
-    QMessageBox, QScrollArea, QWidget, QHeaderView, QFrame, QSizePolicy,
-    QTableWidget, QTableWidgetItem, QAbstractItemView, QApplication,
-    QProgressDialog, QSlider, QFileDialog,
+    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel,
+    QLineEdit, QPushButton, QComboBox, QSpinBox, QCheckBox, QTextEdit,
+    QTabWidget, QTreeWidget, QTreeWidgetItem, QGroupBox, QMessageBox,
+    QScrollArea, QWidget, QHeaderView, QFrame, QTableWidget, QTableWidgetItem,
+    QAbstractItemView, QApplication, QSlider, QFileDialog,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QCursor, QShortcut, QKeySequence
@@ -16,18 +15,14 @@ from PyQt6.QtGui import QColor, QCursor, QShortcut, QKeySequence
 from scheduler_app.core.text_safety import escape_qt_rich
 from scheduler_app.translations import TRANSLATIONS, tr
 from scheduler_app.models import (
-    new_class, room_fits_class, new_lecturer_availability,
-    needs_physical_room, LOCATION_TYPES,
-    LOCATION_FACE_TO_FACE, LOCATION_ONLINE, LOCATION_LECTURER_OFFICE,
-    normalize_class_data, get_effective_room_resource_for_class,
-    get_location_label, get_protection_label, parse_location_type_label,
-    validate_class_fields,
+    new_class, new_lecturer_availability, needs_physical_room, LOCATION_TYPES,
+    LOCATION_FACE_TO_FACE, normalize_class_data,
+    get_effective_room_resource_for_class, get_location_label,
+    get_protection_label, parse_location_type_label, validate_class_fields,
 )
 from scheduler_app import storage
 from scheduler_app.logic import (
-    find_valid_options, get_placed_classes,
-    occupied_slots_of, classroom_of,
-    parse_slot_lines, slot_meaning_changes,
+    find_valid_options, classroom_of, parse_slot_lines, slot_meaning_changes,
     SLOT_ERROR_DUPLICATE,
 )
 from scheduler_app.widgets import MultiSelectButton
