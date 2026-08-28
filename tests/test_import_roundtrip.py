@@ -16,9 +16,13 @@ Findings guarded here
   the documented default silently), and a blank *required* cell (either, but
   never a crash). A single test demanding a report for all three would stay
   red after the register's own recommended fix.
-* **ST-FUNC-009 / 010 / 011 / 012** — pinned with ``xfail(strict=True)``; they
-  are scheduled for a later phase, and the suite must go red the moment they
-  start passing so the pins get flipped.
+* **ST-FUNC-011** (fixed in Phase 7) — a workbook with no recognized sheet at
+  all reports ``is_valid=True``, which the UI announces as a successful import.
+* **ST-FUNC-012** (fixed in Phase 7) — two teacher rows sharing a name fuse
+  into one lecturer and the first one's availability is overwritten.
+* **ST-FUNC-009 / 010** — pinned with ``xfail(strict=True)``; they are
+  scheduled for a later phase, and the suite must go red the moment they start
+  passing so the pins get flipped.
 
 Two conventions used throughout
 -------------------------------
@@ -550,6 +554,123 @@ def test_unknown_allowed_rooms_warn_and_are_filtered(tmp_path):
     assert any("Hayalet Oda" in line for line in ds.report.warnings)
 
 
+# ── ST-FUNC-011 — the wrong workbook must not look like a success ───────────
+
+def test_workbook_with_no_recognized_sheets_is_invalid(tmp_path):
+    """ST-FUNC-011 — importing the wrong file must not look like a success.
+
+    Pointing the importer at an unrelated spreadsheet produced four warnings,
+    an empty state and ``is_valid=True``; ``_import_from_excel`` only warns on
+    ``not report.is_valid``, so the user got the success dialog over nothing.
+    """
+    path = tmp_path / "unrelated.xlsx"
+    wb = openpyxl.Workbook()
+    wb.active.title = "Butce"
+    wb.active["A1"] = "Kalem"
+    wb.save(str(path))
+
+    ds = load_scheduler_data_from_excel(str(path))
+
+    assert ds.state["classes"] == []
+    assert ds.report.is_valid is False, (
+        "an unrecognized workbook was reported as a valid import; "
+        f"report was: {ds.report.summary()}")
+
+
+def test_a_workbook_with_one_recognized_sheet_still_imports(tmp_path):
+    """Guard (ST-FUNC-011 discrimination): *some* sheets missing is not fatal.
+
+    A school may keep its teacher roster in its own file, and the importer has
+    always merged whatever sheets it finds. The ST-FUNC-011 fix must therefore
+    fire on *zero* recognized sheets, not on any missing one — a fix that
+    errors whenever a sheet is absent would make partial workbooks
+    un-importable and would show up here.
+    """
+    path = build_workbook(tmp_path / "teachers_only.xlsx", classes=[],
+                          sheets=("teachers",))
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.errors == [], ds.report.summary()
+    assert ds.report.is_valid is True
+    assert ds.state["lecturers"] == ["Ada Lovelace", "Bora Yildiz"]
+    # The three absent sheets are still named, as warnings.
+    assert len(ds.report.warnings) == 3, ds.report.summary()
+
+
+# ── ST-FUNC-012 — two teachers must not fuse into one lecturer ──────────────
+
+def test_duplicate_lecturer_names_are_not_silently_accepted(tmp_path):
+    """ST-FUNC-012 — two teacher IDs sharing a name corrupt the lecturer list.
+
+    ``state['lecturers']`` and ``state['lecturer_availability']`` are keyed by
+    display name, so a duplicate name silently fuses two real teachers into one
+    and overwrites the first one's availability. The defect is that this is
+    both silent *and* duplicated, so either fix — reporting it or
+    deduplicating — clears the pin.
+    """
+    teachers = [
+        {"teacher_id": "T001", "name": "Ada Lovelace"},
+        {"teacher_id": "T002", "name": "Ada Lovelace"},
+    ]
+    path = build_workbook(tmp_path / "dupe_names.xlsx", teachers=teachers,
+                          classes=[klass("C001")])
+    ds = load_scheduler_data_from_excel(path)
+
+    lecturers = ds.state["lecturers"]
+    reported = any("Ada Lovelace" in line for line in messages(ds.report))
+    deduplicated = len(lecturers) == len(set(lecturers))
+    assert reported or deduplicated, (
+        f"duplicate lecturer name accepted silently; lecturers={lecturers}, "
+        f"report={messages(ds.report)}")
+
+
+def test_lecturer_names_differing_only_in_case_are_not_silently_split(tmp_path):
+    """ST-FUNC-012 — the importer must use the app's own rule for "same teacher".
+
+    ``SchedulingWorkflow.register_lecturer`` (ST-UI-020, Phase 6) matches typed
+    lecturer names with ``casefold()``, so "ayşe yılmaz" is not a second
+    teacher beside "Ayşe Yılmaz". The importer compared nothing at all, so a
+    workbook with both spellings produced *two* lecturers for one person: the
+    two classes came back carrying different lecturer strings, which the core
+    compares with ``==``, so the same teacher could be booked twice in one
+    hour — while the class form went on treating the two spellings as one.
+
+    Asserted as a disjunction on purpose: collapsing the pair or reporting it
+    are both honest, and the register leaves the choice open. What is not
+    allowed is a silent split.
+    """
+    from scheduler_app.core.workflow import SchedulingWorkflow
+
+    first, second = "Ayşe Yılmaz", "ayşe yılmaz"
+
+    # Control: establish that the app really does read these as one teacher,
+    # instead of assuming it. If this ever stops holding, the assertion below
+    # is measuring the wrong rule and must be revisited, not relaxed.
+    probe = {"lecturers": [first]}
+    assert SchedulingWorkflow.register_lecturer(probe, second) == first
+    assert probe["lecturers"] == [first]
+
+    teachers = [
+        {"teacher_id": "T001", "name": first},
+        {"teacher_id": "T002", "name": second},
+    ]
+    path = build_workbook(tmp_path / "case_names.xlsx", teachers=teachers,
+                          classes=[klass("C001"), klass("C002", teacher_id="T002")])
+    ds = load_scheduler_data_from_excel(path)
+
+    lecturers = ds.state["lecturers"]
+    collapsed = len({n.casefold() for n in lecturers}) == len(lecturers)
+    reported = any(first in line or second in line for line in messages(ds.report))
+    assert collapsed or reported, (
+        f"two spellings of one teacher were accepted silently; "
+        f"lecturers={lecturers}, report={messages(ds.report)}")
+    # And the user must not be told the import was clean while the roster
+    # still holds the same teacher twice.
+    assert collapsed or ds.report.is_valid is False, (
+        f"a roster holding one teacher twice was reported as valid; "
+        f"lecturers={lecturers}, report={messages(ds.report)}")
+
+
 # ── Known-defect pins (later phases) ────────────────────────────────────────
 
 @pytest.mark.xfail(strict=True, reason=(
@@ -591,53 +712,3 @@ def test_class_id_containing_a_space_is_not_silently_dropped(tmp_path):
     assert course_names(ds) == ["Ders C 001", "Ders C002"]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "ST-FUNC-011 — a workbook with zero recognized sheets reports "
-    "is_valid=True; fixed in a later phase"))
-def test_workbook_with_no_recognized_sheets_is_invalid(tmp_path):
-    """ST-FUNC-011 — importing the wrong file must not look like a success.
-
-    Pointing the importer at an unrelated spreadsheet currently produces four
-    warnings, an empty state and ``is_valid=True``, which the UI reports as a
-    successful import.
-    """
-    path = tmp_path / "unrelated.xlsx"
-    wb = openpyxl.Workbook()
-    wb.active.title = "Butce"
-    wb.active["A1"] = "Kalem"
-    wb.save(str(path))
-
-    ds = load_scheduler_data_from_excel(str(path))
-
-    assert ds.state["classes"] == []
-    assert ds.report.is_valid is False, (
-        "an unrecognized workbook was reported as a valid import; "
-        f"report was: {ds.report.summary()}")
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "ST-FUNC-012 — duplicate lecturer names are neither deduplicated nor "
-    "reported; fixed in a later phase"))
-def test_duplicate_lecturer_names_are_not_silently_accepted(tmp_path):
-    """ST-FUNC-012 — two teacher IDs sharing a name corrupt the lecturer list.
-
-    ``state['lecturers']`` and ``state['lecturer_availability']`` are keyed by
-    display name, so a duplicate name silently fuses two real teachers into one
-    and overwrites the first one's availability. The defect is that this is
-    both silent *and* duplicated, so either fix — reporting it or
-    deduplicating — clears the pin.
-    """
-    teachers = [
-        {"teacher_id": "T001", "name": "Ada Lovelace"},
-        {"teacher_id": "T002", "name": "Ada Lovelace"},
-    ]
-    path = build_workbook(tmp_path / "dupe_names.xlsx", teachers=teachers,
-                          classes=[klass("C001")])
-    ds = load_scheduler_data_from_excel(path)
-
-    lecturers = ds.state["lecturers"]
-    reported = any("Ada Lovelace" in line for line in messages(ds.report))
-    deduplicated = len(lecturers) == len(set(lecturers))
-    assert reported or deduplicated, (
-        f"duplicate lecturer name accepted silently; lecturers={lecturers}, "
-        f"report={messages(ds.report)}")
