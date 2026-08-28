@@ -38,19 +38,22 @@ Three ways to get this test wrong, all of which were built and measured first
    at a time, which is why the register's remedy is a seam (split ``logic``)
    and not a list.
 
-   **Phase 7 cut that seam.** ``logic.py`` now holds only the scheduling
-   primitives; the eight ``optimized_*`` / scoring bridges live in
-   ``scheduler_app/core/facade.py``, which nothing inside the engine imports,
-   so it can import the engine normally. Measured: the component went from 15
-   modules to 2, mutually importing pairs from 7 to 1, deferred imports in
-   ``logic.py`` from 13 to 0. The residual pair is
-   ``schedule_optimizer <-> solver_worker`` and has nothing to do with
-   ``logic``.
+   **Phase 7 cut that seam and the component is gone.** ``logic.py`` now holds
+   only the scheduling primitives; the eight ``optimized_*`` / scoring bridges
+   live in ``scheduler_app/core/facade.py``, which nothing inside the engine
+   imports, so it can import the engine normally. That took the component from
+   15 modules to 2 and mutually importing pairs from 7 to 1. The residual pair
+   was ``schedule_optimizer <-> solver_worker``, which had nothing to do with
+   ``logic`` and carried two integer constants; those moved to the leaf
+   ``core/constants.py``. Measured end state: **no strongly connected
+   component of size > 1 anywhere in the package, no mutually importing pair,
+   no deferred import in ``logic.py``.**
 
-   The two ways someone will try to give that ground back -- re-exporting the
-   bridges from ``logic.py``, or letting an engine module import the facade --
-   each have their own contract below, because both were built and measured
-   and neither is caught by the SCC number alone.
+   The three ceilings below are therefore ``== 0`` and are contracts, not
+   ratchets. The two ways someone will try to give that ground back --
+   re-exporting the bridges from ``logic.py``, or letting an engine module
+   import the facade -- each have their own contract as well, because both
+   were built and measured and neither is caught by the SCC number alone.
 
 3. **The contract must not go blind when the move lands.** Moving the leaf
    modules under ``scheduler_app/i18n/`` and adding shim aliases for the old
@@ -124,23 +127,31 @@ legitimate reason for `logic.py` to defer anything, and a new deferral means
 somebody has started re-attaching the engine to the primitives.
 """
 
-MAX_CORE_SCC_SIZE = 2
+MAX_CORE_SCC_SIZE = 0
 """Largest strongly connected component once deferred edges are counted.
 
 Was 15 -- nearly all of `core`. Splitting `logic.py` into primitives plus
-`core/facade.py`, which holds the `optimized_*` bridges, took it to 2. What is
-left is `schedule_optimizer <-> solver_worker`, which has nothing to do with
-`logic` and is a separate, smaller row.
+`core/facade.py`, which holds the `optimized_*` bridges, took it to 2; moving
+two integer constants into `core/constants.py` took it to 0. There is now no
+component of size > 1 anywhere in `scheduler_app`.
+
+Zero, and therefore a hard contract: every remaining edge in the package is a
+dependency a module can declare, so a component appearing here is a new
+regression rather than pre-existing debt. Do not raise this again.
 """
 
-MAX_MUTUAL_IMPORT_PAIRS = 1
-"""Module pairs that import each other (deferred edges counted). 9 -> 7 -> 1.
+MAX_MUTUAL_IMPORT_PAIRS = 0
+"""Module pairs that import each other (deferred edges counted). 9 -> 7 -> 0.
 
 `core.logic` was in six of the seven, and all six went with the facade split.
-The one left, `schedule_optimizer <-> solver_worker`, is the one the register
-never named: `solver_worker` defers an import of two integer constants out of
-`schedule_optimizer` so the progress bar's denominators cannot drift from the
-budget the optimizer actually runs.
+The seventh was the one the register never named: `solver_worker` deferred an
+import of `DEFAULT_MULTI_START_RUNS` / `DEFAULT_LNS_ITERATIONS` out of
+`schedule_optimizer`, which imports `solver_worker` back for `SolveCancelled`.
+Two integers cannot justify a cycle; they live in the leaf `core/constants.py`
+now, and `schedule_optimizer` re-exports them so its own attribute access is
+unchanged. `test_progress_scale_matches_the_optimizers_own_default_budget` in
+`test_solver_worker.py` is what stops the two copies drifting, and it still
+passes -- both sides read the same definition.
 """
 
 

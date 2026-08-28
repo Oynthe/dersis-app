@@ -35,12 +35,15 @@ from scheduler_app.translations import tr
 from scheduler_app.core.solver_worker import SolveCancelled
 from scheduler_app.core.infeasibility import diagnose_infeasibility
 
-# The shipped search budget. Named because the progress UI needs the same
-# denominators the optimizer actually runs (ST-PERF-001): a second copy of
-# these numbers elsewhere means the bar stops short of the end, or saturates
-# early, the moment the two drift.
-DEFAULT_MULTI_START_RUNS = 5
-DEFAULT_LNS_ITERATIONS = 200
+# The shipped search budget. Defined in `core/constants.py` and re-exported
+# here so that `schedule_optimizer.DEFAULT_MULTI_START_RUNS` keeps resolving:
+# `solver_worker` needs the same two numbers for the progress bar's
+# denominators (ST-PERF-001) and cannot import this module at module scope,
+# because this module imports it. That was `core`'s last mutually importing
+# pair (ST-ARCH-010).
+from scheduler_app.core.constants import (  # noqa: F401
+    DEFAULT_MULTI_START_RUNS, DEFAULT_LNS_ITERATIONS,
+)
 from scheduler_app.constraint_validator import (
     ConstraintValidator, screen_placements,
 )

@@ -25,6 +25,10 @@ Three pieces:
 import threading
 from dataclasses import dataclass
 
+from scheduler_app.core.constants import (
+    DEFAULT_LNS_ITERATIONS, DEFAULT_MULTI_START_RUNS,
+)
+
 
 class SolveCancelled(Exception):
     """Raised inside the solver when the user has asked it to stop."""
@@ -147,15 +151,15 @@ def run_solve(workflow, weights, *, cancel_token=None, on_progress=None,
     Raises :class:`SolveCancelled` if the token is tripped; the caller turns
     that into a "cancelled" outcome rather than an error.
     """
-    from scheduler_app.core.schedule_optimizer import (
-        DEFAULT_LNS_ITERATIONS, DEFAULT_MULTI_START_RUNS,
-    )
-
     # The denominators must be the budget the optimizer will ACTUALLY run, and
     # the production Generate button passes no budget at all — so the defaults
-    # are the user-facing path. They are read from the optimizer's own
-    # constants rather than copied, or the bar stops short of the end (or
-    # saturates early) on every real solve the moment the two drift.
+    # are the user-facing path. They are read from the one definition in
+    # `core/constants.py` rather than copied, or the bar stops short of the end
+    # (or saturates early) on every real solve the moment the two drift.
+    # ST-ARCH-010: this used to be a deferred import of the same two names out
+    # of `schedule_optimizer`, which imports this module — `core`'s last
+    # mutually importing pair. `schedule_optimizer` re-exports them, so its own
+    # attribute access is unchanged.
     total_runs = optimizer_kwargs.get("multi_start_runs", DEFAULT_MULTI_START_RUNS)
     max_iterations = optimizer_kwargs.get("lns_iterations", DEFAULT_LNS_ITERATIONS)
 
