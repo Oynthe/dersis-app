@@ -172,6 +172,64 @@ def test_a_legacy_config_in_the_app_directory_is_migrated(dersis_home, frozen_in
         "shadow the encrypted copy on the next launch")
 
 
+def test_an_immovable_legacy_file_still_lets_the_app_start(
+        dersis_home, tmp_path, monkeypatch):
+    """``migrate_legacy_files()`` runs before any window exists, so it must return.
+
+    Both callers — ``scheduler_gui.main()`` at line 196 and
+    ``SchedulerApp.__init__`` — call it unguarded, so anything it raises becomes
+    a startup crash box with no window behind it. Every failure path was already
+    contained except one: the ``_backup_original`` in the
+    destination-already-exists branch sat *outside* the migrator's ``try``.
+    Measured with an ``msvcrt.locking`` byte-lock held on a legacy
+    ``learned_weights.json``: ``PermissionError [WinError 33]`` straight out of
+    the function. ``shutil.move`` is patched here instead of taking a real lock,
+    because the point is the containment, not the OS's error code.
+
+    Swallowing is only correct because nothing is discarded: the failed move
+    leaves the legacy file exactly where it was (ST-DATA-001), and the next
+    launch retries. Both halves are asserted.
+    """
+    from scheduler_app.storage import storage
+
+    storage.save_encrypted({"weights": {}}, storage.learned_weights_path())
+    # ``dersis_home`` only rebinds the Dersis root; ``_OLD_DATA_DIR`` is a
+    # module global under the sandboxed HOME and is therefore shared by every
+    # test in the session. Anything left in it leaks into the next test's
+    # migration run, so give this one its own.
+    old_data = tmp_path / "class_scheduler"
+    old_data.mkdir()
+    monkeypatch.setattr(storage, "_OLD_DATA_DIR", str(old_data))
+    src = os.path.join(storage._OLD_DATA_DIR, "learned_weights.json")
+    with open(src, "w", encoding="utf-8") as fh:
+        json.dump({"weights": {"gap": 3}}, fh)
+
+    # The JSONL migrator carries the identical branch; cover both in one run.
+    storage.save_encrypted([], storage.feedback_log_path())
+    src_log = os.path.join(storage._OLD_DATA_DIR, "feedback_log.jsonl")
+    with open(src_log, "w", encoding="utf-8") as fh:
+        fh.write('{"accepted": true}\n')
+
+    def _immovable(*_a, **_kw):
+        raise PermissionError(
+            33, "The process cannot access the file because another process "
+                "has locked a portion of the file")
+
+    monkeypatch.setattr(storage.shutil, "move", _immovable)
+
+    notes = storage.migrate_legacy_files()
+
+    assert notes == [], "nothing could be migrated, so nothing may be claimed"
+    assert os.path.exists(src), (
+        "the legacy file is gone after a failed backup — it must be left exactly "
+        "where it was so the next launch can retry (ST-DATA-001)")
+    with open(src, encoding="utf-8") as fh:
+        assert json.load(fh) == {"weights": {"gap": 3}}
+    assert os.path.exists(src_log), (
+        "the JSONL migrator's destination-exists branch discarded the legacy "
+        "feedback log after a failed backup")
+
+
 @pytest.mark.ui
 @pytest.mark.parametrize("legacy_location", ["app_dir", "old_data_dir"])
 def test_a_legacy_config_survives_a_real_first_run(tmp_path, legacy_location):

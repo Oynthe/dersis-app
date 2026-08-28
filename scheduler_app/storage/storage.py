@@ -687,6 +687,28 @@ def _backup_original(src: str) -> None:
     shutil.move(src, dst)
 
 
+def _try_backup_original(src: str) -> bool:
+    """``_backup_original`` that reports failure instead of raising.
+
+    ``migrate_legacy_files()`` runs before any window exists — from
+    ``scheduler_gui.main()`` and again from ``SchedulerApp.__init__`` — and both
+    callers assume it returns. The one call that used to sit outside a migrator's
+    ``try`` was the ``_backup_original`` in the destination-already-exists
+    branch; measured with an ``msvcrt.locking`` byte-lock held on a legacy
+    ``learned_weights.json``, that raised ``PermissionError [WinError 33]``
+    straight out of ``main()``, so the user got a crash box and no window.
+
+    Nothing is discarded when this returns ``False``: ``shutil.move`` either
+    moves the file or leaves it exactly where it was (ST-DATA-001). The legacy
+    file stays put, the next launch retries, and the app starts either way.
+    """
+    try:
+        _backup_original(src)
+        return True
+    except Exception:
+        return False
+
+
 def quarantine_corrupt(src: str) -> str:
     """Move an unreadable container into ``backups/`` and return its new path.
 
@@ -711,7 +733,7 @@ def _migrate_json_file(src: str, dest_sav: str) -> bool:
     if not os.path.exists(src):
         return False
     if os.path.exists(dest_sav):
-        _backup_original(src)
+        _try_backup_original(src)
         return False
     try:
         with open(src, "r", encoding="utf-8") as f:
@@ -728,7 +750,7 @@ def _migrate_jsonl_file(src: str, dest_sav: str) -> bool:
     if not os.path.exists(src):
         return False
     if os.path.exists(dest_sav):
-        _backup_original(src)
+        _try_backup_original(src)
         return False
     try:
         entries = []
