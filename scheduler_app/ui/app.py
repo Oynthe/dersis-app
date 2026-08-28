@@ -1063,7 +1063,15 @@ class SchedulerApp(QMainWindow):
         view_menu.addSeparator()
         self._toggle_sidebar_action = QAction(tr("menus.toggle_sidebar"), view_menu)
         self._toggle_sidebar_action.setCheckable(True)
-        self._toggle_sidebar_action.setChecked(True)
+        # ST-UI-013: this action is *recreated* on every language change, so a
+        # constant here is a tick that describes the sidebar only until someone
+        # switches language. Born ticked over a collapsed sidebar, the next
+        # Ctrl+B arrives as checked=False, is read as "close it", writes an
+        # intent and moves nothing — the whole keypress goes on resynchronising
+        # the menu. The getattr is load-bearing: _build_menu runs before
+        # _build_main creates _sidebar_is_collapsed on the first pass.
+        self._toggle_sidebar_action.setChecked(
+            not getattr(self, "_sidebar_is_collapsed", False))
         # ST-UI-013: the sidebar is worth a flat 314 px of grid — two day
         # columns at 1000 px — and until now the only ways to reclaim them
         # were a 26 px icon and an unaccelerated menu item. Ctrl+B is free;

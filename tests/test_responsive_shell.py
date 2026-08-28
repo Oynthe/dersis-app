@@ -621,3 +621,52 @@ def test_a_sidebar_the_user_closed_comes_back_closed(make_app, qapp):
         "splitter" % (again.splitter.sizes()[1],))
     assert not again._toggle_sidebar_action.isChecked(), (
         "View > Sidebar is ticked on a sidebar that is not there")
+
+
+# ── 5. The menu tick still describes the sidebar after a language change ───
+
+def test_a_language_change_leaves_the_sidebar_tick_telling_the_truth(
+        make_app, qapp, make_state):
+    """``_build_menu`` recreates the action, and it was born ticked.
+
+    ``_set_language`` rebuilds the whole menu bar, so the View > Sidebar action
+    is a new ``QAction`` whose checked state is whatever the constructor set —
+    ``True`` — regardless of where the sidebar actually is. The cost is one
+    keypress: the next Ctrl+B arrives as ``checked=False``, which is read as
+    "close it", so it writes an intent and moves nothing.
+
+    Predates Phase 7 — ``ff1fa34^`` has the same unconditional ``setChecked``
+    — but until Ctrl+B existed and auto-collapse made "collapsed" an ordinary
+    state, there was nothing for the stale tick to be wrong about.
+    """
+    win = _shown(make_app, qapp)
+    try:
+        _load(win, qapp, make_state(n_days=5, n_slots=8, n_classes=20, seed=11))
+        # Reach the collapsed state the way the app itself reaches it, with
+        # nobody's intent recorded: a window too narrow for the grid.
+        win._sidebar_intent = "auto"
+        _set_splitter_width(win, qapp, _width_the_sidebar_costs(win) - 600)
+        assert win._sidebar_is_collapsed, "the sidebar never yielded at all"
+        assert not win._toggle_sidebar_action.isChecked()
+
+        win._set_language("en")
+        qapp.processEvents()
+        # A relation, not a state: English has a narrower tab bar than Turkish,
+        # so the language change may legitimately hand the sidebar back. What
+        # may not happen is the menu and the panel disagreeing about it.
+        assert (win._toggle_sidebar_action.isChecked()
+                != win._sidebar_is_collapsed), (
+            "after the language change View > Sidebar reads %r on a sidebar "
+            "that is %s"
+            % (win._toggle_sidebar_action.isChecked(),
+               "collapsed" if win._sidebar_is_collapsed else "open"))
+
+        # And the consequence the stale tick has: the first press must move it.
+        was = win._sidebar_is_collapsed
+        win._toggle_sidebar_action.trigger()
+        qapp.processEvents()
+        assert win._sidebar_is_collapsed != was, (
+            "the first Ctrl+B after a language change moved nothing; it only "
+            "resynchronised the menu with the sidebar")
+    finally:
+        _restore_language(win, qapp)
