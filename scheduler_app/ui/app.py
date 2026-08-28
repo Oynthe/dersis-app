@@ -81,7 +81,7 @@ from scheduler_app.core.schedule_impact_analyzer import (
 from scheduler_app.dialogs import (
     SetupDialog, AddClassDialog,
     PlaceClassDialog, SelectClassDialog, MultiSelectClassDialog,
-    WarningsDialog, OpenSlotsDialog, PostAddDialog,
+    PostAddDialog,
     BulkAddDialog, BulkResultsDialog, EditClassesDialog,
     _ensure_excel_deps,
 )

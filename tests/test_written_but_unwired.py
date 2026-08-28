@@ -300,3 +300,24 @@ def test_the_panel_does_not_let_the_data_pick_the_rendering_rule(make_app):
         "Qt still renders these room names by different rules: %r" % eaten)
 
 
+@pytest.mark.ui
+def test_no_dialog_reimplements_the_two_live_report_panels(qapp):
+    """ST-ARCH-003 -- the superseded copy must not come back.
+
+    `ui/dialogs.py` held a `WarningsDialog` and an `OpenSlotsDialog` that
+    rendered the same two reports through `QTextEdit.append`, both carrying the
+    ST-UI-007 defect and neither constructed anywhere in the tree. A fix applied
+    to that copy would have looked done and changed nothing a user sees -- the
+    shape Phase 6 was caught by in `data_io/exporter.py`, where 48 tests guarded
+    an Excel writer with no production caller.
+    """
+    from scheduler_app.ui import dialogs
+
+    reimplemented = [name for name in ("WarningsDialog", "OpenSlotsDialog")
+                     if hasattr(dialogs, name)]
+    assert not reimplemented, (
+        "ui/dialogs.py defines %r again; the live surfaces are "
+        "SchedulerApp._refresh_warnings and SchedulerApp._refresh_open_slots"
+        % reimplemented)
+
+
