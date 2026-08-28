@@ -1063,7 +1063,15 @@ class SchedulerApp(QMainWindow):
         view_menu.addSeparator()
         self._toggle_sidebar_action = QAction(tr("menus.toggle_sidebar"), view_menu)
         self._toggle_sidebar_action.setCheckable(True)
-        self._toggle_sidebar_action.setChecked(True)
+        # ST-UI-013: this action is *recreated* on every language change, so a
+        # constant here is a tick that describes the sidebar only until someone
+        # switches language. Born ticked over a collapsed sidebar, the next
+        # Ctrl+B arrives as checked=False, is read as "close it", writes an
+        # intent and moves nothing — the whole keypress goes on resynchronising
+        # the menu. The getattr is load-bearing: _build_menu runs before
+        # _build_main creates _sidebar_is_collapsed on the first pass.
+        self._toggle_sidebar_action.setChecked(
+            not getattr(self, "_sidebar_is_collapsed", False))
         # ST-UI-013: the sidebar is worth a flat 314 px of grid — two day
         # columns at 1000 px — and until now the only ways to reclaim them
         # were a 26 px icon and an unaccelerated menu item. Ctrl+B is free;
@@ -2402,6 +2410,24 @@ class SchedulerApp(QMainWindow):
         elif tab_idx == 4:
             self.dashboard_widget.refresh(self.state_data)
 
+        # ST-UI-013: the threshold has two sides and only one of them is the
+        # window. Every other trigger — resizeEvent, _init_splitter_sizes,
+        # _set_language — fires when the *window* changes, so a schedule that
+        # grew two days, a freshly opened file, or a click on "Show everything"
+        # moved the *content* side by hundreds of pixels with the decision from
+        # startup still standing. Measured on 6x10 Turkish at 1366x768: the
+        # sidebar kept 314 px the sixth day needed, and only a 1 px nudge of
+        # the window would hand them over.
+        #
+        # Here rather than in `refresh_grid`, because `notebook.currentChanged`
+        # connects straight to this method and never reaches `refresh_grid`.
+        # The hasattr mirrors `resizeEvent`'s guard: the filter combo boxes
+        # this method returns on exist earlier in `_build_main` than the
+        # sidebar state does. No re-render can come back through here — the
+        # collapse only moves splitter sizes, and no view defines resizeEvent.
+        if hasattr(self, '_sidebar_intent'):
+            self._apply_sidebar_intent()
+
     def _update_side_panels(self):
         """Update unplaced panel, open slots, and warnings."""
         if not hasattr(self, 'lecturer_filter'):
@@ -2514,8 +2540,20 @@ class SchedulerApp(QMainWindow):
             self.splitter.setSizes([nb, sw])
         finally:
             self._in_collapse_sync = False
-        # ST-UI-013: decide once, here, rather than waiting for the first
-        # resize the user happens to perform.
+        # ST-UI-013: a restored "closed" is a decision the user made in an
+        # earlier session, and it has two halves — switch the width-aware
+        # collapse off, *and* close the panel. `_restore_window_geometry` can
+        # only apply the first: it runs before show(), where the splitter still
+        # reports its own 640 px size hint and nothing measured off it is worth
+        # acting on. Applying only that half produced the one state this whole
+        # row exists to remove — an open sidebar in a window too narrow for it,
+        # now sticky on disk instead of one resize away from being fixed.
+        # `by_user` stays False deliberately: this is replaying the stored
+        # decision, not taking a new one.
+        if self._sidebar_intent == "closed" and not self._sidebar_is_collapsed:
+            self._collapse_panel("sidebar")
+        # Decide once, here, rather than waiting for the first resize the user
+        # happens to perform.
         self._apply_sidebar_intent()
 
     def _on_splitter_moved(self):
