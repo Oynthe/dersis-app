@@ -143,6 +143,10 @@ def state():
 _STREAM_RE = re.compile(rb"stream\r?\n(.*?)endstream", re.DOTALL)
 _BASEFONT_RE = re.compile(rb"/BaseFont\s*/([A-Za-z0-9+#\-,]+)")
 _FONTFILE_RE = re.compile(rb"/FontFile\d?")
+_OBJ_RE = re.compile(rb"(\d+)\s+0\s+obj\b(.*?)\bendobj", re.DOTALL)
+_FONT_RES_NAME_RE = re.compile(rb"/Name\s*/([A-Za-z0-9+#\-]+)")
+_TF_RE = re.compile(rb"/([A-Za-z0-9+#\-]+)\s+[\d.]+\s+Tf")
+_BFCHAR_RE = re.compile(rb"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]{4,})>")
 
 
 def _decode_pdf_stream(body):
@@ -171,6 +175,49 @@ def pdf_base_fonts(raw):
 def pdf_embedded_font_programs(raw):
     """The ``/FontFile*`` keys present, i.e. actually embedded font programs."""
     return [m.decode("latin-1") for m in _FONTFILE_RE.findall(raw)]
+
+
+def pdf_zapfdingbats_runs(raw):
+    """Font resources bound to ZapfDingbats that a content stream selects.
+
+    reportlab's response to a codepoint the current font cannot encode is not
+    the missing-glyph box the audit register described. It splits the paragraph
+    at that character and switches to ZapfDingbats, in which it draws the ASCII
+    letter ``n`` -- a filled block. So the page shows a solid blob mid-word
+    (which reads as redaction, not as a font problem) *and* the text layer is
+    falsified: Ctrl-F for "Öğretmen" finds nothing, copy-paste yields
+    "Önretmen".
+
+    This is the assertion ``pdf_embedded_font_programs`` cannot make. An
+    exporter that embedded a Unicode font for some styles while leaving others
+    on Helvetica would satisfy that check and still substitute here.
+    """
+    dingbats = set()
+    for _num, body in _OBJ_RE.findall(raw):
+        if b"/BaseFont" in body and b"ZapfDingbats" in body:
+            dingbats.update(m.decode("latin-1")
+                            for m in _FONT_RES_NAME_RE.findall(body))
+    selected = {m.decode("latin-1")
+                for m in _TF_RE.findall(pdf_content_text(raw))}
+    return dingbats & selected
+
+
+def pdf_text_layer_codepoints(raw):
+    """Unicode codepoints the PDF's ``/ToUnicode`` CMaps make recoverable.
+
+    An embedded TrueType face is subsetted, so a non-ASCII character is drawn
+    as a subset index rather than as its own bytes -- searching the content
+    stream for "ğ" proves nothing either way. The CMap is what a reader, a
+    Ctrl-F, or a copy-paste actually resolves the glyph through, so it is the
+    honest place to assert that the letter survived into the document.
+    """
+    found = set()
+    for blob in (_decode_pdf_stream(b) for b in _STREAM_RE.findall(raw)):
+        if b"beginbfchar" not in blob:
+            continue
+        for _src, dst in _BFCHAR_RE.findall(blob):
+            found.add(int(dst[:4], 16))
+    return found
 
 
 def assert_well_formed_pdf(path, min_size=1000):
@@ -218,11 +265,14 @@ def accepted_day_cell_values(day_key):
 
 
 def ascii_day_headers():
-    """Localized weekday labels that survive a Latin-1-only PDF font.
+    """Localized weekday labels findable as literal bytes in a content stream.
 
-    ST-FUNC-004 means non-ASCII labels ("Salı", "Çarşamba") are split across
-    font runs and lose characters in the current output, so only the ASCII
-    ones can be asserted on until that finding is fixed.
+    Still only the ASCII ones, but for a different reason since ST-FUNC-004 was
+    fixed: the PDF now embeds a *subsetted* TrueType face, in which ASCII keeps
+    its own code while "Salı" and "Çarşamba" are drawn as subset indices. Their
+    survival is asserted through the ``/ToUnicode`` CMap instead -- see
+    ``pdf_text_layer_codepoints`` and
+    ``test_pdf_text_layer_keeps_every_turkish_letter``.
     """
     return [tr(f"weekdays.{d}") for d in DAYS
             if tr(f"weekdays.{d}").isascii()]
@@ -722,14 +772,32 @@ def test_csv_is_utf8_with_turkish_characters_intact(state, tmp_path):
 #  5. ST-FUNC-004 — PDF cannot render Turkish letters
 # ══════════════════════════════════════════════════════════════════════════
 
+# Every Turkish-specific letter. Measured in Phase 7: only six of them ever
+# broke -- ö ü ç Ö Ü Ç are WinAnsi codepoints and always drew correctly under
+# Helvetica, so the register's "every Turkish-specific letter (ş ğ İ ı ö ü ç)"
+# was wrong about half the list. All twelve are asserted anyway: the fix must
+# not regress the six that worked.
+TURKISH_LETTERS = "ğĞşŞıİöÖüÜçÇ"
+TURKISH_BROKEN_UNDER_HELVETICA = "ğĞşŞıİ"
+
+
+def _state_with_every_turkish_letter():
+    """A one-lesson schedule whose text carries all twelve Turkish letters."""
+    lecturer = "Şükrü Işık Öğretmen"
+    state = _empty_state(lecturers=[lecturer], rooms=["A-101"],
+                         years={"1. Sınıf": ["A"]})
+    _place(state, "D001",
+           "İŞ SAĞLIĞI ÜNİTESİ: Ölçme, gözlem, Değerlendirme, Çalıştay",
+           lecturer, "monday", "09:00", "A-101", "1. Sınıf", "A", 1)
+    blob = "".join(
+        str(v) for c in state["classes"]
+        for v in (c["name"], c["lecturer"])) + "1. Sınıf"
+    missing = [ch for ch in TURKISH_LETTERS if ch not in blob]
+    assert not missing, f"fixture text lacks {missing} — the test is broken"
+    return state
+
+
 @pytest.mark.pdf
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-FUNC-004 — exporter.py:461-485 style every Paragraph as "
-           "Helvetica, a base-14 font with no Turkish glyphs and no embedded "
-           "font program; fix is the 'Register a Unicode TTF for PDF export' "
-           "item in stress-test/13-improvement-opportunities.md (unphased)",
-)
 def test_pdf_embeds_a_unicode_capable_font(state, tmp_path, reportlab_mod):
     """ST-FUNC-004 — the PDF must embed a font that can draw ğ Ğ ş Ş ı İ.
 
@@ -754,6 +822,161 @@ def test_pdf_embeds_a_unicode_capable_font(state, tmp_path, reportlab_mod):
         "PDF embeds no font program at all; it references only "
         f"{sorted(pdf_base_fonts(raw))}, none of which carry Turkish glyphs"
     )
+
+
+@pytest.mark.pdf
+@pytest.mark.parametrize("mode", MODES)
+def test_pdf_text_layer_has_no_zapfdingbats_substitution(
+        tmp_path, reportlab_mod, mode):
+    """ST-FUNC-004 — no Turkish letter may fall through to ZapfDingbats.
+
+    A failure means the printed timetable draws a filled black block in the
+    middle of a teacher's name and writes the wrong character into the text
+    layer behind it, so the archived PDF cannot be searched for that name.
+
+    This is the half ``test_pdf_embeds_a_unicode_capable_font`` cannot see: it
+    only asks whether *some* font program is embedded, so an export that
+    embedded one font and left another style on Helvetica would satisfy it
+    while still substituting. Parametrized over all four modes because each
+    builds its own table, and the ``everything`` layout is the only one that
+    uses ``session_style``.
+    """
+    out = tmp_path / f"dingbats_{mode}.pdf"
+    export_schedule(_state_with_every_turkish_letter(), "pdf", str(out),
+                    mode=mode)
+
+    raw = assert_well_formed_pdf(out)
+    runs = pdf_zapfdingbats_runs(raw)
+    assert not runs, (
+        f"mode={mode}: the content stream selects ZapfDingbats resource(s) "
+        f"{sorted(runs)}, i.e. reportlab could not encode a character and "
+        f"substituted a filled block for it; base fonts are "
+        f"{sorted(pdf_base_fonts(raw))}"
+    )
+
+
+@pytest.mark.pdf
+def test_pdf_text_layer_keeps_every_turkish_letter(tmp_path, reportlab_mod):
+    """ST-FUNC-004 — the twelve Turkish letters must be recoverable from the PDF.
+
+    A failure means a school that archives its printed timetables cannot find
+    "Öğretmen" in them with Ctrl-F, and copy-paste out of the PDF yields
+    mangled names. Measured before the fix: copying "Şükrü Işık Öğretmen"
+    produced "Önretmen" for the last word.
+    """
+    out = tmp_path / "textlayer.pdf"
+    export_schedule(_state_with_every_turkish_letter(), "pdf", str(out),
+                    mode="everything")
+
+    raw = assert_well_formed_pdf(out)
+    recoverable = pdf_text_layer_codepoints(raw)
+    missing = [ch for ch in TURKISH_LETTERS if ord(ch) not in recoverable]
+    assert not missing, (
+        f"these letters have no /ToUnicode mapping in the exported PDF and so "
+        f"cannot be searched or copied out of it: {missing}"
+    )
+
+
+@pytest.mark.pdf
+def test_pdf_export_falls_back_to_helvetica_when_the_font_file_is_missing(
+        tmp_path, reportlab_mod, monkeypatch):
+    """ST-FUNC-004 — a build without reportlab's fonts must degrade, not crash.
+
+    A failure means the Unicode-font fix turned a cosmetic defect into a dead
+    export button on any build where ``reportlab/fonts/Vera.ttf`` did not ship.
+    That is not hypothetical: ``requirements-lock.txt`` pins reportlab 4.4.10
+    while the venv this suite runs in has 5.0.1, and ``Dersis-mac.spec`` does
+    not collect reportlab's package data at all.
+    """
+    from scheduler_app.data_io import exporter
+
+    with monkeypatch.context() as m:
+        m.setattr(exporter, "_pdf_font_names", None)
+        m.setattr(exporter.os.path, "exists", lambda _p: False)
+        assert exporter._register_unicode_fonts() == ("Helvetica",
+                                                      "Helvetica-Bold"), \
+            "a missing font file must resolve to the base-14 fallback"
+
+    # And the export must still produce a document with that fallback in force.
+    monkeypatch.setattr(exporter, "_pdf_font_names", ("Helvetica",
+                                                      "Helvetica-Bold"))
+    out = tmp_path / "fallback.pdf"
+    export_schedule(_state_with_every_turkish_letter(), "pdf", str(out))
+    content = pdf_content_text(assert_well_formed_pdf(out))
+    assert b"D001" in content, "the fallback export drew no lessons at all"
+
+
+def _state_with_a_crowded_cell():
+    """A schedule whose longest lesson overflows a default-height PDF row."""
+    lecturer = "Şükrü Işık Öğretmen"
+    state = _empty_state(lecturers=[lecturer, LECT_A], rooms=["A-101"],
+                         years={"1. Sınıf": ["A", "B"]})
+    _place(state, "D001",
+           "Öğrenci Değerlendirme ve Ölçme Çalıştayı: İş Sağlığı ve "
+           "Güvenliği Uygulamaları",
+           lecturer, "monday", "09:00", "A-101", "1. Sınıf", "A", 1)
+    _place(state, "D002", "Kontrol", LECT_A, "tuesday", "10:00", "A-101",
+           "1. Sınıf", "B", 1)
+    return state
+
+
+@pytest.mark.pdf
+@pytest.mark.parametrize("mode", MODES)
+def test_pdf_rows_are_tall_enough_for_the_cells_they_hold(
+        tmp_path, reportlab_mod, monkeypatch, mode):
+    """A fixed-height PDF row must fit the paragraph drawn into it.
+
+    A failure means an hour of the printed timetable is written over the hours
+    above and below it: ``rowHeights`` is fixed and reportlab does not grow a
+    fixed row to fit its content, it overprints the neighbours. The
+    contested-cell branch has measured itself for exactly this reason since
+    ST-UI-001; the ordinary occupied cell did not, and measurement says it
+    should have -- 51pt of content in a 50pt row under Helvetica, which
+    ST-FUNC-004's embedded (wider) face pushed to 60pt.
+
+    Asserts a relation between two quantities measured in the same process --
+    what reportlab says the paragraph needs against what the table allots it --
+    never an absolute point count.
+    """
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Table
+
+    captured = []
+    real_build = SimpleDocTemplate.build
+
+    def spy(self, flowables, *args, **kwargs):
+        captured.extend(f for f in flowables if isinstance(f, Table))
+        return real_build(self, flowables, *args, **kwargs)
+
+    monkeypatch.setattr(SimpleDocTemplate, "build", spy)
+    export_schedule(_state_with_a_crowded_cell(), "pdf",
+                    str(tmp_path / f"rows_{mode}.pdf"), mode=mode)
+
+    assert captured, "no Table reached doc.build() -- the spy is broken"
+
+    checked = 0
+    for tbl in captured:
+        heights, widths = tbl._argH, tbl._argW
+        if any(h is None for h in heights):
+            # Auto-sized (the appendix). reportlab grows those itself.
+            continue
+        spans = {(c0, r0): r1 - r0 + 1
+                 for _cmd, (c0, r0), (_c1, r1) in tbl._spanCmds}
+        for r, row in enumerate(tbl._cellvalues):
+            if r < tbl.repeatRows:
+                continue  # header rows: short labels at their own fixed height
+            for c, cell in enumerate(row):
+                if not isinstance(cell, Paragraph):
+                    continue
+                # LEFTPADDING + RIGHTPADDING = 4, TOP + BOTTOM = 6.
+                _w, needed = cell.wrap(widths[c] - 4, 1e6)
+                allotted = sum(heights[r:r + spans.get((c, r), 1)])
+                assert needed + 6 <= allotted + 0.01, (
+                    f"mode={mode}: row {r} column {c} is {allotted:.1f}pt tall "
+                    f"but the cell drawn in it needs {needed + 6:.1f}pt, so it "
+                    f"overprints the hours above and below it"
+                )
+                checked += 1
+    assert checked, "no fixed-height paragraph cell was checked"
 
 
 @pytest.mark.pdf

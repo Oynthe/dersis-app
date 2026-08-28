@@ -890,6 +890,76 @@ def _export_csv(schedule: FinalSchedule, filepath: str):
 
 # ── PDF export (optional) ───────────────────────────────────────────────────
 
+# ST-FUNC-004. Helvetica is a base-14 Type1 font limited to WinAnsi, so six of
+# the twelve Turkish letters -- ğ Ğ ş Ş ı İ -- have no codepoint in it. (ö ü ç
+# Ö Ü Ç do, and always drew correctly; the register's "every Turkish-specific
+# letter" was wrong about that.) What reportlab does with the other six is
+# worse than the missing-glyph box the register described: it splits the
+# paragraph at each unmappable codepoint and switches to ZapfDingbats, whose
+# ASCII `n` is a filled block. So "Şükrü Işık Öğretmen" printed as a name with
+# solid blobs in it, and -- because the substitution also rewrites the text
+# layer -- Ctrl-F for "Öğretmen" found nothing and copy-paste yielded
+# "Önretmen". A school archiving its timetables could not search them by
+# teacher name.
+#
+# The fix embeds a TrueType font instead. Nothing is bundled: reportlab ships
+# Bitstream Vera inside its own wheel (283 glyphs, missing none of the twelve),
+# under a permissive licence it already redistributes, and build_nuitka.bat:118
+# already carries --include-package-data=reportlab. Installer delta: 0 bytes.
+# Per-document delta: +40 KB for the embedded subset, measured.
+_PDF_FALLBACK_FONTS = ("Helvetica", "Helvetica-Bold")
+_PDF_UNICODE_FONTS = ("DersisSans", "DersisSans-Bold")
+
+# pdfmetrics keeps a module-global registry, so registration is once per
+# process rather than once per canvas -- measured: a second export in the same
+# process is byte-identical without re-registering. None means "not yet tried".
+_pdf_font_names: "tuple[str, str] | None" = None
+
+
+def _register_unicode_fonts() -> "tuple[str, str]":
+    """Register a Turkish-capable TrueType family; return ``(regular, bold)``.
+
+    Degrades to Helvetica rather than raising. That guard is not theoretical:
+    ``requirements-lock.txt`` pins ``reportlab==4.4.10`` while the audit venv
+    actually runs 5.0.1, and ``Dersis-mac.spec`` does not collect reportlab's
+    package data at all -- so a build where ``fonts/Vera.ttf`` is absent is a
+    real possibility, and it must cost the user unreadable letters, not a
+    failed export.
+    """
+    global _pdf_font_names
+    if _pdf_font_names is not None:
+        return _pdf_font_names
+
+    _pdf_font_names = _PDF_FALLBACK_FONTS
+    try:
+        import reportlab
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        return _pdf_font_names
+
+    font_dir = os.path.join(os.path.dirname(reportlab.__file__), "fonts")
+    regular_path = os.path.join(font_dir, "Vera.ttf")
+    bold_path = os.path.join(font_dir, "VeraBd.ttf")
+    if not (os.path.exists(regular_path) and os.path.exists(bold_path)):
+        return _pdf_font_names
+
+    regular, bold = _PDF_UNICODE_FONTS
+    try:
+        pdfmetrics.registerFont(TTFont(regular, regular_path))
+        pdfmetrics.registerFont(TTFont(bold, bold_path))
+        # The cell markup uses <b>, which reportlab resolves through the family
+        # map -- without this the bold runs fall back to Helvetica-Bold and the
+        # six letters break again inside every class name.
+        pdfmetrics.registerFontFamily(
+            regular, normal=regular, bold=bold,
+            italic=regular, boldItalic=bold)
+    except Exception:
+        return _pdf_font_names
+
+    _pdf_font_names = (regular, bold)
+    return _pdf_font_names
+
 
 def _pdf_rich_markup(cls, include_room=False, include_targets=False):
     """The colour-coded markup for one class, without wrapping it in a Paragraph.
@@ -942,6 +1012,31 @@ def _pdf_rich_paragraph(cls, cell_style, include_room=False, include_targets=Fal
         _pdf_rich_markup(cls, include_room=include_room,
                          include_targets=include_targets),
         cell_style)
+
+
+def _note_cell_height(tall_rows, para, content_w, first_row, span, min_row_h):
+    """Grow *tall_rows* so ``para`` fits the rows it is drawn across.
+
+    ``rowHeights`` is fixed, and reportlab does not grow a fixed row to fit its
+    content -- it overprints the neighbours. The contested-cell branch already
+    measured itself for that reason; the ordinary occupied cell did not, and
+    measurement says it should have: at 7pt in the everything layout's narrow
+    columns, "Öğrenci Değerlendirme ve Ölçme Çalıştayı / Şükrü Işık Öğretmen /
+    A-101" needs 51pt against MIN_ROW_H's 50 under Helvetica and 60pt under the
+    embedded TrueType face (ST-FUNC-004 widens the glyphs). The lecturer layout
+    needs 51pt for even a one-word lesson, because it prints the group line
+    too. So the printed timetable has been overprinting the hour above and
+    below it all along, and the font fix would have made that worse silently.
+
+    A cell merged across *span* rows is drawn in the sum of their heights, so
+    the requirement is divided rather than applied to each row.
+    """
+    span = max(span, 1)
+    _w, _h = para.wrap(content_w, 1e6)
+    per_row = (_h + 6) / span
+    for off in range(span):
+        tall_rows[first_row + off] = max(
+            tall_rows.get(first_row + off, min_row_h), per_row)
 
 
 def _pdf_conflict_paragraph(classes, cell_style, conflicted,
@@ -1007,29 +1102,33 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     avail_w = page_size[0] - 16 * mm
 
     # ── Paragraph styles ──────────────────────────────────────────────
+    # ST-FUNC-004: every style names the registered family, never Helvetica.
+    # A style left on Helvetica would still substitute ZapfDingbats for ğ ş ı,
+    # and the day-header row is exactly where "Çarşamba" lives.
+    FONT_REGULAR, FONT_BOLD = _register_unicode_fonts()
     cell_style = ParagraphStyle(
         "CellContent", fontSize=7, leading=9,
-        alignment=TA_CENTER, fontName="Helvetica",
+        alignment=TA_CENTER, fontName=FONT_REGULAR,
     )
     hdr_style = ParagraphStyle(
         "HdrContent", fontSize=9, leading=11, alignment=TA_CENTER,
-        textColor=rl_colors.white, fontName="Helvetica-Bold",
+        textColor=rl_colors.white, fontName=FONT_BOLD,
     )
     branch_hdr_style = ParagraphStyle(
         "BranchHdr", fontSize=8, leading=10, alignment=TA_CENTER,
-        textColor=rl_colors.white, fontName="Helvetica-Bold",
+        textColor=rl_colors.white, fontName=FONT_BOLD,
     )
     time_style = ParagraphStyle(
         "TimeContent", fontSize=8, leading=10, alignment=TA_CENTER,
-        textColor=rl_colors.white, fontName="Helvetica-Bold",
+        textColor=rl_colors.white, fontName=FONT_BOLD,
     )
     session_style = ParagraphStyle(
         "SessionNum", fontSize=8, leading=10, alignment=TA_CENTER,
-        textColor=rl_colors.HexColor("#333333"), fontName="Helvetica-Bold",
+        textColor=rl_colors.HexColor("#333333"), fontName=FONT_BOLD,
     )
     title_style = ParagraphStyle(
         "PageTitle", fontSize=11, leading=14, alignment=TA_CENTER,
-        fontName="Helvetica-Bold", textColor=rl_colors.HexColor("#1E293B"),
+        fontName=FONT_BOLD, textColor=rl_colors.HexColor("#1E293B"),
         spaceAfter=4 * mm,
     )
 
@@ -1140,10 +1239,13 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                 key = (si, day)
                 if key in occupied_start:
                     cls, span = occupied_start[key]
-                    row.append(_pdf_rich_paragraph(
+                    para = _pdf_rich_paragraph(
                         cls, cell_style,
                         include_room=include_room,
-                        include_targets=include_targets))
+                        include_targets=include_targets)
+                    row.append(para)
+                    _note_cell_height(tall_rows, para, day_w - 4,
+                                      data_row_idx, span, MIN_ROW_H)
                     yr_name = cls["targets"][0]["year"] if cls.get("targets") else ""
                     base = get_year_color(state, yr_name)
                     light = lighten_color(base, 0.45)
@@ -1246,6 +1348,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
         cell_bg_cmds = []
         row_heights = [24]
+        tall_rows = {}
         for si, slot in enumerate(slots):
             data_row_idx = si + 1
             row = [Paragraph(escape_pdf_markup(slot), time_style)]
@@ -1259,9 +1362,12 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                     block = starts[key]
                     cls = block["cls"]
                     span = block["span"]
-                    row.append(_pdf_rich_paragraph(
+                    para = _pdf_rich_paragraph(
                         cls, cell_style,
-                        include_room=False, include_targets=True))
+                        include_room=False, include_targets=True)
+                    row.append(para)
+                    _note_cell_height(tall_rows, para, data_w - 4,
+                                      data_row_idx, span, MIN_ROW_H)
                     yr_name = cls["targets"][0]["year"] if cls.get("targets") else ""
                     base = get_year_color(state, yr_name)
                     light = lighten_color(base, 0.45)
@@ -1287,6 +1393,9 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                          (col_idx, data_row_idx), COL_EMPTY))
             table_data.append(row)
             row_heights.append(MIN_ROW_H)
+
+        for _ri, _h in tall_rows.items():
+            row_heights[_ri] = _h
 
         style_cmds.extend(cell_bg_cmds)
         tbl = Table(table_data, colWidths=col_widths, rowHeights=row_heights,
@@ -1452,9 +1561,12 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                         if kind == "span":
                             row.append("")
                             continue
-                        row.append(_pdf_rich_paragraph(
+                        para = _pdf_rich_paragraph(
                             cls, cell_style,
-                            include_room=True, include_targets=False))
+                            include_room=True, include_targets=False)
+                        row.append(para)
+                        _note_cell_height(tall_rows, para, data_col_w - 4,
+                                          data_row, span, MIN_ROW_H)
                         yr_hex = get_year_color(state, yr).lstrip("#")
                         light_hex = lighten_color(f"#{yr_hex}", 0.45)
                         bg = rl_colors.HexColor(light_hex)
