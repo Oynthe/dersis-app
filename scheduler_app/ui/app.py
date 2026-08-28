@@ -2532,8 +2532,20 @@ class SchedulerApp(QMainWindow):
             self.splitter.setSizes([nb, sw])
         finally:
             self._in_collapse_sync = False
-        # ST-UI-013: decide once, here, rather than waiting for the first
-        # resize the user happens to perform.
+        # ST-UI-013: a restored "closed" is a decision the user made in an
+        # earlier session, and it has two halves — switch the width-aware
+        # collapse off, *and* close the panel. `_restore_window_geometry` can
+        # only apply the first: it runs before show(), where the splitter still
+        # reports its own 640 px size hint and nothing measured off it is worth
+        # acting on. Applying only that half produced the one state this whole
+        # row exists to remove — an open sidebar in a window too narrow for it,
+        # now sticky on disk instead of one resize away from being fixed.
+        # `by_user` stays False deliberately: this is replaying the stored
+        # decision, not taking a new one.
+        if self._sidebar_intent == "closed" and not self._sidebar_is_collapsed:
+            self._collapse_panel("sidebar")
+        # Decide once, here, rather than waiting for the first resize the user
+        # happens to perform.
         self._apply_sidebar_intent()
 
     def _on_splitter_moved(self):

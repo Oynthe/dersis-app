@@ -579,3 +579,45 @@ def test_switching_to_a_wider_tab_takes_the_sidebar_s_room(
     assert win._sidebar_is_collapsed, (
         "switching to a tab that needs %d px left the sidebar open in a %d px "
         "window" % (everything_needs, room))
+
+
+# ── 4. A sidebar the user closed comes back closed ─────────────────────────
+
+def test_a_sidebar_the_user_closed_comes_back_closed(make_app, qapp):
+    """Restoring the intent has to restore the panel it describes.
+
+    The intent was read back and applied to the half of the feature that
+    switches the width-aware collapse *off*, and not to the half that closes
+    the panel — so the relaunch produced the one state ST-UI-013 exists to
+    prevent, an open sidebar in a window that cannot afford it, and now sticky
+    on disk rather than one resize away from being fixed.
+
+    The last assertion is not decoration. Doing this in
+    ``_restore_window_geometry``, where the intent is read, sets the flag but
+    leaves the panel at 170 px: the splitter is still at its own size hint
+    there, and ``_init_splitter_sizes`` widens the "collapsed" panel again
+    afterwards. Measured; the flag alone would not have caught it.
+    """
+    first = _shown(make_app, qapp)
+    first._sidebar_expand_btn.click()          # the user opens it
+    qapp.processEvents()
+    assert not first._sidebar_is_collapsed
+    first._sidebar_collapse_btn.click()        # ...and then shuts it again
+    qapp.processEvents()
+    assert first._sidebar_is_collapsed
+    assert first._sidebar_intent == "closed"
+    first.close()
+    qapp.processEvents()
+
+    again = _shown(make_app, qapp)
+    assert again._sidebar_intent == "closed", (
+        "the decision did not survive the quit at all (intent %r)"
+        % (again._sidebar_intent,))
+    assert again._sidebar_is_collapsed, (
+        "the sidebar the user closed came back open, and with the width-aware "
+        "collapse switched off behind it")
+    assert again.splitter.sizes()[1] == again._collapsed_width, (
+        "the panel calls itself collapsed but still occupies %d px of the "
+        "splitter" % (again.splitter.sizes()[1],))
+    assert not again._toggle_sidebar_action.isChecked(), (
+        "View > Sidebar is ticked on a sidebar that is not there")
