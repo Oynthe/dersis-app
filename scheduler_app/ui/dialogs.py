@@ -13,6 +13,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QCursor, QShortcut, QKeySequence
 
 from scheduler_app.core.text_safety import escape_qt_rich
+from scheduler_app.data_io.schema import is_lecturer_name_header
 from scheduler_app.translations import TRANSLATIONS, tr
 from scheduler_app.models import (
     new_class, new_lecturer_availability, needs_physical_room, LOCATION_TYPES,
@@ -1717,10 +1718,16 @@ class SetupDialog(QDialog):
             if df.empty:
                 QMessageBox.information(self, tr("dialogs.import.excel_title"), tr("warnings.no_data_found"))
                 return
+            # A non-empty frame has at least one column, so cols[0] exists.
             cols = list(df.columns)
+            if not is_lecturer_name_header(cols[0]):
+                QMessageBox.warning(
+                    self, tr("status.import_failed"),
+                    tr("errors.missing_columns").format(cols=tr("labels.lecturer")))
+                return
             count = 0
             for _, row in df.iterrows():
-                name = str(row[cols[0]]).strip() if len(cols) > 0 else ""
+                name = str(row[cols[0]]).strip()
                 if not name:
                     continue
                 # Parse availability from comma-separated strings

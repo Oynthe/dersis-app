@@ -19,8 +19,9 @@ from scheduler_app.models import (
 from scheduler_app.translations import tr
 from scheduler_app.data_io.schema import (
     canonicalize_workbook_columns,
+    get_workbook_sheet_description_texts,
     get_workbook_sheet_header_map,
-    lookup_workbook_sheet_id,
+    resolve_workbook_sheet_ids,
 )
 
 
@@ -452,12 +453,11 @@ def load_scheduler_data_from_excel(filepath: str) -> SchedulerDataset:
         report.add_error(tr("menus.file"), None, tr("errors.cannot_open_excel").format(err=e))
         return dataset
 
-    sheet_names = xls.sheet_names
-    sheet_lookup = {}
-    for actual_name in sheet_names:
-        sheet_id = lookup_workbook_sheet_id(actual_name)
-        if sheet_id and sheet_id not in sheet_lookup:
-            sheet_lookup[sheet_id] = actual_name
+    # Resolved against the whole workbook at once, not sheet by sheet: one
+    # title can name two different sheets in two different languages (Spanish
+    # *Aulas* is a classroom, Portuguese *Aulas* is a class), and only the
+    # company a title keeps can say which one this workbook means.
+    sheet_lookup = resolve_workbook_sheet_ids(xls.sheet_names)
 
     # ST-FUNC-011: a workbook in which *no* sheet is recognized is not a
     # half-filled roster, it is the wrong file. Measured on an unrelated
@@ -479,20 +479,24 @@ def load_scheduler_data_from_excel(filepath: str) -> SchedulerDataset:
     classes_df = None
 
     def _read_sheet(sheet_id):
-        """Read a sheet, auto-detecting and skipping description rows."""
+        """Read a sheet, dropping the template's row-2 help text if it is there."""
         actual_name = sheet_lookup[sheet_id]
         df = pd.read_excel(xls, actual_name)
         df = df.rename(columns=canonicalize_workbook_columns(sheet_id, df.columns))
         if df.empty:
             return df
-        # If the first data row looks like descriptions (all strings, no
-        # valid IDs), skip it — this handles the template's row-2 descriptions.
-        first = df.iloc[0]
-        id_col = [c for c in df.columns if c.endswith("_id")]
-        if id_col:
-            val = str(first.get(id_col[0], ""))
-            # Heuristic: description rows have long text with spaces
-            if len(val) > 20 or " " in val:
+        # The generated template puts one row of help text under the headers.
+        # It is recognized by *being* one of the strings the template writes,
+        # in any of the shipped languages — not by being long or containing a
+        # space, which is a description in Turkish and a class id in Chinese.
+        # Getting that wrong cost data in both directions: the zh and ja
+        # templates imported their own help text as a lecturer, a classroom
+        # and a branch, and a class id written "C 001" was silently dropped
+        # (ST-FUNC-010).
+        id_cols = [c for c in df.columns if c.endswith("_id")]
+        if id_cols:
+            val = _cell_text(df.iloc[0].get(id_cols[0], ""))
+            if val and val in get_workbook_sheet_description_texts(sheet_id):
                 df = df.iloc[1:].reset_index(drop=True)
         return df
 

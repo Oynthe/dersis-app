@@ -86,6 +86,31 @@ def get_workbook_sheet_description_map(sheet_id):
     }
 
 
+def get_workbook_sheet_description_texts(sheet_id):
+    """Every string the template has ever written into a sheet's row 2.
+
+    The importer drops that row rather than reading it as data. It used to
+    recognize it by shape — "longer than 20 characters, or contains a space" —
+    which no Chinese or Japanese sentence satisfies, so the zh and ja templates
+    imported their own help text as a lecturer, a classroom and a branch; and
+    which a class id like ``9 A`` does satisfy, so that class was dropped
+    (ST-FUNC-010). Matching the actual strings, in every language, decides both
+    cases on what the row *is* instead of how long it is.
+    """
+    texts = set()
+    for _, _, desc_key in WORKBOOK_SHEETS[sheet_id]["columns"]:
+        for lang_dict in TRANSLATIONS.values():
+            text = lang_dict.get(desc_key)
+            if text:
+                texts.add(str(text).strip())
+        # The active language, which falls back to English for any key its
+        # own catalogue is missing — that is the string the template wrote.
+        text = tr(desc_key)
+        if text and text != desc_key:
+            texts.add(str(text).strip())
+    return texts
+
+
 def get_workbook_sheet_reverse_header_map(sheet_id):
     reverse = {}
     for field, label_key, _ in WORKBOOK_SHEETS[sheet_id]["columns"]:
@@ -98,24 +123,120 @@ def get_workbook_sheet_reverse_header_map(sheet_id):
     return reverse
 
 
-def get_workbook_sheet_alias_map():
-    alias_map = {}
-    for sheet_id, spec in WORKBOOK_SHEETS.items():
-        names = {
-            spec["legacy_title"],
-            _normalize_label(tr(spec["title_key"]) or spec["legacy_title"]),
-        }
+#: Column-header keys that mean "this column holds a member of staff's name".
+#: ``SetupDialog._export_lecturers_to_excel`` writes ``labels.lecturer``; the
+#: File ▸ Import Excel template writes ``import.columns.teacher_name`` on its
+#: Teachers sheet. Both are accepted, so either export round-trips.
+#: Deliberately *not* including a generic "Name": the job is to tell a roster
+#: from a budget.
+LECTURER_NAME_HEADER_KEYS = (
+    "labels.lecturer",
+    "import.columns.teacher_name",
+    "labels.teachers",
+    "setup.lecturers",
+)
+
+
+def is_lecturer_name_header(label):
+    """True when a spreadsheet column header names staff, in any language.
+
+    Setup ▸ Lecturers ▸ Import Excel read sheet 0, column 0 as names with no
+    recognition of any kind, so a budget spreadsheet ("Kalem"/"Tutar") reported
+    three lecturers imported and put its line items in the roster, where they
+    are indistinguishable from real staff — the lecturer list is keyed by
+    display name. Same class of defect as ST-FUNC-011, through another door.
+    Every catalogue is consulted, not just the active one, so a roster exported
+    before a language change still imports afterwards.
+    """
+    candidate = _normalize_label(label).casefold()
+    if not candidate:
+        return False
+    for key in LECTURER_NAME_HEADER_KEYS:
+        if candidate == _normalize_label(tr(key)).casefold():
+            return True
         for lang_dict in TRANSLATIONS.values():
-            label = _normalize_label(lang_dict.get(spec["title_key"], spec["legacy_title"]))
-            if label:
-                names.add(label)
-        for name in names:
-            alias_map[name.casefold()] = sheet_id
-    return alias_map
+            if candidate == _normalize_label(lang_dict.get(key, "")).casefold():
+                return True
+    return False
 
 
-def lookup_workbook_sheet_id(sheet_name):
-    return get_workbook_sheet_alias_map().get(_normalize_label(sheet_name).casefold())
+def get_workbook_sheet_titles(sheet_id):
+    """Every title the app has ever written for one sheet, in any language."""
+    spec = WORKBOOK_SHEETS[sheet_id]
+    names = {
+        spec["legacy_title"],
+        _normalize_label(tr(spec["title_key"]) or spec["legacy_title"]),
+    }
+    for lang_dict in TRANSLATIONS.values():
+        label = _normalize_label(lang_dict.get(spec["title_key"], spec["legacy_title"]))
+        if label:
+            names.add(label)
+    return names
+
+
+def get_workbook_sheet_alias_candidates():
+    """Map each known sheet title to *every* sheet it could be naming.
+
+    Sheet titles are not unique across the 22 shipped languages: Spanish calls
+    its classroom sheet *Aulas* and Portuguese calls its class sheet *Aulas*.
+    The single-valued map this replaced had to pick a winner per title, and
+    classes always won, so a Spanish workbook's rooms sheet was read as its
+    class sheet — the Spanish template could not be re-imported at all.
+    Ambiguity is a property of the title, so it is recorded here and resolved
+    per workbook by :func:`resolve_workbook_sheet_ids`.
+    """
+    candidates = {}
+    for sheet_id in WORKBOOK_SHEETS:
+        for name in get_workbook_sheet_titles(sheet_id):
+            bucket = candidates.setdefault(name.casefold(), [])
+            if sheet_id not in bucket:
+                bucket.append(sheet_id)
+    return candidates
+
+
+def resolve_workbook_sheet_ids(sheet_names):
+    """Decide which sheet of one workbook holds which kind of data.
+
+    Two passes, so that a title only one sheet can be claims it before an
+    ambiguous title gets a chance to: in a Spanish workbook *Clases* is
+    unambiguously the class sheet, which leaves *Aulas* the rooms slot; in a
+    Portuguese workbook *Salas* is unambiguously rooms, which leaves *Aulas*
+    the classes slot. The answer therefore comes from the workbook itself and
+    not from the language the reader's app happens to be running in — letting
+    the active locale's titles win instead would repair Spanish by breaking
+    the Portuguese workbook opened on a Spanish desktop.
+
+    Returns ``{sheet_id: actual sheet title}`` for the sheets that resolved.
+    """
+    candidates = get_workbook_sheet_alias_candidates()
+    resolved = {}
+    ambiguous = []
+    for actual_name in sheet_names:
+        sheet_ids = candidates.get(_normalize_label(actual_name).casefold())
+        if not sheet_ids:
+            continue
+        if len(sheet_ids) == 1:
+            resolved.setdefault(sheet_ids[0], actual_name)
+        else:
+            ambiguous.append((actual_name, sheet_ids))
+
+    for actual_name, sheet_ids in ambiguous:
+        free = [s for s in sheet_ids if s not in resolved]
+        if not free:
+            continue
+        # Only reachable when a workbook carries an ambiguous title and none of
+        # the sheets it could name are spoken for — a rooms-only file called
+        # *Aulas*, say. Nothing in the workbook can settle that, so the reader's
+        # own language breaks the tie; with a complete workbook this branch
+        # never decides anything, which the round-trip tests pin.
+        for sheet_id in free:
+            if _normalize_label(actual_name).casefold() == \
+                    get_workbook_sheet_title(sheet_id).casefold():
+                resolved[sheet_id] = actual_name
+                break
+        else:
+            resolved[free[0]] = actual_name
+    return resolved
 
 
 def canonicalize_workbook_columns(sheet_id, columns):

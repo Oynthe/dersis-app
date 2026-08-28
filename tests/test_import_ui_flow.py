@@ -427,3 +427,117 @@ def test_failed_import_rolls_back_the_whole_merge(
 
     assert window.state_data == before
     assert detonated, "import never reached the repaint, so nothing was rolled back"
+
+
+# ── 4. Setup ▸ Lecturers ▸ Import Excel is a second front door ──────────────
+#
+# ST-FUNC-011 guarded ``load_scheduler_data_from_excel`` / File ▸ Import Excel.
+# The Setup dialog has five import buttons of its own (days, slots, rooms,
+# lecturers, years) that never go near that pipeline: each reads sheet 0 with
+# ``pd.read_excel(path, sheet_name=0, header=0)`` and takes column 0 as data.
+# Only the lecturer door is closed here, because only it is measured; the other
+# four are the same shape and want the same guard as their own change.
+
+def _budget_workbook(tmp_path):
+    """An unrelated spreadsheet — the file ST-FUNC-011 was written about."""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Butce"
+    ws.append(["Kalem", "Tutar"])
+    for item, amount in (("Kirtasiye", 1200), ("Temizlik", 800), ("Yakit", 4500)):
+        ws.append([item, amount])
+    path = os.path.join(str(tmp_path), "butce.xlsx")
+    wb.save(path)
+    return path
+
+
+def _lecturer_workbook(tmp_path, lang="tr"):
+    """What Setup ▸ Lecturers ▸ Export Excel writes — the round-trip partner.
+
+    Built from the same translation keys ``_export_lecturers_to_excel`` uses, so
+    a header rename cannot make this fixture and the export drift apart. ``lang``
+    picks the catalogue the headers are drawn from without touching the process
+    language: a school that exported before switching the app to another
+    language must still be able to import the file it already has.
+    """
+    import openpyxl
+
+    from scheduler_app.translations import TRANSLATIONS
+
+    labels = TRANSLATIONS[lang]
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append([labels["labels.lecturer"], labels["setup.allowed_days"],
+               labels["setup.allowed_hours"], labels["setup.excluded_days"],
+               labels["setup.excluded_hours"]])
+    ws.append(["Ada Lovelace", "", "", "", ""])
+    ws.append(["Bora Yildiz", "", "", "", ""])
+    path = os.path.join(str(tmp_path), f"lecturers_{lang}.xlsx")
+    wb.save(path)
+    return path
+
+
+@pytest.fixture
+def setup_dialog(qapp, dersis_home, message_boxes):
+    """A real ``SetupDialog`` over an empty roster, never shown."""
+    from scheduler_app.core.models import new_state
+    from scheduler_app.ui.dialogs import SetupDialog
+
+    state = new_state()
+    state["days"] = ["monday", "tuesday"]
+    state["slots"] = ["09:00", "10:00"]
+    dlg = SetupDialog(None, state)
+    try:
+        yield dlg
+    finally:
+        dlg.deleteLater()
+        qapp.processEvents()
+
+
+def test_setup_lecturer_import_refuses_an_unrelated_spreadsheet(
+        setup_dialog, message_boxes, choose_file, tmp_path):
+    """A budget sheet must not become three members of staff.
+
+    Measured before the fix: the button's own slot read "Kalem"/"Tutar",
+    inserted Kirtasiye, Temizlik and Yakit into the lecturer table and showed
+    ``('information', 'İçe aktarma başarılı', '3 Öğretim Elemanları')``. OK then
+    wrote those three strings into ``state['lecturers']``, where they are
+    indistinguishable from real staff — the lecturer list is keyed by name.
+    """
+    choose_file(_budget_workbook(tmp_path))
+
+    setup_dialog._import_lecturers_from_excel()
+
+    names = [setup_dialog.lec_table.item(r, 0).text()
+             for r in range(setup_dialog.lec_table.rowCount())]
+    assert names == [], f"budget line items were imported as lecturers: {names}"
+    assert not message_boxes["information"].called, (
+        "the user was told an unrelated spreadsheet imported successfully: "
+        f"{message_boxes['information'].texts()}")
+    assert message_boxes["warning"].called, (
+        "the import was refused without telling the user anything")
+
+
+@pytest.mark.parametrize("lang", ["tr", "en", "zh"])
+def test_setup_lecturer_import_still_reads_its_own_export(
+        setup_dialog, message_boxes, choose_file, tmp_path, lang):
+    """Discrimination: the export/import loop must keep working.
+
+    Without this, "refuse everything" passes the test above. The workbook here
+    is exactly what ``_export_lecturers_to_excel`` writes — in three languages,
+    because the app is Turkish-first but ships 22 and a roster exported before
+    a language change is still the user's roster.
+    """
+    choose_file(_lecturer_workbook(tmp_path, lang))
+
+    setup_dialog._import_lecturers_from_excel()
+
+    names = [setup_dialog.lec_table.item(r, 0).text()
+             for r in range(setup_dialog.lec_table.rowCount())]
+    assert names == ["Ada Lovelace", "Bora Yildiz"], (
+        f"the dialog cannot read back its own export: {names}")
+    assert message_boxes["information"].called
+    assert not message_boxes["warning"].called, (
+        f"a valid roster was refused: {message_boxes['warning'].texts()}")
