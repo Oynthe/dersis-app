@@ -35,12 +35,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-14 runners are Apple Silicon (arm64).
+          # The bare `macos-15` label is the Apple Silicon (arm64) image.
           - arch: arm64
-            runner: macos-14
-          # macos-13 runners are Intel (x86_64).
+            runner: macos-15
+          # `macos-15-intel` is the x86_64 image. It replaced `macos-13`, which
+          # GitHub retired on 2025-12-08 (runner-images #13046) — a job asking
+          # for a label that no longer exists never starts and never logs why.
           - arch: x64
-            runner: macos-13
+            runner: macos-15-intel
 
     runs-on: ${{ matrix.runner }}
 

@@ -24,6 +24,16 @@ tag. They also pin that CI *runs* on a tag push — it did not, so ``ci.yml``'s
 "Verify tag matches VERSION" step was unreachable and the tag gate gated on
 nothing.
 
+Deleting ``build-release.yml`` also promoted a latent gate on a lane that had
+never executed into the one path a release now takes. ``release.yml``'s
+``publish`` job needed a macOS matrix whose Intel leg asked for ``macos-13``, a
+runner GitHub retired; a job with no ``if:`` requires *every* need to succeed,
+so the first real ``v*`` tag would have published nothing at all — and the
+"publishing Windows-only" fallback written for exactly that case sits inside the
+job that gets skipped. Two tests below evaluate the publisher's ``if:`` against
+concrete ``needs`` outcomes rather than matching its text, and a third checks
+every macOS runner label against the images GitHub actually offers.
+
 **ST-SEC-006.** Two defects in ``scripts/download_release.py``, both measured:
 the ``Authorization`` header was forwarded across GitHub's cross-host redirect to
 ``release-assets.githubusercontent.com`` (3/3 in a two-server harness — Python
@@ -225,6 +235,138 @@ def _release_publishing_workflows():
     return names
 
 
+def _scalars(node):
+    """Every string leaf in a parsed workflow, however deeply nested."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            yield from _scalars(key)
+            yield from _scalars(value)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _scalars(item)
+
+
+MACOS_LABEL_RE = re.compile(r"macos-[0-9a-z.-]+")
+
+
+def _macos_runner_labels():
+    """`{label: [where]}` for every macOS runner label any workflow names.
+
+    Scanning every scalar rather than `runs-on:` alone is deliberate: this
+    repository selects its runner through `runs-on: ${{ matrix.runner }}`, so the
+    label only ever appears inside a `matrix.include` entry.
+    """
+    found = {}
+    for filename, workflow in _workflows().items():
+        for value in _scalars(workflow):
+            if MACOS_LABEL_RE.fullmatch(value.strip()):
+                found.setdefault(value.strip(), []).append(filename)
+    return found
+
+
+# ── evaluating a job-level `if:` ────────────────────────────────────────────
+# A job's `if:` decides whether it runs, so asserting on its *text* pins the
+# spelling and not the behaviour. This evaluates the slice of GitHub's
+# expression language the release publisher uses — the status functions,
+# `needs.<job>.result`, `!`, `&&`, `||`, parentheses, string literals — against
+# concrete `needs` outcomes, so a test can ask "does publish run when the macOS
+# leg fails?" and get the answer rather than a substring match.
+
+_IF_TOKEN_RE = re.compile(
+    r"\s+|\(|\)|&&|\|\||!(?!=)|==|!=|'[^']*'"
+    r"|needs\.[A-Za-z0-9_-]+\.result"
+    r"|[A-Za-z_]+\(\)"
+)
+
+_IF_LITERAL_RE = re.compile(r"\A(\s+|\(|\)|==|!=|'[^']*')\Z")
+
+
+def _job_runs(condition, results, cancelled=False):
+    """Would a job carrying this `if:` run, given these `needs` outcomes?
+
+    `condition` may be `None`, which is the implicit `success()` GitHub applies
+    to a job that declares no `if:` — i.e. every single need must have
+    succeeded. That implicit rule is the whole of finding 1.
+    """
+    expression = (condition or "success()").strip()
+    if expression.startswith("${{") and expression.endswith("}}"):
+        expression = expression[3:-2].strip()
+
+    tokens = _IF_TOKEN_RE.findall(expression)
+    assert "".join(tokens) == expression, (
+        "this evaluator does not understand %r. It supports the four status "
+        "functions, needs.<job>.result, string literals, ! && || and "
+        "parentheses; widen it deliberately rather than loosening the test."
+        % (expression,)
+    )
+
+    functions = {
+        "success()": all(r == "success" for r in results.values()) and not cancelled,
+        "failure()": any(r == "failure" for r in results.values()),
+        "cancelled()": cancelled,
+        "always()": True,
+    }
+    operators = {"&&": " and ", "||": " or ", "!": " not "}
+
+    python = []
+    for token in tokens:
+        if token in functions:
+            python.append(repr(functions[token]))
+        elif token in operators:
+            python.append(operators[token])
+        elif token.startswith("needs."):
+            job = token.split(".")[1]
+            assert job in results, (
+                "the `if:` reads %s but no outcome was supplied for job %r"
+                % (token, job)
+            )
+            python.append(repr(results[job]))
+        else:
+            assert _IF_LITERAL_RE.match(token), "unhandled token %r" % (token,)
+            python.append(token)
+    return bool(eval("".join(python), {"__builtins__": {}}, {}))  # nosec B307
+
+
+# ── which macOS runners GitHub actually has ─────────────────────────────────
+# Read from actions/runner-images' README on 2026-08-29, not from memory. A
+# `runs-on:` label GitHub no longer offers does not fail loudly: the job never
+# starts, and a `needs` on it is simply never satisfied.
+#
+# macos-13 is *gone* — runner-images issue #13046 (deprecation from 2025-09-22,
+# "fully unsupported by December 8th, 2025", replacement label `macos-15-intel`
+# available until August 2027), and the images/macos directory now holds only
+# macos-14, macos-15 and macos-26 readmes.
+#
+# macos-14 is still live but carries a `deprecated` badge in that same table,
+# pointing at issue #13518: brownout failures from 2026-10-05, fully unsupported
+# 2026-11-02. It is excluded here on purpose. A release lane scheduled to break
+# on a published date is a release lane that breaks.
+SUPPORTED_MACOS_RUNNER_LABELS = {
+    "macos-latest",
+    "macos-latest-large",
+    "macos-latest-xlarge",
+    "macos-15",
+    "macos-15-arm64",
+    "macos-15-intel",
+    "macos-15-large",
+    "macos-15-xlarge",
+    "macos-26",
+    "macos-26-arm64",
+    "macos-26-intel",
+    "macos-26-large",
+    "macos-26-xlarge",
+}
+
+WHY_A_MACOS_LABEL_IS_UNUSABLE = {
+    "macos-13": "retired (runner-images #13046: unsupported since 2025-12-08). "
+                "The x64 replacement is `macos-15-intel`.",
+    "macos-14": "deprecated (runner-images #13518: brownouts from 2026-10-05, "
+                "unsupported 2026-11-02). The arm64 replacement is `macos-15`.",
+}
+
+
 # ── ST-SEC-004: what the build downloads and runs ───────────────────────────
 
 def test_every_build_time_download_is_pinned_and_hash_checked():
@@ -371,6 +513,194 @@ def test_only_one_workflow_races_for_a_version_tag():
     assert listeners == ["ci.yml", "release.yml"], (
         "workflows triggered by a version tag: %s. Only the publisher and CI "
         "should be; the rest are workflow_dispatch build lanes." % listeners
+    )
+
+
+def test_no_workflow_targets_a_macos_runner_github_no_longer_offers():
+    """A dead `runs-on:` label is a job that never starts and never logs why.
+
+    Both macOS matrices named ``macos-13`` for the Intel leg. GitHub retired
+    that image; the queue simply has nothing to give the job. Because
+    ``publish`` needs ``build-macos``, the first ``v*`` tag would have produced
+    no release at all — not a Windows-only one, none.
+    """
+    labels = _macos_runner_labels()
+    assert labels, "no macOS runner label found; did the matrices move?"
+
+    unusable = sorted(set(labels) - SUPPORTED_MACOS_RUNNER_LABELS)
+    assert not unusable, "\n".join(
+        "%s (in %s): %s" % (
+            label,
+            ", ".join(sorted(set(labels[label]))),
+            WHY_A_MACOS_LABEL_IS_UNUSABLE.get(
+                label,
+                "not in the runner-images README label table. Check "
+                "https://github.com/actions/runner-images#available-images "
+                "and update SUPPORTED_MACOS_RUNNER_LABELS in this file.",
+            ),
+        )
+        for label in unusable
+    )
+
+
+def test_a_failed_macos_leg_still_publishes_the_windows_release():
+    """The Windows-only fallback must live somewhere that can actually run.
+
+    ``publish`` declares ``needs: [build, build-macos]`` and no ``if:``, and no
+    ``if:`` means *every* need must succeed. So a macOS leg failure skipped
+    ``publish`` — and with it the ``::warning::No macOS .dmg artifacts found —
+    publishing Windows-only`` line written for exactly this case, which sits
+    **inside** the skipped job. ``fail-fast: false`` does not help: it stops the
+    sibling leg being cancelled, it does not change the matrix job's conclusion.
+
+    Skipping in the other direction still has to hold. A gate of bare
+    ``always()`` would publish a release with no installer to attach.
+    """
+    publish = _workflows()["release.yml"]["jobs"]["publish"]
+    needs = list(publish.get("needs") or [])
+    condition = publish.get("if")
+    assert "build" in needs and "build-macos" in needs, (
+        "publish should still wait for both build lanes; found needs=%s" % needs
+    )
+
+    green = {job: "success" for job in needs}
+    assert _job_runs(condition, green), (
+        "publish does not run even when everything it needs succeeded"
+    )
+
+    assert _job_runs(condition, dict(green, **{"build-macos": "failure"})), (
+        "publish is skipped when the macOS leg fails, so the Windows installer "
+        "and its checksum never reach the release and the ::warning:: fallback "
+        "inside publish never prints. Gate publish on the jobs it cannot ship "
+        "without and let the optional one fail."
+    )
+
+    assert not _job_runs(condition, dict(green, **{"build": "failure"})), (
+        "publish runs with no installer to attach. A bare `always()` does this; "
+        "the gate must still require the Windows build."
+    )
+
+    assert not _job_runs(condition, green, cancelled=True), (
+        "a cancelled release run still publishes. Use `!cancelled()` rather "
+        "than `always()`, which ignores cancellation by definition."
+    )
+
+
+def test_the_publisher_will_not_ship_a_tag_the_suite_failed_on():
+    """Publishing must wait for the tests, not merely run beside them.
+
+    ``ci.yml`` now triggers on ``v*``, but it starts as an independent run on
+    the same ref and nothing consumes its result: a red suite and a published
+    installer are concurrent, unrelated events.
+
+    The second half of this is a trap that only appears once both fixes are in
+    place. An ``if:`` replaces the implicit ``success()`` for *every* need, not
+    just the one it names, so a publisher gated on ``needs.build.result`` alone
+    would ignore a failing test job it lists in ``needs``.
+    """
+    workflow = _workflows()["release.yml"]
+    suite_jobs = sorted({
+        job for job, step in _steps(workflow)
+        if "pytest" in str(step.get("run") or "")
+    })
+    assert suite_jobs, (
+        "release.yml runs no tests anywhere before it publishes. A tag is the "
+        "one push where 'the suite ran somewhere else, concurrently' is not "
+        "good enough."
+    )
+
+    publish = workflow["jobs"]["publish"]
+    needs = list(publish.get("needs") or [])
+    for job in suite_jobs:
+        assert job in needs, (
+            "release.yml runs the suite in job %r but publish does not need it, "
+            "so the release ships whatever the tests said" % job
+        )
+        red = {other: "success" for other in needs}
+        red[job] = "failure"
+        assert not _job_runs(publish.get("if"), red), (
+            "publish still runs when %r fails. Its `if:` overrides the implicit "
+            "success() for every need at once, so the condition has to name the "
+            "test job too." % job
+        )
+
+
+def test_the_release_doc_describes_the_triggers_the_workflows_have():
+    """A runbook naming a trigger a workflow lost is worse than no runbook.
+
+    ``docs/release-workflow-plan.md`` told a maintainer that
+    ``build-installer.yml`` runs on version tags and validates tag/VERSION
+    consistency. ST-SEC-001 removed that trigger — one tag used to start 2
+    Windows builds and 4 macOS builds — so both sentences describe a lane that
+    does not exist. The CI section is stale in the other direction: it names a
+    ``master`` branch and omits the tag trigger that gates the release.
+    """
+    text = _read("docs", "release-workflow-plan.md")
+    workflows = _workflows()
+
+    checked = []
+    for section in re.split(r"^### ", text, flags=re.M)[1:]:
+        heading, _, body = section.partition("\n")
+        match = re.search(r"`\.github/workflows/([A-Za-z0-9_.-]+)`", heading)
+        if not match:
+            continue
+        name = match.group(1)
+        assert name in workflows, (
+            "the doc documents %s, which is not in .github/workflows/" % name
+        )
+        checked.append(name)
+
+        # The whole paragraph, not its first line: markdown reflows, and a
+        # trigger that fell onto line two is still documented.
+        paragraphs = [
+            " ".join(p.split())
+            for p in re.split(r"\n\s*\n", body)
+            if p.strip().startswith("Runs on")
+        ]
+        assert len(paragraphs) == 1, (
+            "the %s section needs exactly one paragraph starting 'Runs on'; "
+            "found %d" % (name, len(paragraphs))
+        )
+        sentences = paragraphs
+        sentence = paragraphs[0].lower()
+        triggers = _on(workflows[name]) or {}
+        branches = _push_filter(workflows[name], "branches")
+
+        assert ("tag" in sentence) == bool(_push_filter(workflows[name], "tags")), (
+            "%s: the doc says %r but on.push.tags is %r"
+            % (name, sentences[0], _push_filter(workflows[name], "tags"))
+        )
+        assert ("dispatch" in sentence or "manual" in sentence) == (
+            "workflow_dispatch" in triggers
+        ), (
+            "%s: the doc says %r but workflow_dispatch is %sin its triggers"
+            % (name, sentences[0], "" if "workflow_dispatch" in triggers else "not ")
+        )
+        for branch in branches:
+            assert branch.lower() in sentence, (
+                "%s: the doc says %r but the workflow pushes on branch %r"
+                % (name, sentences[0], branch)
+            )
+
+    assert sorted(checked) == [
+        "build-installer.yml", "build-macos.yml", "ci.yml", "release.yml"
+    ], (
+        "the doc should document exactly the four build/release workflows by "
+        "path; it documents %s" % sorted(checked)
+    )
+
+
+def test_no_release_doc_claims_the_repository_has_no_tests():
+    """The doc that tells a maintainer how to ship must not deny the suite.
+
+    ``release-workflow-plan.md`` was written before ST-ARCH-001 and still said
+    "There are no test files in the repository" while ci.yml runs
+    ``pytest -m "not slow"`` over 57 modules.
+    """
+    text = _read("docs", "release-workflow-plan.md").lower()
+    assert "no test files" not in text, (
+        "docs/release-workflow-plan.md still tells a maintainer the repository "
+        "has no tests"
     )
 
 
