@@ -318,31 +318,46 @@ def _default_copy_table_rows(table):
 
 
 def _ensure_excel_deps(parent):
-    """Return True if pandas+openpyxl are available, auto-installing if needed."""
+    """Return True if pandas+openpyxl are importable; otherwise say so and stop.
+
+    ST-SEC-005. This used to offer "Install now?" and, on Yes, run
+    ``pip install pandas openpyxl`` as a child of ``sys.executable``. Three
+    reasons that is gone, in order of weight:
+
+    1. ``README-en.md:151`` promises "Fully offline — no network calls of any
+       kind". This function and the two beside it were the app's *only* network
+       reach — the remaining spawn is the local CP-SAT worker, and both
+       ``webbrowser.open`` calls sit behind ``if PRICING_PAGE_URL:`` with
+       ``PRICING_PAGE_URL = ""``. Deleting them makes the promise true rather
+       than aspirational, and ``tests/test_offline_guarantee.py`` now holds it.
+    2. The branch is unreachable in every shipped configuration. pandas,
+       openpyxl and reportlab are pinned in ``requirements-lock.txt``, the
+       Windows build gates on ``verify_deps.py``, and the mac spec lists all
+       three in ``hiddenimports``. Only a developer with a thin venv ever got
+       here, and a developer can run pip themselves — which is exactly what
+       ``errors.pandas_openpyxl_required`` already tells them to do, so that
+       string stays correct and no locale needed editing.
+    3. Under Nuitka and PyInstaller ``sys.executable`` is the *app binary*, so
+       "install" relaunched DERSİS with argv it ignores and blocked the Qt
+       event loop for up to 120 s until the user closed the second window,
+       then reported success.
+
+    Note what is *not* the reason: the recommended Windows embed build ships a
+    working pip on a user-writable prefix, and ``pip install`` from that
+    windowless process was measured to exit 0. "It could not have worked" is
+    false; "it should not be there" is the argument.
+    """
     try:
         import pandas  # noqa: F401
         import openpyxl  # noqa: F401
         return True
     except ImportError:
-        pass
-    reply = QMessageBox.question(
-        parent, tr("dialogs.import.excel_title"),
-        tr("errors.pandas_openpyxl_required")
-        + "\n\n" + tr("dialogs.install.prompt"),
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-    )
-    if reply != QMessageBox.StandardButton.Yes:
-        return False
-    import subprocess
-    import sys
-    try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "pandas", "openpyxl"],
-            timeout=120,
+        # A plain warning, not a Yes/No question: there is nothing to say Yes
+        # to. The message already carries the pip command to run by hand.
+        QMessageBox.warning(
+            parent, tr("dialogs.import.excel_title"),
+            tr("errors.pandas_openpyxl_required"),
         )
-        return True
-    except Exception as exc:
-        QMessageBox.warning(parent, tr("status.import_failed"), str(exc))
         return False
 
 

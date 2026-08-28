@@ -80,6 +80,7 @@ from scheduler_app.dialogs import (
     PlaceClassDialog, SelectClassDialog, MultiSelectClassDialog,
     WarningsDialog, OpenSlotsDialog, PostAddDialog,
     BulkAddDialog, BulkResultsDialog, EditClassesDialog,
+    _ensure_excel_deps,
 )
 from scheduler_app.widgets import Toast, WarningLogPanel, YearLegend
 from scheduler_app.ui.bug_report import BugReportButton, BugReportDialog
@@ -4714,28 +4715,18 @@ class SchedulerApp(QMainWindow):
         from scheduler_app.plans import FEATURE_EXPORT_PDF
         if not TierEnforcement.instance().require_feature(FEATURE_EXPORT_PDF, self):
             return
-        # Check reportlab availability, offer to install if missing
+        # ST-SEC-005: report the missing dependency, do not install it. DERSİS
+        # reaches the network nowhere, and this was one of the three places it
+        # used to. See `dialogs._ensure_excel_deps` for the full argument;
+        # `errors.reportlab_required` already ends with the pip command, which
+        # remains accurate advice for the only audience that can reach this
+        # branch — a developer with an incomplete venv.
         try:
             import reportlab  # noqa: F401
         except ImportError:
-            reply = QMessageBox.question(
-                self, tr("dialogs.export.pdf_title"),
-                tr("errors.reportlab_required")
-                + "\n\n" + tr("dialogs.install.prompt"),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            import subprocess, sys
-            try:
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", "reportlab"],
-                    timeout=120,
-                )
-            except Exception as exc:
-                QMessageBox.warning(self, tr("dialogs.error.title"),
-                                    tr("errors.reportlab_install_failed") + f"\n{exc}")
-                return
+            QMessageBox.warning(self, tr("dialogs.export.pdf_title"),
+                                tr("errors.reportlab_required"))
+            return
 
         s = self.state_data
         if not s["days"] or not s["slots"] or not s["years"]:
@@ -4769,31 +4760,17 @@ class SchedulerApp(QMainWindow):
 
 
     def _ensure_excel_deps(self):
-        """Return True if pandas+openpyxl are available, auto-installing if needed."""
-        try:
-            import pandas  # noqa: F401
-            import openpyxl  # noqa: F401
-            return True
-        except ImportError:
-            pass
-        reply = QMessageBox.question(
-            self, tr("dialogs.import.excel_title"),
-            tr("errors.pandas_openpyxl_required")
-            + "\n\n" + tr("dialogs.install.prompt"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return False
-        import subprocess, sys
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "pandas", "openpyxl"],
-                timeout=120,
-            )
-            return True
-        except Exception as exc:
-            QMessageBox.warning(self, tr("status.import_failed"), str(exc))
-            return False
+        """Return True if pandas+openpyxl are importable.
+
+        A one-line delegate to the module-level ``dialogs._ensure_excel_deps``,
+        which had 13 callers to this copy's 2 while the two bodies were
+        byte-identical modulo ``self``/``parent``. That is the
+        ``data_io/exporter.py`` shape Phase 6 was burned by — two copies, one
+        well-exercised, the next fix landing on the wrong one.
+        ``DataEditorDialog`` in dialogs.py already delegated the same way; this
+        now matches it.
+        """
+        return _ensure_excel_deps(self)
 
     # Every state key `_import_from_excel` may overwrite. The import rolls all
     # of them back together, so a failure cannot leave lecturers from the
