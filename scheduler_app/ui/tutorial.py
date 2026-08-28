@@ -10,10 +10,10 @@ a specific tab, opening a panel, scrolling to a widget).
 
 from PyQt6.QtWidgets import (
     QWidget, QLabel, QPushButton, QHBoxLayout, QVBoxLayout,
-    QGraphicsDropShadowEffect, QProgressBar, QScrollArea,
+    QGraphicsDropShadowEffect, QProgressBar,
 )
-from PyQt6.QtCore import Qt, QRect, QRectF, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QPainter, QColor, QPen, QPainterPath
+from PyQt6.QtCore import Qt, QRect, QRectF, pyqtSignal, QTimer
+from PyQt6.QtGui import QPainter, QColor, QPen
 
 from scheduler_app.translations import tr
 

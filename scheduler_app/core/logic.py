@@ -813,38 +813,6 @@ def build_occupancy(state, exclude_ids=None):
     return room_occ, lect_occ, group_occ
 
 
-def _add_to_occupancy(state, cls, day, start_slot, room,
-                      room_occ, lect_occ, group_occ):
-    """Add a class placement to occupancy maps."""
-    td = total_duration(cls)
-    si = slot_index(state, start_slot)
-    slots_list = state["slots"][si:si + td]
-    track_room = needs_physical_room(cls) and room is not None
-    for off, s in enumerate(slots_list):
-        key = (day, s)
-        if track_room:
-            occ_claim(room_occ, key, room)
-        occ_claim(lect_occ, key, cls["lecturer"])
-        for t in _active_targets(cls, off):
-            occ_claim(group_occ, key, (t["year"], t["branch"]))
-
-
-def _remove_from_occupancy(state, cls, day, start_slot, room,
-                           room_occ, lect_occ, group_occ):
-    """Remove a class placement from occupancy maps."""
-    td = total_duration(cls)
-    si = slot_index(state, start_slot)
-    slots_list = state["slots"][si:si + td]
-    track_room = needs_physical_room(cls) and room is not None
-    for off, s in enumerate(slots_list):
-        key = (day, s)
-        if track_room:
-            occ_release(room_occ, key, room)
-        occ_release(lect_occ, key, cls["lecturer"])
-        for t in _active_targets(cls, off):
-            occ_release(group_occ, key, (t["year"], t["branch"]))
-
-
 def _compactness_gap(state, day, slot_idx, entity_key, occ_map, entity_getter):
     """Calculate the gap penalty for placing an entity at a given slot on a day.
 
@@ -869,75 +837,6 @@ def _compactness_gap(state, day, slot_idx, entity_key, occ_map, entity_getter):
     min_dist = min(abs(slot_idx - oi) for oi in occupied_indices)
     # Gap = distance - 1 (adjacent slots have 0 gap)
     return max(0, min_dist - 1)
-
-
-def _score_placement(state, cls, day, slot, room, room_occ, lect_occ, group_occ):
-    """Score a placement: lower is better.
-
-    Priorities (highest to lowest weight):
-    1. Lecturer compactness — minimize gaps between a lecturer's classes on same day
-    2. Student group compactness — minimize gaps for student groups on same day
-    3. Structural preference — earlier days/slots for tidiness
-    """
-    score = 0.0
-    day_idx = state["days"].index(day) if day in state["days"] else 0
-    si = slot_index(state, slot)
-    td = total_duration(cls)
-
-    # Hard penalty: conflict slots (shouldn't happen if filtered, but safety)
-    for off in range(td):
-        if si + off < len(state["slots"]):
-            key = (day, state["slots"][si + off])
-            if cls["lecturer"] in lect_occ.get(key, set()):
-                score += 100
-
-    # ── Lecturer compactness (high priority, weight ~5.0 per gap slot) ──
-    # For each slot the class occupies, measure gap to nearest lecturer slot
-    lect_key = cls["lecturer"]
-    if lect_key:
-        lect_gap = _compactness_gap(state, day, si, lect_key, lect_occ, None)
-        score += lect_gap * 5.0
-        # Bonus: prefer days where the lecturer already has classes (encourages grouping)
-        lect_on_day = sum(1 for s in state["slots"]
-                          if lect_key in lect_occ.get((day, s), set()))
-        if lect_on_day > 0:
-            score -= 2.0  # Reward clustering on same day
-
-    # ── Student group compactness (medium priority, weight ~2.0 per gap slot) ──
-    for t in cls["targets"]:
-        grp_key = (t["year"], t["branch"])
-        grp_gap = _compactness_gap(state, day, si, grp_key, group_occ, None)
-        score += grp_gap * 2.0
-        # Bonus for days where group already has classes
-        grp_on_day = sum(1 for s in state["slots"]
-                         if grp_key in group_occ.get((day, s), set()))
-        if grp_on_day > 0:
-            score -= 1.0
-
-    # ── Spread across days (light penalty for overloading a single day) ──
-    lect_day_load = sum(1 for s in state["slots"]
-                        if lect_key in lect_occ.get((day, s), set())) if lect_key else 0
-    if lect_day_load > len(state["slots"]) * 0.6:
-        score += 1.5  # Discourage packing too many on one day
-
-    # ── Structural preference (low priority) ──
-    score += day_idx * 0.05 + si * 0.01
-
-    return score
-
-
-def _constraint_tightness(state, cls):
-    """Estimate how constrained a class is (lower = tighter = schedule first)."""
-    days = filter_class_days(cls, state["days"])
-    times = filter_class_times(cls, state["slots"])
-    # Apply lecturer availability (consistent with constraint_validator)
-    days, times = apply_lecturer_availability_filters(
-        state, cls.get("lecturer", ""), days, times)
-    rooms = get_room_candidates(state, cls)
-    td = total_duration(cls)
-    valid_time_count = sum(1 for s in times
-                           if slot_index(state, s) + td <= len(state["slots"]))
-    return len(days) * valid_time_count * len(rooms)
 
 
 # ══════════════════════════════════════════════════════════════════════════

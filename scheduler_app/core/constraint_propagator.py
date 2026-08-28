@@ -15,7 +15,6 @@ All hard constraints remain enforced by ConstraintValidator — this module
 only caches and incrementally maintains valid-count metadata.
 """
 
-from scheduler_app.logic import total_duration, slot_index, _active_targets
 from scheduler_app.models import (
     needs_physical_room, get_physical_room_candidates, cls_key,
 )

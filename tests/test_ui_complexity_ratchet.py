@@ -93,8 +93,13 @@ because Phase 6 deleted `_write_excel` (574 lines, the second Excel engine of
 ST-ARCH-003). Phase 7's release work put it at 915.
 """
 
-MAX_DIALOGS_PY_TOTAL_MCCABE = 914
-"""The same sum for `ui/dialogs.py`. 882 -> 914.
+MAX_DIALOGS_PY_TOTAL_MCCABE = 885
+"""The same sum for `ui/dialogs.py`. 882 -> 914 -> 885.
+
+Back down to 885 because ST-ARCH-011 deleted `WarningsDialog` and
+`OpenSlotsDialog` (95 lines, 29 points), which no code constructed: the two
+reports they render have lived in `SchedulerApp._refresh_warnings` and
+`_refresh_open_slots` since the live panels replaced them.
 
 `dialogs.py` is here because ST-ARCH-005 names the wrong file as the worst
 one. Measured: it carries essentially the same total complexity as `app.py`,

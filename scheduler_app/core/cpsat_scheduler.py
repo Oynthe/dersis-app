@@ -25,19 +25,14 @@ try:
 except ImportError:
     HAS_ORTOOLS = False
 
-from scheduler_app.logic import slot_index, total_duration, _active_targets
+from scheduler_app.logic import total_duration
 from scheduler_app.models import (
-    DEFAULT_OPTIMIZER_SEED,
-    PROTECTION_LOCKED, PROTECTION_SOFT, PROTECTION_SAME_DAY,
-    PROTECTION_IMPROVE_ONLY,
-    cls_key,
-    room_fits_class, needs_physical_room,
-    get_physical_room_candidates,
-    filter_class_days, filter_class_times,
+    DEFAULT_OPTIMIZER_SEED, PROTECTION_LOCKED, PROTECTION_SOFT,
+    PROTECTION_SAME_DAY, PROTECTION_IMPROVE_ONLY, cls_key, needs_physical_room,
+    get_physical_room_candidates, filter_class_days, filter_class_times,
     apply_lecturer_availability_filters,
 )
 from scheduler_app.placement_scorer import DEFAULT_WEIGHTS
-from scheduler_app.timetable_scorer import TimetableScorer
 from scheduler_app.translations import tr
 
 

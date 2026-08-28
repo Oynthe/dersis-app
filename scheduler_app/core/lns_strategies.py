@@ -8,7 +8,7 @@ All strategies preserve pinned and protected classes.
 
 import random
 
-from scheduler_app.logic import slot_index, total_duration, _active_targets
+from scheduler_app.logic import slot_index, total_duration
 from scheduler_app.models import cls_key, DEFAULT_OPTIMIZER_SEED
 from scheduler_app.placement_scorer import DEFAULT_WEIGHTS
 

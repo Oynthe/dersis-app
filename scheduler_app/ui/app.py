@@ -6,25 +6,21 @@ import json
 import csv
 import hashlib
 import os
-import sys
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QComboBox, QLabel, QPushButton, QFrame, QScrollArea,
-    QGridLayout, QMenu, QMenuBar, QToolBar, QStatusBar, QFileDialog,
-    QMessageBox, QListWidget, QSplitter, QSizePolicy, QToolButton, QDialog,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QAbstractItemView,
-    QSlider, QWidgetAction, QStackedWidget,
+    QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
+    QComboBox, QLabel, QPushButton, QFrame, QScrollArea, QMenu, QToolBar,
+    QFileDialog, QMessageBox, QListWidget, QSplitter, QSizePolicy, QToolButton,
+    QDialog, QAbstractItemView, QSlider, QWidgetAction, QStackedWidget,
 )
 from PyQt6.QtCore import Qt, QPoint, QMimeData, QTimer, QSize
 from PyQt6.QtGui import (
-    QAction, QKeySequence, QColor, QPainter, QDrag, QFont, QCursor,
-    QShortcut, QIcon,
+    QAction, QKeySequence, QColor, QPainter, QDrag, QCursor, QShortcut, QIcon,
 )
 
 from scheduler_app.renderer import (
-    TimetableView, TimetableScene, LessonItem,
-    FILTER_MODE_DEFAULT, FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP,
+    TimetableView, TimetableScene, FILTER_MODE_DEFAULT,
+    FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP,
 )
 from scheduler_app.dashboard import DashboardWidget
 
@@ -37,36 +33,23 @@ try:
 except ImportError:
     openpyxl = None
 
-from scheduler_app.constants import (
-    MIN_CELL_W, MIN_CELL_H, EMPTY_BG, HEADER_BG_DARK, TIME_BG, CORNER_BG,
-    MATRIX_BORDER, MATRIX_DAY_BG, MATRIX_DAY_FG, MATRIX_BRANCH_BG,
-    MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CELL_FG,
-    MATRIX_CORNER_BG, OPEN_SLOTS_FG_ROOM,
-)
+from scheduler_app.constants import OPEN_SLOTS_FG_ROOM
 from scheduler_app.translations import tr, get_language, set_language, is_rtl
 from scheduler_app.core.text_safety import csv_safe
 from scheduler_app.i18n.day_keys import (
     normalize_state_day_keys, day_label, display_day, format_day_time,
 )
 from scheduler_app.models import (
-    new_state, split_non_joint,
-    LOCATION_FACE_TO_FACE, LOCATION_ONLINE, LOCATION_LECTURER_OFFICE,
-    get_location_label, is_virtual_location_type,
-    normalize_state_classes,
-    get_classroom_export_labels,
-    effective_day, effective_time, mark_placed, mark_unplaced,
-    needs_physical_room,
-    get_effective_room_resource_for_class,
+    new_state, split_non_joint, LOCATION_FACE_TO_FACE, LOCATION_ONLINE,
+    LOCATION_LECTURER_OFFICE, get_location_label, is_virtual_location_type,
+    normalize_state_classes, effective_day, effective_time, mark_placed,
+    mark_unplaced, needs_physical_room, get_effective_room_resource_for_class,
     cls_key,
 )
 from scheduler_app.logic import (
-    get_placed_classes,
-    occupied_slots_of, classroom_of, total_duration,
-    build_virtual_classroom_day_layout,
-    find_schedule_conflicts, conflict_partner_index,
-    schedule_counts,
+    get_placed_classes, occupied_slots_of, classroom_of,
+    find_schedule_conflicts, conflict_partner_index, schedule_counts,
     find_valid_options,
-    get_year_color, lighten_color,
 )
 # ST-ARCH-010: moved out of `logic.py` with the rest of the optimization
 # bridge; see `scheduler_app/core/facade.py`.
@@ -81,7 +64,7 @@ from scheduler_app.core.schedule_impact_analyzer import (
 from scheduler_app.dialogs import (
     SetupDialog, AddClassDialog,
     PlaceClassDialog, SelectClassDialog, MultiSelectClassDialog,
-    WarningsDialog, OpenSlotsDialog, PostAddDialog,
+    PostAddDialog,
     BulkAddDialog, BulkResultsDialog, EditClassesDialog,
     _ensure_excel_deps,
 )
@@ -1535,6 +1518,9 @@ class SchedulerApp(QMainWindow):
         osp_lay.setContentsMargins(4, 4, 4, 4)
         osp_lay.setSpacing(4)
         self._open_slots_filter_hint = QLabel("")
+        # ST-UI-007: the hint names the selected lesson, so its text is the
+        # user's. See _refresh_open_slots for the measurement.
+        self._open_slots_filter_hint.setTextFormat(Qt.TextFormat.PlainText)
         self._open_slots_filter_hint.setStyleSheet(
             "QLabel { font-size: 7pt; color: #4B5563; background: #E0F2FE;"
             "  border: 1px solid #BAE6FD; border-radius: 4px;"
@@ -3829,7 +3815,21 @@ class SchedulerApp(QMainWindow):
                 row_layout.setContentsMargins(10, 6, 10, 6)
                 row_layout.setSpacing(0)
 
+                # ST-UI-007. A QLabel defaults to AutoText, so Qt decides PER
+                # STRING whether to parse markup -- and both of these carry
+                # free text the school typed into Setup. Measured offscreen on
+                # this panel, sizeHint width before -> after forcing PlainText:
+                # a slot labelled "09:00 <b>x</b>" 77 -> 154, a room called
+                # "Lab <b>A</b>" 50 -> 120. Qt was drawing "Lab A", so the
+                # panel disagreed with the classroom list about the room's
+                # name and the user had no way to tell which was right.
+                #
+                # Removing Qt's choice is the fix, NOT escaping: html.escape on
+                # a string Qt would have shown literally puts '&amp;' on the
+                # screen, and "R&D Lab" is a plausible room name. Same remedy
+                # as the toast in ui/widgets.py.
                 time_label = QLabel(slot_time)
+                time_label.setTextFormat(Qt.TextFormat.PlainText)
                 time_label.setStyleSheet(
                     "QLabel { font-size: 8pt; font-weight: 700;"
                     "  color: #111827; background: transparent; }")
@@ -3845,6 +3845,7 @@ class SchedulerApp(QMainWindow):
                     get_effective_room_resource_for_class(
                         selected_cls, room_override=room)
                     if selected_cls is not None and not room else (room or ""))
+                room_label.setTextFormat(Qt.TextFormat.PlainText)
                 room_label.setStyleSheet(
                     "QLabel { font-size: 7.5pt; color: %s;"
                     "  background: transparent; }" % OPEN_SLOTS_FG_ROOM)
@@ -4821,41 +4822,6 @@ class SchedulerApp(QMainWindow):
             return
         self._clear_empty_slot_selection()
         self._apply_class_selection(items, anchor=items[0])
-
-    def _select_all(self):
-        focus = QApplication.focusWidget()
-        if hasattr(self, "unplaced_list"):
-            ul = self.unplaced_list
-            ul_focused = (
-                focus is ul
-                or (focus is not None and ul.isAncestorOf(focus))
-                or ul.hasFocus()
-                or ul.viewport().hasFocus()
-                or ul.underMouse()
-                or ul.viewport().underMouse()
-            )
-            if ul_focused:
-                ul.selectAll()
-                return
-
-        if hasattr(self, "_open_slots_scroll"):
-            ost = self._open_slots_scroll
-            ost_focused = (
-                focus is ost
-                or (focus is not None and ost.isAncestorOf(focus))
-                or ost.hasFocus()
-                or ost.underMouse()
-            )
-            if ost_focused:
-                return
-
-        tab_idx = self.notebook.currentIndex() if hasattr(self, "notebook") else -1
-        if tab_idx in (0, 1, 2, 3):
-            view = [self.grid_view1, self.grid_view2, self.grid_view3, self.grid_view4][tab_idx]
-            self._select_all_in_view(view)
-            return
-        self._selected_class = None
-
 
     def _copy_to_clipboard(self):
         s = self.state_data

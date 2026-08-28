@@ -9,9 +9,8 @@ Provides:
 import platform
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QLabel, QLineEdit, QPushButton, QComboBox,
-    QTextEdit, QWidget, QSizePolicy, QMessageBox, QApplication,
+    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
+    QPushButton, QComboBox, QTextEdit, QMessageBox, QApplication,
 )
 from PyQt6.QtCore import Qt, QUrl, QUrlQuery
 from PyQt6.QtGui import QColor, QPainter, QPen, QCursor, QDesktopServices

@@ -1,16 +1,11 @@
 """Reusable PyQt6 widgets: Toast, MultiSelectButton, WarningLogPanel."""
-import html
-
 from PyQt6.QtWidgets import (
-    QLabel, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
-    QMenu, QWidgetAction, QCheckBox, QScrollArea, QFrame,
-    QTextEdit, QSizePolicy,
+    QLabel, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QMenu,
+    QWidgetAction, QCheckBox, QFrame, QTextEdit, QSizePolicy,
 )
-from PyQt6.QtCore import (
-    QTimer, Qt, QPropertyAnimation, QEasingCurve, QEvent, QPoint,
-)
-from PyQt6.QtGui import QColor, QAction, QPainter, QBrush, QPen
+from PyQt6.QtCore import QTimer, Qt, QEvent, QPoint
 
+from scheduler_app.core.text_safety import escape_qt_rich
 from scheduler_app.translations import tr
 
 
@@ -45,7 +40,7 @@ class Toast(QWidget):
         # renders as markup while the next one renders literally, decided by the
         # user's own data. Measured: QLabel('R&D <b>Lab</b>') has sizeHint width
         # 84 as AutoText and 168 as PlainText — Qt was eating half the message.
-        # Removing Qt's choice is the fix here, NOT escaping: html.escape on a
+        # Removing Qt's choice is the fix here, NOT escaping: escaping a
         # string Qt would have shown literally puts '&amp;' on the screen.
         lbl.setTextFormat(Qt.TextFormat.PlainText)
         lbl.setStyleSheet(f"color: {fg}; font-weight: bold; font-size: 10pt; border: none;")
@@ -321,7 +316,7 @@ class WarningLogPanel(QFrame):
         # unescaped; re-committing that into new code is avoidable even though
         # the finding itself belongs to a later phase.
         color = _LOG_COLORS.get(kind, _LOG_COLORS["info"])
-        return f'<span style="color:{color}">{html.escape(str(message))}</span>'
+        return f'<span style="color:{color}">{escape_qt_rich(message)}</span>'
 
     def _append_rendered(self, message, kind):
         """Add one line without re-rendering the whole document."""

@@ -5,7 +5,6 @@ Does not modify scheduling logic or constraints.
 """
 
 from dataclasses import dataclass, field
-from typing import Any
 
 try:
     import pandas as pd

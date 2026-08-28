@@ -25,14 +25,10 @@ import multiprocessing
 import random
 import time
 
-from scheduler_app.logic import (
-    slot_index, total_duration, get_placed_classes, classroom_of,
-)
 from scheduler_app.models import cls_key, DEFAULT_OPTIMIZER_SEED
 # Used by the unplaced-reason fallback below. Was missing, so the
 # `generator is None` branch raised NameError instead of reporting.
 from scheduler_app.translations import tr
-from scheduler_app.core.solver_worker import SolveCancelled
 from scheduler_app.core.infeasibility import diagnose_infeasibility
 
 # The shipped search budget. Defined in `core/constants.py` and re-exported
@@ -51,7 +47,7 @@ from scheduler_app.candidate_generator import CandidateGenerator
 from scheduler_app.placement_scorer import PlacementScorer
 from scheduler_app.timetable_scorer import TimetableScorer
 from scheduler_app.lns_strategies import (
-    RepairStrategy, get_destroy_strategy, AdaptiveStrategySelector,
+    RepairStrategy, AdaptiveStrategySelector,
 )
 from scheduler_app.conflict_graph import ConflictGraphBuilder, ConflictAnalyzer
 from scheduler_app.constraint_propagator import ConstraintState, ConstraintPropagator

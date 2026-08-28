@@ -5,7 +5,7 @@ Provides a global quality score, per-entity breakdowns, and
 actionable insights about the current timetable state.
 """
 
-from scheduler_app.logic import find_slot_index, total_duration, _active_targets
+from scheduler_app.logic import find_slot_index, total_duration
 from scheduler_app.models import get_effective_room_resource_for_class
 from scheduler_app.translations import tr
 
