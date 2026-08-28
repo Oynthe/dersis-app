@@ -35,7 +35,8 @@ from scheduler_app.constants import (
     CELL_FG_CODE, CELL_FG_NAME, CELL_FG_LECTURER, CELL_FG_ROOM,
     CELL_FG_BRANCH,
 )
-from scheduler_app.core.text_safety import escape_pdf_markup
+from scheduler_app.core.text_safety import escape_pdf_markup, csv_safe
+from scheduler_app.data_io.spreadsheet_safety import neutralize_formula_cells
 from scheduler_app.models import (
     get_classroom_export_labels,
     get_protection_label,
@@ -370,6 +371,10 @@ def _export_excel(schedule: FinalSchedule, filepath: str):
 
             _write_grid_sheet(ws, f"B_{safe_name}", filter_fn=branch_filter)
 
+    # ST-UI-008: the workbook is made to be emailed, so a cell openpyxl typed
+    # as a formula must not stay one. Done in memory, on the cell attribute,
+    # never by prefixing the string -- this app re-imports its own workbooks.
+    neutralize_formula_cells(wb)
     wb.save(filepath)
 
 # CSV export
@@ -403,13 +408,16 @@ def _export_csv(schedule: FinalSchedule, filepath: str):
                 if targets:
                     for t in targets:
                         writer.writerow([
-                            day, slot, code, cls["name"], cls["lecturer"],
-                            room, t["year"], t["branch"],
+                            day, csv_safe(slot), csv_safe(code),
+                            csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
+                            csv_safe(room), csv_safe(t["year"]),
+                            csv_safe(t["branch"]),
                         ])
                 else:
                     writer.writerow([
-                        day, slot, code, cls["name"], cls["lecturer"],
-                        room, "", "",
+                        day, csv_safe(slot), csv_safe(code),
+                        csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
+                        csv_safe(room), "", "",
                     ])
 
 

@@ -43,6 +43,7 @@ from scheduler_app.constants import (
     MATRIX_CORNER_BG, OPEN_SLOTS_FG_ROOM,
 )
 from scheduler_app.translations import tr, get_language, set_language, is_rtl
+from scheduler_app.core.text_safety import csv_safe
 from scheduler_app.ui.day_keys import (
     normalize_state_day_keys, day_label, display_day, format_day_time,
 )
@@ -2603,9 +2604,16 @@ class SchedulerApp(QMainWindow):
                     start = effective_time(c)
                     room = classroom_of(c)
                     for t in c["targets"]:
-                        writer.writerow([c["name"], c["lecturer"],
-                                         t["year"], t["branch"],
-                                         day, start, c["duration"], room])
+                        # ST-UI-008. The .csv is emailed to colleagues and a
+                        # leading "=" is executed by their spreadsheet. Safe to
+                        # prefix here and ONLY here: nothing in DERSIS reads a
+                        # CSV back (zero csv.reader / read_csv call sites, and
+                        # the import filters offer only *.xlsx).
+                        writer.writerow([
+                            csv_safe(c["name"]), csv_safe(c["lecturer"]),
+                            csv_safe(t["year"]), csv_safe(t["branch"]),
+                            day, csv_safe(start), c["duration"],
+                            csv_safe(room)])
             QMessageBox.information(self, tr("status.exported"),
                                    f"{tr('status.exported_to')} {os.path.basename(fname)}")
         except Exception as e:
@@ -4479,7 +4487,7 @@ class SchedulerApp(QMainWindow):
                         hdr2.append(br)
                 lines.append("\t".join(hdr2))
                 for si, slot in enumerate(slots):
-                    row_data = [str(si + 1), slot]
+                    row_data = [str(si + 1), csv_safe(slot)]
                     for d_idx, day in enumerate(days):
                         for b_idx, br in enumerate(branches):
                             cell_text = ""
@@ -4494,7 +4502,9 @@ class SchedulerApp(QMainWindow):
                                 occ = occupied_slots_of(s, c)
                                 if (day, slot) in occ:
                                     room = classroom_of(c)
-                                    cell_text = f"{c['name']} / {c['lecturer']} / {room}"
+                                    cell_text = csv_safe(
+                                        f"{c['name']} / {c['lecturer']} / "
+                                        f"{room}")
                                     break
                             row_data.append(cell_text)
                     lines.append("\t".join(row_data))
@@ -4506,13 +4516,14 @@ class SchedulerApp(QMainWindow):
                          self._filter_lecturer][tab_idx]
             filtered = [c for c in placed if filter_fn(c)]
             for slot in s["slots"]:
-                row_data = [slot]
+                row_data = [csv_safe(slot)]
                 for day in s["days"]:
                     cell_text = ""
                     for c in filtered:
                         occ = occupied_slots_of(s, c)
                         if (day, slot) in occ:
-                            cell_text = f"{c['name']} ({c['lecturer']})"
+                            cell_text = csv_safe(
+                                f"{c['name']} ({c['lecturer']})")
                             break
                     row_data.append(cell_text)
                 lines.append("\t".join(row_data))
@@ -5214,6 +5225,13 @@ class SchedulerApp(QMainWindow):
             )
             ws.cell(row=1, column=1, value=tr("warnings.no_schedule_data"))
 
+        # ST-UI-008, the same sweep data_io/exporter.py runs. This is app.py's
+        # own parallel Excel writer (ST-ARCH-003); until the two are unified it
+        # needs the fix independently, or the two exports disagree.
+        from scheduler_app.data_io.spreadsheet_safety import (
+            neutralize_formula_cells,
+        )
+        neutralize_formula_cells(wb)
         wb.save(fname)
 
     def _ensure_excel_deps(self):

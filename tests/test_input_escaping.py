@@ -219,12 +219,21 @@ def test_csv_prefix_is_only_ever_used_where_nothing_reads_it_back():
     from scheduler_app.data_io import exporter
 
     src = inspect.getsource(exporter)
-    for marker in ("_export_excel", "_rich_cell"):
-        assert marker in src
-    excel_region = src[src.index("def _rich_cell"):src.index("def _export_pdf")]
+    for marker in ("def _rich_cell", "def _export_excel", "def _export_csv"):
+        assert marker in src, "exporter.py no longer defines %r" % marker
+
+    # The Excel writers only. `_export_csv` sits between `_export_excel` and
+    # `_export_pdf`, so bounding this region at `_export_pdf` would sweep the
+    # CSV writer in and fail on the one place `csv_safe` is *correct*.
+    excel_region = src[src.index("def _rich_cell"):src.index("def _export_csv")]
     assert "csv_safe" not in excel_region, (
         "csv_safe reached an XLSX writer; a literal apostrophe there is "
         "re-imported as part of the name (see the module docstring)"
+    )
+    # ...and the workbook path must still be neutralised, by the other means.
+    assert "neutralize_formula_cells" in src, (
+        "the XLSX formula sweep is gone; exported workbooks can carry live "
+        "formulas again"
     )
 
 
@@ -254,3 +263,187 @@ def test_escape_qt_rich_and_escape_pdf_markup_differ_on_quotes():
     """
     assert escape_qt_rich("O'Brien") != escape_pdf_markup("O'Brien")
     assert escape_pdf_markup("O'Brien") == "O'Brien"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  ST-UI-008 — a spreadsheet must not execute a class name
+# ═══════════════════════════════════════════════════════════════════════
+#
+# The .xlsx and .csv exist to be emailed to colleagues, so a cell whose text
+# begins with "=" is executed on someone else's machine.
+#
+# The register's own recommendation -- "prefix risky cells with an apostrophe"
+# -- is right for the CSV and a DATA-CORRUPTION BUG for the workbook, because
+# DERSİS re-imports its own workbooks through six symmetric export/import pairs.
+# Measured across one export/re-import round trip with the value prefixed:
+#
+#     '=1+1'           -> "'=1+1"           RENAMED
+#     '-9A Matematik'  -> "'-9A Matematik"  RENAMED   <- a real class name
+#                                           5 of 8 values renamed
+#
+# Excel stores the same protection as a cell attribute, `quotePrefix`, which
+# suppresses evaluation without touching the stored string: 0 of 8 renamed,
+# 0 <f> elements in the saved file.
+#
+# Scope, corrected against the spec that proposed it: the apostrophe is safe in
+# the .csv (zero csv.reader / read_csv call sites; the import filters offer only
+# *.xlsx) and in the timetable-grid clipboard copy, but NOT in the three
+# dialogs.py clipboard writers -- `_copy_rows`, the years copy and the shared
+# table copy all round-trip through `_paste_rows` and the rooms/lecturers paste
+# handlers, so a prefix there would be read back as part of the name.
+
+# WHICH FIELD IS ACTUALLY AT RISK, measured -- and it is not the one the
+# register names. A class NAME is written through `CellRichText`, which openpyxl
+# never types as a formula; the TIME-SLOT LABEL is written as a plain string in
+# column A of every sheet and does become one. Same shape as the PDF finding
+# above: the class name is the field that is already safe.
+#
+#     name  = "=1+1"   ->  0 formula cells
+#     room  = "=1+1"   ->  0 formula cells
+#     slot  = "=1+1"   ->  4 formula cells  (Master Schedule!A2, T_L1!A2, ...)
+#
+# The first version of these tests put the payload in the name and passed with
+# the neutralisation deleted.
+
+FORMULA_FIELDS = ["slot", "name", "room", "lecturer"]
+
+
+def _state_with_payload(field, payload):
+    from scheduler_app.core.models import new_state, new_class, mark_placed
+    name, slot, room, lecturer = "Fizik", "09:00", "R001", "L1"
+    if field == "slot":
+        slot = payload
+    elif field == "name":
+        name = payload
+    elif field == "room":
+        room = payload
+    elif field == "lecturer":
+        lecturer = payload
+
+    state = new_state()
+    state["days"] = ["monday"]
+    state["slots"] = [slot]
+    state["classrooms"] = [room]
+    state["years"] = {"Year-1": ["A"]}
+    state["lecturers"] = [lecturer]
+    cls = new_class()
+    cls["name"] = name
+    cls["lecturer"] = lecturer
+    cls["class_code"] = "AAA111"
+    cls["targets"] = [{"year": "Year-1", "branch": "A"}]
+    state["classes"] = [cls]
+    mark_placed(cls, "monday", slot, room)
+    return state
+
+
+@pytest.mark.excel
+@pytest.mark.parametrize("field", FORMULA_FIELDS)
+def test_the_workbook_carries_no_formula_cells(field, tmp_path, dersis_home):
+    """ST-UI-008 — no exported cell may be a formula.
+
+    A failure means the colleague who receives the file opens it and their
+    spreadsheet evaluates whatever the school called one of its hours.
+    """
+    openpyxl = pytest.importorskip("openpyxl")
+    from scheduler_app.data_io.exporter import export_schedule
+
+    out = tmp_path / ("sched_%s.xlsx" % field)
+    export_schedule(_state_with_payload(field, "=1+1"), "xlsx", str(out))
+
+    book = openpyxl.load_workbook(str(out))
+    formulas = ["%s!%s" % (ws.title, cell.coordinate)
+                for ws in book.worksheets
+                for row in ws.iter_rows() for cell in row
+                if cell.data_type == "f"]
+    assert not formulas, "formula cells in the export: %r" % (formulas,)
+
+
+@pytest.mark.excel
+def test_the_slot_label_really_is_the_injectable_field(tmp_path, dersis_home):
+    """ST-UI-008 — anti-vacuity: prove the sweep has something to sweep.
+
+    If openpyxl stops typing a leading-``=`` string as a formula, or the writer
+    stops putting the slot label in a plain cell, the parametrised test above
+    becomes trivially true and pins nothing. This asserts the premise directly
+    by neutralising a workbook and counting what changed.
+    """
+    pytest.importorskip("openpyxl")
+    from openpyxl import Workbook
+    from scheduler_app.data_io.spreadsheet_safety import neutralize_formula_cells
+
+    book = Workbook()
+    sheet = book.active
+    sheet.cell(row=1, column=1, value="=1+1")
+    sheet.cell(row=2, column=1, value="Fizik")
+    assert sheet.cell(row=1, column=1).data_type == "f", (
+        "openpyxl no longer types a leading '=' as a formula; ST-UI-008's "
+        "premise has changed and these tests need re-deriving")
+    assert neutralize_formula_cells(book) == 1, (
+        "the sweep did not neutralise the one formula cell present")
+    assert sheet.cell(row=1, column=1).value == "=1+1", (
+        "the sweep altered the stored string; it must set quotePrefix instead")
+    assert sheet.cell(row=1, column=1).quotePrefix is True
+
+
+@pytest.mark.excel
+@pytest.mark.parametrize("payload", ["=1+1", "-9A Matematik", "Fizik"])
+def test_neutralising_the_workbook_does_not_rename_anything(
+        payload, tmp_path, dersis_home):
+    """ST-UI-008 — the protection must not corrupt what it protects.
+
+    This is the assertion the register's own recommendation fails. DERSİS
+    re-imports its own workbooks, so a literal apostrophe written into the value
+    comes back as part of the name — measured 5 of 8 values renamed, including
+    the perfectly innocent ``-9A Matematik``. ``quotePrefix`` renames 0 of 8.
+    """
+    openpyxl = pytest.importorskip("openpyxl")
+    from scheduler_app.data_io.exporter import export_schedule
+
+    out = tmp_path / "sched.xlsx"
+    export_schedule(_state_with_payload("slot", payload), "xlsx", str(out))
+
+    book = openpyxl.load_workbook(str(out))
+    found = [cell.value
+             for ws in book.worksheets
+             for row in ws.iter_rows() for cell in row
+             if isinstance(cell.value, str) and payload in cell.value]
+    assert found, "the payload %r does not appear in the export at all" % payload
+    assert not any(v.startswith("'") for v in found), (
+        "the export prefixed the stored string; re-import would rename it: %r"
+        % (found[:3],))
+
+
+def test_the_csv_neutralises_a_formula_name(tmp_path, dersis_home):
+    """ST-UI-008 — the flat export is the one that gets emailed most."""
+    import csv as _csv
+    from scheduler_app.data_io.exporter import export_schedule
+
+    out = tmp_path / "sched.csv"
+    export_schedule(_state_with_payload("slot", "=1+1"), "csv", str(out))
+
+    with open(str(out), encoding="utf-8", newline="") as fh:
+        cells = [c for row in _csv.reader(fh) for c in row]
+    assert not any(c.startswith("=") for c in cells), (
+        "a CSV cell still begins with '=': %r"
+        % ([c for c in cells if c.startswith("=")],))
+    assert any(c == "'=1+1" for c in cells), (
+        "the neutralised name is not in the file: %r" % (cells,))
+
+
+def test_the_generated_template_carries_no_formula_cells(tmp_path, dersis_home):
+    """ST-UI-008 — the blank template travels furthest of all.
+
+    It is the file a user hands to colleagues to fill in, so it is the one most
+    likely to be opened on a machine that is not theirs.
+    """
+    openpyxl = pytest.importorskip("openpyxl")
+    from scheduler_app.data_io.template import generate_excel_template
+
+    out = tmp_path / "template.xlsx"
+    generate_excel_template(str(out))
+    book = openpyxl.load_workbook(str(out))
+    formulas = [cell.coordinate
+                for ws in book.worksheets
+                for row in ws.iter_rows() for cell in row
+                if cell.data_type == "f"]
+    assert not formulas, "formula cells in the blank template: %r" % (formulas,)
