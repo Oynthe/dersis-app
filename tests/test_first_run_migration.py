@@ -21,13 +21,36 @@ The **file** migration was left behind, and it is a live data loss.
 
 So a user upgrading from the pre-Dersis build picks a language and lands on an
 empty timetable. Their whole schedule survives only as an unreferenced
-``backups/scheduler_config.json``, with nothing in the UI saying so, and their
-saved language is lost with it.
+``backups/scheduler_config.json``, with nothing in the UI saying so.
 
-Measured on a simulated frozen install before the fix::
+**The ordering was only half of it.** ``storage._old_app_config_path()``
+resolved its "app directory" from ``storage.py``'s own ``__file__``, so it
+looked in ``{app}/scheduler_app/storage/`` — two directories below the place
+its docstring named, and a place the legacy file can never be. Measured end to
+end with the payload written beside ``scheduler_gui.py`` and **nothing**
+stubbed::
 
-    classes_recovered  []            language 'en'   notes []
-    after the fix:     ['LEGACY-LESSON']  language 'tr'
+    before: notes []   settings keys []             legacy file still in place
+    after:  notes ['Migrated scheduler_config.json → settings/app_settings.egu']
+            settings keys ['language', 'last_file', 'state']
+
+``sys.frozen`` never rescued it. ``build_embed.bat`` ships ``Dersis.exe`` as a
+C# wrapper that runs ``{app}\\python\\pythonw.exe {app}\\scheduler_gui.py``, so
+the frozen branch is dead on the build the installer produces, and
+``dirname(sys.executable)`` would be ``{app}\\python`` even if it were not.
+``_app_dir()`` now climbs the package root instead, and step 1 also checks
+``~/.class_scheduler/scheduler_config.json`` — the location
+``dersis-mapped/09_SETTINGS_LOCALIZATION_AND_PERSISTENCE_MAP.md`` documents.
+
+What the migration does **not** carry over is the saved language. The gate
+writes ``language`` from the dialog *after* the migration, so the value that
+survives is always the one the user just picked. Measured against the real
+probe: legacy ``tr`` + dialog ``en`` → ``en``; legacy ``tr`` + dialog ``tr`` →
+``tr``; legacy ``de`` + dialog ``en`` → ``en``. An earlier revision of this
+module asserted ``language == 'tr'`` while stubbing the dialog to ``tr`` as
+well — it was reading the stub, and stayed green with the fix removed. Its
+replacement is ``last_file``: a legacy key nothing downstream rewrites, which
+does redden when the migration is taken out.
 
 The guard is deliberately in two halves, because neither alone is enough:
 
@@ -51,11 +74,14 @@ import sys
 import pytest
 
 
+LEGACY_LAST_FILE = r"D:\Okul\2019_2020_guz.uva"
+
+
 def _write_legacy_config(app_dir, *, language="tr", class_name="LEGACY-LESSON"):
     """Write the pre-Dersis ``scheduler_config.json`` beside the "executable"."""
     cfg = {
         "language": language,
-        "last_file": "",
+        "last_file": LEGACY_LAST_FILE,
         "state": {
             "classes": [{"name": class_name, "code": "LGC101"}],
             "days": ["monday"],
@@ -72,9 +98,10 @@ def _write_legacy_config(app_dir, *, language="tr", class_name="LEGACY-LESSON"):
 def frozen_install(tmp_path, monkeypatch):
     """Make ``storage._old_app_config_path()`` resolve to a fake install dir.
 
-    A real user's legacy config sits next to ``Dersis.exe``. ``_old_app_config_path``
-    branches on ``sys.frozen``, so without this the test would look for the file
-    beside ``storage.py`` in the checkout and silently measure nothing.
+    A real user's legacy config sits in the app directory, which for the
+    checkout is the repository root — no test may write there. ``_app_dir()``
+    honours ``sys.frozen``/``sys.executable``, so moving those two moves the
+    anchor while the join, the basename and the candidate list stay real.
     """
     import sys
 
@@ -85,13 +112,79 @@ def frozen_install(tmp_path, monkeypatch):
     return app_dir
 
 
+def test_the_legacy_config_is_looked_for_beside_the_entry_script():
+    """The path half of item 6, asserted against the **unstubbed** resolver.
+
+    Both guards below stub ``_old_app_config_path`` (they have to: no test may
+    write into the install directory it is running from), so without this one
+    nothing in the suite ever executes the function that decides whether the
+    file is found. It was resolving to
+    ``{app}/scheduler_app/storage/scheduler_config.json`` while its own
+    docstring said "the app directory", and every guard stayed green.
+
+    A failure means the lookup has drifted away from the directory
+    ``scheduler_gui.py`` is started from — on the shipped build, the directory
+    the C# ``Dersis.exe`` wrapper passes to ``pythonw.exe``.
+    """
+    from scheduler_app.storage import storage
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    assert os.path.isfile(os.path.join(repo, "scheduler_gui.py")), (
+        "this test's anchor moved: the entry script is no longer at %s" % repo)
+
+    resolved = storage._old_app_config_path()  # real, unstubbed
+    assert os.path.basename(resolved) == "scheduler_config.json"
+    assert os.path.normcase(os.path.dirname(resolved)) == os.path.normcase(repo), (
+        "the legacy config is looked for in %r, but a pre-Dersis install put it "
+        "beside the entry script in %r. Nothing will ever be migrated from a "
+        "directory inside the installed package tree."
+        % (os.path.dirname(resolved), repo))
+
+    candidates = [os.path.normcase(p) for p in storage._old_app_config_candidates()]
+    documented = os.path.normcase(
+        os.path.join(storage._OLD_DATA_DIR, "scheduler_config.json"))
+    assert documented in candidates, (
+        "09_SETTINGS_LOCALIZATION_AND_PERSISTENCE_MAP.md names %r as the legacy "
+        "source; step 1 no longer looks there: %r" % (documented, candidates))
+
+
+def test_a_legacy_config_in_the_app_directory_is_migrated(dersis_home, frozen_install):
+    """The app-directory candidate, end to end, in process.
+
+    ``frozen_install`` moves the *whole* resolver — ``sys.frozen`` plus
+    ``sys.executable`` — rather than replacing ``_old_app_config_path``, so the
+    join and the basename are the real ones; only the anchor directory is a
+    tmp_path. The unstubbed anchor is pinned by the test above.
+    """
+    from scheduler_app.storage import storage
+
+    _write_legacy_config(str(frozen_install))
+
+    notes = storage.migrate_legacy_files()
+
+    assert any("scheduler_config.json" in n for n in notes), (
+        "a legacy config sitting in the app directory was not migrated: %r" % notes)
+    settings = storage.load_encrypted(storage.settings_path())
+    assert [c["name"] for c in settings.get("state", {}).get("classes", [])] \
+        == ["LEGACY-LESSON"]
+    assert not os.path.exists(frozen_install / "scheduler_config.json"), (
+        "the migrated original was left in place; it will be re-migrated or "
+        "shadow the encrypted copy on the next launch")
+
+
 @pytest.mark.ui
-def test_a_legacy_config_survives_a_real_first_run(tmp_path):
+@pytest.mark.parametrize("legacy_location", ["app_dir", "old_data_dir"])
+def test_a_legacy_config_survives_a_real_first_run(tmp_path, legacy_location):
     """ST-ARCH-001 item 6 — picking a language must not cost the user their schedule.
 
     A failure here means an upgrading user opens DERSİS, chooses a language, and
     finds an empty timetable, with their real schedule moved into ``backups/``
     where nothing will ever read it again.
+
+    Run once per documented legacy location. The ``old_data_dir`` case stubs
+    **nothing** about path resolution — ``~/.class_scheduler`` is inside the
+    sandboxed HOME, so the real ``_old_app_config_candidates()`` finds the file
+    on its own.
 
     This drives the **real** ``scheduler_gui.main()``, because the defect is an
     *ordering* between two calls that each work fine in isolation. A version of
@@ -111,20 +204,29 @@ def test_a_legacy_config_survives_a_real_first_run(tmp_path):
     app_dir = tmp_path / "install"
     (home / "Documents").mkdir(parents=True)
     app_dir.mkdir()
-    _write_legacy_config(str(app_dir))
 
     env = dict(os.environ)
+    env.pop("DERSIS_PROBE_FROZEN_DIR", None)
     env.update(
         HOME=str(home),
         USERPROFILE=str(home),
         QT_QPA_PLATFORM="offscreen",
         PYTHONIOENCODING="utf-8",
         PYTHONPATH=repo,
-        DERSIS_PROBE_LANG="tr",
-        # _old_app_config_path() branches on sys.frozen and reads the directory
-        # of sys.executable, which is where a real user's legacy config lives.
-        DERSIS_PROBE_FROZEN_DIR=str(app_dir),
+        # Deliberately NOT the legacy config's language: with both set to "tr"
+        # an assertion on the surviving language reads the stub, not the code.
+        DERSIS_PROBE_LANG="en",
     )
+    if legacy_location == "app_dir":
+        _write_legacy_config(str(app_dir))
+        # The real user's file sits beside the entry script. A test cannot write
+        # there, so the anchor is moved; test_the_legacy_config_is_looked_for_
+        # beside_the_entry_script pins the unstubbed anchor separately.
+        env["DERSIS_PROBE_FROZEN_DIR"] = str(app_dir)
+    else:
+        old_data = home / ".class_scheduler"
+        old_data.mkdir()
+        _write_legacy_config(str(old_data))
 
     proc = subprocess.run(
         [sys.executable, os.path.join(repo, "tests", "_support", "first_run_probe.py")],
@@ -145,8 +247,21 @@ def test_a_legacy_config_survives_a_real_first_run(tmp_path):
         "destination already exists — and side-lines the source anyway."
         % sorted(settings)
     )
-    assert settings.get("language") == "tr", (
-        "the user's saved language was lost in the migration"
+    assert settings.get("last_file") == LEGACY_LAST_FILE, (
+        "the language gate replaced the migrated settings container instead of "
+        "extending it: last_file is %r. Every legacy key other than the ones "
+        "the gate writes must still be there after the first run."
+        % settings.get("last_file")
+    )
+    # Not a pin on the migration, and deliberately so: the gate writes
+    # ``language`` from the dialog after migrate_legacy_files() has run, so the
+    # migrated ``language`` ("tr" above) is always overwritten by the user's
+    # pick. This assertion pins that behaviour — it reddens if someone makes the
+    # gate honour a migrated language and skip the dialog, which would deny the
+    # user the choice on the one launch where the app changed identity.
+    assert settings.get("language") == "en", (
+        "the language gate did not write the language the user picked; the "
+        "migrated value must not win over the dialog (%r)" % settings.get("language")
     )
 
 

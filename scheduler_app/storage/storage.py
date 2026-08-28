@@ -630,13 +630,49 @@ def load_encrypted_lines_since(path: str, skip: int) -> list:
 _OLD_DATA_DIR = os.path.join(os.path.expanduser("~"), ".class_scheduler")
 
 
+def _app_dir() -> str:
+    """The directory DERSİS was installed into — where ``scheduler_gui.py`` sits.
+
+    ST-ARCH-001 item 6. This used to resolve to ``os.path.dirname(__file__)``,
+    which is ``{app}/scheduler_app/storage`` — two levels below the "app
+    directory" the caller's docstring names, and a place the pre-Dersis
+    ``scheduler_config.json`` can never be. Measured: with the legacy payload
+    written beside ``scheduler_gui.py``, ``migrate_legacy_files()`` returned
+    ``[]`` and wrote no settings.
+
+    ``sys.executable`` is not the anchor either on the build the installer
+    ships: ``build_embed.bat`` compiles ``Dersis.exe`` as a C# wrapper that runs
+    ``{app}\\python\\pythonw.exe {app}\\scheduler_gui.py``, so ``sys.frozen`` is
+    never set and ``dirname(sys.executable)`` is ``{app}\\python``. The package
+    root is what tracks the app directory in every layout this project ships:
+    this module is always ``{app}/scheduler_app/storage/storage.py``.
+
+    The ``sys.frozen`` branch is kept for a PyInstaller-style bundle, where the
+    package is unpacked into a temporary ``_MEIPASS`` and the executable's own
+    directory is the only meaningful anchor.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 def _old_app_config_path() -> str:
     """Legacy config location: scheduler_config.json in the app directory."""
-    if getattr(sys, "frozen", False):
-        app_dir = os.path.dirname(sys.executable)
-    else:
-        app_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(app_dir, "scheduler_config.json")
+    return os.path.join(_app_dir(), "scheduler_config.json")
+
+
+def _old_app_config_candidates() -> list[str]:
+    """Both documented homes of the pre-Dersis ``scheduler_config.json``.
+
+    The app directory is what this module has always claimed;
+    ``~/.class_scheduler`` is what
+    ``dersis-mapped/09_SETTINGS_LOCALIZATION_AND_PERSISTENCE_MAP.md`` documents
+    and where the other four legacy files live. Nobody now has a build that can
+    say which one the pre-Dersis release really used, so both are checked. The
+    basename is fixed, so neither candidate can pick up anything else.
+    """
+    return [_old_app_config_path(),
+            os.path.join(_OLD_DATA_DIR, "scheduler_config.json")]
 
 
 def _backup_original(src: str) -> None:
@@ -716,9 +752,11 @@ def migrate_legacy_files() -> list:
     notes = []
 
     # 1. scheduler_config.json → settings/app_settings.egu
-    old_cfg = _old_app_config_path()
-    if _migrate_json_file(old_cfg, settings_path()):
-        notes.append(f"Migrated {os.path.basename(old_cfg)} → settings/app_settings.egu")
+    for old_cfg in _old_app_config_candidates():
+        if _migrate_json_file(old_cfg, settings_path()):
+            notes.append(
+                f"Migrated {os.path.basename(old_cfg)} → settings/app_settings.egu")
+            break
 
     # 2. ~/.class_scheduler/learned_weights.json → learning/learned_weights.egu
     old_weights = os.path.join(_OLD_DATA_DIR, "learned_weights.json")
