@@ -1,17 +1,16 @@
 """Scheduling logic: conflict detection, slot fitting, color helpers."""
 
 from scheduler_app.constants import YEAR_COLORS
-# ST-ARCH-010: ExplanationEngine is imported at module scope because
-# explanation_engine imports nothing from logic -- measured, one of only
-# two of logic.py's 21 deferrals that is not load-bearing. The other 19
-# genuinely do raise ImportError if promoted.
-from scheduler_app.explanation_engine import ExplanationEngine
+# ST-ARCH-010: this module holds the scheduling *primitives* only. The eight
+# bridge functions that used to sit at the bottom of the file, and the 13
+# deferred imports they carried, are in `scheduler_app/core/facade.py` now --
+# see the note at the end of this file. Nothing imported here may import
+# `logic` back; that is what keeps the module-level graph acyclic.
 from scheduler_app.models import (
-    DEFAULT_OPTIMIZER_SEED,
-    PROTECTION_NONE, PROTECTION_LOCKED,
+    PROTECTION_NONE,
     room_fits_class, lecturer_available_at, needs_physical_room, display_room,
     get_room_candidates, get_physical_room_candidates,
-    effective_day, effective_time, effective_room,
+    effective_day, effective_time,
     mark_placed, mark_unplaced,
     filter_class_days, filter_class_times,
     apply_lecturer_availability_filters,
@@ -1082,271 +1081,21 @@ def lighten_color(hex_color, factor=0.45):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  AI-ASSISTED OPTIMIZATION BRIDGE
-# ══════════════════════════════════════════════════════════════════════════
-# These functions delegate to the new optimization classes while
-# maintaining the same API as the original functions above.
-
-def optimized_auto_place(state, new_cls, weights=None):
-    """AI-assisted auto-placement using scored candidate ranking.
-
-    Generates all valid candidates, scores them, and picks the best.
-    Falls back to reschedule if no direct placement exists.
-
-    Same return signature as auto_place_class.
-    """
-    from scheduler_app.schedule_optimizer import ScheduleOptimizer
-    # No seed needed: place_with_reschedule reaches only quick_place and
-    # _greedy_construct, and neither draws from the RNG. The randomized paths
-    # (_perturb_ordering, _lns_improve) are called only from optimize().
-    optimizer = ScheduleOptimizer(state, weights=weights)
-    return optimizer.place_with_reschedule(new_cls)
-
-
-def optimized_reschedule_all(state, weights=None, protected_ids=None,
-                             progress_callback=None,
-                             multi_start_runs=5,
-                             multi_start_time_limit=120.0,
-                             use_cpsat=False, cpsat_time_limit=15.0,
-                             parallel_workers=0,
-                             seed=DEFAULT_OPTIMIZER_SEED,
-                             cancel_token=None, **optimizer_kwargs):
-    """Hybrid timetable-wide reschedule with multi-start LNS + optional CP-SAT.
-
-    Preserves pinned and protected placements. Uses greedy construction
-    with look-ahead scoring followed by iterative LNS destroy-repair
-    for better overall quality. Runs multiple independent optimization
-    passes from perturbed starting states and keeps the best.
-    Optionally refines with Google OR-Tools CP-SAT constraint solver.
-
-    Args:
-        parallel_workers: Number of worker processes for parallel
-                          candidate evaluation. 0 = auto, negative = disabled.
-        seed: RNG seed; the default makes the result reproducible
-              (ST-SCHED-013). None draws a fresh seed. The seed used is
-              reported back as summary['seed'].
-
-    Returns:
-        (placed_list, unplaced_list, changes, summary) where summary
-        contains before/after quality breakdown and improvement stats.
-    """
-    from scheduler_app.schedule_optimizer import ScheduleOptimizer
-    optimizer = ScheduleOptimizer(
-        state, weights=weights, protected_ids=protected_ids,
-        progress_callback=progress_callback,
-        multi_start_runs=multi_start_runs,
-        multi_start_time_limit=multi_start_time_limit,
-        use_cpsat=use_cpsat, cpsat_time_limit=cpsat_time_limit,
-        parallel_workers=parallel_workers, seed=seed,
-        cancel_token=cancel_token, **optimizer_kwargs)
-    return optimizer.optimize()
-
-
-def optimized_batch_schedule(state, new_classes, weights=None):
-    """AI-assisted batch scheduling with candidate scoring.
-
-    Phase 1: Place new classes using scored candidates.
-    Phase 2: Full reschedule if any fail.
-
-    Same return signature as batch_schedule.
-    """
-    from scheduler_app.constraint_validator import ConstraintValidator
-    from scheduler_app.candidate_generator import CandidateGenerator
-    from scheduler_app.placement_scorer import PlacementScorer
-
-
-    new_ids = {cls_key(c) for c in new_classes}
-    # ST-SCHED-007: a `protection="locked"` class is not flexible. Phase 2
-    # re-solves everything in `existing_flexible` from scratch, so including
-    # locked classes here let adding one new lesson relocate a lesson the user
-    # had explicitly frozen — observed moving monday/09:00 -> tuesday/10:00.
-    # Excluded here, they stay in build_occupancy() and act as fixed points
-    # the reschedule has to work around, which is what "locked" means.
-    existing_flexible = [c for c in state["classes"]
-                         if c["placed"] and not c["pinned"]
-                         and c.get("protection") != PROTECTION_LOCKED
-                         and cls_key(c) not in new_ids]
-
-    new_pinned = [c for c in new_classes if c["pinned"]]
-    new_flexible = [c for c in new_classes if not c["pinned"]]
-
-    # ── Phase 1: Place new classes around existing ──
-    validator = ConstraintValidator(state, exclude_ids=new_ids)
-    generator = CandidateGenerator(state, validator=validator)
-    scorer = PlacementScorer(state, validator, weights=weights)
-
-    placed_result = []
-    unplaced_result = []
-
-    # Place new pinned classes
-    pinned_ok = True
-    for cls in new_pinned:
-        day, slot, room = cls["pinned_day"], cls["pinned_time"], cls["pinned_classroom"]
-        if validator.check_placement(cls, day, slot, room):
-            validator.add_placement(cls, day, slot, room)
-            placed_result.append((cls, day, slot, room))
-        else:
-            pinned_ok = False
-            conflicts = validator.find_conflicts(cls, day, slot, room)
-            reason = "; ".join(conflicts) if conflicts else tr("conflicts.batch_conflict")
-            unplaced_result.append((cls, reason))
-
-    # Sort by difficulty (hardest first)
-    new_flexible_sorted = validator.sort_by_difficulty(new_flexible)
-
-    # Try placing each using scored candidates with look-ahead
-    all_placed = True
-    for pos, cls in enumerate(new_flexible_sorted):
-        candidates = generator.generate(cls)
-        if candidates:
-            remaining = new_flexible_sorted[pos + 1:]
-            if remaining and len(candidates) > 1:
-                scored = scorer.score_candidates_with_lookahead(
-                    cls, candidates, remaining, generator)
-            else:
-                scored = scorer.score_candidates(cls, candidates)
-            best = scored[0]
-            day, slot, room = best[0], best[1], best[2]
-            validator.add_placement(cls, day, slot, room)
-            placed_result.append((cls, day, slot, room))
-        else:
-            all_placed = False
-            break
-
-    if all_placed and pinned_ok:
-        # Every already-placed class keeps its position, locked ones included —
-        # they are absent from `existing_flexible` by design now, and leaving
-        # them out of the result would report them as no longer placed.
-        for cls in state["classes"]:
-            if (cls["placed"] and not cls["pinned"]
-                    and cls_key(cls) not in new_ids):
-                placed_result.append((cls, cls["placed_day"],
-                                      cls["placed_time"],
-                                      cls["placed_classroom"]))
-        return placed_result, unplaced_result, False
-
-    # ── Phase 2: Full reschedule ──
-    from scheduler_app.schedule_optimizer import ScheduleOptimizer
-    # Remove phase 1 partial results
-    placed_result = []
-    unplaced_result = []
-
-    all_exclude = new_ids | {cls_key(c) for c in existing_flexible}
-    validator2 = ConstraintValidator(state, exclude_ids=all_exclude)
-
-    # Place pinned
-    for cls in new_pinned:
-        day, slot, room = cls["pinned_day"], cls["pinned_time"], cls["pinned_classroom"]
-        if validator2.check_placement(cls, day, slot, room):
-            validator2.add_placement(cls, day, slot, room)
-            placed_result.append((cls, day, slot, room))
-        else:
-            conflicts = validator2.find_conflicts(cls, day, slot, room)
-            reason = "; ".join(conflicts) if conflicts else tr("conflicts.pinned_conflict")
-            unplaced_result.append((cls, reason))
-
-    combined = existing_flexible + new_flexible
-    combined = validator2.sort_by_difficulty(combined)
-
-    generator2 = CandidateGenerator(state, validator=validator2)
-    scorer2 = PlacementScorer(state, validator2, weights=weights)
-
-    # Greedy with backtracking via optimizer.
-    # ST-PERF-008: bounded like every other greedy phase. This one is reached
-    # from the "add classes" and "place batch" buttons, so an unbounded search
-    # here is a frozen window with no progress dialog behind it.
-    import time as _time
-    optimizer = ScheduleOptimizer(state, weights=weights)
-    solution, _greedy_stats = optimizer._greedy_construct(
-        combined, validator2, generator2, scorer2,
-        deadline=_time.time() + optimizer.multi_start_time_limit)
-
-    for i, cls in enumerate(combined):
-        if solution[i] is not None:
-            day, slot, room = solution[i]
-            placed_result.append((cls, day, slot, room))
-        else:
-            reason = generator2.unplaced_reason(cls)
-            unplaced_result.append((cls, reason))
-
-    return placed_result, unplaced_result, True
-
-
-def score_placement(state, cls, day, slot, room, weights=None):
-    """Score a single placement using the PlacementScorer.
-
-    Convenience function for UI display and feedback logging.
-    """
-    from scheduler_app.constraint_validator import ConstraintValidator
-    from scheduler_app.placement_scorer import PlacementScorer
-
-    exclude = {cls_key(cls)}
-    validator = ConstraintValidator(state, exclude_ids=exclude)
-    scorer = PlacementScorer(state, validator, weights=weights)
-    return scorer.score(cls, day, slot, room)
-
-
-def score_placement_explained(state, cls, day, slot, room, weights=None):
-    """Score a placement and return (score, breakdown, explanation).
-
-    Returns:
-        (float, dict, dict) — numerical score, component breakdown,
-        and human-readable explanation from ExplanationEngine.
-    """
-    from scheduler_app.constraint_validator import ConstraintValidator
-    from scheduler_app.placement_scorer import PlacementScorer
-
-    exclude = {cls_key(cls)}
-    validator = ConstraintValidator(state, exclude_ids=exclude)
-    scorer = PlacementScorer(state, validator, weights=weights)
-    score, breakdown = scorer.score_explained(cls, day, slot, room)
-    engine = ExplanationEngine()
-    explanation = engine.explain_placement(cls, day, slot, room, breakdown)
-    return score, breakdown, explanation
-
-
-def analyze_schedule(state, placements=None):
-    """Analyze full timetable quality and return structured analytics.
-
-    If placements is None, builds list from currently placed classes.
-
-    Returns:
-        dict with global_score, grade, per-entity metrics, and insights.
-    """
-    from scheduler_app.schedule_analytics import ScheduleAnalytics
-
-    if placements is None:
-        placements = []
-        for cls in get_placed_classes(state):
-            day = effective_day(cls)
-            slot = effective_time(cls)
-            room = effective_room(cls)
-            placements.append((cls, day, slot, room))
-
-    analytics = ScheduleAnalytics(state)
-    return analytics.analyze(placements)
-
-
-def negotiate_after_optimization(state, placed_list, unplaced_list):
-    """Run constraint negotiation after an optimization pass.
-
-    Called when ScheduleOptimizer leaves unplaced classes.
-
-    Returns:
-        dict with negotiation results or None if all placed.
-    """
-    from scheduler_app.constraint_negotiator import ConstraintNegotiator
-    negotiator = ConstraintNegotiator(state)
-    return negotiator.negotiate_after_optimization(placed_list, unplaced_list)
-
-
-def apply_negotiation_suggestion(cls, suggestion):
-    """Apply a single constraint relaxation suggestion to a class.
-
-    Modifies the class dict in-place.
-
-    Returns:
-        True if the suggestion was applied.
-    """
-    from scheduler_app.constraint_negotiator import ConstraintNegotiator
-    return ConstraintNegotiator.apply_suggestion(None, cls, suggestion)
+#  (moved)  ST-ARCH-010 — the AI-assisted optimization bridge
+# ------------------------------------------------------------------
+# `optimized_auto_place`, `optimized_reschedule_all`,
+# `optimized_batch_schedule`, `score_placement`, `score_placement_explained`,
+# `analyze_schedule`, `negotiate_after_optimization` and
+# `apply_negotiation_suggestion` now live in `scheduler_app/core/facade.py`.
+# They held all 13 of this module's function-level deferred imports, and they
+# were the reason 15 of `core`'s modules formed one strongly connected
+# component: `logic` supplies the primitives the engine imports at module
+# scope, so it could not import the engine back except from inside a function.
+# The facade sits above both and imports whatever it needs normally.
+#
+# Do NOT re-export those eight names from here "for compatibility". Both ways
+# of doing it were built and measured: a star re-export turns the cycle into a
+# module-level one and `import scheduler_app.core.workflow` raises ImportError;
+# a lazy PEP 562 `__getattr__` runs fine and puts the component at 16 modules,
+# larger than the 15 the split removed. `tests/test_import_layering.py` fails
+# on either.

@@ -28,11 +28,19 @@ from scheduler_app.logic import (
     find_slot_index,
     slots_fit, total_duration,
     find_valid_options,
+    get_placed_classes,
+)
+# ST-ARCH-010: the `optimized_*` entry points moved out of `logic.py` into
+# `core/facade.py` so that `logic` could stop importing the engine from inside
+# function bodies. This module is the only one under `core` allowed to import
+# the facade -- see `tests/test_import_layering.py`. The names still land in
+# this module's namespace, so the tests that monkeypatch
+# `workflow.optimized_batch_schedule` are unaffected.
+from scheduler_app.core.facade import (
     optimized_auto_place, optimized_batch_schedule,
     optimized_reschedule_all,
     score_placement, score_placement_explained,
     analyze_schedule, negotiate_after_optimization,
-    get_placed_classes,
 )
 
 

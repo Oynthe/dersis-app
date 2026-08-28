@@ -204,7 +204,7 @@ from scheduler_app.core import workflow as wf_mod
 from scheduler_app.core.constraint_validator import ConstraintValidator
 from scheduler_app.core.models import needs_physical_room
 from scheduler_app.core.workflow import SchedulingWorkflow
-from scheduler_app.logic import negotiate_after_optimization
+from scheduler_app.core.facade import negotiate_after_optimization
 
 from _support.dataset_gen import make_state as build_state
 
