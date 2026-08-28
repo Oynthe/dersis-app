@@ -1102,6 +1102,12 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     placed = schedule.placed_classes()
     days = schedule.days
     slots = schedule.slots
+    # ST-FUNC-013: every table builder records the lessons it actually put on a
+    # page here, so the appendix can name the ones no page had room for. Same
+    # mechanism the workbook's _write_unplaceable_sheet already uses, and it is
+    # a report on the built document rather than a second guess at the filter
+    # rules -- so a lesson lost for a reason nobody predicted still surfaces.
+    drawn: set = set()
     # ST-UI-001: one scan for the whole document, so every page marks the
     # same clashes and the printout agrees with the screen.
     conflicts = find_schedule_conflicts(state)
@@ -1205,6 +1211,8 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             entries.append(entry)
             for off in range(span):
                 claims.setdefault((start_si + off, c_day), []).append(entry)
+
+        drawn.update(cls_key(e["cls"]) for e in entries)
 
         overlapping = {id(e["cls"]) for cells in claims.values()
                        if len(cells) > 1 for e in cells}
@@ -1341,6 +1349,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             (block["row"], block["subcolumn"]): block
             for block in layout["blocks"]
         }
+        drawn.update(cls_key(block["cls"]) for block in layout["blocks"])
         covered = set(layout["occupied_subcolumns"])
 
         table_data = [header]
@@ -1516,6 +1525,8 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                     if all(x is not entry for x in bucket):
                         bucket.append(entry)
 
+        drawn.update(cls_key(e["cls"]) for e in entries)
+
         overlapping = {id(e) for cells in claims.values() if len(cells) > 1
                        for e in cells}
         occupied = {}
@@ -1677,11 +1688,19 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
     # ── Appendix: everything the grid could not say ───────────────────
     #
-    # ST-FUNC-013 + ST-UI-001. Two different ways a lesson goes missing from a
-    # printed timetable, one page:
+    # ST-FUNC-013 + ST-UI-001. Three different ways a lesson goes missing from
+    # a printed timetable, one page:
     #
     #   * a placement on a day or hour the user has since deleted has no cell
     #     to be drawn in, so every grid-shaped page simply omits it;
+    #   * a lesson no page had a column for -- the everything and group layouts
+    #     are built by filtering each class's `targets`, so a lesson whose
+    #     targets list is empty matches no page. That is not exotic:
+    #     new_class() initializes targets to [] (core/models.py:578) and
+    #     neither class-editor path requires one (ui/dialogs.py:3694, :3915),
+    #     so it is the default state of every lesson placed before its groups
+    #     were ticked. classroom and lecturer filter on room and teacher and
+    #     kept it, which is why only two of the four layouts lost it;
     #   * a double-booking is now stacked into its cell rather than dropped,
     #     but a stacked cell is easy to miss on a dense page.
     #
@@ -1694,7 +1713,26 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     # would make `elements` non-empty and silently delete the "no schedule
     # data" page that the empty-export test pins.
     appendix_rows = []
-    for cls, _reason in find_off_grid_placements(state):
+    off_grid = list(find_off_grid_placements(state))
+    off_grid_keys = {cls_key(cls) for cls, _reason in off_grid}
+    for cls, _reason in off_grid:
+        appendix_rows.append((
+            tr("export.appendix_offgrid"),
+            cls.get("class_code", ""),
+            cls.get("name", ""),
+            cls.get("lecturer", ""),
+            f"{display_day(effective_day(cls))} {effective_time(cls) or ''}",
+        ))
+    # The same heading, deliberately: "not on the timetable" is literally what
+    # happened to these too, the string is already translated in all 22
+    # locales, and _write_unplaceable_sheet reuses it for the workbook's
+    # version of this list for the same reason. Minting a key here would move
+    # the ST-UI-011 ratchet by 21 pairs for a phrase a reader cannot
+    # distinguish from the one above.
+    for cls in placed:
+        key = cls_key(cls)
+        if key in drawn or key in off_grid_keys:
+            continue
         appendix_rows.append((
             tr("export.appendix_offgrid"),
             cls.get("class_code", ""),

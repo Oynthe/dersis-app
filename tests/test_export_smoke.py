@@ -539,23 +539,8 @@ def test_csv_and_xlsx_keep_a_class_with_no_target_groups(tmp_path, fmt, request)
             "the group-less lesson was dropped from the workbook"
 
 
-_GROUPLESS_PDF_DROP = pytest.mark.xfail(
-    strict=True,
-    reason="ST-FUNC-013 (new instance) — the 'everything' and 'group' PDF "
-           "pages are built by filtering on each class's targets "
-           "(exporter.py:831-866), so a placed class whose targets list is "
-           "empty (the new_class() default) matches no page and is dropped "
-           "with no warning; same 'silently omits' family as the off-grid case",
-)
-
-
 @pytest.mark.pdf
-@pytest.mark.parametrize("mode", [
-    pytest.param("everything", marks=_GROUPLESS_PDF_DROP),
-    "classroom",
-    pytest.param("group", marks=_GROUPLESS_PDF_DROP),
-    "lecturer",
-])
+@pytest.mark.parametrize("mode", MODES)
 def test_pdf_keeps_a_class_with_no_target_groups(tmp_path, reportlab_mod, mode):
     """ST-FUNC-013 (new instance) — a group-less lesson must not vanish.
 
@@ -563,6 +548,12 @@ def test_pdf_keeps_a_class_with_no_target_groups(tmp_path, reportlab_mod, mode):
     class group is simply absent from the printed timetable, with nothing
     saying so -- the same silent data loss as the off-grid case below, but
     reachable from the default state of every freshly created class.
+
+    The ``everything`` and ``group`` layouts were the two that lost it: they
+    are built by filtering each class's ``targets``, and an empty list matches
+    no page. ``classroom`` and ``lecturer`` filter on room and teacher, which
+    is why only two of the four parametrisations used to be xfailed. The fix
+    reports it on the printout's own appendix, so this now holds for all four.
     """
     out = tmp_path / f"notargets_{mode}.pdf"
 
@@ -574,10 +565,49 @@ def test_pdf_keeps_a_class_with_no_target_groups(tmp_path, reportlab_mod, mode):
     content = pdf_content_text(assert_well_formed_pdf(out))
     assert b"D001" in content, "control class D001 missing — test is broken"
 
+    # Both the code and the name: a page that printed the code alone would not
+    # tell a reader which lesson is missing from their timetable.
+    reported = b"D900" in content and b"Serbest Ders" in content
     warned = any("D900" in str(w.message) for w in caught)
-    assert b"D900" in content or warned, (
+    assert reported or warned, (
         f"the group-less lesson D900 is absent from the mode={mode} PDF and "
         "no warning was raised about it"
+    )
+
+
+@pytest.mark.pdf
+@pytest.mark.parametrize("mode", MODES)
+def test_pdf_keeps_a_class_whose_target_year_was_deleted(
+        tmp_path, reportlab_mod, mode):
+    """ST-FUNC-013 — a lesson pointing at a deleted year must not vanish either.
+
+    A failure means deleting a year from Setup silently removes every lesson
+    that targeted it from the printout, while the app still lists them as
+    placed.
+
+    This is the second reason a page can have no column for a lesson, and it is
+    here to prove the fix reports what the document actually drew rather than
+    re-deriving "which lessons have no targets". A fix that special-cased the
+    empty-targets list would pass the test above and fail this one.
+    """
+    state = _state_with_a_group_less_class()
+    state["classes"][-1]["targets"] = [{"year": "Silinmiş Sınıf",
+                                        "branch": "A"}]
+    assert "Silinmiş Sınıf" not in state["years"], "the test is broken"
+
+    out = tmp_path / f"deletedyear_{mode}.pdf"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        export_schedule(state, "pdf", str(out), mode=mode)
+
+    content = pdf_content_text(assert_well_formed_pdf(out))
+    assert b"D001" in content, "control class D001 missing — test is broken"
+
+    reported = b"D900" in content and b"Serbest Ders" in content
+    warned = any("D900" in str(w.message) for w in caught)
+    assert reported or warned, (
+        f"the lesson whose target year was deleted is absent from the "
+        f"mode={mode} PDF and no warning was raised about it"
     )
 
 
