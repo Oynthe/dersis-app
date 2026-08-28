@@ -7,9 +7,14 @@
 
 name: CI
 
+# ST-SEC-001: `tags` is load-bearing. Without it a tag push ran zero tests
+# while release.yml built and published from that same tag, and the
+# "Verify tag matches VERSION" step below — guarded on refs/tags/v — had never
+# once executed. A tag gate in a workflow tags cannot trigger gates on nothing.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:

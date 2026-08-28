@@ -7,8 +7,14 @@
 # ship universal2 binaries.
 #
 # Triggers:
-#   - Manual dispatch — build on demand and download from the run's artifacts
-#   - Version tags (v*) — produce the macOS distributables alongside a release
+#   - Manual dispatch only — build on demand and download from the run's
+#     artifacts.
+#
+# ST-SEC-001: this used to also fire on `push: tags: v*`, as did release.yml and
+# build-installer.yml. One human tag therefore started 2 Windows builds and 4
+# macOS builds, of which only release.yml's three ever reached a release. The
+# release lane builds its own macOS artifacts (release.yml, job `build-macos`),
+# so nothing is lost by making this an on-demand lane.
 #
 # This is the macOS counterpart to build-installer.yml (Windows). It does not
 # touch the Windows build.
@@ -18,9 +24,6 @@ name: Build macOS
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: read

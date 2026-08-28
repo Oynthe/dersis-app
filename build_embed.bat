@@ -30,6 +30,12 @@ echo   Version: %APP_VERSION%
 set PY_VERSION=3.11.9
 set PY_ZIP=python-%PY_VERSION%-embed-amd64.zip
 set PY_URL=https://www.python.org/ftp/python/%PY_VERSION%/%PY_ZIP%
+:: ST-SEC-004. The interpreter that runs DERSIS on every user's machine is
+:: downloaded here, so it is verified here. SHA-256 of the 11,249,023-byte
+:: python-3.11.9-embed-amd64.zip, fetched twice from python.org on 2026-08-28.
+:: A download that "succeeds" and yields the wrong bytes is the failure mode
+:: that already broke this pipeline once, on the Inno Setup fetch.
+set PY_SHA256=009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b
 set DIST_DIR=build\Dersis.dist
 set PY_DIR=%DIST_DIR%\python
 
@@ -75,6 +81,18 @@ if not exist "build\%PY_ZIP%" (
 ) else (
     echo   Using cached %PY_ZIP%
 )
+
+:: Verify before extracting. This also covers the cached path above: a build\
+:: directory left over from an earlier run is not evidence of anything.
+powershell -NoProfile -Command "$h = (Get-FileHash -Path 'build\%PY_ZIP%' -Algorithm SHA256).Hash.ToLower(); if ($h -ne '%PY_SHA256%') { Write-Host ('  SHA-256 MISMATCH: expected %PY_SHA256%, got ' + $h); exit 1 }; Write-Host ('  [OK] SHA-256 verified: ' + $h)"
+if errorlevel 1 (
+    echo ERROR: build\%PY_ZIP% does not match its published SHA-256.
+    echo        The download was not what python.org publishes. Deleting it.
+    del /q "build\%PY_ZIP%" 2>nul
+    pause
+    exit /b 1
+)
+
 echo   Extracting to %PY_DIR%...
 powershell -Command "Expand-Archive -Force 'build\%PY_ZIP%' '%PY_DIR%'"
 echo   [OK] Python embeddable ready
