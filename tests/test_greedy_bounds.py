@@ -633,6 +633,11 @@ def shipped_run():
                 "committed": sum(1 for c in state["classes"]
                                  if c.get("placed") or c.get("pinned")),
                 "applied": check_schedule(state),
+                # ST-SCHED-001. Placements the optimizer proposed and then had
+                # to withdraw because they broke a hard constraint. Free to
+                # record here; asserted below.
+                "repaired": result.summary["repaired_conflicts"],
+                "repaired_classes": result.summary.get("repaired_classes"),
             }
         return cache[preset]
 
@@ -695,8 +700,26 @@ def test_bounding_does_not_cost_placements(shipped_run, preset,
 
     The clean-schedule assertion is what stops the floors being met by a
     "solution" that double-books its way to a higher count.
+
+    ST-SCHED-001 rides along. ``summary['repaired_conflicts']`` counts
+    placements the optimizer withdrew from its own answer; production says a
+    non-zero value "means the engine produced something it should not have".
+    Nothing asserted it before Phase 7, and that mattered: deleting the
+    occupancy resync loses 10 of 76 lessons on ``normal`` with ``rejected == 0``
+    and every parity test in ``tests/test_scheduler_invariants.py`` still green,
+    because ``screen_placements`` turns the desync into silent *unplacement*.
+    The placement floors above are what would eventually have caught the
+    shortfall; this assertion is what names the cause. It costs no extra solve.
     """
     run = shipped_run(preset)
+
+    assert run["repaired"] == 0, (
+        f"`{preset}`: the optimizer withdrew {run['repaired']} of its own "
+        f"placements ({run['repaired_classes']}) because they broke a hard "
+        "constraint. They are not in `rejected` and not in the timetable — the "
+        "lessons simply vanish, and the user is told nothing. Measured 0 on "
+        "every preset since Phase 3; a non-zero value is an engine defect, not "
+        "a property of the instance.")
 
     assert run["committed"] >= committed_floor, (
         f"`{preset}`: only {run['committed']} of "
