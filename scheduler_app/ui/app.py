@@ -1535,6 +1535,9 @@ class SchedulerApp(QMainWindow):
         osp_lay.setContentsMargins(4, 4, 4, 4)
         osp_lay.setSpacing(4)
         self._open_slots_filter_hint = QLabel("")
+        # ST-UI-007: the hint names the selected lesson, so its text is the
+        # user's. See _refresh_open_slots for the measurement.
+        self._open_slots_filter_hint.setTextFormat(Qt.TextFormat.PlainText)
         self._open_slots_filter_hint.setStyleSheet(
             "QLabel { font-size: 7pt; color: #4B5563; background: #E0F2FE;"
             "  border: 1px solid #BAE6FD; border-radius: 4px;"
@@ -3829,7 +3832,21 @@ class SchedulerApp(QMainWindow):
                 row_layout.setContentsMargins(10, 6, 10, 6)
                 row_layout.setSpacing(0)
 
+                # ST-UI-007. A QLabel defaults to AutoText, so Qt decides PER
+                # STRING whether to parse markup -- and both of these carry
+                # free text the school typed into Setup. Measured offscreen on
+                # this panel, sizeHint width before -> after forcing PlainText:
+                # a slot labelled "09:00 <b>x</b>" 77 -> 154, a room called
+                # "Lab <b>A</b>" 50 -> 120. Qt was drawing "Lab A", so the
+                # panel disagreed with the classroom list about the room's
+                # name and the user had no way to tell which was right.
+                #
+                # Removing Qt's choice is the fix, NOT escaping: html.escape on
+                # a string Qt would have shown literally puts '&amp;' on the
+                # screen, and "R&D Lab" is a plausible room name. Same remedy
+                # as the toast in ui/widgets.py.
                 time_label = QLabel(slot_time)
+                time_label.setTextFormat(Qt.TextFormat.PlainText)
                 time_label.setStyleSheet(
                     "QLabel { font-size: 8pt; font-weight: 700;"
                     "  color: #111827; background: transparent; }")
@@ -3845,6 +3862,7 @@ class SchedulerApp(QMainWindow):
                     get_effective_room_resource_for_class(
                         selected_cls, room_override=room)
                     if selected_cls is not None and not room else (room or ""))
+                room_label.setTextFormat(Qt.TextFormat.PlainText)
                 room_label.setStyleSheet(
                     "QLabel { font-size: 7.5pt; color: %s;"
                     "  background: transparent; }" % OPEN_SLOTS_FG_ROOM)
