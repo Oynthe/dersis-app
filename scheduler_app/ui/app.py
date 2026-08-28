@@ -41,7 +41,14 @@ from scheduler_app.constants import (
     MATRIX_BORDER, MATRIX_DAY_BG, MATRIX_DAY_FG, MATRIX_BRANCH_BG,
     MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CELL_FG,
     MATRIX_CORNER_BG, OPEN_SLOTS_FG_ROOM,
+    CELL_FG_CODE, CELL_FG_NAME, CELL_FG_LECTURER, CELL_FG_ROOM, CELL_FG_BRANCH,
 )
+from scheduler_app.ui.badge_formatter import get_badge
+
+
+def _x(color):
+    """openpyxl wants a bare hex; the palette is stored web-style with '#'."""
+    return color.lstrip("#")
 from scheduler_app.translations import tr, get_language, set_language, is_rtl
 from scheduler_app.core.text_safety import csv_safe
 from scheduler_app.ui.day_keys import (
@@ -4731,43 +4738,42 @@ class SchedulerApp(QMainWindow):
         center_nowrap = Alignment(horizontal="center", vertical="center")
 
         def _append_rich_cell_blocks(blocks, cls, include_room=False, include_targets=False):
-            """Append rich text fragments for one class into *blocks*."""
+            """Append rich text fragments for one class into *blocks*.
+
+            ST-ARCH-003 / ST-UI-005. These colours used to be literals here, and
+            because this writer is the one the Excel menu actually reaches --
+            ``data_io/exporter.py``'s Excel path has no production caller -- the
+            Phase 5 contrast fix never reached the workbook a school prints.
+            Measured on the exported file: room 1.55:1, class code 3.15:1,
+            lecturer 3.56:1, branch 3.34:1, against a 4.5:1 requirement, while
+            the screen and the PDF were correct. They now come from the same
+            source those two already use.
+            """
             code = cls.get("class_code", "")
             if code:
                 blocks.append(TextBlock(
-                    InlineFont(b=True, sz=9, color="1D4ED8"), code + "\n"))
+                    InlineFont(b=True, sz=9, color=_x(CELL_FG_CODE)), code + "\n"))
             blocks.append(TextBlock(
-                InlineFont(b=True, sz=10, color="1E293B"), cls["name"] + "\n"))
+                InlineFont(b=True, sz=10, color=_x(CELL_FG_NAME)), cls["name"] + "\n"))
             if cls.get("lecturer"):
                 blocks.append(TextBlock(
-                    InlineFont(sz=9, color="475569"), cls["lecturer"]))
+                    InlineFont(sz=9, color=_x(CELL_FG_LECTURER)), cls["lecturer"]))
             if include_room:
                 room = classroom_of(cls)
                 if room:
                     blocks.append(TextBlock(
-                        InlineFont(sz=9, color="16A34A"), "\n" + room))
+                        InlineFont(sz=9, color=_x(CELL_FG_ROOM)), "\n" + room))
             if include_targets:
                 groups = ", ".join(f"{t['year']}/{t['branch']}" for t in cls.get("targets", []))
                 if groups:
                     blocks.append(TextBlock(
-                        InlineFont(sz=8, color="6D28D9"), "\n" + groups))
-            # Protection badge
-            badge_text, badge_color = "", ""
-            if cls.get("pinned"):
-                badge_text, badge_color = "\U0001F4CC " + tr("badges.pinned"), "DC2626"
-            else:
-                prot = cls.get("protection", "none")
-                if prot == "locked":
-                    badge_text, badge_color = "\U0001F512 " + tr("badges.locked"), "DC2626"
-                elif prot == "soft":
-                    badge_text, badge_color = "\U0001F6E1 " + tr("badges.protected"), "D97706"
-                elif prot == "same_day":
-                    badge_text, badge_color = "\u2194 " + tr("badges.same_day"), "2563EB"
-                elif prot == "improve_only":
-                    badge_text, badge_color = "\u2191 " + tr("badges.improve_only"), "7C3AED"
-            if badge_text:
+                        InlineFont(sz=8, color=_x(CELL_FG_BRANCH)), "\n" + groups))
+            # Protection badge -- one source, shared with the screen and the PDF.
+            emoji, label, badge_color = get_badge(cls)
+            if emoji and label:
                 blocks.append(TextBlock(
-                    InlineFont(b=True, sz=8, color=badge_color), "\n" + badge_text))
+                    InlineFont(b=True, sz=8, color=_x(badge_color)),
+                    "\n" + emoji + " " + label))
             return blocks
 
         def _build_rich_cell(cls, include_room=False, include_targets=False):
