@@ -847,7 +847,16 @@ def _export_excel(schedule, filepath, mode="everything"):
 # CSV export
 
 def _export_csv(schedule: FinalSchedule, filepath: str):
-    """Export to a flat CSV file."""
+    """Export to a flat CSV file.
+
+    Scope note, measured in Phase 7: ``export_schedule(..., "csv", ...)`` has
+    **no production caller**. The CSV a user gets comes from
+    ``ui/app.py::export_csv``, a separate writer emitting a different product
+    (a class list, not a timetable), wired to the menu at ``ui/app.py:1000``.
+    ST-FUNC-006's user-facing pin therefore lives against *that* function; this
+    one is fixed to match so the two writers cannot drift again, and so that
+    wiring this entry point up later does not reintroduce the defect.
+    """
     grid = schedule.build_grid()
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -871,24 +880,99 @@ def _export_csv(schedule: FinalSchedule, filepath: str):
                 # rather than dropping it (ST-DATA-003).
                 cells = [(effective_day(cls), effective_time(cls))]
             for day, slot in cells:
+                # ST-FUNC-006: the header row is Turkish, so the day column
+                # must be too. display_day rather than tr("weekdays.<key>") so
+                # a day the grid no longer defines prints its stored value
+                # instead of the lookup key.
+                day_text = display_day(day)
                 targets = cls.get("targets", [])
                 if targets:
                     for t in targets:
                         writer.writerow([
-                            day, csv_safe(slot), csv_safe(code),
+                            day_text, csv_safe(slot), csv_safe(code),
                             csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
                             csv_safe(room), csv_safe(t["year"]),
                             csv_safe(t["branch"]),
                         ])
                 else:
                     writer.writerow([
-                        day, csv_safe(slot), csv_safe(code),
+                        day_text, csv_safe(slot), csv_safe(code),
                         csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
                         csv_safe(room), "", "",
                     ])
 
 
 # ── PDF export (optional) ───────────────────────────────────────────────────
+
+# ST-FUNC-004. Helvetica is a base-14 Type1 font limited to WinAnsi, so six of
+# the twelve Turkish letters -- ğ Ğ ş Ş ı İ -- have no codepoint in it. (ö ü ç
+# Ö Ü Ç do, and always drew correctly; the register's "every Turkish-specific
+# letter" was wrong about that.) What reportlab does with the other six is
+# worse than the missing-glyph box the register described: it splits the
+# paragraph at each unmappable codepoint and switches to ZapfDingbats, whose
+# ASCII `n` is a filled block. So "Şükrü Işık Öğretmen" printed as a name with
+# solid blobs in it, and -- because the substitution also rewrites the text
+# layer -- Ctrl-F for "Öğretmen" found nothing and copy-paste yielded
+# "Önretmen". A school archiving its timetables could not search them by
+# teacher name.
+#
+# The fix embeds a TrueType font instead. Nothing is bundled: reportlab ships
+# Bitstream Vera inside its own wheel (283 glyphs, missing none of the twelve),
+# under a permissive licence it already redistributes, and build_nuitka.bat:118
+# already carries --include-package-data=reportlab. Installer delta: 0 bytes.
+# Per-document delta: +40 KB for the embedded subset, measured.
+_PDF_FALLBACK_FONTS = ("Helvetica", "Helvetica-Bold")
+_PDF_UNICODE_FONTS = ("DersisSans", "DersisSans-Bold")
+
+# pdfmetrics keeps a module-global registry, so registration is once per
+# process rather than once per canvas -- measured: a second export in the same
+# process is byte-identical without re-registering. None means "not yet tried".
+_pdf_font_names: "tuple[str, str] | None" = None
+
+
+def _register_unicode_fonts() -> "tuple[str, str]":
+    """Register a Turkish-capable TrueType family; return ``(regular, bold)``.
+
+    Degrades to Helvetica rather than raising. That guard is not theoretical:
+    ``requirements-lock.txt`` pins ``reportlab==4.4.10`` while the audit venv
+    actually runs 5.0.1, and ``Dersis-mac.spec`` does not collect reportlab's
+    package data at all -- so a build where ``fonts/Vera.ttf`` is absent is a
+    real possibility, and it must cost the user unreadable letters, not a
+    failed export.
+    """
+    global _pdf_font_names
+    if _pdf_font_names is not None:
+        return _pdf_font_names
+
+    _pdf_font_names = _PDF_FALLBACK_FONTS
+    try:
+        import reportlab
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        return _pdf_font_names
+
+    font_dir = os.path.join(os.path.dirname(reportlab.__file__), "fonts")
+    regular_path = os.path.join(font_dir, "Vera.ttf")
+    bold_path = os.path.join(font_dir, "VeraBd.ttf")
+    if not (os.path.exists(regular_path) and os.path.exists(bold_path)):
+        return _pdf_font_names
+
+    regular, bold = _PDF_UNICODE_FONTS
+    try:
+        pdfmetrics.registerFont(TTFont(regular, regular_path))
+        pdfmetrics.registerFont(TTFont(bold, bold_path))
+        # The cell markup uses <b>, which reportlab resolves through the family
+        # map -- without this the bold runs fall back to Helvetica-Bold and the
+        # six letters break again inside every class name.
+        pdfmetrics.registerFontFamily(
+            regular, normal=regular, bold=bold,
+            italic=regular, boldItalic=bold)
+    except Exception:
+        return _pdf_font_names
+
+    _pdf_font_names = (regular, bold)
+    return _pdf_font_names
 
 
 def _pdf_rich_markup(cls, include_room=False, include_targets=False):
@@ -944,6 +1028,31 @@ def _pdf_rich_paragraph(cls, cell_style, include_room=False, include_targets=Fal
         cell_style)
 
 
+def _note_cell_height(tall_rows, para, content_w, first_row, span, min_row_h):
+    """Grow *tall_rows* so ``para`` fits the rows it is drawn across.
+
+    ``rowHeights`` is fixed, and reportlab does not grow a fixed row to fit its
+    content -- it overprints the neighbours. The contested-cell branch already
+    measured itself for that reason; the ordinary occupied cell did not, and
+    measurement says it should have: at 7pt in the everything layout's narrow
+    columns, "Öğrenci Değerlendirme ve Ölçme Çalıştayı / Şükrü Işık Öğretmen /
+    A-101" needs 51pt against MIN_ROW_H's 50 under Helvetica and 60pt under the
+    embedded TrueType face (ST-FUNC-004 widens the glyphs). The lecturer layout
+    needs 51pt for even a one-word lesson, because it prints the group line
+    too. So the printed timetable has been overprinting the hour above and
+    below it all along, and the font fix would have made that worse silently.
+
+    A cell merged across *span* rows is drawn in the sum of their heights, so
+    the requirement is divided rather than applied to each row.
+    """
+    span = max(span, 1)
+    _w, _h = para.wrap(content_w, 1e6)
+    per_row = (_h + 6) / span
+    for off in range(span):
+        tall_rows[first_row + off] = max(
+            tall_rows.get(first_row + off, min_row_h), per_row)
+
+
 def _pdf_conflict_paragraph(classes, cell_style, conflicted,
                             include_room=False, include_targets=False):
     """One Paragraph holding every class that claims a contested PDF cell.
@@ -993,6 +1102,12 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     placed = schedule.placed_classes()
     days = schedule.days
     slots = schedule.slots
+    # ST-FUNC-013: every table builder records the lessons it actually put on a
+    # page here, so the appendix can name the ones no page had room for. Same
+    # mechanism the workbook's _write_unplaceable_sheet already uses, and it is
+    # a report on the built document rather than a second guess at the filter
+    # rules -- so a lesson lost for a reason nobody predicted still surfaces.
+    drawn: set = set()
     # ST-UI-001: one scan for the whole document, so every page marks the
     # same clashes and the printout agrees with the screen.
     conflicts = find_schedule_conflicts(state)
@@ -1007,29 +1122,33 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     avail_w = page_size[0] - 16 * mm
 
     # ── Paragraph styles ──────────────────────────────────────────────
+    # ST-FUNC-004: every style names the registered family, never Helvetica.
+    # A style left on Helvetica would still substitute ZapfDingbats for ğ ş ı,
+    # and the day-header row is exactly where "Çarşamba" lives.
+    FONT_REGULAR, FONT_BOLD = _register_unicode_fonts()
     cell_style = ParagraphStyle(
         "CellContent", fontSize=7, leading=9,
-        alignment=TA_CENTER, fontName="Helvetica",
+        alignment=TA_CENTER, fontName=FONT_REGULAR,
     )
     hdr_style = ParagraphStyle(
         "HdrContent", fontSize=9, leading=11, alignment=TA_CENTER,
-        textColor=rl_colors.white, fontName="Helvetica-Bold",
+        textColor=rl_colors.white, fontName=FONT_BOLD,
     )
     branch_hdr_style = ParagraphStyle(
         "BranchHdr", fontSize=8, leading=10, alignment=TA_CENTER,
-        textColor=rl_colors.white, fontName="Helvetica-Bold",
+        textColor=rl_colors.white, fontName=FONT_BOLD,
     )
     time_style = ParagraphStyle(
         "TimeContent", fontSize=8, leading=10, alignment=TA_CENTER,
-        textColor=rl_colors.white, fontName="Helvetica-Bold",
+        textColor=rl_colors.white, fontName=FONT_BOLD,
     )
     session_style = ParagraphStyle(
         "SessionNum", fontSize=8, leading=10, alignment=TA_CENTER,
-        textColor=rl_colors.HexColor("#333333"), fontName="Helvetica-Bold",
+        textColor=rl_colors.HexColor("#333333"), fontName=FONT_BOLD,
     )
     title_style = ParagraphStyle(
         "PageTitle", fontSize=11, leading=14, alignment=TA_CENTER,
-        fontName="Helvetica-Bold", textColor=rl_colors.HexColor("#1E293B"),
+        fontName=FONT_BOLD, textColor=rl_colors.HexColor("#1E293B"),
         spaceAfter=4 * mm,
     )
 
@@ -1093,6 +1212,8 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             for off in range(span):
                 claims.setdefault((start_si + off, c_day), []).append(entry)
 
+        drawn.update(cls_key(e["cls"]) for e in entries)
+
         overlapping = {id(e["cls"]) for cells in claims.values()
                        if len(cells) > 1 for e in cells}
 
@@ -1140,10 +1261,13 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                 key = (si, day)
                 if key in occupied_start:
                     cls, span = occupied_start[key]
-                    row.append(_pdf_rich_paragraph(
+                    para = _pdf_rich_paragraph(
                         cls, cell_style,
                         include_room=include_room,
-                        include_targets=include_targets))
+                        include_targets=include_targets)
+                    row.append(para)
+                    _note_cell_height(tall_rows, para, day_w - 4,
+                                      data_row_idx, span, MIN_ROW_H)
                     yr_name = cls["targets"][0]["year"] if cls.get("targets") else ""
                     base = get_year_color(state, yr_name)
                     light = lighten_color(base, 0.45)
@@ -1225,6 +1349,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             (block["row"], block["subcolumn"]): block
             for block in layout["blocks"]
         }
+        drawn.update(cls_key(block["cls"]) for block in layout["blocks"])
         covered = set(layout["occupied_subcolumns"])
 
         table_data = [header]
@@ -1246,6 +1371,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
         cell_bg_cmds = []
         row_heights = [24]
+        tall_rows = {}
         for si, slot in enumerate(slots):
             data_row_idx = si + 1
             row = [Paragraph(escape_pdf_markup(slot), time_style)]
@@ -1259,9 +1385,12 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                     block = starts[key]
                     cls = block["cls"]
                     span = block["span"]
-                    row.append(_pdf_rich_paragraph(
+                    para = _pdf_rich_paragraph(
                         cls, cell_style,
-                        include_room=False, include_targets=True))
+                        include_room=False, include_targets=True)
+                    row.append(para)
+                    _note_cell_height(tall_rows, para, data_w - 4,
+                                      data_row_idx, span, MIN_ROW_H)
                     yr_name = cls["targets"][0]["year"] if cls.get("targets") else ""
                     base = get_year_color(state, yr_name)
                     light = lighten_color(base, 0.45)
@@ -1287,6 +1416,9 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                          (col_idx, data_row_idx), COL_EMPTY))
             table_data.append(row)
             row_heights.append(MIN_ROW_H)
+
+        for _ri, _h in tall_rows.items():
+            row_heights[_ri] = _h
 
         style_cmds.extend(cell_bg_cmds)
         tbl = Table(table_data, colWidths=col_widths, rowHeights=row_heights,
@@ -1393,6 +1525,8 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                     if all(x is not entry for x in bucket):
                         bucket.append(entry)
 
+        drawn.update(cls_key(e["cls"]) for e in entries)
+
         overlapping = {id(e) for cells in claims.values() if len(cells) > 1
                        for e in cells}
         occupied = {}
@@ -1452,9 +1586,12 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                         if kind == "span":
                             row.append("")
                             continue
-                        row.append(_pdf_rich_paragraph(
+                        para = _pdf_rich_paragraph(
                             cls, cell_style,
-                            include_room=True, include_targets=False))
+                            include_room=True, include_targets=False)
+                        row.append(para)
+                        _note_cell_height(tall_rows, para, data_col_w - 4,
+                                          data_row, span, MIN_ROW_H)
                         yr_hex = get_year_color(state, yr).lstrip("#")
                         light_hex = lighten_color(f"#{yr_hex}", 0.45)
                         bg = rl_colors.HexColor(light_hex)
@@ -1551,11 +1688,19 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
     # ── Appendix: everything the grid could not say ───────────────────
     #
-    # ST-FUNC-013 + ST-UI-001. Two different ways a lesson goes missing from a
-    # printed timetable, one page:
+    # ST-FUNC-013 + ST-UI-001. Three different ways a lesson goes missing from
+    # a printed timetable, one page:
     #
     #   * a placement on a day or hour the user has since deleted has no cell
     #     to be drawn in, so every grid-shaped page simply omits it;
+    #   * a lesson no page had a column for -- the everything and group layouts
+    #     are built by filtering each class's `targets`, so a lesson whose
+    #     targets list is empty matches no page. That is not exotic:
+    #     new_class() initializes targets to [] (core/models.py:578) and
+    #     neither class-editor path requires one (ui/dialogs.py:3694, :3915),
+    #     so it is the default state of every lesson placed before its groups
+    #     were ticked. classroom and lecturer filter on room and teacher and
+    #     kept it, which is why only two of the four layouts lost it;
     #   * a double-booking is now stacked into its cell rather than dropped,
     #     but a stacked cell is easy to miss on a dense page.
     #
@@ -1568,7 +1713,26 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     # would make `elements` non-empty and silently delete the "no schedule
     # data" page that the empty-export test pins.
     appendix_rows = []
-    for cls, _reason in find_off_grid_placements(state):
+    off_grid = list(find_off_grid_placements(state))
+    off_grid_keys = {cls_key(cls) for cls, _reason in off_grid}
+    for cls, _reason in off_grid:
+        appendix_rows.append((
+            tr("export.appendix_offgrid"),
+            cls.get("class_code", ""),
+            cls.get("name", ""),
+            cls.get("lecturer", ""),
+            f"{display_day(effective_day(cls))} {effective_time(cls) or ''}",
+        ))
+    # The same heading, deliberately: "not on the timetable" is literally what
+    # happened to these too, the string is already translated in all 22
+    # locales, and _write_unplaceable_sheet reuses it for the workbook's
+    # version of this list for the same reason. Minting a key here would move
+    # the ST-UI-011 ratchet by 21 pairs for a phrase a reader cannot
+    # distinguish from the one above.
+    for cls in placed:
+        key = cls_key(cls)
+        if key in drawn or key in off_grid_keys:
+            continue
         appendix_rows.append((
             tr("export.appendix_offgrid"),
             cls.get("class_code", ""),
