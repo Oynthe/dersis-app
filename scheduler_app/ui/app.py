@@ -4823,41 +4823,6 @@ class SchedulerApp(QMainWindow):
         self._clear_empty_slot_selection()
         self._apply_class_selection(items, anchor=items[0])
 
-    def _select_all(self):
-        focus = QApplication.focusWidget()
-        if hasattr(self, "unplaced_list"):
-            ul = self.unplaced_list
-            ul_focused = (
-                focus is ul
-                or (focus is not None and ul.isAncestorOf(focus))
-                or ul.hasFocus()
-                or ul.viewport().hasFocus()
-                or ul.underMouse()
-                or ul.viewport().underMouse()
-            )
-            if ul_focused:
-                ul.selectAll()
-                return
-
-        if hasattr(self, "_open_slots_scroll"):
-            ost = self._open_slots_scroll
-            ost_focused = (
-                focus is ost
-                or (focus is not None and ost.isAncestorOf(focus))
-                or ost.hasFocus()
-                or ost.underMouse()
-            )
-            if ost_focused:
-                return
-
-        tab_idx = self.notebook.currentIndex() if hasattr(self, "notebook") else -1
-        if tab_idx in (0, 1, 2, 3):
-            view = [self.grid_view1, self.grid_view2, self.grid_view3, self.grid_view4][tab_idx]
-            self._select_all_in_view(view)
-            return
-        self._selected_class = None
-
-
     def _copy_to_clipboard(self):
         s = self.state_data
         if not s["days"] or not s["slots"]:

@@ -41,16 +41,6 @@ def get_location_label(location_type):
     return tr(key)
 
 
-def get_location_labels():
-    """Return translated location labels keyed by location type."""
-    return {lt: get_location_label(lt) for lt in LOCATION_TYPES}
-
-
-def get_virtual_location_labels():
-    """Return translated virtual resource labels in stable display order."""
-    return [get_location_label(lt) for lt in VIRTUAL_LOCATION_TYPES]
-
-
 def parse_location_type_label(value):
     """Parse a raw or translated location-type label into a stable key."""
     text = str(value or "").strip()
@@ -91,11 +81,6 @@ def class_uses_physical_room(cls):
 
 def needs_physical_room(cls):
     """Backward-compatible alias for class_uses_physical_room()."""
-    return class_uses_physical_room(cls)
-
-
-def should_show_physical_classroom(cls):
-    """Return True when physical classroom fields should be visible/active."""
     return class_uses_physical_room(cls)
 
 
@@ -610,15 +595,6 @@ def cls_key(cls):
         uid = str(uuid.uuid4())
         cls["class_uid"] = uid
     return uid
-
-
-def ensure_class_uid(cls):
-    """Assign a class_uid if the class dict doesn't already have one.
-
-    Used for migration of legacy data that predates the class_uid field.
-    """
-    if not cls.get("class_uid"):
-        cls["class_uid"] = str(uuid.uuid4())
 
 
 _EDITABLE_CLASS_FIELDS = (
