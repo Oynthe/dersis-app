@@ -14,13 +14,437 @@ what has changed since. Per-finding state also lives in the
 | **4 — Core workflow UX** | ✅ Complete | `fix/phase-4-workflow-ux` |
 | **5 — UI consistency & accessibility** | 🟡 Mostly complete | `fix/phase-5-consistency` |
 | **6 — Architecture & maintainability** | 🟡 Mostly complete | `fix/phase-6-architecture` |
-| 7 | Not started | — |
+| **7 — Testing, observability & release** | 🟢 Complete | `fix/phase-7-release` |
+
+---
+
+## Phase 7 — complete
+
+**Suite: 1026 tests — 1018 pass, 8 known-defect pins, 0 failures.** Both lanes
+exit 0. (725 at the start of the phase: **+301 tests, and 7 pins deleted**; two
+were added that document newly-measured open defects.) `mypy` is clean over the
+six Qt-free packages. **All four layering ratchets are now `0`.**
+
+All seven roadmap rows are done, all four Phase 6 carry-overs are resolved, and
+**seven of the thirteen `xfail` pins the roadmap never scheduled are closed by
+fixing the defect** (ST-FUNC-004, 006, 010, 011, 012, and both ST-FUNC-013
+cases). One more was **retired** because its reason string described code
+ST-PERF-005 had already deleted. Three new pins were added, each documenting a
+defect this phase measured and did not fix: 13 → 8.
+
+**An adversarial round then attacked everything this phase landed**, and every
+candidate was independently reproduced or refuted by a second agent that
+defaulted to REFUTED: **20 CONFIRMED, 9 PARTLY, 1 REFUTED**. All 29 are fixed or
+narrowed. Two of the worst were introduced by this phase's own work, including
+its headline fix — see "What the adversarial round caught" below.
+
+### The headline is a data loss on the upgrade path
+
+**Opening the new build for the first time destroyed the user's entire
+schedule.** Not in the register, not in the roadmap, found by asking which of
+the "top-10 untested behaviours" were genuinely untested.
+
+`run_language_gate()` writes `settings/app_settings.egu` to record the chosen
+language. `storage.migrate_legacy_files()` was called only from
+`SchedulerApp.__init__`, i.e. *after* it. And `_migrate_json_file`
+(`storage.py:677-679`) is:
+
+```python
+if os.path.exists(dest_sav):
+    _backup_original(src)   # move the user's file out of the way
+    return False            # ...and do not migrate it
+```
+
+Measured on a simulated frozen install:
+
+| order | classes recovered | language |
+|---|---|---|
+| language gate first (**shipped**) | `[]` | `tr` → `en` |
+| migration first (counterfactual) | `['LEGACY-LESSON']` | `tr` |
+
+So a user upgrading from the pre-DERSİS build picked a language and landed on an
+empty timetable, with their whole schedule sitting in
+`backups/scheduler_config.json` and nothing in the UI saying so. Their saved
+language was lost too. `grep migrate_legacy_files tests/` returned **zero**
+matches: `scheduler_gui.py` is imported by no test, which is why seven phases
+never saw it.
+
+Half of this had already been fixed by accident — ST-DATA-012 moved the
+single-instance lock ahead of the gate, and the lock calls `ensure_dirs()`, so
+the *folder* copy was carried over. Only the *file* migration was left behind.
+The register's stated reason for the finding ("the language gate creates dirs
+before `ensure_dirs`") describes the half that was already closed.
+
+### Findings closed
+
+| ID | Sev | What changed |
+|---|---|---|
+| **ST-ARCH-001** | 🔴 Critical | **Closed.** The upgrade data loss above; the three genuinely-untested top-10 behaviours now pinned; drag-and-drop tested for the first time. |
+| [ST-FUNC-004](12-findings-register.md) | 🟠 High | The printed timetable spells Turkish names. Six letters, not "every Turkish letter" — and the failure was a falsified text layer, not a box. |
+| [ST-FUNC-006](12-findings-register.md) | 🟡 Medium | The **live** CSV writer is UTF-8 and localizes its day column. The pinned one had no production caller. |
+| [ST-FUNC-011](12-findings-register.md) | 🟡 Medium | An unrecognized workbook is no longer announced as a successful import. |
+| [ST-FUNC-012](12-findings-register.md) | 🟡 Medium | Duplicate lecturer names are reported, case-insensitively. |
+| [ST-FUNC-013](12-findings-register.md) | 🟢 Low | The PDF names the lessons it could not draw instead of dropping them. |
+| [ST-SEC-001](12-findings-register.md) | 🟠 High | No workflow publishes a release from a branch push. `build-release.yml` deleted. |
+| [ST-SEC-002](12-findings-register.md) | 🟡 Medium | The README says what the storage actually protects. |
+| [ST-SEC-003](12-findings-register.md) | 🟡 Medium | The installer no longer makes the program directory world-writable. |
+| [ST-SEC-004](12-findings-register.md) | 🟡 Medium | Every build-time download is pinned and hash-gated. **This one had already fired.** |
+| [ST-SEC-005](12-findings-register.md) | 🟡 Medium | A missing dependency is reported, not installed over the network. |
+| [ST-SEC-006](12-findings-register.md) | 🟢 Low | No credential crosses the CDN redirect; an unverifiable download is a hard failure. |
+| [ST-SEC-007](12-findings-register.md) | 🟢 Low | The AppId is pinned with the reason it must never change. |
+| [ST-SEC-008](12-findings-register.md) | 🟢 Low | The Windows account name stays on the machine when a bug report is sent. |
+| [ST-ARCH-009](12-findings-register.md) | 🟡 Medium | **Reopened and re-closed.** The macOS bundle collected 13 of 58 modules. |
+| [ST-ARCH-010](12-findings-register.md) | 🟡 Medium | **Closed outright.** The 15-module knot is gone; every layering ratchet is `0`. |
+| [ST-ARCH-011](12-findings-register.md) | 🟡 Medium | Three calls to functions that exist nowhere, deleted and guarded. |
+| [ST-PERF-001](12-findings-register.md) | 🔴 Critical | Regression-guarded: a work-count ratchet, and CI now runs the solver gates written for it. |
+| [ST-UI-013](12-findings-register.md) | 🟡 Medium | **Closed.** The window opens the size of the screen; the sidebar yields to the grid. |
+| [ST-DATA-002](12-findings-register.md) | 🟡 Medium | Partly — the append half was **already fixed**; the pin was describing deleted code. |
+
+### Where the register was not enough
+
+As in Phases 1–6, each was proved by building the naive version and watching it
+fail, or by measuring rather than assuming.
+
+1. **ST-SEC-004 was not hypothetical — it had already fired, and it had been
+   breaking every release build for two days.**
+   `https://jrsoftware.org/download.php/is.exe` now serves an HTML page
+   (302 → `/isdl.php`, `text/html`, 10 478 bytes).
+   `Invoke-WebRequest -OutFile` writes it into `innosetup.exe` and **exits 0**;
+   `Start-Process` then dies *"The file or directory is corrupted and
+   unreadable."* — verbatim the failure of build-release runs 11 and 13–16. Had
+   the served bytes been a working `.exe` it would have been installed with
+   `/VERYSILENT` and used to compile the installer users download, with no hash,
+   no signature and no log line. An unverified download had already been
+   silently substituted; it was benign only by luck.
+2. **"Switch to `release.yml`, it already does the right thing" ships nothing.**
+   `release.yml` has **20 runs, every one a startup failure, zero jobs ever
+   executed** — and it carries the identical broken Inno step. The YAML parse
+   error was fixed in June, but it still cannot be reached: `build-release.yml`
+   creates its tag with `secrets.GITHUB_TOKEN`, and GitHub suppresses workflow
+   triggering from GITHUB_TOKEN events. Proof: three `v*` tags exist and
+   `build-installer.yml` (`on.push.tags: v*`, present before all three) has **0
+   runs, ever**.
+3. **A tag gate would have gated on nothing.** `ci.yml` did not trigger on tags,
+   so a tag push ran **zero tests** — and `ci.yml`'s own "Verify tag matches
+   VERSION (on tag push)" step, guarded by `startsWith(github.ref,
+   'refs/tags/v')`, was unreachable dead code.
+4. **The macOS bundle could never open its main window.** `scheduler_gui.py`
+   imports through the `sys.meta_path` shim (`scheduler_app.app`, `.first_run`,
+   `.translations` are aliases with no file on disk), and `Dersis-mac.spec`
+   declared no hiddenimports. Measured with PyInstaller's own modulegraph:
+   **13 of 58 modules collected, 45 dropped, 0 warnings emitted.** The READMEs
+   advertised those `.dmg` downloads. (No release has ever carried one, which is
+   the only reason nobody hit it.)
+5. **ST-FUNC-006 is ST-FUNC-005 repeating one format later.** The pinned test
+   drives `exporter.py::_export_csv`, which **has no production caller** — the
+   CSV a user gets comes from `ui/app.py::export_csv`. The dead copy already
+   wrote `encoding="utf-8"`; the live one had no `encoding=` at all, so it wrote
+   cp1254 and raised `UnicodeEncodeError` on a cp1252 machine. The suite's
+   *passing* "CSV is UTF-8" guard was also guarding the dead writer.
+6. **ST-FUNC-004 is six letters, not "every Turkish letter", and the failure is
+   worse than a box.** `öüçÖÜÇ` are WinAnsi and render correctly; only
+   `ğĞşŞıİ` break. reportlab does not draw tofu — it splits the paragraph at
+   each unmappable codepoint and switches to **ZapfDingbats**, drawing the ASCII
+   letter `n`, which paints as a solid block. So the page looks redacted rather
+   than broken, and the **text layer is falsified**: Ctrl-F for "Öğretmen" finds
+   nothing and copy-paste yields `Önretmen`.
+7. **And the recommended fix was unnecessary work.** "Bundle a Unicode TTF (e.g.
+   DejaVu)" would add ~700 KB, a new asset directory, an `installer.iss` entry
+   and a `build_nuitka.bat` line — to duplicate `Vera.ttf`, which **reportlab
+   already ships** (283 glyphs, missing none of the twelve Turkish letters) and
+   which `--include-package-data=reportlab` already collects. Installer delta:
+   **0 bytes**.
+8. **ST-SEC-005's stated premise is false.** "It can't work in the frozen build"
+   — `build_embed.bat` installs pip via `get-pip.py`, uncomments `import site`
+   in `python._pth`, and *gates the build* on `python.exe -m pip install -r
+   requirements-lock.txt`. Measured from a windowless pythonw with NULL std
+   handles: `check_call([exe,"-m","pip","install","--no-index","reportlab"])` →
+   **exit 0**. Where it *is* true is Nuitka/PyInstaller, for a reason the finding
+   never states: `sys.executable` is the app binary, so "install" silently
+   **relaunches DERSİS** and blocks until the user closes the second window.
+9. **ST-SEC-002's defect is a heading, not a sentence.** A 22-locale scan found
+   **zero** strings promising confidentiality. Every factual claim is true —
+   AES-256-GCM, unique salt and nonce per file, SHA-256 integrity. The encryption
+   bullet simply sits under a section titled *privacy*, beside "no network
+   calls". Cost: **12 lines in 4 Markdown files**, not the register's Effort L
+   across 22 locales; `translations.py` needed **zero** edits. And the suite had
+   been asserting the false version for six phases — a docstring told the reader
+   a green test meant the data was not "readable by anyone with access to the
+   Documents folder", which a ten-line probe disproves while that test passes.
+10. **DPAPI was rejected on measurement, not preference.** It buys nothing on a
+    shared Windows login (one profile = one principal) and near-nothing on
+    separate logins, while creating a **new permanent data-loss mode**: the naive
+    wrapper broke 3 of 42 storage tests because a 282-byte DPAPI blob trips
+    `storage.py:218`'s `len(key) == 32` and reports ST-DATA-001's "your saved
+    timetables cannot be opened". A user resetting their Windows profile would
+    lose every save.
+11. **ST-SEC-003's escalation needs a case the finding does not state.**
+    `PrivilegesRequired=lowest` means Setup never runs elevated "even if it was
+    started by a member of the Administrators group", so `{autopf}` is **never**
+    Program Files. The real default-install exposure is different and still real:
+    `%LOCALAPPDATA%\Programs\Dersis` inherits SYSTEM/Administrators/owner and
+    **no** `BUILTIN\Users`, and the Inno grant adds it. All three candidate
+    justifications for `users-modify` measured **false** — `build_embed.bat`
+    deletes every `.py` and ships sourceless `.pyc`, and a write-denied directory
+    imports fine (`rc=0`, zero files written; CPython swallows the bytecode
+    `OSError`).
+12. **ST-SEC-007's implied fix is itself the bug.** Inno keys upgrade *and*
+    uninstall detection on AppId. `Dersis_Setup_v1.0.0.exe` has 106 downloads; a
+    new GUID makes every existing install invisible to the new setup — two
+    Add/Remove entries, and uninstalling either deletes the other's files.
+13. **Phase 6's own ST-UI-013 headline is wrong.** It recorded the sidebar's
+    `minimumSizeHint` as locale-dependent, 140–253 px, "never the 301 on record".
+    Read off the live widget it is **tr = 301 exactly** — the register's original
+    number. Phase 6 summed regular-weight text advances; the real hint is
+    `12 + minSizeHint(button) + 4 + minSizeHint(button)` and both buttons are
+    bold, padded and emoji-prefixed. The locale-dependent number that actually
+    bites is the **tab bar** (ko 913 … tr 1148 … ru 1214 … id 1232).
+14. **ST-UI-013 is not about small screens.** The app's own default window —
+    1150×720, never saved and never restored — draws an 841×607 timetable into a
+    769×457 viewport. **Both scrollbars, every launch, every machine.** It clears
+    the Turkish tab bar by exactly 0 px and fails `id`, `pl` and `ru` outright.
+15. **The translation ratchet had zero slack, and the measurement that said
+    otherwise was taken with a broken instrument — this one.** Mid-phase, two
+    agents disagreed: one reported the backlog at its 2508 ceiling, another at
+    1660. The disagreement was settled by re-measuring, and the re-measurement
+    was wrong: it read `TRANSLATIONS` **without importing
+    `scheduler_app.i18n.tier_translations`**, which merges **52 further `en`
+    keys** into the catalogue on import. `test_translation_coverage.py` imports
+    it; a count that does not is taken against a half-built catalogue.
+
+    | counted | `en` keys | missing pairs |
+    |---|---|---|
+    | without the tier import | 1022 | 1700 |
+    | **as the test counts it** | **1074** | **2548** |
+
+    So the ceiling was exact and the "848 pairs of headroom" figure — which then
+    propagated into two agent briefings — never existed. Two independent fix
+    agents caught it within the same hour, each while adding a key. The house
+    rule is *verify the evidence, not just the claim*; the corollary this phase
+    adds is that **re-measuring only helps if the instrument matches the one
+    that matters.** Here the authority is the test, not a REPL.
+16. **The "reuse `tests/scheduler_benchmark.py`" row does not survive contact.**
+    It has **0 asserts**, hard-codes `REPO = r"C:\dev\dersis-app"`, and appends
+    to a repo-tracked CSV; 28 of its 432 lines port. And a wall-clock gate is the
+    wrong instrument: 11 real `ubuntu-latest` runs spread 1.36–1.49×, and the
+    runner is **1.87× faster** than the audit box, so a locally-calibrated
+    threshold is ~1.9× wrong before variance is counted.
+17. **CI was not running 13 of the suite's 19 `slow` tests.** The engine job ran
+    only `test_scheduler_invariants.py`, so `test_greedy_bounds.py`'s placement
+    floors and both slow reproducibility pins — written for exactly this purpose
+    — executed in **no CI job at all**.
+18. **The god object cannot be fixed by extraction, and the number that matters
+    had never been measured.** Six plausible seams were built; **all six leave
+    the Maintainability Index at exactly 0.00**, because the complexity term
+    alone (−205.4) exceeds the formula's 171 constant. Meanwhile `ui/app.py` is
+    **47.7 %** covered, **79 of its 145 `SchedulerApp` methods never execute a
+    single statement**, and `SessionStore` — the seam the roadmap wanted
+    extracted — is the *best*-covered part at 86 %. Six phases of remediation
+    **raised** the file's complexity from 838 to 893.
+
+### Defects found in passing, none in the register
+
+- **Drag-and-drop had no test at all.** Replacing `_execute_drop`'s body with a
+  bare `return` left the entire suite — 859 passed — green. The one helper that
+  claimed to mirror it "phase for phase" cited a line range hundreds of lines
+  stale and omitted two of production's inputs, so it answered `valid=True`
+  where production says `valid=False`.
+- **Three calls to functions that exist nowhere.** `find_conflicting_classes`
+  (×2) and `_get_valid_slots` are called in `core/logic.py` and defined in no
+  file. Reachable only from `cascade_relocate` and `_unplaced_reason`, which
+  have no callers — so wiring any of it raises `NameError` on the first call.
+  This is the inverse of Phase 6's "dead code that should not be dead".
+- **A strict pin was describing deleted code.** `test_append_does_not_overwrite_a_corrupt_log`'s
+  reason string says `append_encrypted_entry` "rebuilds from the swallowed empty
+  list and overwrites the corrupt log, destroying history". ST-PERF-005 replaced
+  that with an O(1) append; measured, the damaged bytes survive verbatim as a
+  prefix. A strict pin whose reason is false is exactly how ST-FUNC-005 survived
+  six phases guarding a bug in code with no callers.
+- **Two ST-DATA-013 pins have no production producer.** `new_state()`,
+  `new_class()`, the default learned weights and every state dict are string-keyed
+  and finite, and the importer coerces every name through `_cell_text` — so an
+  Excel room literally named `42` arrives as `"42"`. True at the library level,
+  unobservable to any user.
+- **21 of 22 language switches sized the sidebar against the previous
+  language.** `setText` only *posts* a layout request; without `layout().activate()`
+  the new hint is not readable yet.
+- **`build_nuitka.bat` never shipped `VERSION`**, so `iscc` emitted
+  `Dersis_Setup_v0.0.0.exe`, and its `ERRORS` list printed "BUILD SUCCESSFUL!"
+  over a missing-asset report.
+- **A mutation harness reported a false negative.** Every workflow file is CRLF,
+  so 13 of 24 multi-line mutation patterns silently did not apply and the harness
+  measured an *unmutated* tree — concluding "your test pins nothing" when nothing
+  had happened. Phase 4 recorded the same class of failure with stale
+  `__pycache__`. **A mutation test that cannot see its own mutation manufactures
+  confidence.**
+- **`os.chmod(key.bin, 0o600)` is a no-op on Windows** — `st_mode` 0o100666
+  before and after, identical DACLs. Recorded, not fixed.
+- **`requirements-lock.txt` does not describe the environment the suite runs
+  in** — it pins `reportlab==4.4.10`; `.venv-audit` has 5.0.1.
+
+### What the adversarial round caught
+
+Eight agents attacked the landed work; every candidate was independently
+reproduced or refuted by a second agent that **defaulted to REFUTED**. 20
+CONFIRMED, 9 PARTLY, 1 REFUTED. The pattern from Phase 4 held: nothing here was
+visible from the suite being green.
+
+**Two of the three worst were introduced by this phase, and its own tests could
+not see either.**
+
+1. **The headline data-loss fix did not fire on the shipped build.** The
+   ordering fix was right; the *path* was not. `_old_app_config_path()` resolved
+   to `scheduler_app/storage/scheduler_config.json` — two directories below the
+   app directory its own docstring names. Reproduced unstubbed: `notes []`, no
+   settings written, legacy file still in place. The frozen branch was dead too:
+   `build_embed.bat` ships a C# wrapper launching `pythonw.exe`, so `sys.frozen`
+   is never set. **And the test passed because it stubbed the path** — a second
+   finding showed its language assertion also passed with the fix removed. Both
+   halves fixed; one assertion now calls the real unstubbed resolver.
+2. **A new `xfail(strict=True)` would have reddened the engine job on every
+   run.** It pinned `deterministic is True` as *failing*, on the premise that an
+   80-class solve cannot finish 5 restarts in 120 s. Measured: it XPASSes at
+   96.4 s with 20 % headroom, and CI is 1.87x faster. Worse, the verdict flips
+   on one machine within an hour — 96.4/103.6 s idle, 120.07/120.24 s loaded —
+   so it was non-deterministic on the author's own box. Its reason string also
+   named `core/logic.py` (the code had moved to `core/facade.py`) and cited
+   "11/11 CI runs" that could not have included it, since no CI job ran that
+   module and the test is `slow`. **This phase spent effort retiring a pin whose
+   reason described deleted code, and then wrote a new one.**
+3. **The first `v*` tag would have published nothing.** `publish` needs
+   `build-macos`, whose x64 leg targeted **`macos-13`, retired by GitHub**
+   (verified live against the runner-images API). And the Windows-only fallback
+   written for exactly this case was unreachable — the `::warning::` line lives
+   *inside* the job that gets skipped. The release row was this phase's largest
+   effort and would have shipped nothing on first use.
+
+**Defects the round found in work that was not new**
+
+- **The live CSV reports the wrong hour for every group after the first** in a
+  non-joint lesson. The grid, the PDF and the XLSX matrix all add
+  `slot_offset_for_target`; `SchedulerApp.export_csv` was the only one of the
+  four surfaces that did not — and it is the default shape, since the class
+  dialog writes `joint_session=False` whenever there is more than one target.
+  The new `test_export_csv_live.py` could not see it: every state it builds is
+  single-target.
+- **The Spanish template cannot be re-imported** — Spanish *Aulas* is claimed by
+  Portuguese *Classes* in the flat alias map, so a Spanish user re-importing the
+  app's own generated template gets classrooms read as classes.
+- **The zh/ja template imports phantom data.** The description-row heuristic
+  never fires for CJK, so the template imports as **valid** with a phantom
+  lecturer, classroom and branch made of instruction text.
+- **ST-FUNC-004 was closed on twelve Turkish letters while the product ships 22
+  languages.** Vera covers Latin-1 only, so **9 of 22 locales** printed their
+  weekday names as boxes. Not a regression — before the fix the same locales drew
+  ZapfDingbats blobs — but the fix's own three tests ran only in the default
+  locale.
+- **A `%` followed by two hex digits was eaten out of the bug-report body.**
+  Turkish writes every percentage that way, and that field is the one place a
+  user writes free prose.
+
+**Where a proposed fix was itself wrong** — the round's verifiers proposed
+remedies, and four were rejected on measurement:
+
+- `always() && needs.build.result == 'success'` **reintroduces the defect beside
+  it**: a job-level `if:` replaces the implicit `success()` for *every* need, so
+  a `publish` that also needs the new `test` job would publish a red tag.
+- Resolving the app directory via `__main__.__file__ or sys.argv[0]` answers a
+  *different* directory under pytest than under `pythonw.exe`, and makes the very
+  assertion the finding demands unwritable.
+- Substituting a host font for Arabic/Hebrew/Indic: reportlab has no bidi and no
+  shaping, so `arial.ttf` emits Arabic in **logical order in isolated forms** — a
+  word printed backwards still reads as a word, which is worse than a box that
+  announces itself. Undrawable codepoints are named on a final page instead.
+- Excluding the space from the redaction's segment boundary turns
+  `C:\Users\Ayşe Yılmaz\Documents` into `C:\Users\<user> Yılmaz\Documents` —
+  trading a cosmetic over-redaction for a real leak. Measured and declined; the
+  refusal is pinned by its own test.
+
+### Behaviour changes worth knowing
+
+- **The printed PDF spells Turkish names**, and its text layer is searchable.
+  Every PDF grows ~40 KB (one embedded font subset per document).
+- **The exported CSV is UTF-8 with a BOM and localized day names.** A colleague
+  on a non-Turkish Windows can open it; previously it was written in the OS
+  codepage and raised on a cp1252 machine.
+- **An import that recognizes no sheet is now an error, not a success.** A
+  workbook with duplicate lecturer names is reported rather than silently
+  merged — including case variants, which used to import as two teachers whose
+  classes carried different strings while the class form treated them as one.
+- **The app never runs `pip`.** A missing dependency is reported. This makes the
+  README's "no network calls of any kind" true for the first time.
+- **A bug report no longer carries your Windows account name.** The on-disk
+  crash log still does, on purpose — it never leaves the machine and a local
+  support person needs the real path.
+- **The window opens at the size of your screen and remembers where you left
+  it.** First run is maximized. The sidebar yields 314 px to the grid when the
+  grid needs it, and an explicit expand survives later resizes.
+- **`Ctrl+B` toggles the sidebar.** It had no shortcut.
+- **Releases are tag-gated.** A push to `main` no longer publishes anything;
+  `build-release.yml` is deleted. Every build-time download is pinned and
+  hash-checked before it is executed.
+- **The installer no longer makes its own program directory writable by every
+  local account**, and the uninstaller now removes the bundled Python tree it
+  was leaving behind.
+- **`ci.yml` runs on tags**, and the engine job runs the solver-quality gates
+  that were written for it and had never executed anywhere.
+
+### Known gaps left behind
+
+1. **Nothing in the release/packaging cluster was executed.** No workflow ran,
+   `iscc` is not installed, PyInstaller was not run, no `.app` was launched.
+   What *is* evidence: the Inno digest was fetched twice and compared, and
+   PyInstaller's own `collect_submodules("scheduler_app")` returns 58 names —
+   exactly the 58 files on disk, up from the measured 13. **Unproven:** that
+   `release.yml` completes at all (20 runs, zero jobs ever); that Inno 6.7.3
+   compiles `installer.iss` as the June build did; that a `v*` tag triggers
+   exactly `ci.yml` + `release.yml`. **Rehearse a `v1.0.1` tag on a scratch fork
+   before trusting any of it.**
+2. **Eight pins remain. Five are deferred defects, three are new.**
+   *Deferred:* ST-FUNC-009 (`required_room_type` is advertised in the template
+   and never consumed — the only one that adds solver input, ~4 h), ST-FUNC-007
+   (legacy ASCII saves misroute to the Fernet branch), the swallow half of
+   ST-DATA-002 (one flipped byte silently disables preference learning forever),
+   and the two ST-DATA-013 pins, which are **documentation rather than defects** —
+   true at the library level with no production producer, measured, and their
+   reason strings now say so with the date.
+   *New this phase, each pinning something measured and not fixed:* a Turkish
+   day name typed in capitals (`PAZARTESİ`, `SALI`) is not recognised, because
+   `casefold()` is not Turkish-correct on the dotted/dotless I — the same root
+   cause the importer's duplicate-lecturer check declined to fix unilaterally,
+   since `register_lecturer` shares it and the two must not diverge; and one
+   undo after a drag does not put the lesson back where it was.
+4. **No installer is signed.** The hook is wired behind a secret and is inert:
+   `gh secret list`, `gh variable list` and the environments list are all empty.
+   A checksum is published instead, and that is what the README should say.
+5. **The README still advertises a macOS build that has never been released.**
+   The download promise was corrected, but `release.yml` attaches mac artifacts
+   with `fail_on_unmatched_files: false`, so it can silently publish
+   Windows-only again.
+6. **`os.chmod(key.bin, 0o600)` is a no-op on Windows.** Measured; not fixed.
+7. **`requirements-lock.txt` is stale** — it pins `reportlab==4.4.10` while the
+   audit venv runs 5.0.1, so the lock does not describe the environment the
+   suite validates against.
+8. **`check_untyped_defs` is still off** at 168 errors, unchanged from Phase 6.
+9. **The translation backlog is 2548 (locale, key) pairs** against a ceiling
+   this phase moved deliberately from 2508, for the two `en`+`tr` keys it added
+   (`export.unprintable_note`, `bug_report.no_mail_client`). There is **no
+   slack**: the ceiling is exact, so the next English string anyone adds must
+   move this number in the same commit. Measure it **with
+   `scheduler_app.i18n.tier_translations` imported** — without it the count
+   reads ~850 pairs low, which is a mistake this phase made and had to correct.
+   It still needs a translator.
+10. **The work-count ratchet's anti-vacuity floor does not catch a broken
+    validator.** A `check_placement` stubbed to `True` lands *inside* the band.
+    The gate gets cheaper regressions, not correctness; the oracle is what
+    guards correctness.
 
 ---
 
 ## Phase 6 — mostly complete
 
-> **Starting the next session?** → [`HANDOFF-PHASE7.md`](HANDOFF-PHASE7.md).
+> Phase 7's handoff was [`HANDOFF-PHASE7.md`](HANDOFF-PHASE7.md); it is kept as a
+> record.
 
 **Suite: 725 tests — 712 pass, 13 known-defect pins, 0 failures.** Both lanes
 exit 0. (671 at the start of the phase: +54 new tests, and **11 pins deleted**,
