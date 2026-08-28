@@ -1,8 +1,9 @@
 # DERSİS on macOS — Build & Install Guide
 
 DERSİS runs on macOS as a native `Dersis.app` bundle, packaged into a
-`.dmg` (and an optional `.zip`). This is the macOS counterpart to the Windows
-installer (`Dersis_Setup.exe`); both can be published side by side.
+`.dmg` (and an optional `.zip`). It is the macOS counterpart to the Windows
+installer (`Dersis_Setup.exe`) — but you build it yourself: the Windows
+installer is the only file any release has ever carried.
 
 > **Naming note:** the app is **displayed** everywhere as **DERSİS** (Turkish
 > dotted capital İ). Distributable **filenames** use the ASCII-safe `Dersis`
@@ -12,25 +13,38 @@ installer (`Dersis_Setup.exe`); both can be published side by side.
 
 ## For users — what to download
 
-On the [latest release page](https://github.com/Oynthe/dersis-app/releases/latest)
-you will find one macOS `.dmg` per architecture:
+**Nothing: there is no ready-made Mac download.** Every DERSİS release so far
+carries a single asset, the Windows installer `Dersis_Setup_v<version>.exe`, and
+no macOS artifact has ever been attached to one. An earlier revision of this page
+sent Mac users to the releases page for `.dmg` files that were not there — the
+READMEs that link here have already been corrected, and so has this page.
 
-| You have… | Download |
-|-----------|----------|
-| A **2020-or-newer Mac** (Apple Silicon — M1/M2/M3/M4) | `Dersis-<version>-mac-arm64.dmg` |
-| An **older Intel Mac** | `Dersis-<version>-mac-x64.dmg` |
+On a Mac you produce the bundle yourself from this repository. It takes a few
+minutes and needs no Apple Developer account:
 
-**Not sure which Mac you have?** Click the  Apple menu → **About This Mac**.
-If it says *Apple M1/M2/M3/…* (or "Apple silicon"), choose **arm64**. If it
-says *Intel*, choose **x64**. (Apple Silicon Macs can also run the x64 build
-through Rosetta, but the arm64 build is faster — prefer it.)
+```bash
+./build_mac.sh
+```
 
-A `.zip` of the same app is also published as a secondary download for people
-who prefer not to use a disk image.
+The script writes into `dist/`:
 
-### Installing
+| File | What it is |
+|------|------------|
+| `dist/Dersis-<version>-mac-<arch>.dmg` | Drag-to-Applications disk image |
+| `dist/Dersis-<version>-mac-<arch>.zip` | The same bundle zipped, for people who prefer not to use a disk image (skip it with `DERSIS_SKIP_ZIP=1`) |
 
-1. Open the `.dmg`.
+`<arch>` is whichever architecture you built on: `arm64` on a 2020-or-newer
+Apple Silicon Mac (M1/M2/M3/M4), `x64` on an older Intel Mac. **Not sure which
+Mac you have?** Click the  Apple menu → **About This Mac**. If it says *Apple
+M1/M2/M3/…* (or "Apple silicon") you are on Apple Silicon; if it says *Intel*,
+you are not. You can only build each architecture on a machine of that
+architecture — see [For developers — building
+locally](#for-developers--building-locally) for the prerequisites and the full
+build.
+
+### Installing what you built
+
+1. Open the `.dmg` in `dist/`.
 2. Drag **DERSİS** onto the **Applications** folder.
 3. Launch it from Applications or Launchpad.
 
@@ -133,10 +147,10 @@ Optional related environment variables:
 secrets. Once you have signed with a Developer ID, you can notarize manually:
 
 ```bash
-xcrun notarytool submit dist/Dersis-<version>-mac-arm64.dmg \
+xcrun notarytool submit dist/Dersis-<version>-mac-<arch>.dmg \
     --apple-id you@example.com --team-id TEAMID --password APP_SPECIFIC_PW \
     --wait
-xcrun stapler staple dist/Dersis-<version>-mac-arm64.dmg
+xcrun stapler staple dist/Dersis-<version>-mac-<arch>.dmg
 ```
 
 ---
