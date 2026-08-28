@@ -10,3 +10,10 @@ pytest>=7.0
 # ST-ARCH-013. Gates the Qt-free layers at zero errors; see mypy.ini for
 # the scope and for what this does and does not catch.
 mypy>=1.8
+
+# ST-SEC-001/004. tests/test_release_pipeline.py reads .github/workflows/*.yml
+# as data rather than grepping it: which workflow can publish a release, what
+# triggers it, and which build-time downloads are pinned and hash-checked. CI
+# installs requirements.txt and then this file, so without the line the suite
+# would skip those tests on the one machine that matters.
+PyYAML>=6

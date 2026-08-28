@@ -16,7 +16,13 @@
 #
 # Triggers:
 #   - Manual dispatch (workflow_dispatch) with build method choice
-#   - Version tags (v*) — uses embed method
+#
+# ST-SEC-001: this used to also fire on `push: tags: v*`. It never ran once —
+# GitHub suppresses workflow triggering from events created with
+# secrets.GITHUB_TOKEN, and every v* tag in this repository was created that way
+# by build-release.yml — so a trigger that looked like coverage was providing
+# none. release.yml is the release lane; this is the on-demand build lane, and
+# the nuitka method in particular has no other home.
 # ============================================================================
 
 name: Build Installer
@@ -32,9 +38,6 @@ on:
         options:
           - embed
           - nuitka
-  push:
-    tags:
-      - "v*"
 
 jobs:
   build:
@@ -67,19 +70,11 @@ jobs:
 
           Write-Host "Version: $version"
 
-      - name: Verify tag matches VERSION
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}" -replace '^v', ''
-          $version = $env:APP_VERSION
-
-          if ($tag -ne $version) {
-            Write-Error "Tag 'v$tag' does not match VERSION file '$version'"
-            exit 1
-          }
-
-          Write-Host "Tag v$tag matches VERSION $version"
+      # (A "Verify tag matches VERSION" step lived here, guarded on
+      # refs/tags/v. This workflow is workflow_dispatch-only, so github.ref is
+      # always a branch and the guard could never be true. The check that
+      # matters is in ci.yml, which now runs on tag pushes, and in release.yml,
+      # which refuses to publish a tag that disagrees with VERSION.)
 
       # ── Python setup ──────────────────────────────────────────────────
       - name: Set up Python
@@ -321,14 +316,24 @@ jobs:
           Write-Host "OK: version.iss matches VERSION"
 
       # ── Install Inno Setup ────────────────────────────────────────────
+      # Immutable release asset + digest gate. See the same step in release.yml
+      # for what the old floating URL did on 2026-08-28. Stay on 6.x.
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          $url = "https://jrsoftware.org/download.php/is.exe"
-          $installer = "$env:TEMP\innosetup.exe"
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe"
+          $expected = "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732"
+          $installer = "$env:TEMP\innosetup-6.7.3.exe"
 
-          Write-Host "Downloading Inno Setup..."
+          Write-Host "Downloading Inno Setup 6.7.3..."
           Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+
+          $actual = (Get-FileHash -Path $installer -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) {
+            Write-Error "Inno Setup download failed verification.`n  expected $expected`n  actual   $actual`nRefusing to run it."
+            exit 1
+          }
+          Write-Host "SHA-256 verified: $actual"
 
           Write-Host "Installing Inno Setup silently..."
           Start-Process -FilePath $installer -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\InnoSetup" -Wait -NoNewWindow

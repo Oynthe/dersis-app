@@ -123,11 +123,30 @@ jobs:
           Write-Host "Build output verified"
 
       # ── Installer ──────────────────────────────────────────────────
+      # The URL is an immutable GitHub release asset and the digest is checked
+      # before the file is executed. The old URL, jrsoftware.org/download.php/is.exe,
+      # is a redirector: on 2026-08-28 it 302'd to /isdl.php and returned 10478
+      # bytes of text/html. Invoke-WebRequest wrote that into innosetup.exe and
+      # exited 0; Start-Process then failed "The file or directory is corrupted and
+      # unreadable" — which is what killed build-release runs 11 and 13-16.
+      # Stay on 6.x. The download page also offers 7.1.0; taking it would be a
+      # silent major-version change of the compiler that builds what users run.
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          $installer = "$env:TEMP\innosetup.exe"
-          Invoke-WebRequest -Uri "https://jrsoftware.org/download.php/is.exe" -OutFile $installer -UseBasicParsing
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe"
+          $expected = "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732"
+          $installer = "$env:TEMP\innosetup-6.7.3.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+
+          $actual = (Get-FileHash -Path $installer -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) {
+            Write-Error "Inno Setup download failed verification.`n  expected $expected`n  actual   $actual`nRefusing to run it."
+            exit 1
+          }
+          Write-Host "Inno Setup 6.7.3 SHA-256 verified: $actual"
+
           Start-Process -FilePath $installer -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\InnoSetup" -Wait -NoNewWindow
           echo "C:\InnoSetup" >> $env:GITHUB_PATH
 
