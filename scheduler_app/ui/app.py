@@ -44,10 +44,10 @@ from scheduler_app.models import (
     LOCATION_LECTURER_OFFICE, get_location_label, is_virtual_location_type,
     normalize_state_classes, effective_day, effective_time, mark_placed,
     mark_unplaced, needs_physical_room, get_effective_room_resource_for_class,
-    cls_key,
+    cls_key, slot_offset_for_target,
 )
 from scheduler_app.logic import (
-    get_placed_classes, occupied_slots_of, classroom_of,
+    get_placed_classes, occupied_slots_of, classroom_of, find_slot_index,
     find_schedule_conflicts, conflict_partner_index, schedule_counts,
     find_valid_options,
 )
@@ -2971,7 +2971,34 @@ class SchedulerApp(QMainWindow):
                     # one, so iterating it alone wrote NO row for a lesson the
                     # user had placed -- the same silent drop the PDF had, in
                     # the file that gets emailed. A flat file has room for it.
+                    si = find_slot_index(self.state_data, start)
                     for t in c["targets"] or [{"year": "", "branch": ""}]:
+                        # A non-joint lesson gives each group its own
+                        # consecutive block ("If unchecked, each group gets its
+                        # own consecutive time block"), and the dialog writes
+                        # joint_session=False for every multi-target class, so
+                        # this is the default shape. `start` is the *class*
+                        # start; every other surface adds the group's offset --
+                        # renderer.py, the PDF everything table and the XLSX
+                        # everything matrix -- and this row's duration column
+                        # says 1, so without the offset it states group B's
+                        # session at group A's hour.
+                        #
+                        # `.index(t)` rather than enumerate, deliberately: the
+                        # other three surfaces index the same way (see the
+                        # consistency note at renderer.py:1477), so duplicate
+                        # targets resolve identically here and on screen.
+                        t_idx = c["targets"].index(t) if c["targets"] else 0
+                        row_start = start
+                        off = slot_offset_for_target(c, t_idx)
+                        if si is not None and si + off < len(self.state_data["slots"]):
+                            row_start = self.state_data["slots"][si + off]
+                        # else: the group's own hour is off the grid -- a
+                        # deleted slot, or a block that runs past the end of
+                        # the day. A grid can only drop that; a flat file
+                        # reports it at the stored start instead (ST-DATA-003,
+                        # the rule data_io/exporter.py's CSV already follows).
+                        #
                         # ST-UI-008. The .csv is emailed to colleagues and a
                         # leading "=" is executed by their spreadsheet. Safe to
                         # prefix here and ONLY here: nothing in DERSIS reads a
@@ -2980,7 +3007,7 @@ class SchedulerApp(QMainWindow):
                         writer.writerow([
                             csv_safe(c["name"]), csv_safe(c["lecturer"]),
                             csv_safe(t["year"]), csv_safe(t["branch"]),
-                            day, csv_safe(start), c["duration"],
+                            day, csv_safe(row_start), c["duration"],
                             csv_safe(room)])
             QMessageBox.information(self, tr("status.exported"),
                                    f"{tr('status.exported_to')} {os.path.basename(fname)}")
