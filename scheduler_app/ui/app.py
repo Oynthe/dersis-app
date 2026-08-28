@@ -744,10 +744,11 @@ class DraggableUnplacedList(QListWidget):
                 > QApplication.startDragDistance()):
             row = self.row(self.itemAt(self._drag_start_pos))
             self._drag_start_pos = None
-            if row < 0 or row >= len(self.app._unplaced_indices):
+            # ST-ARCH-015: resolve through the uid map, never a stored position.
+            dragged = self._classes_from_rows([row])
+            if not dragged:
                 return
-            idx = self.app._unplaced_indices[row]
-            cls = self.app.state_data["classes"][idx]
+            cls = dragged[0]
             selected = self._classes_from_rows(
                 self.row(sel_item) for sel_item in self.selectedItems()
             )
@@ -771,13 +772,33 @@ class DraggableUnplacedList(QListWidget):
         super().mouseReleaseEvent(event)
 
     def _classes_from_rows(self, rows):
+        """Resolve sidebar rows to class dicts, tolerating a stale panel.
+
+        ST-ARCH-015. This used to index ``state_data["classes"]`` with a
+        position stored when the panel was last built, guarding only the *row*
+        against ``len(_unplaced_indices)``. Both failure modes were live:
+
+        * the list shrank and the stored position was past the end, which
+          raised ``IndexError`` inside a Qt slot — and PyQt6 answers an
+          unhandled exception in a slot with ``qFatal``, so the process died
+          at ``0xC0000409`` with no dialog and no traceback;
+        * the list shrank at the *front* and the stored position still
+          resolved, silently returning a **different class** than the one the
+          user had highlighted, which is worse than the crash.
+
+        Identity, not position: ``class_uid`` exists precisely so it survives
+        list mutations (``models.cls_key``). A uid that no longer resolves is
+        not a selection, because that class is genuinely gone.
+        """
+        by_uid = self.app._unplaced_class_by_uid()
+        uids = self.app._unplaced_uids
         classes = []
         for sel_row in rows:
-            if 0 <= sel_row < len(self.app._unplaced_indices):
-                sel_idx = self.app._unplaced_indices[sel_row]
-                sel_cls = self.app.state_data["classes"][sel_idx]
-                if sel_cls not in classes:
-                    classes.append(sel_cls)
+            if not (0 <= sel_row < len(uids)):
+                continue
+            sel_cls = by_uid.get(uids[sel_row])
+            if sel_cls is not None and sel_cls not in classes:
+                classes.append(sel_cls)
         return classes
 
     def selected_classes(self):
@@ -844,6 +865,10 @@ class SchedulerApp(QMainWindow):
         self._autosave_pending = False
         self._autosave_fingerprint = None
         self._active_tutorial = None
+
+        # ST-ARCH-015: the unplaced sidebar addresses classes by uid, never by
+        # position — a position goes stale the moment the classes list shrinks.
+        self._unplaced_uids = []
 
         # Selection state
         self._selected_class = None
@@ -2334,15 +2359,23 @@ class SchedulerApp(QMainWindow):
     #  UNPLACED PANEL
     # ══════════════════════════════════════════════════════════════════════
 
+    def _unplaced_class_by_uid(self):
+        """Live uid -> class dict map for the unplaced sidebar.
+
+        ST-ARCH-015. Built from ``state_data["classes"]`` at read time, so it
+        cannot go stale the way a stored position can.
+        """
+        return {cls_key(c): c for c in self.state_data["classes"]}
+
     def _refresh_unplaced_panel(self):
         self.unplaced_list.clear()
-        self._unplaced_indices = []
-        for i, c in enumerate(self.state_data["classes"]):
+        self._unplaced_uids = []
+        for c in self.state_data["classes"]:
             if not c["pinned"] and not c["placed"]:
                 code = c.get("class_code", "")
                 label = f"[{code}] {c['name']}" if code else c["name"]
                 self.unplaced_list.addItem(f"{label}  ({c['lecturer']})")
-                self._unplaced_indices.append(i)
+                self._unplaced_uids.append(cls_key(c))
 
     def _switch_sidebar_tab(self, index):
         """Switch sidebar tab (0 = Open Slots, 1 = Unplaced Classes)."""
@@ -2470,10 +2503,11 @@ class SchedulerApp(QMainWindow):
 
     def _on_unplaced_dblclick(self, item):
         row = self.unplaced_list.row(item)
-        if row < 0 or row >= len(self._unplaced_indices):
+        # ST-ARCH-015: identity, not position — see _classes_from_rows.
+        picked = self.unplaced_list._classes_from_rows([row])
+        if not picked:
             return
-        idx = self._unplaced_indices[row]
-        cls = self.state_data["classes"][idx]
+        cls = picked[0]
         dlg = PostAddDialog(self, self.state_data, cls)
         if dlg.exec() == PostAddDialog.DialogCode.Accepted:
             if dlg.result and dlg.result != "skip":
