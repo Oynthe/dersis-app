@@ -2534,6 +2534,12 @@ class SchedulerApp(QMainWindow):
                 self, tr("menus.file_new"),
                 tr("dialogs.new_schedule.confirm")
         ) == QMessageBox.StandardButton.Yes:
+            # ST-ARCH-011/ST-PERF-002: land the pending debounced write BEFORE
+            # state_data points somewhere else. This guard was written and
+            # never called; without it an edit made inside the 1.5 s window and
+            # followed by File > New is lost, because the timer fires later and
+            # persists the empty schedule instead.
+            self._flush_before_state_swap()
             self.state_data = new_state()
             self._workflow.state = self.state_data
             self.current_file = None
@@ -2551,6 +2557,9 @@ class SchedulerApp(QMainWindow):
         if not fname:
             return
         is_legacy = fname.lower().endswith(".uva")
+        # Same swap hazard as new_schedule: flush before rebinding, or the
+        # previous schedule's last edit is written onto the opened one.
+        self._flush_before_state_swap()
         try:
             self.state_data = storage.load_encrypted(fname)
             self._workflow.state = self.state_data

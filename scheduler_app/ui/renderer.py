@@ -42,6 +42,7 @@ from scheduler_app.models import (
     get_protection_label, effective_day, effective_time,
     is_sequential_class, slot_offset_for_target, cls_key,
 )
+from scheduler_app.core.text_safety import qt_tooltip
 from scheduler_app.ui.badge_formatter import get_badge, badge_text
 from scheduler_app.ui.cell_formatter import tooltip_text
 
@@ -590,9 +591,15 @@ class LessonItem(QGraphicsRectItem):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
 
-        # Tooltip with class details
-        self.setToolTip(_conflict_tooltip(
-            tooltip_text(cls), self._conflict, self._conflict_labels))
+        # Tooltip with class details.
+        # ST-UI-007: through qt_tooltip, so the class name is shown literally.
+        # setToolTip sniffs its argument with Qt.mightBeRichText, so without
+        # this a lesson called "Fizik <b>I</b>" renders as "Fizik I" while an
+        # adjacent one renders literally -- the format depends on the user's
+        # own text. Measured: mightBeRichText is True for that name and False
+        # for "<Vekil> Dersi", so identical-looking data behaves differently.
+        self.setToolTip(qt_tooltip(_conflict_tooltip(
+            tooltip_text(cls), self._conflict, self._conflict_labels)))
 
     def set_ghost(self, enabled):
         """Toggle ghost (semi-transparent) mode during drag."""
@@ -930,10 +937,10 @@ class MatrixLessonItem(QGraphicsRectItem):
         self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        # Tooltip
-        self.setToolTip(_conflict_tooltip(
+        # Tooltip -- ST-UI-007, see the sibling site in LessonItem.
+        self.setToolTip(qt_tooltip(_conflict_tooltip(
             tooltip_text(cls, include_groups=False, include_duration=False),
-            self._conflict, self._conflict_labels))
+            self._conflict, self._conflict_labels)))
 
     def mark_selected(self, selected):
         self._selected = selected
