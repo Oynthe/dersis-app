@@ -141,6 +141,19 @@ ST-UI-019 was closed by Phase 2's sticky/derived split. The live items are:
   an English string moves the first by 20 and *should*; bump it deliberately and
   say why. It fired on both Phase 5 commits that added keys, which is the design.
 
+## One thing that is fixed but not solved
+
+`Claude Code Review` was red on every PR from before Phase 0 and was carried as
+an unexplained known gap through three phases. The cause is that the repository
+has **no secrets configured at all** — `gh secret list` returns nothing — so
+`secrets.CLAUDE_CODE_OAUTH_TOKEN` is empty, the action falls back to
+direct-Anthropic-API mode, and it aborts on credential validation in 21 s.
+
+Both Claude workflows now **skip** with an explanatory `::notice::` instead of
+failing. The review still does not run. To actually enable it, add
+`CLAUDE_CODE_OAUTH_TOKEN` under *Settings → Secrets and variables → Actions*;
+the workflows pick it up with no further edit.
+
 ## The single most useful thing Phase 5 learned
 
 **Mutation-test every test, and distrust every measurement — including the ones

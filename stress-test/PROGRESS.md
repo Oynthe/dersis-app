@@ -168,7 +168,24 @@ its own pass rather than a half-build on numbers that do not hold.
    translator. Machine translation is not available as a shortcut: 174
    `tr(key).format(...)` sites are unguarded, 26 of them in
    `ConstraintValidator`, and a drifted placeholder raises rather than degrades.
-8. **`Claude Code Review` CI still fails**, as it has since before this work.
+8. **`Claude Code Review` CI no longer fails — but it does not run either.**
+   Carried as an unexplained gap since Phase 3; the cause turned out to be
+   trivial and worth writing down. `gh secret list` returns **nothing** — the
+   repository has no secrets at all — so
+   `secrets.CLAUDE_CODE_OAUTH_TOKEN` interpolates to an empty string, the
+   action falls back to direct-Anthropic-API mode, and it aborts on credential
+   validation after 21 s. It never had the credentials to run.
+
+   Both Claude workflows now gate their steps on the token being present, so
+   the job **skips** with a `::notice::` naming the missing secret instead of
+   reporting failure. A check that is red for every change, regardless of the
+   change, teaches everyone to ignore the checks. Adding the token under
+   *Settings → Secrets and variables → Actions* switches the review on with no
+   further edit.
+
+   The two checks that actually exercise this repository both pass on Linux /
+   Python 3.11 — `Validate` 647 passed / 24 xfailed, `Scheduling invariants`
+   16 passed — identical to the local Windows / 3.12 result.
 
 ---
 
