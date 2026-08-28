@@ -20,7 +20,7 @@ Architecture:
 
 import os
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 # ── Identity ────────────────────────────────────────────────────────────────
 APP_DISPLAY_NAME = "DERSİS"      # shown to users (Turkish dotted capital İ)
@@ -57,13 +57,34 @@ ortools_datas, ortools_binaries, ortools_hidden = collect_all("ortools")
 #   <root>/docs/dersis.png        -> window/branding icon (scheduler_app/ui/app.py)
 #   <root>/VERSION                -> read by scheduler_app/_version.py
 #   <root>/scheduler_app/assets/  -> static icons
+#   reportlab's bundled faces  -> the PDF export resolves a font by name at
+#                                 runtime; hiddenimports collects modules, not
+#                                 the .ttf/.pfb files sitting beside them.
 datas = [
     ("flags", "flags"),
     ("docs/dersis.png", "docs"),
     ("VERSION", "."),
     ("scheduler_app/assets", "scheduler_app/assets"),
-] + ortools_datas
+] + ortools_datas + collect_data_files("reportlab")
 
+# ST-ARCH-009: scheduler_app must be collected by name, not by import analysis.
+#
+# scheduler_app/__init__.py installs a sys.meta_path finder that maps 32 flat
+# aliases onto real modules, and scheduler_gui.py imports through three of them:
+# `scheduler_app.app`, `scheduler_app.first_run` and `scheduler_app.translations`
+# are aliases with NO FILE of that name. PyInstaller's modulegraph records
+# `from pkg import name` on a non-existent submodule as an attribute rather than
+# a missing module, so it warns about nothing and collects nothing.
+#
+# Measured with PyInstaller's own modulegraph 6.22.2 against this spec before
+# this line existed: 13 of 58 scheduler_app modules collected, 45 dropped, 0
+# warnings emitted — the 45 including ui/app.py (the main window) and
+# i18n/translations.py (the entire translation table). A real launch imports 37
+# modules, 24 of them absent from the bundle. The .dmg built green and could not
+# open its window.
+#
+# collect_submodules walks the package on disk, so it sees all 58 regardless of
+# how they are imported. tests/test_packaging_manifest.py pins this.
 hiddenimports = [
     "PyQt6",
     "cryptography",
@@ -72,7 +93,7 @@ hiddenimports = [
     "reportlab",
     "packaging",
     "deepdiff",
-] + ortools_hidden
+] + collect_submodules("scheduler_app") + ortools_hidden
 
 block_cipher = None
 
