@@ -38,6 +38,8 @@ ROOM = "A-101"
 # a colleague on a non-Turkish Windows would have been writing the file in.
 LESSON = "İş Sağlığı ve Güvenliği"
 GROUPLESS_LESSON = "Serbest Etüt"
+SEQ_LESSON = "Beden Eğitimi"
+JOINT_LESSON = "Müzik"
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -95,6 +97,59 @@ def _turkish_state(with_groupless=False):
         # of every lesson placed before its groups were ticked.
         place("D900", GROUPLESS_LESSON, "tuesday", "10:00", [])
     return state
+
+
+def _sequential_state(slots=("09:00", "10:00")):
+    """A non-joint two-group lesson, plus a joint one as a control.
+
+    This is the *default* shape, not an exotic one: ``dialogs.py`` leaves the
+    joint checkbox unchecked for a new class and stores
+    ``joint_session=False`` whenever more than one target is ticked, and the
+    hint under that box promises "each group gets its own consecutive time
+    block". So group B of ``SEQ_LESSON`` meets one slot after group A.
+
+    ``JOINT_LESSON`` is placed alongside on purpose: a joint lesson's groups
+    really do share one hour, so it pins the other direction and stops a fix
+    that simply adds the target index to every row.
+    """
+    from scheduler_app.core.models import mark_placed, new_class, new_state
+
+    state = new_state()
+    state["days"] = ["monday", "tuesday"]
+    state["slots"] = list(slots)
+    state["classrooms"] = [ROOM]
+    state["classroom_capacities"] = {ROOM: 30}
+    state["lecturers"] = [LECTURER]
+    state["years"] = {YEAR: ["A", "B"]}
+
+    def place(code, name, day, slot, joint):
+        cls = new_class()
+        cls["class_code"] = code
+        cls["name"] = name
+        cls["lecturer"] = LECTURER
+        cls["targets"] = [{"year": YEAR, "branch": "A"},
+                          {"year": YEAR, "branch": "B"}]
+        cls["joint_session"] = joint
+        cls["duration"] = 1
+        cls["participants"] = 20
+        mark_placed(cls, day, slot, ROOM)
+        state["classes"].append(cls)
+
+    place("D010", SEQ_LESSON, "monday", slots[0], False)
+    place("D011", JOINT_LESSON, "tuesday", slots[0], True)
+    return state
+
+
+def _start_times(raw):
+    """Return ``{(lesson, branch): start_time}`` from an exported CSV."""
+    from scheduler_app.translations import tr
+
+    rows = list(csv.reader(raw.decode("utf-8-sig").splitlines()))
+    header, data = rows[0], rows[1:]
+    name_col = header.index(tr("labels.class_item"))
+    branch_col = header.index(tr("labels.branch"))
+    start_col = header.index(tr("labels.start_time"))
+    return {(r[name_col], r[branch_col]): r[start_col] for r in data}
 
 
 @pytest.fixture
@@ -239,4 +294,68 @@ def test_live_csv_export_keeps_a_lesson_with_no_target_groups(
     assert GROUPLESS_LESSON in names, (
         f"the group-less lesson was dropped from the CSV; it holds only "
         f"{sorted(names)}"
+    )
+
+
+# ── Sequential (non-joint) groups ───────────────────────────────────────────
+
+def test_live_csv_export_gives_each_group_of_a_non_joint_lesson_its_own_hour(
+        window, export_to, message_boxes, tmp_path):
+    """Each group of a non-joint lesson meets at its own hour in the CSV.
+
+    A failure means the emailed file tells group B to turn up at group A's
+    hour -- and the row's own duration column says 1, so it is not describing
+    a two-hour block, it is describing B's session at the wrong time.
+
+    The grid (``ui/renderer.py``), the PDF everything table and the XLSX
+    everything matrix all add ``slot_offset_for_target``; this is the fourth
+    surface and must agree with them. The joint lesson is asserted in the same
+    test because "all groups share the start hour" is the correct answer there,
+    and only asserting both directions distinguishes a fix from a shift.
+    """
+    out = tmp_path / "sequential.csv"
+    export_to(out)
+
+    raw = _run_export(window, _sequential_state(), out, message_boxes)
+    starts = _start_times(raw)
+
+    assert starts.get((SEQ_LESSON, "A")) == "09:00", \
+        f"the first group moved: {starts}"
+    assert starts.get((SEQ_LESSON, "B")) == "10:00", (
+        "the second group of a non-joint lesson is printed at the first "
+        f"group's hour: {starts}"
+    )
+    assert starts.get((JOINT_LESSON, "A")) == "09:00", \
+        f"a joint lesson's first group moved: {starts}"
+    assert starts.get((JOINT_LESSON, "B")) == "09:00", (
+        "a joint lesson's groups share one hour, but the second group was "
+        f"pushed to a later slot: {starts}"
+    )
+
+
+def test_live_csv_export_still_reports_a_group_pushed_off_the_grid(
+        window, export_to, message_boxes, tmp_path):
+    """A group whose own hour no longer exists is reported, not dropped.
+
+    Deleting a time slot leaves the second group of a non-joint lesson without
+    a slot to name (ST-DATA-003). A grid can only drop such a placement; a flat
+    file has a row for it, and the export must not become the surface that
+    silently loses a group the user can still see in the class editor.
+    """
+    out = tmp_path / "off_grid.csv"
+    export_to(out)
+
+    # One hour on the grid: group A takes it, group B's would be the second.
+    raw = _run_export(window, _sequential_state(slots=("09:00",)), out,
+                      message_boxes)
+    starts = _start_times(raw)
+
+    assert (SEQ_LESSON, "A") in starts, "the first group vanished too"
+    assert (SEQ_LESSON, "B") in starts, (
+        "the group whose hour ran off the end of the grid was dropped from "
+        f"the CSV entirely; it holds only {sorted(starts)}"
+    )
+    assert starts[(SEQ_LESSON, "B")], (
+        "the off-grid group was reported with an empty time column, which "
+        "says less than its stored placement does"
     )

@@ -51,6 +51,7 @@ import pytest
 from scheduler_app.core.models import mark_placed, new_class, new_state
 from scheduler_app.data_io.exporter import FinalSchedule, export_schedule
 from scheduler_app.translations import tr
+from scheduler_app.i18n.translations import TRANSLATIONS
 
 MODES = ("everything", "classroom", "group", "lecturer")
 
@@ -917,6 +918,133 @@ def test_pdf_text_layer_keeps_every_turkish_letter(tmp_path, reportlab_mod):
     )
 
 
+# ── The other 21 languages ──────────────────────────────────────────────────
+#
+# ST-FUNC-004 was closed on twelve Turkish letters, and the three tests above
+# run only in the pinned default locale. The product ships 22 languages and
+# offers all of them in the first-run gate, while the bundled face (Vera, 283
+# glyphs) covers Latin-1 and nothing else -- so ru, ar, fa, hi, zh, ja, ko, pl
+# and az printed their weekday names as empty boxes with nothing saying so.
+
+def _ascii_state_for_locale():
+    """A schedule whose only non-ASCII text is the locale's own weekday names.
+
+    Deliberately ASCII everywhere else: this isolates the question "can the
+    document draw the language the user picked", instead of asking whether one
+    face happens to cover Turkish lesson names AND Korean day names at once.
+    """
+    state = _empty_state(lecturers=["Teacher A"], rooms=["A-101"],
+                         years={"Year 1": ["A"]})
+    _place(state, "D001", "Lesson", "Teacher A", "monday", "09:00",
+           "A-101", "Year 1", "A", 1)
+    return state
+
+
+def pdf_page_count(raw):
+    """Number of page objects in *raw*."""
+    return len(re.findall(rb"/Type\s*/Page[^s]", raw))
+
+
+@pytest.mark.pdf
+@pytest.mark.parametrize("locale", sorted(TRANSLATIONS))
+def test_pdf_either_draws_a_locales_weekday_names_or_says_it_cannot(
+        locale, tmp_path, reportlab_mod, monkeypatch):
+    """Every shipped language: no character is drawn as a silent empty box.
+
+    A failure means a school that picked this language in the first-run gate
+    gets a printed timetable whose day headers are rectangles, with no hint on
+    the page that anything went wrong -- and an archived PDF that cannot be
+    searched for them either, because a .notdef glyph carries no /ToUnicode
+    entry.
+
+    The assertion is the honest invariant, not "every locale renders": the
+    exporter may draw the characters (they must then be recoverable from the
+    /ToUnicode CMap, which is what Ctrl-F and copy-paste resolve through), or
+    it may say it cannot draw them -- but not neither. Which of the two
+    happens depends on the host's fonts, so this passes on a machine with no
+    Cyrillic face and on one with Arial, without asserting either.
+    """
+    from scheduler_app.translations import get_language, set_language
+
+    monkeypatch.setattr("scheduler_app.data_io.exporter._pdf_font_names", None)
+    previous = get_language()
+    set_language(locale)
+    try:
+        wanted = {ord(ch)
+                  for d in DAYS
+                  for ch in tr(f"weekdays.{d}") if ord(ch) > 127}
+        out = tmp_path / f"{locale}.pdf"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            export_schedule(_ascii_state_for_locale(), "pdf", str(out),
+                            mode="everything")
+        control = tmp_path / f"{locale}_control.pdf"
+        set_language("en")
+        export_schedule(_ascii_state_for_locale(), "pdf", str(control),
+                        mode="everything")
+    finally:
+        set_language(previous)
+
+    raw = assert_well_formed_pdf(out)
+    recoverable = pdf_text_layer_codepoints(raw)
+    admitted = set()
+    for w in caught:
+        admitted |= {int(m, 16) for m in re.findall(r"U\+([0-9A-F]{4,6})",
+                                                    str(w.message))}
+
+    unaccounted = wanted - recoverable - admitted
+    assert not unaccounted, (
+        f"locale {locale}: {sorted(hex(c) for c in unaccounted)} are drawn "
+        f"into the PDF with no /ToUnicode mapping (i.e. as .notdef boxes) and "
+        f"the document says nothing about them"
+    )
+
+    if admitted:
+        # It said so on the page too, not only in a warning nobody reads: the
+        # printout is what gets pinned to a noticeboard.
+        assert pdf_page_count(raw) > pdf_page_count(
+            assert_well_formed_pdf(control)), (
+            f"locale {locale}: the exporter knows it cannot draw "
+            f"{sorted(hex(c) for c in admitted)} but the document has no more "
+            f"pages than the fully drawable control -- the note is missing"
+        )
+
+
+@pytest.mark.pdf
+def test_pdf_reports_a_shaped_script_instead_of_drawing_it_unshaped(
+        reportlab_mod, monkeypatch):
+    """An RTL or Indic script is admitted, never substituted into place.
+
+    A failure means the exporter reached for a font that covers Arabic and
+    drew the word with it. Measured: registering ``arial.ttf`` and drawing
+    "العربية" emits ``(\\001\\002\\003\\004\\005\\006\\007) Tj`` -- the seven
+    codepoints in LOGICAL order, each as its isolated form, because reportlab
+    has no bidi and no shaping engine. That prints an Arabic word backwards in
+    disconnected letters, which reads as a real word and is not one; the empty
+    box plus the note says the same thing without pretending.
+
+    Asserted against ``_register_covering_font`` not being consulted, rather
+    than against the produced PDF: whether this machine even has a face that
+    covers Arabic is not something a test may depend on.
+    """
+    from scheduler_app.data_io import exporter
+
+    consulted = []
+    monkeypatch.setattr(
+        exporter, "_register_covering_font",
+        lambda text: consulted.append(text) or ("Fake", "Fake-Bold"))
+    monkeypatch.setattr(exporter, "_pdf_font_names", None)
+
+    _regular, _bold, unprintable = exporter._resolve_pdf_fonts(
+        "Pazartesi العربية")
+
+    assert not consulted, (
+        "the exporter went looking for a font to draw an Arabic run with; "
+        "reportlab would lay it out left to right in isolated forms"
+    )
+    assert unprintable, "the Arabic characters were neither drawn nor reported"
+
+
 @pytest.mark.pdf
 def test_pdf_export_falls_back_to_helvetica_when_the_font_file_is_missing(
         tmp_path, reportlab_mod, monkeypatch):
@@ -946,11 +1074,23 @@ def test_pdf_export_falls_back_to_helvetica_when_the_font_file_is_missing(
     assert b"D001" in content, "the fallback export drew no lessons at all"
 
 
+# A branch name a school really can type: branches are a comma-split line of
+# free text in the class-group editor, defaulting to "A, B" but not limited to
+# it. At this length it wraps to four lines in the everything table's narrow
+# columns, which is where the fixed 18pt sub-header row stops being enough.
+LONG_BRANCH = "9/A Fen Bilimleri Ağırlıklı Sınıf Şubesi"
+
+
 def _state_with_a_crowded_cell():
-    """A schedule whose longest lesson overflows a default-height PDF row."""
+    """A schedule whose longest lesson overflows a default-height PDF row.
+
+    Carries a long branch name as well as a long lesson name: the branch
+    sub-header is a fixed-height row holding user text, so it can overflow for
+    exactly the same reason the data rows could.
+    """
     lecturer = "Şükrü Işık Öğretmen"
     state = _empty_state(lecturers=[lecturer, LECT_A], rooms=["A-101"],
-                         years={"1. Sınıf": ["A", "B"]})
+                         years={"1. Sınıf": ["A", "B", LONG_BRANCH]})
     _place(state, "D001",
            "Öğrenci Değerlendirme ve Ölçme Çalıştayı: İş Sağlığı ve "
            "Güvenliği Uygulamaları",
@@ -999,17 +1139,24 @@ def test_pdf_rows_are_tall_enough_for_the_cells_they_hold(
         if any(h is None for h in heights):
             # Auto-sized (the appendix). reportlab grows those itself.
             continue
-        spans = {(c0, r0): r1 - r0 + 1
-                 for _cmd, (c0, r0), (_c1, r1) in tbl._spanCmds}
+        # Both directions of every merge: a day header is merged ACROSS the
+        # branch columns, so measuring it against one column's width would
+        # invent an overflow that the printed page does not have.
+        spans = {(c0, r0): (c1 - c0 + 1, r1 - r0 + 1)
+                 for _cmd, (c0, r0), (c1, r1) in tbl._spanCmds}
         for r, row in enumerate(tbl._cellvalues):
-            if r < tbl.repeatRows:
-                continue  # header rows: short labels at their own fixed height
+            # Header rows are checked too. They were skipped as "short labels
+            # at their own fixed height", which is wrong for the branch
+            # sub-header: branch names are free user text (a comma-split line
+            # in the class-group editor), so that row overflows exactly the
+            # way a data row does.
             for c, cell in enumerate(row):
                 if not isinstance(cell, Paragraph):
                     continue
+                colspan, rowspan = spans.get((c, r), (1, 1))
                 # LEFTPADDING + RIGHTPADDING = 4, TOP + BOTTOM = 6.
-                _w, needed = cell.wrap(widths[c] - 4, 1e6)
-                allotted = sum(heights[r:r + spans.get((c, r), 1)])
+                _w, needed = cell.wrap(sum(widths[c:c + colspan]) - 4, 1e6)
+                allotted = sum(heights[r:r + rowspan])
                 assert needed + 6 <= allotted + 0.01, (
                     f"mode={mode}: row {r} column {c} is {allotted:.1f}pt tall "
                     f"but the cell drawn in it needs {needed + 6:.1f}pt, so it "
@@ -1099,6 +1246,63 @@ def test_pdf_does_not_silently_drop_offgrid_placements(
     assert b"D001" in content or warned, (
         "D001 is placed on saturday (outside state['days']) and was silently "
         f"omitted from the mode={mode} PDF — not drawn and not warned about"
+    )
+
+
+def _sequential_state(slots=None):
+    """A non-joint two-group lesson: A at 09:00, B at 10:00, one hour each."""
+    state = _empty_state(lecturers=[LECT_A], rooms=["A-101"],
+                         years={YEAR_1: ["A", "B"]})
+    if slots is not None:
+        state["slots"] = list(slots)
+    cls = _place(state, "D001", "Beden Eğitimi", LECT_A, "monday", "09:00",
+                 "A-101", YEAR_1, "A", 1)
+    cls["targets"] = [{"year": YEAR_1, "branch": "A"},
+                      {"year": YEAR_1, "branch": "B"}]
+    cls["joint_session"] = False
+    return state
+
+
+def test_csv_gives_each_group_of_a_non_joint_lesson_its_own_hour(tmp_path):
+    """This writer's version of the live CSV's ST-FUNC-006 defect.
+
+    ``_export_csv`` emits one row per occupied slot and, inside each, one row
+    per target -- a cross product. For a non-joint lesson that is two rows too
+    many and two of them are false: it says group A meets in the hour that
+    belongs to B, and B in A's.
+
+    This entry point has no production caller, so this is a library guard, not
+    a user-facing pin (that one lives in ``tests/test_export_csv_live.py``).
+    It is here because the two writers are kept in step deliberately -- the
+    docstring on ``_export_csv`` says so -- and because whoever wires this one
+    up later inherits whatever it does today.
+    """
+    out = tmp_path / "sequential.csv"
+    export_schedule(_sequential_state(), "csv", str(out))
+
+    rows = read_csv_rows(out)
+    seen = {(r[7], r[1]) for r in rows[1:] if r[2] == "D001"}  # branch, time
+    assert seen == {("A", "09:00"), ("B", "10:00")}, (
+        "each group of a non-joint lesson gets exactly its own hour; the file "
+        f"says {sorted(seen)}"
+    )
+
+
+def test_csv_reports_a_group_whose_hour_ran_off_the_grid(tmp_path):
+    """ST-DATA-003 for the second group of a non-joint lesson.
+
+    With one hour left on the grid, group B's hour does not exist. A grid can
+    only drop that; this file has a row for it, and dropping the group here
+    would be the silent data loss the whole ST-FUNC-013 appendix exists to
+    stop.
+    """
+    out = tmp_path / "sequential_offgrid.csv"
+    export_schedule(_sequential_state(slots=["09:00"]), "csv", str(out))
+
+    rows = read_csv_rows(out)
+    branches = {r[7] for r in rows[1:] if r[2] == "D001"}
+    assert branches == {"A", "B"}, (
+        f"the group with no hour left on the grid was dropped: {branches}"
     )
 
 
