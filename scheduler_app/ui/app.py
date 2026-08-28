@@ -44,7 +44,7 @@ from scheduler_app.constants import (
 )
 from scheduler_app.translations import tr, get_language, set_language, is_rtl
 from scheduler_app.core.text_safety import csv_safe
-from scheduler_app.ui.day_keys import (
+from scheduler_app.i18n.day_keys import (
     normalize_state_day_keys, day_label, display_day, format_day_time,
 )
 from scheduler_app.models import (

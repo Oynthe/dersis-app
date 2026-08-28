@@ -113,6 +113,12 @@ jobs:
               'scheduler_app._version',
               'scheduler_app.core.models',
               'scheduler_app.core.workflow',
+              # ST-ARCH-009: the engine must import with no Qt present. These
+              # two reach the i18n leaf and the CP-SAT path, which are exactly
+              # what the spawned solver subprocess re-imports from scratch.
+              'scheduler_app.i18n.translations',
+              'scheduler_app.core.cpsat_scheduler',
+              'scheduler_app.data_io.exporter',
               'scheduler_app.plans',
               'scheduler_app.storage',
           ]

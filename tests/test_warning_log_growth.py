@@ -309,7 +309,7 @@ def window(qapp, dersis_home, message_boxes, monkeypatch):
     the same session.
     """
     from scheduler_app.plans import TIER_INSTITUTIONAL
-    from scheduler_app.ui.day_keys import DAY_KEYS
+    from scheduler_app.i18n.day_keys import DAY_KEYS
     from scheduler_app.ui.first_run import FirstRunController
     from scheduler_app.ui.tier_enforcement import TierEnforcement
 
@@ -373,7 +373,7 @@ def seeded(window):
     Returns ``(window, ghost_class)``.
     """
     from scheduler_app.core.models import new_class
-    from scheduler_app.ui.day_keys import DAY_KEYS
+    from scheduler_app.i18n.day_keys import DAY_KEYS
 
     state = window.state_data
 
@@ -553,7 +553,7 @@ def test_known_warning_is_present_after_every_single_refresh(seeded):
     stops being reported at all, which is worse than reporting it twice.
     """
     from scheduler_app.translations import tr
-    from scheduler_app.ui.day_keys import DAY_KEYS, day_label
+    from scheduler_app.i18n.day_keys import DAY_KEYS, day_label
 
     window, _ = seeded
     heavy = f"{tr('warnings.heavy_days_short')} {day_label(DAY_KEYS[0])}"
@@ -592,7 +592,7 @@ def test_warning_disappears_once_the_condition_is_fixed(seeded):
     session, with the stale copy sitting above the fresh one.
     """
     from scheduler_app.translations import tr
-    from scheduler_app.ui.day_keys import DAY_KEYS, day_label
+    from scheduler_app.i18n.day_keys import DAY_KEYS, day_label
 
     window, ghost = seeded
     state = window.state_data
@@ -662,7 +662,7 @@ def test_settings_failure_is_reported_once_and_survives_the_rebuild(
     """
     from scheduler_app import storage
     from scheduler_app.translations import tr
-    from scheduler_app.ui.day_keys import DAY_KEYS, day_label
+    from scheduler_app.i18n.day_keys import DAY_KEYS, day_label
 
     window, _ = seeded
 
@@ -914,7 +914,7 @@ def test_open_slots_panel_still_updates_when_the_state_changes(seeded, qapp):
     require that exactly that ``(day, time, room)`` disappears and nothing else
     moves. A failure means the open-slots panel is lying about the timetable.
     """
-    from scheduler_app.ui.day_keys import DAY_KEYS
+    from scheduler_app.i18n.day_keys import DAY_KEYS
 
     window, ghost = seeded
     target = (DAY_KEYS[3], "09:00", "R002")

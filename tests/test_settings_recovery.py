@@ -107,7 +107,7 @@ def _settings_path():
 
 def _saved_schedule_state(make_preset):
     """A small, fully-shaped state carrying an identifiable class."""
-    from scheduler_app.ui.day_keys import normalize_state_day_keys
+    from scheduler_app.i18n.day_keys import normalize_state_day_keys
     from scheduler_app.core.models import normalize_state_classes
 
     state = make_preset("tiny")
@@ -338,7 +338,7 @@ def make_window(qapp, dersis_home, monkeypatch):
     ``SchedulerApp`` registers into them and never unregisters.
     """
     from scheduler_app.plans import TIER_INSTITUTIONAL
-    from scheduler_app.ui.day_keys import DAY_KEYS
+    from scheduler_app.i18n.day_keys import DAY_KEYS
     from scheduler_app.ui.first_run import FirstRunController
     from scheduler_app.ui.tier_enforcement import TierEnforcement
 
@@ -415,7 +415,7 @@ def test_autosave_roundtrips_state_last_file_and_language(
     """
     from scheduler_app import storage
     from scheduler_app.core.models import normalize_state_classes
-    from scheduler_app.ui.day_keys import normalize_state_day_keys
+    from scheduler_app.i18n.day_keys import normalize_state_day_keys
 
     win = make_window()
     win.state_data = _saved_schedule_state(make_preset)

@@ -43,7 +43,7 @@ from scheduler_app.models import (
     is_sequential_class, slot_offset_for_target, cls_key,
 )
 from scheduler_app.core.text_safety import qt_tooltip
-from scheduler_app.ui.badge_formatter import get_badge, badge_text
+from scheduler_app.i18n.badge_formatter import get_badge, badge_text
 from scheduler_app.ui.cell_formatter import tooltip_text
 
 # ── Layout constants ─────────────────────────────────────────────────
@@ -1874,7 +1874,7 @@ class TimetableView(QGraphicsView):
         The sentence comes from ``cell_formatter``, which the tooltip already
         uses, so the keyboard and the mouse describe a cell the same way.
         """
-        from scheduler_app.ui.day_keys import format_day_time
+        from scheduler_app.i18n.day_keys import format_day_time
 
         item = self.cursor_item()
         if item is None:

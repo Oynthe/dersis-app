@@ -23,7 +23,7 @@ Three ways to get this test wrong, all of which were built and measured first
 --------------------------------------------------------------------------
 1. **A grep for ``ui`` finds a quarter of the problem.** 16 of the 22 upward
    imports go through the *flat shim name* ``scheduler_app.translations``,
-   which ``scheduler_app/__init__.py`` maps onto ``scheduler_app.ui.translations``
+   which ``scheduler_app/__init__.py`` maps onto ``scheduler_app.i18n.translations``
    at import time. They never mention ``ui``. This module therefore resolves
    every target through ``_SHIM_MAP``, parsed out of the package source with
    ``ast.literal_eval`` so it can never drift from the real one.
@@ -67,13 +67,19 @@ UI_LAYER = "ui"
 # commit that introduced it. They may go DOWN. Raising one is a deliberate act
 # and needs a sentence in the commit saying why.
 
-MAX_UPWARD_IMPORT_PAIRS = 22
-"""Module-level imports from a lower layer into `ui`. 22 at Phase 6.
+MAX_UPWARD_IMPORT_PAIRS = 0
+"""Module-level imports from a lower layer into `ui`. 22 -> 0 in Phase 6.
 
-By importing package: core 13, data_io 7, learning 1, storage 1.
-By imported module: translations 16, day_keys 4, badge_formatter 1,
+Was 22, distributed core 13 / data_io 7 / learning 1 / storage 1, and by
+imported module translations 16, day_keys 4, badge_formatter 1,
 cell_formatter 1. The register says 19; it was 19 at the audit commit and three
 were added by the remediation itself.
+
+Now **zero**, and this ceiling is therefore a hard contract: `translations`,
+`day_keys`, `badge_formatter` and `tier_translations` moved to
+`scheduler_app/i18n/`, and `plain_cell_text` moved to its only caller in
+`data_io/exporter.py`. A new upward import is now a regression, not a
+pre-existing debt, so this must never be raised again.
 """
 
 MAX_DEFERRED_IMPORTS_IN_LOGIC = 13
@@ -358,8 +364,68 @@ def test_the_graph_builder_actually_sees_the_shim_imports():
     """
     assert SHIM, "the shim map parsed as empty"
     assert "scheduler_app.translations" in SHIM, sorted(SHIM)[:5]
-    through_shim = [e for e in _upward_pairs(_edges()) if e[4]]
-    assert len(through_shim) >= 10, (
-        "only %d upward imports resolved through the shim; the flat-name "
-        "resolution has stopped working and the count is now an undercount"
-        % len(through_shim))
+
+    through_shim = [e for e in _edges() if e[4]]
+    assert len(through_shim) >= 20, (
+        "only %d imports resolved through the shim; the flat-name resolution "
+        "has stopped working, and every contract in this file is now counting "
+        "a fraction of the real graph" % len(through_shim))
+
+    # The specific alias that carried three quarters of ST-ARCH-009 must still
+    # be resolved, and must land inside the leaf package now.
+    resolved = {e[1] for e in through_shim
+                if e[1].endswith(".translations")}
+    assert resolved == {"scheduler_app.i18n.translations"}, (
+        "the flat `scheduler_app.translations` import no longer resolves into "
+        "the i18n leaf: %r" % (resolved,))
+
+
+def test_the_i18n_leaf_stays_a_leaf():
+    """ST-ARCH-009 — the fix only holds while `i18n` depends on nothing.
+
+    Every layer imports this package, so one import out of it re-creates the
+    inversion in a new direction. `cell_formatter` is the concrete temptation:
+    it looks like it belongs here and its `tooltip_text` needs
+    `core.logic.classroom_of`, which would make `i18n -> core -> i18n` a cycle
+    and put the leaf inside the knot `test_the_core_knot_does_not_grow` tracks.
+    """
+    leaks = [
+        "scheduler_app/%s.py:%d imports %s"
+        % (a.split("scheduler_app.", 1)[-1].replace(".", "/"), ln, b)
+        for a, b, _deferred, ln, _shim in _edges()
+        if _layer(a) == "i18n" and _layer(b) != "i18n"
+    ]
+    assert not leaks, (
+        "scheduler_app/i18n must import nothing else from scheduler_app:\n  "
+        + "\n  ".join(sorted(leaks)))
+
+
+def test_the_engine_imports_no_qt():
+    """ST-ARCH-009's real payload: the engine must run without an interface.
+
+    The layering count can reach zero while a Qt import hides one module
+    deeper. This walks the actual module graph of the packages the CP-SAT
+    subprocess and the Linux CI oracle import, and fails on any PyQt6 reachable
+    from them -- which is the failure those two consumers would hit, and which
+    a headless machine reports as an ImportError with no obvious cause.
+    """
+    qt_importers = []
+    for path in _python_files():
+        module = _module_name(path)
+        if _layer(module) not in LOWER_LAYERS + ("i18n",):
+            continue
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module]
+            for name in names:
+                if name.split(".")[0] in ("PyQt6", "PyQt5", "PySide6"):
+                    qt_importers.append("%s:%d imports %s"
+                                        % (module, node.lineno, name))
+    assert not qt_importers, (
+        "these engine-layer modules import Qt, so the CP-SAT subprocess and "
+        "the headless CI oracle cannot load them:\n  "
+        + "\n  ".join(sorted(qt_importers)))

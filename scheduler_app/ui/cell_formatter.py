@@ -1,8 +1,15 @@
-"""Unified cell content assembly for timetable display and export."""
+"""Unified cell content assembly for timetable display.
+
+ST-ARCH-009: this module is deliberately NOT in `scheduler_app/i18n/`.
+`tooltip_text` needs `core.logic.classroom_of`, so moving it there would
+turn a core->ui violation into an i18n->core one and make the leaf package
+part of a cycle. Its one dependency-free function, `plain_cell_text`, went
+to its single caller in `data_io/exporter.py` instead.
+"""
 
 from scheduler_app.logic import classroom_of
 from scheduler_app.translations import tr
-from scheduler_app.ui.badge_formatter import badge_text
+from scheduler_app.i18n.badge_formatter import badge_text
 
 
 def tooltip_text(cls, include_groups=True, include_duration=True):
@@ -27,21 +34,4 @@ def tooltip_text(cls, include_groups=True, include_duration=True):
     bt = badge_text(cls)
     if bt:
         parts.append(f"[{bt}]")
-    return "\n".join(parts)
-
-
-def plain_cell_text(entry):
-    """Return plain single-line text for a schedule entry (CSV/clipboard).
-
-    Expects an entry dict with keys: name, lecturer, room, class_code.
-    """
-    parts = []
-    code = entry.get("class_code", "")
-    if code:
-        parts.append(code)
-    parts.append(entry["name"])
-    if entry["lecturer"]:
-        parts.append(entry["lecturer"])
-    if entry["room"]:
-        parts.append(f"[{entry['room']}]")
     return "\n".join(parts)

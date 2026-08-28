@@ -109,7 +109,7 @@ CELL_TEXT = {
 
 def badge_colours():
     """The protection/pinned badge colours, read from their single source."""
-    from scheduler_app.ui import badge_formatter as bf
+    from scheduler_app.i18n import badge_formatter as bf
     out = {"pinned": bf._PINNED_COLOR}
     for prot, (_emoji, _key, colour) in bf._BADGE_MAP.items():
         out["badge:" + prot] = colour
@@ -365,7 +365,7 @@ def test_the_workbook_paints_the_same_palette_as_the_screen(tmp_path):
     export_schedule(state, "xlsx", str(out), mode="lecturer")
     painted = {c.upper() for c in _cell_text_colours(out)}
 
-    from scheduler_app.ui.badge_formatter import get_badge
+    from scheduler_app.i18n.badge_formatter import get_badge
     expected_badge = get_badge(state["classes"][0])[2]
     for role, colour in (("class code", CELL_FG_CODE),
                          ("class name", CELL_FG_NAME),

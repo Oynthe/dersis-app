@@ -488,7 +488,7 @@ def window(qapp, dersis_home, message_boxes, monkeypatch):
     never unregisters them, so the registries are snapshotted and restored.
     """
     from scheduler_app.plans import TIER_INSTITUTIONAL
-    from scheduler_app.ui.day_keys import DAY_KEYS
+    from scheduler_app.i18n.day_keys import DAY_KEYS
     from scheduler_app.ui.first_run import FirstRunController
     from scheduler_app.ui.tier_enforcement import TierEnforcement
 
@@ -536,7 +536,7 @@ def clicky(window):
     nothing.
     """
     from scheduler_app.core.models import new_class
-    from scheduler_app.ui.day_keys import DAY_KEYS
+    from scheduler_app.i18n.day_keys import DAY_KEYS
 
     state = window.state_data
 

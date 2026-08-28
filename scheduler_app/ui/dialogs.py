@@ -31,7 +31,7 @@ from scheduler_app.logic import (
     SLOT_ERROR_DUPLICATE,
 )
 from scheduler_app.widgets import MultiSelectButton
-from scheduler_app.ui.day_keys import DAY_KEYS, day_label, normalize_day_list, normalize_day_value
+from scheduler_app.i18n.day_keys import DAY_KEYS, day_label, normalize_day_list, normalize_day_value
 
 
 _DIALOG_STYLESHEET_TEMPLATE = """

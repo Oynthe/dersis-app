@@ -163,7 +163,7 @@ def test_the_pill_does_not_paint_over_the_pinned_badge(width, qapp):
     ``badge_formatter._PINNED_COLOR``. If the pill is painted over the badge,
     the badge's rows are inside the pill's rows — or gone entirely.
     """
-    from scheduler_app.ui.badge_formatter import _PINNED_COLOR
+    from scheduler_app.i18n.badge_formatter import _PINNED_COLOR
     from scheduler_app.ui.renderer import CONFLICT_BORDER
 
     cls = _pinned_class()

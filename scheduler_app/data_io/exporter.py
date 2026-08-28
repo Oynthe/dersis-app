@@ -45,9 +45,8 @@ from scheduler_app.models import (
     slot_offset_for_target, cls_key, find_off_grid_placements,
 )
 from scheduler_app.translations import tr
-from scheduler_app.ui.badge_formatter import get_badge
-from scheduler_app.ui.cell_formatter import plain_cell_text
-from scheduler_app.ui.day_keys import display_day
+from scheduler_app.i18n.badge_formatter import get_badge
+from scheduler_app.i18n.day_keys import display_day
 
 
 class FinalSchedule:
@@ -94,6 +93,29 @@ class FinalSchedule:
                 }
                 grid.setdefault((day, slot), []).append(entry)
         return grid
+
+
+def plain_cell_text(entry):
+    """Plain single-line text for a schedule entry (CSV / clipboard).
+
+    ST-ARCH-009. Lived in `ui/cell_formatter.py`, which this module imported --
+    one of the 22 upward layering violations. It needs nothing at all: no
+    translation, no logic, just string assembly over a dict. So it moved to its
+    only caller rather than into the i18n leaf, where it would have been the
+    one member with no language content.
+
+    Expects an entry dict with keys: name, lecturer, room, class_code.
+    """
+    parts = []
+    code = entry.get("class_code", "")
+    if code:
+        parts.append(code)
+    parts.append(entry["name"])
+    if entry["lecturer"]:
+        parts.append(entry["lecturer"])
+    if entry["room"]:
+        parts.append(f"[{entry['room']}]")
+    return "\n".join(parts)
 
 
 def _strip_hash(color):
