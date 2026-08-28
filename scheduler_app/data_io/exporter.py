@@ -1502,6 +1502,18 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
         row_heights = [24, 18]  # header rows
         tall_rows = {}
 
+        # The branch sub-header is the one header cell holding free user text:
+        # branch names come from a comma-split line the user types
+        # (dialogs.py), so "9/A Fen Bilimleri Agirlikli Sube" is as legal as
+        # "A". 18pt fits one line, and a fixed row does not grow -- measured,
+        # a 2-line label spills 1pt past each border into padding (harmless),
+        # but a 4-line one is 60pt in an 18pt row and prints over the day
+        # header above and the first lesson below. Measured here for the same
+        # reason every other Paragraph in this table is.
+        for _hdr_cell in row1:
+            if isinstance(_hdr_cell, Paragraph):
+                _note_cell_height(tall_rows, _hdr_cell, data_col_w - 4, 1, 1, 18)
+
         for si, slot in enumerate(slots):
             data_row = si + 2  # after 2 header rows
             row = [

@@ -946,11 +946,23 @@ def test_pdf_export_falls_back_to_helvetica_when_the_font_file_is_missing(
     assert b"D001" in content, "the fallback export drew no lessons at all"
 
 
+# A branch name a school really can type: branches are a comma-split line of
+# free text in the class-group editor, defaulting to "A, B" but not limited to
+# it. At this length it wraps to four lines in the everything table's narrow
+# columns, which is where the fixed 18pt sub-header row stops being enough.
+LONG_BRANCH = "9/A Fen Bilimleri Ağırlıklı Sınıf Şubesi"
+
+
 def _state_with_a_crowded_cell():
-    """A schedule whose longest lesson overflows a default-height PDF row."""
+    """A schedule whose longest lesson overflows a default-height PDF row.
+
+    Carries a long branch name as well as a long lesson name: the branch
+    sub-header is a fixed-height row holding user text, so it can overflow for
+    exactly the same reason the data rows could.
+    """
     lecturer = "Şükrü Işık Öğretmen"
     state = _empty_state(lecturers=[lecturer, LECT_A], rooms=["A-101"],
-                         years={"1. Sınıf": ["A", "B"]})
+                         years={"1. Sınıf": ["A", "B", LONG_BRANCH]})
     _place(state, "D001",
            "Öğrenci Değerlendirme ve Ölçme Çalıştayı: İş Sağlığı ve "
            "Güvenliği Uygulamaları",
@@ -999,17 +1011,24 @@ def test_pdf_rows_are_tall_enough_for_the_cells_they_hold(
         if any(h is None for h in heights):
             # Auto-sized (the appendix). reportlab grows those itself.
             continue
-        spans = {(c0, r0): r1 - r0 + 1
-                 for _cmd, (c0, r0), (_c1, r1) in tbl._spanCmds}
+        # Both directions of every merge: a day header is merged ACROSS the
+        # branch columns, so measuring it against one column's width would
+        # invent an overflow that the printed page does not have.
+        spans = {(c0, r0): (c1 - c0 + 1, r1 - r0 + 1)
+                 for _cmd, (c0, r0), (c1, r1) in tbl._spanCmds}
         for r, row in enumerate(tbl._cellvalues):
-            if r < tbl.repeatRows:
-                continue  # header rows: short labels at their own fixed height
+            # Header rows are checked too. They were skipped as "short labels
+            # at their own fixed height", which is wrong for the branch
+            # sub-header: branch names are free user text (a comma-split line
+            # in the class-group editor), so that row overflows exactly the
+            # way a data row does.
             for c, cell in enumerate(row):
                 if not isinstance(cell, Paragraph):
                     continue
+                colspan, rowspan = spans.get((c, r), (1, 1))
                 # LEFTPADDING + RIGHTPADDING = 4, TOP + BOTTOM = 6.
-                _w, needed = cell.wrap(widths[c] - 4, 1e6)
-                allotted = sum(heights[r:r + spans.get((c, r), 1)])
+                _w, needed = cell.wrap(sum(widths[c:c + colspan]) - 4, 1e6)
+                allotted = sum(heights[r:r + rowspan])
                 assert needed + 6 <= allotted + 0.01, (
                     f"mode={mode}: row {r} column {c} is {allotted:.1f}pt tall "
                     f"but the cell drawn in it needs {needed + 6:.1f}pt, so it "
