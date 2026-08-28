@@ -81,7 +81,7 @@ from scheduler_app.dialogs import (
     WarningsDialog, OpenSlotsDialog, PostAddDialog,
     BulkAddDialog, BulkResultsDialog, EditClassesDialog,
 )
-from scheduler_app.widgets import Toast, WarningLogPanel
+from scheduler_app.widgets import Toast, WarningLogPanel, YearLegend
 from scheduler_app.ui.bug_report import BugReportButton, BugReportDialog
 from scheduler_app.icons import (
     icon_add_class, icon_placement, icon_reschedule, icon_setup,
@@ -1334,6 +1334,13 @@ class SchedulerApp(QMainWindow):
         self.group_filter.currentIndexChanged.connect(lambda: self._render_current_tab())
         fb2.addWidget(self.group_filter)
         fb2.addStretch()
+        # ST-UI-006: year colour was the grid's primary grouping cue and
+        # nothing explained it. Goes in the filter row that already exists, so
+        # it costs the grid zero height -- measured natively, a 12-year legend
+        # is 738 px wide and 23 px tall, and the row is 23 px anyway.
+        self.year_legend = YearLegend()
+        fb2.addWidget(self.year_legend)
+        fb2.addSpacing(10)
         self._export_btn2 = QToolButton()
         self._export_btn2.setText("\u21D7  " + tr("buttons.export"))
         self._export_btn2.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -2206,6 +2213,12 @@ class SchedulerApp(QMainWindow):
 
     def _update_filters(self):
         s = self.state_data
+
+        # ST-UI-006: rebuilt from the live year list, so it can never claim a
+        # mapping the palette does not have. Cheap -- it early-returns unless
+        # the year list itself changed.
+        if hasattr(self, "year_legend"):
+            self.year_legend.update_years(s)
 
         self.classroom_filter.blockSignals(True)
         cur = self.classroom_filter.currentData()
