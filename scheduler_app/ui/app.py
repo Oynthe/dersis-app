@@ -247,7 +247,10 @@ QToolButton:pressed, QToolButton::menu-button:pressed {
     background: #DBEAFE;
 }
 QToolButton::menu-indicator {
-    image: none;
+    /* ST-UI-017: `image: none` was here, which made a toolbar button that
+       opens a MENU pixel-identical to one that performs an action. The user
+       could not tell which of the two a button was until they clicked it.
+       The width/position lines stay, so the layout is unchanged. */
     subcontrol-position: right center;
     subcontrol-origin: padding;
     width: 12px;
@@ -2760,6 +2763,12 @@ class SchedulerApp(QMainWindow):
         if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
             return
         cls = dlg.result
+        # ST-UI-020: the lecturer combo is editable, so this name may be
+        # one the user just typed. Register it BEFORE the undo snapshot,
+        # or undo restores a class pointing at a lecturer the restored
+        # state does not list -- and the next Setup OK unplaces it.
+        cls["lecturer"] = SchedulingWorkflow.register_lecturer(
+            self.state_data, cls.get("lecturer")) or ""
         snap_before = capture_snapshot(self.state_data)
         self._push_undo(tr("actions.add").format(name=cls["name"]))
         split_classes = split_non_joint(cls)
@@ -3237,6 +3246,9 @@ class SchedulerApp(QMainWindow):
         dlg = AddClassDialog(self, self.state_data, edit_cls=cls)
         if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
             return
+        # ST-UI-020: see add_class. The edited name is in dlg.result.
+        dlg.result["lecturer"] = SchedulingWorkflow.register_lecturer(
+            self.state_data, dlg.result.get("lecturer")) or ""
         self._push_undo(tr("actions.edit").format(name=cls["name"]))
         edit_result = SchedulingWorkflow.apply_class_edit(
             self.state_data, cls, dlg.result)
@@ -4456,6 +4468,12 @@ class SchedulerApp(QMainWindow):
         if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
             return
         cls = dlg.result
+        # ST-UI-020: the lecturer combo is editable, so this name may be
+        # one the user just typed. Register it BEFORE the undo snapshot,
+        # or undo restores a class pointing at a lecturer the restored
+        # state does not list -- and the next Setup OK unplaces it.
+        cls["lecturer"] = SchedulingWorkflow.register_lecturer(
+            self.state_data, cls.get("lecturer")) or ""
         snap_before = capture_snapshot(self.state_data)
         self._push_undo(tr("actions.add").format(name=cls["name"]))
         split_classes = split_non_joint(cls)

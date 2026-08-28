@@ -918,6 +918,42 @@ class SchedulingWorkflow:
         return invalidated
 
     @staticmethod
+    def register_lecturer(state, name) -> Optional[str]:
+        """Make a typed lecturer name real, and return its canonical spelling.
+
+        ST-UI-020. ``AddClassDialog``'s lecturer combo is editable, so a user
+        can type a name that is not in ``state["lecturers"]`` -- which is the
+        obvious thing to do when adding a class for a teacher who is not on the
+        list yet. Nothing registered it, and the consequences were invisible
+        until much later:
+
+        * ``reconcile_placements`` treats a lecturer not in the list as a
+          deleted one, so the next Setup OK **unplaces the lesson** and reports
+          it as "N placements cleared" -- attributed to whatever the user just
+          changed in Setup, not to the name they typed hours earlier;
+        * lecturer availability is keyed on ``state["lecturer_availability"]``
+          and no UI can create a record for a name that is not in the list, so
+          the teacher's unavailable hours never applied;
+        * the class was still counted and drawn, so nothing looked wrong.
+
+        Matching is casefold-based so "ayşe yılmaz" does not become a second
+        teacher beside "Ayşe Yılmaz"; the FIRST spelling wins and is returned,
+        because the existing one is the one availability records are keyed on.
+        Returns ``None`` for a blank name, which ``new_class()`` ships as the
+        default and the core reads as "no lecturer constraint".
+        """
+        clean = (name or "").strip()
+        if not clean:
+            return None
+        existing = state.setdefault("lecturers", [])
+        folded = clean.casefold()
+        for known in existing:
+            if (known or "").strip().casefold() == folded:
+                return known
+        existing.append(clean)
+        return clean
+
+    @staticmethod
     def reconcile_placements(state) -> list:
         """Clear every placement or pin that points at an axis value the state
         no longer has. Returns the affected class dicts.
