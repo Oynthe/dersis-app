@@ -14,8 +14,27 @@ test here that failed before it and passes after.
 .venv-audit/Scripts/python.exe -m mypy                # the engine type gate
 ```
 
-CI runs `pytest -m "not slow"` on Ubuntu with `QT_QPA_PLATFORM=offscreen`, plus
-`mypy` over the five Qt-free packages (`mypy.ini`), gated at **zero** errors.
+CI runs two jobs. **Validate** runs `pytest -m "not slow"` on Ubuntu with
+`QT_QPA_PLATFORM=offscreen`, plus `mypy` over the five Qt-free packages
+(`mypy.ini`), gated at **zero** errors. **Scheduling invariants** runs the
+`slow` engine gates that the first job deselects:
+
+```bash
+pytest tests/test_scheduler_invariants.py tests/test_greedy_bounds.py \
+       tests/test_optimizer_determinism.py tests/test_solver_work.py
+```
+
+Until Phase 7 the second job ran only `test_scheduler_invariants.py`, so **13 of
+the suite's 19 `slow` tests executed in no CI job at all** — including
+`test_greedy_bounds.py`'s placement floors and both slow reproducibility pins,
+which had been written for exactly that purpose. Seven still do
+(`test_optimizer_occupancy.py`'s two `_on_small` twins, whose fast versions run
+in Validate; `test_reschedule_overhead.py` ×2; `test_warning_log_growth.py` ×2,
+which need Qt; `test_cpsat_subprocess_boundary.py` ×1). Measured budget for the
+second job: ~8 min against a 25-minute timeout.
+
+**If you add a `slow` test, name the job that will run it.** A `slow` marker with
+no job behind it is a test that exists and never executes.
 
 ## The one rule you cannot break
 
@@ -37,7 +56,11 @@ throwaway temp directory at conftest-import time, before pytest collects anythin
 | `test_optimizer_occupancy.py` | ST-SCHED-001/010 — the greedy/LNS seam, ref-counted occupancy |
 | `test_validator_unification.py` | ST-ARCH-004/007/009 — every path reaches one verdict |
 | `test_cpsat_semantics.py` | ST-SCHED-005/006 — availability across duration, all protection levels |
-| `test_greedy_bounds.py` | ST-PERF-004/008, ST-SCHED-012 — bounds, convergence, no recursion |
+| `test_greedy_bounds.py` | ST-PERF-004/008, ST-SCHED-012 — bounds, convergence, no recursion; the placement floors and `repaired_conflicts == 0` at 25 and 80 classes |
+| `test_solver_work.py` | ST-PERF-001 — how much work the solver does, as a ratchet on `check_placement` calls; ST-SCHED-001's `repaired_conflicts`; the open ST-SCHED-013 xfail |
+| `test_protection_semantics.py` | ST-ARCH-001 item 5 — `soft` and `improve_only` on the **default** (greedy+LNS) engine, which `test_cpsat_semantics.py` never covered |
+| `test_sequential_classes.py` | ST-ARCH-001 item 7 — non-joint multi-target classes: block length, per-sub-block occupancy, generator/validator agreement |
+| `test_day_key_normalization.py` | ST-ARCH-001 item 9 — day labels become day keys on open/import; stale placements and pins are released |
 | `test_unplaced_diagnostics.py` | ST-SCHED-014/015 — dropped classes, global infeasibility |
 | `test_storage_roundtrip.py` · `test_import_roundtrip.py` · `test_export_smoke.py` | persistence and I/O |
 | `test_grid_integrity.py` · `test_setup_reconcile.py` · `test_state_transactions.py` | ST-DATA family |
@@ -104,11 +127,26 @@ title — an unpinned locale makes template round-trip tests irreproducible.
   the class name, which `CellRichText` never makes a formula; a pill-overlap
   assertion that reduced to `f(x) == f(x)`; and a double-scroll test that could
   not fail because the grid fits the viewport offscreen and nothing can scroll.
-- **A ratchet is a ceiling that may only go down.** `test_import_layering.py` and
-  `test_translation_coverage.py` both carry measured maxima. Adding a violation
-  turns the suite red; removing one means lowering the ceiling in the same
-  commit, so ground gained cannot be quietly given back. Raising one is a
-  deliberate act and needs a sentence in the commit saying why.
+- **A ratchet is a ceiling that may only go down.** `test_import_layering.py`,
+  `test_translation_coverage.py` and `test_solver_work.py` all carry measured
+  maxima. Adding a violation turns the suite red; removing one means lowering the
+  ceiling in the same commit, so ground gained cannot be quietly given back.
+  Raising one is a deliberate act and needs a sentence in the commit saying why.
+- **Gate on counts, never on the wall clock.** Measured over 11 consecutive
+  `ubuntu-latest` runs of identical code: runner variance 1.36–1.49x (historical
+  outlier 3.38x), and the runner is **1.87x faster** than the audit machine, so a
+  locally calibrated threshold is ~1.9x wrong before variance is considered. Over
+  the same runs `ConstraintValidator.check_placement` call counts were **bit-exact**
+  across processes with randomised `PYTHONHASHSEED`. `test_solver_work.py` gates on
+  the count; the suite's one wall-clock assertion
+  (`test_reschedule_overhead.py`) is a **ratio of two times measured inside one
+  call**, so machine speed divides out. Write the second shape or none.
+- **A cost gate and a quality gate are not substitutes.** Measured: a
+  `check_placement` stubbed to bless every cell stays inside the work ratchet at
+  both scales while producing 16 (`tiny`) and 138 (`small`) hard violations;
+  removing the LNS stopping condition triples the work while `placed`,
+  `hard_violations` and `q_after` do not move at all. Each is blind to exactly
+  what the other catches, so neither may be deleted as redundant.
 - **Ask which copy of the code the user runs.** Phase 6's sharpest lesson:
   `tests/test_export_smoke.py` had 48 tests against an Excel engine with **no
   production caller**, while the writer the menu actually reached had three.
