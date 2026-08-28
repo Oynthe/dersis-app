@@ -13,7 +13,251 @@ what has changed since. Per-finding state also lives in the
 | **3 — Scheduling engine hardening** | ✅ Complete | `fix/phase-3-engine-hardening` |
 | **4 — Core workflow UX** | ✅ Complete | `fix/phase-4-workflow-ux` |
 | **5 — UI consistency & accessibility** | 🟡 Mostly complete | `fix/phase-5-consistency` |
-| 6–7 | Not started | — |
+| **6 — Architecture & maintainability** | 🟡 Mostly complete | `fix/phase-6-architecture` |
+| 7 | Not started | — |
+
+---
+
+## Phase 6 — mostly complete
+
+> **Starting the next session?** → [`HANDOFF-PHASE7.md`](HANDOFF-PHASE7.md).
+
+**Suite: 725 tests — 712 pass, 13 known-defect pins, 0 failures.** Both lanes
+exit 0. (671 at the start of the phase: +54 new tests, and **11 pins deleted**,
+none added.) `mypy` runs in CI over the five Qt-free packages at **0 errors**.
+
+Six of the roadmap's seven rows are done, plus two of the three Phase 5
+leftovers. **ST-UI-013 (the responsive shell) is still not built** — see below;
+its remaining premise turned out to be language-dependent, which nobody knew.
+The `SessionStore` extraction and the `dialogs.py` split were **deliberately
+descoped** to the defects they surfaced; the reasoning is under "The two rows
+that were not built as written".
+
+### The headline is not an architecture finding
+
+**Ctrl+Z, or deleting a class, could kill DERSİS silently.** New finding,
+ST-ARCH-015, found while scouting ST-ARCH-012 and not in the register.
+
+`refresh_grid` → `_render_current_tab` → `_clear_class_selection` →
+`_refresh_open_slots` → `_open_slots_fingerprint` → `selected_classes` reads the
+unplaced sidebar's stored *positions* into `state_data["classes"]` **before**
+`_update_side_panels` rebuilds them. After any shrink of the classes list, with
+a row selected in that sidebar, the reader indexed the new short list with an
+old long-list position. Two live failures:
+
+1. **The process died.** `IndexError` inside a Qt slot, and PyQt6 answers that
+   with `qFatal()`. Measured: exit **`0xC0000409`**, empty stdout, empty
+   stderr — no dialog, no traceback, no crash report, and any edit still inside
+   the 1.5 s autosave debounce unwritten.
+2. **Silently the wrong class.** When the shrink was at the *front*, the stale
+   position still resolved — to a different class than the one highlighted.
+   That half never raised, so no crash could ever have revealed it.
+
+Fixed by addressing classes through `class_uid`, whose docstring already said it
+exists so identity "survives serialization, copying, and list mutations".
+Bounds-checking the position instead would have fixed the crash and left
+failure 2 alive.
+
+### Findings closed
+
+| ID | Sev | What changed |
+|---|---|---|
+| **ST-ARCH-015** | 🔴 Critical | **New.** The unplaced sidebar addresses classes by identity, not position. Ctrl+Z and Delete no longer kill the app. |
+| [ST-ARCH-003](12-findings-register.md) | 🟠 High | One Excel engine, and it is the one the menu reaches. `mode` reaches Excel for the first time. |
+| [ST-ARCH-009](12-findings-register.md) | 🟡 Medium | **22 upward layering violations → 0.** New `scheduler_app/i18n/` leaf package; the ceiling is now a hard contract. |
+| [ST-ARCH-010](12-findings-register.md) | 🟡 Medium | Deferred imports in `logic.py` 21 → 13; mutually importing pairs 9 → 7. Enforced as a ratchet. |
+| [ST-ARCH-011](12-findings-register.md) | 🟡 Medium | The legacy solver family and 9 more dead symbols deleted; `logic.py` 1668 → 1349 lines. |
+| [ST-ARCH-012](12-findings-register.md) | 🟡 Medium | Undo covers the whole state. **Setup is undoable** — the fix Phase 4 had to withdraw. |
+| [ST-ARCH-013](12-findings-register.md) | 🟡 Medium | `mypy` gate at 0 errors over the engine; `ClassDict`/`StateDict` declared; the KeyError the finding names is fixed. |
+| [ST-FUNC-005](12-findings-register.md) | 🟠 High | **Closed by deletion.** The crash only ever existed in the unused engine. 11 strict pins deleted. |
+| [ST-UI-005](12-findings-register.md) | 🟠 High | **Reopened and re-closed.** Phase 5's fix never reached the Excel file (below). |
+| [ST-UI-006](12-findings-register.md) | 🟠 High | The grid has a colour key that groups years sharing a swatch instead of claiming a mapping the palette cannot make. |
+| [ST-UI-007](12-findings-register.md) | 🟡 Medium | Phase 5's Qt-side escaping was written and never called. Wired. |
+| [ST-UI-017/018/020](12-findings-register.md) | 🟢 Low | Dropdown caret restored; all validation errors shown; **a typed lecturer is registered**. |
+
+### Where the register was not enough
+
+As in Phases 1–5, each was proved by building the naive version and watching it
+fail, or by measuring rather than assuming.
+
+1. **ST-ARCH-003 had already cost a shipped fix, silently, one phase after it
+   landed.** `export_schedule` is called from the app only with `format="pdf"`;
+   the XLSX a school prints comes from `ui/app.py`'s own writer. Phase 5 fixed
+   the *other* copy, so the workbook kept the pre-Phase-5 palette. Measured by
+   exporting a file and reading the colours back out of it: room `#16A34A` at
+   **1.55:1**, class code 3.15:1, lecturer 3.56:1, branch 3.34:1, badge 1.50:1,
+   against AA's 4.5:1 — while the screen and the PDF were correct. The guard
+   written to prevent exactly this drift scans `renderer` and `exporter` by
+   name, and the live writer is in neither.
+2. **The suite was testing the wrong engine, and it hid two data-loss bugs.**
+   Unifying them turned two tests red immediately: a placed lesson with **no
+   target groups**, and one whose **target year was deleted**, are both absent
+   from the everything-matrix. The printout looked complete. Neither could fire
+   before, because the tests exercised the copy with no users.
+3. **ST-FUNC-005 was never reachable.** Registered High, pinned by 11
+   `xfail(strict=True)` cases, and the crash existed only in the dead writer —
+   the live one has sanitised sheet titles since before the audit. All 11 went
+   XPASS the moment the engines merged. The finding is closed by deleting code,
+   not by fixing it.
+4. **ST-ARCH-010's "11 module-level import cycles" is wrong in both halves.**
+   Measured with a shim-aware AST grapher and Tarjan: module-level edges alone
+   form **zero** cycles and zero mutually-importing pairs — nothing cyclic runs
+   at import time, today or at the audit commit. The cycles appear only once
+   `logic.py`'s deferred imports are counted, and then it is not 11 discrete
+   cycles but **one 15-module strongly connected component** covering nearly
+   all of `core`. You cannot fix a 15-node SCC one cycle at a time, which is
+   why the remedy is the `logic` split and not a list.
+5. **ST-ARCH-009 is 22, not 19 — and 16 of them never mention `ui`.** They go
+   through the flat shim name `scheduler_app.translations`. A grep-driven fix
+   finds six of twenty-two. (19 was right at the audit commit; three were added
+   by this remediation.)
+6. **"The shim makes the leaf move a zero-call-site change" is false.**
+   `_SHIM_MAP` carries only the flat `translations` name; `day_keys`,
+   `badge_formatter` and `cell_formatter` are imported by real path at 31
+   statements and are not in the map at all. Doing what the audit says breaks
+   26 of 58 modules — the app does not start.
+7. **`cell_formatter` must not move, though the finding lists it.** Its
+   `tooltip_text` needs `core.logic.classroom_of`, so relocating it converts a
+   `core → ui` violation into an `i18n → core` one and puts the leaf package
+   inside a cycle — strictly worse than the defect. Its one dependency-free
+   function moved to its single caller instead.
+8. **ST-ARCH-011 undercounts by 3×.** "~30 dead/unreachable symbols" measures
+   at **91**; the Phase 3 comment's three named orphan helpers are three of
+   eleven.
+9. **ST-ARCH-013's remedy does not address the failure it cites.** A TypedDict
+   catches a missing key at *neither* totality, is blind to `.get()` (over half
+   of all class-dict reads), and the cited KeyError lives in a **third** dict
+   shape the remedy never mentions. `[name-defined]` needs
+   `check_untyped_defs`, which costs 168 errors here and finds **zero**
+   name-defined problems. So the crash was chased directly instead — and it was
+   still live: `get_lecturer_availability` fell back to defaults only when the
+   lecturer key was *absent*, so a present-but-partial record raised `KeyError`
+   in `lecturer_available_at`. Exactly the audit's example, three phases on.
+10. **ST-ARCH-012's cost premise is stale.** Full-state snapshots measure
+    **+1.6–2.9 % time and +2.6–3.8 % memory** over classes-only, across the
+    whole 50-entry stack, because the classes list is ~97 % of the bytes either
+    way. The audit's "stacked on the per-refresh encryption write" was removed
+    by Phase 2.
+11. **ST-UI-006's collision pairs are not the ones predicted.** The handoff
+    said Year-01 and Year-09, from the modulo. Year names are free text and
+    `sorted()` is lexicographic, so for a real Turkish school `"10. Sınıf"`
+    sorts between `"1."` and `"2."`, and 12 years give **four** pairs —
+    `1./6.`, `7./10.`, `8./11.`, `9./12.` Which years collide depends on how
+    the school names them, which is why the legend is built from the live list.
+12. **"No legend fits" was an offscreen artifact.** Measured under
+    `QT_QPA_PLATFORM=offscreen` a 12-chip legend is 1449 px and fits no
+    supported window; measured natively with real Segoe UI it is **738 px** and
+    fits comfortably. The offscreen fallback is fixed-pitch, so every advance
+    roughly doubles. The analysis that recommended dropping the row had walked
+    into the exact trap `tests/README.md` warns about.
+13. **ST-UI-020's item (a) fix is a no-op as written.** "AddClassDialog
+    validates before the constraint checkboxes are read, so contradictory
+    allow/exclude sets are never checked" — the ordering is real, but
+    `validate_class_fields` has no contradiction check at all, so moving the
+    reads changes nothing. Contradictions *are* detected, by
+    `ConstraintNegotiator`, after commit, in a collapsed log line.
+
+### Defects found in passing, none in the register
+
+- **A typed lecturer name was a delayed, silent unplacement.** The combo is
+  editable; nothing registered the name; `reconcile_placements` treats a
+  lecturer absent from `state["lecturers"]` exactly as it treats a **deleted**
+  one. So the next Setup OK unplaced the lesson and blamed whatever the user
+  had just changed in Setup. Availability never applied to that teacher either,
+  because no UI can create a record for an unlisted name.
+- **The CP-SAT subprocess answered in English.** `translations._current_lang`
+  is a module global and Windows multiprocessing uses **spawn**, so the child
+  re-imports and resets it. Measured: a Turkish parent got `'Optimum'`, the
+  child produced `'Optimal'`. Those are the *unplaced reasons* the user reads,
+  so a Turkish school running Thorough got an English list.
+- **A dead CP-SAT child silently downgraded the run.** Every failure path
+  returned `None` and the caller fell back to the heuristic with no message and
+  no summary key. The user asked for Thorough, got Quick, same completion
+  dialog.
+- **`_flush_before_state_swap` had zero callers** and its own docstring
+  describes the loss: an edit inside the 1.5 s debounce followed by File ▸ New
+  or File ▸ Open never reaches disk.
+- **`text_safety.escape_qt_rich` / `qt_tooltip` were written in Phase 5 and
+  never called.** `setToolTip` sniffs its argument with `Qt.mightBeRichText`,
+  so the *format* of a grid tooltip was decided by the user's own class name.
+- **`build_nuitka.bat` enumerates subpackages one by one**, so the new `i18n`
+  package would have shipped a Windows build with no translation table at all.
+
+### The two rows that were not built as written
+
+**`SessionStore` (ST-ARCH-005/006) was descoped to its defects.** Measured, the
+extraction is worth **4.7 % of `app.py`** and moves its Maintainability Index by
+**exactly zero** — `app.py` is at the 0.00 floor because of its size, and one
+seam does not change that. The audit's premise that the code is Qt-free is also
+no longer true: Phase 1 closed ST-ARCH-006 by giving `_auto_save` a user-facing
+error channel, and that channel is Qt. What the row was really worth is the
+defects it surfaced, and those are fixed. The god-object finding is real and
+still open; it needs a plan that moves the number, not one seam.
+
+**The `dialogs.py` split was descoped for the same reason.** Splitting by class
+moves 14 of 15 modules into radon's A band and leaves `setup_dialog.py` at
+**exactly 0.00** — the same floor the finding is about. The MI is relocated, not
+fixed. The shim hazard was checked empirically and is *absent* (a throwaway
+replica of the real `_ShimLoader` passes all five checks with the target as a
+package, including `scheduler_app.dialogs is scheduler_app.ui.dialogs`), so the
+move is safe whenever someone wants it — it is the *value* that is unproven.
+
+**ST-UI-013 (responsive shell) is still not built**, and the reason has changed.
+Phase 5 deferred it because the numbers were wrong. Measured natively now, the
+one number everyone treated as a constant is not one: the sidebar's
+`minimumSizeHint` is **the width of two translated strings**, and it ranges from
+**140 px (ja)** through **195 px (tr)** to **253 px (ru)** — never the 301 px on
+record. So the responsive breakpoint differs per language, and any threshold
+calibrated in one locale is wrong in another. That is a bigger finding than the
+row, and it needs its own pass.
+
+### Behaviour changes worth knowing
+
+- **The Excel export is one engine.** Sheets are named after the year / room /
+  group / lecturer, localized and deduplicated — the `T_`/`R_`/`B_` prefixed
+  sheets are gone with the writer that made them. A lesson the matrix has no
+  column for now gets its own sheet instead of vanishing.
+- **Undo covers everything, and Setup is undoable.** The entry is recorded only
+  when the dialog is accepted, so a cancelled Setup no longer destroys redo.
+- **A lecturer typed into the class form joins the school's lecturer list**,
+  matched case-insensitively so `"ayşe yılmaz"` does not become a second
+  teacher beside `"Ayşe Yılmaz"`.
+- **The By-Group tab has a colour key**, in the filter row, costing no grid
+  height. Above eight years it shows one swatch per *colour*, listing the years
+  that share it.
+- **Toolbar dropdown buttons look like dropdowns again.**
+- **The class form reports every mistake at once.**
+- **`summary` gained `cpsat_failure`**, naming why deep mode did not run.
+
+### Known gaps left behind
+
+1. **ST-UI-013 is not implemented**, and its premise is language-dependent —
+   see above. Re-measure into the register before working it.
+2. **ST-ARCH-005 (god object) is open.** `app.py` is 5 796 → 5 243 lines and
+   still MI 0.00. The `_write_excel` extraction removed its worst function
+   (CC 57 → the file's worst is now 27).
+3. **The `core` SCC is still 15 modules.** Breaking it needs the `logic.py`
+   primitives/facade split, which is the one seam the audit got exactly right.
+   `MAX_CORE_SCC_SIZE` in `tests/test_import_layering.py` is the ratchet.
+4. **19 of `logic.py`'s remaining deferred imports are load-bearing.** Recorded
+   for whoever promotes them: `python -c "import scheduler_app.core.logic"` is
+   **not** the check — it succeeds for every one of them while
+   `import scheduler_app.core.workflow`, the real entry path, still raises.
+5. **~80 dead symbols remain** of the 91 measured. This phase deleted the
+   family the finding names; the rest is a mechanical follow-up, along with 131
+   unused imports.
+6. **`check_untyped_defs` is off**, at 168 errors. Turning it on is a project,
+   not a config flip; the measurement is in `mypy.ini`.
+7. **The rest of ST-UI-019/018 is untouched** — bug-dialog theming, warning-log
+   timestamps and de-duplication, empty-state CTAs. All Low, all better done
+   together.
+8. **CSV is still two writers, deliberately.** `exporter._export_csv` emits the
+   timetable; `app.export_csv` emits a class list. Different columns, different
+   granularity — two products, not a duplicate. Merging them would silently
+   change the file a user has been getting.
+9. **The translation backlog is unchanged** at 2508 (locale, key) pairs. This
+   phase added no new keys on purpose, reusing `export.appendix_offgrid` and
+   `actions.setup` where new ones were tempting.
 
 ---
 

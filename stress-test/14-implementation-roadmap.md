@@ -139,19 +139,43 @@ Proposals P3/P4/P5:
 | Escape HTML/CSV/PDF inputs (injection) ✅ | [ST-UI-007](12-findings-register.md), [ST-UI-008](12-findings-register.md) | 3/3/3/S | S |
 | Form UX (all errors, inline markers, QFormLayout); light-theme dialogs; warning-log polish; empty-state CTAs ⬜ *(triaged; much of it is already false — see HANDOFF-PHASE6)* | [ST-UI-015](12-findings-register.md) ✅ (Phase 4)…020 | 3/2/2/M | M |
 
-## Phase 6 — Architecture & maintainability
+## Phase 6 — Architecture & maintainability 🟡 MOSTLY COMPLETE
 
-*Justified by the findings above; do after the safety net and correctness land.*
+*Done on `fix/phase-6-architecture`; see [`PROGRESS.md`](PROGRESS.md#phase-6--mostly-complete)
+for what the register got wrong and [`HANDOFF-PHASE7.md`](HANDOFF-PHASE7.md) for
+what is left.*
+
+> **The headline was not an architecture finding.** Scouting ST-ARCH-012 turned
+> up **ST-ARCH-015**: Ctrl+Z, or deleting a class, could kill DERSİS silently at
+> `0xC0000409` with no dialog and no traceback, and a second, quieter half that
+> returned the *wrong class* and never raised at all. Fixed first.
 
 | Task | Findings | I/U/R/E | Effort |
 |---|---|---|---|
-| Extract `SessionStore` (persistence+undo) from `app.py` | [ST-ARCH-005](12-findings-register.md), [ST-ARCH-006](12-findings-register.md) | 4/2/4/L | L |
-| Unify export engines; delete dead one | [ST-ARCH-003](12-findings-register.md) | 3/2/3/M | M |
-| Move i18n/formatters to leaf package; break core→ui cycles | [ST-ARCH-009](12-findings-register.md), [ST-ARCH-010](12-findings-register.md) | 3/2/3/M | M |
-| Delete dead legacy solver family + unreachable symbols | [ST-ARCH-011](12-findings-register.md) | 3/2/3/M | M |
-| `TypedDict` state/class + mypy-on-core | [ST-ARCH-013](12-findings-register.md) | 3/2/3/M | M |
-| Split `dialogs.py` into a package (re-exporting `__init__`) | [ST-ARCH-005](12-findings-register.md) | 2/1/2/M | M |
-| Full-state undo snapshots | [ST-ARCH-012](12-findings-register.md) | 3/2/3/M | M |
+| Unify export engines; delete dead one ✅ | [ST-ARCH-003](12-findings-register.md) | 3/2/3/M | M |
+| Move i18n/formatters to leaf package ✅ · break core→ui cycles 🟡 | [ST-ARCH-009](12-findings-register.md) ✅ (22→0), [ST-ARCH-010](12-findings-register.md) 🟡 (ratcheted) | 3/2/3/M | M |
+| Delete dead legacy solver family ✅ · remaining unreachable symbols ⬜ | [ST-ARCH-011](12-findings-register.md) | 3/2/3/M | M |
+| `TypedDict` state/class + mypy-on-core ✅ | [ST-ARCH-013](12-findings-register.md) | 3/2/3/M | M |
+| Full-state undo snapshots ✅ | [ST-ARCH-012](12-findings-register.md) | 3/2/3/M | M |
+| Extract `SessionStore` (persistence+undo) from `app.py` ⬜ *(descoped — see below)* | [ST-ARCH-005](12-findings-register.md), [ST-ARCH-006](12-findings-register.md) ✅ | 4/2/4/L | L |
+| Split `dialogs.py` into a package ⬜ *(descoped — see below)* | [ST-ARCH-005](12-findings-register.md) | 2/1/2/M | M |
+
+**Two rows were descoped to the defects they surfaced, with measurements.** The
+`SessionStore` seam is worth 4.7 % of `app.py` and moves its Maintainability
+Index by **exactly zero**; the audit's "no Qt dependency" premise is also no
+longer true, because Phase 1 closed ST-ARCH-006 by giving `_auto_save` a Qt
+error channel. Splitting `dialogs.py` leaves `setup_dialog.py` at **exactly
+0.00** — the same floor the finding is about, relocated rather than fixed. Both
+surfaced real defects (a latent data loss in `_flush_before_state_swap`, an
+unwired Phase 5 escaping helper) and those are fixed. ST-ARCH-005 stays open and
+needs a plan that moves the number.
+
+**Also closed here:** [ST-FUNC-005](12-findings-register.md) (by deletion — the
+crash only ever existed in the engine with no callers; 11 strict pins removed),
+[ST-UI-005](12-findings-register.md) (reopened: Phase 5's fix never reached the
+Excel file), [ST-UI-006](12-findings-register.md),
+[ST-UI-007](12-findings-register.md) (its Qt half was written and never wired),
+and the live items of [ST-UI-017/018/020](12-findings-register.md).
 
 ## Phase 7 — Testing, observability & release
 

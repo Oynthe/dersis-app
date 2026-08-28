@@ -6,3 +6,7 @@
 -r requirements.txt
 
 pytest>=7.0
+
+# ST-ARCH-013. Gates the Qt-free layers at zero errors; see mypy.ini for
+# the scope and for what this does and does not catch.
+mypy>=1.8

@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from scheduler_app.translations import tr
-import scheduler_app.ui.tier_translations  # noqa: F401 — registers upgrade.* keys
+import scheduler_app.i18n.tier_translations  # noqa: F401 — registers upgrade.* keys
 from scheduler_app.plans import (
     PLANS,
     TIER_FREE,

@@ -101,6 +101,7 @@ python -m nuitka ^
     --include-package=scheduler_app ^
     --include-package=scheduler_app.core ^
     --include-package=scheduler_app.ui ^
+    --include-package=scheduler_app.i18n ^
     --include-package=scheduler_app.storage ^
     --include-package=scheduler_app.learning ^
     --include-package=scheduler_app.data_io ^

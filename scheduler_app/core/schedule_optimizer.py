@@ -100,14 +100,27 @@ def _make_cpsat_state_snapshot(state):
 
 def _cpsat_subprocess_worker(state_snap, weights, time_limit,
                              protected_indices, heuristic_indices,
-                             result_queue, seed=DEFAULT_OPTIMIZER_SEED):
+                             result_queue, seed=DEFAULT_OPTIMIZER_SEED,
+                             language=None):
     """Run CP-SAT solver in an isolated subprocess.
 
     All arguments are plain serializable Python objects. Results are
     placed in *result_queue* as a dict.  If the solver crashes at the
     native level the subprocess dies without affecting the main process.
+
+    *language* is the parent's UI language, and it has to be passed explicitly.
+    ``translations._current_lang`` is a module global, and Windows
+    multiprocessing uses **spawn** -- the child re-imports the module from
+    scratch, so the global returns to its default. Measured: a parent running
+    Turkish got 'Optimum' while the child produced 'Optimal', and those strings
+    are not diagnostics. They are the unplaced reasons the user reads in the
+    results dialog, so a Turkish school running Thorough mode got a list of
+    English sentences with no way to tell why.
     """
     try:
+        if language:
+            from scheduler_app.translations import set_language
+            set_language(language)
         from scheduler_app.cpsat_scheduler import CPSATScheduler, HAS_ORTOOLS
         if not HAS_ORTOOLS:
             result_queue.put(None)
@@ -564,6 +577,7 @@ class ScheduleOptimizer:
             cpsat_used = False
             cpsat_status = None
             cpsat_status_label = None
+            self._cpsat_failure = None
             if self.use_cpsat:
                 # Shut down parallel pool before CP-SAT to free resources
                 if parallel_pool is not None:
@@ -680,6 +694,11 @@ class ScheduleOptimizer:
                 "classes_placed": len(placed_list),
                 "classes_unplaced": len(unplaced_list),
                 "cpsat_used": cpsat_used,
+                # Why deep mode did not contribute, when it was asked for and
+                # did not run. None when it ran, or was never requested.
+                "cpsat_failure": (getattr(self, "_cpsat_failure", None)
+                                  if self.use_cpsat and not cpsat_used
+                                  else None),
                 "cpsat_status": cpsat_status,
                 "cpsat_status_label": cpsat_status_label,
                 "greedy_stats": greedy_stats,
@@ -1281,8 +1300,12 @@ class ScheduleOptimizer:
         try:
             from scheduler_app.cpsat_scheduler import HAS_ORTOOLS
         except ImportError:
+            # The likeliest cause on a frozen build, and the one that used to
+            # be indistinguishable from "deep mode simply did nothing".
+            self._cpsat_failure = "import_failed"
             return None
         if not HAS_ORTOOLS:
+            self._cpsat_failure = "ortools_missing"
             return None
 
         classes = self.state["classes"]
@@ -1306,11 +1329,15 @@ class ScheduleOptimizer:
         state_snap = _make_cpsat_state_snapshot(self.state)
         result_queue = multiprocessing.Queue()
 
+        # The child is a spawn, so it re-imports translations and would answer
+        # in English regardless of the UI language. Carry it across explicitly.
+        from scheduler_app.translations import get_language
         proc = multiprocessing.Process(
             target=_cpsat_subprocess_worker,
             args=(state_snap, dict(self.weights or {}),
                   self.cpsat_time_limit, protected_indices,
-                  heuristic_indices, result_queue, self.seed))
+                  heuristic_indices, result_queue, self.seed,
+                  get_language()))
         proc.start()
 
         # Poll until the subprocess finishes, calling progress callback
@@ -1322,24 +1349,38 @@ class ScheduleOptimizer:
             if self.progress_callback:
                 self.progress_callback(0, 0, 0, -1, 0)
 
+        # ST-ARCH-011/ST-SCHED-014: every one of these returns None, and the
+        # caller then falls back to the heuristic result with no message at
+        # all. The user asked for Thorough and silently got Quick. Record WHY,
+        # so `summary['cpsat_failure']` can say so.
         if proc.is_alive():
             proc.kill()
             proc.join(timeout=5)
+            self._cpsat_failure = "timeout"
             return None
 
         if proc.exitcode != 0:
-            # Subprocess crashed (native segfault, abort, etc.)
+            # Subprocess died: native segfault, abort, or -- much more likely
+            # on a frozen build -- an ImportError re-importing the module chain
+            # in the spawned child.
+            self._cpsat_failure = "subprocess_exit_%s" % proc.exitcode
             return None
 
         if result_queue.empty():
+            self._cpsat_failure = "no_result"
             return None
 
         try:
             result = result_queue.get_nowait()
         except Exception:
+            self._cpsat_failure = "no_result"
             return None
 
-        if result is None or result.get("status") != "ok":
+        if result is None:
+            self._cpsat_failure = "unavailable"
+            return None
+        if result.get("status") != "ok":
+            self._cpsat_failure = str(result.get("status") or "error")
             return None
 
         # Map index-based results back to original class dicts

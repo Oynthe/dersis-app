@@ -28,11 +28,11 @@ from scheduler_app.renderer import (
 from scheduler_app.dashboard import DashboardWidget
 
 try:
+    # ST-ARCH-003: the workbook writer moved to data_io/exporter.py and took
+    # the styling imports with it. This name is still read -- `_export_to_excel`
+    # checks `openpyxl is None` to tell the user the dependency is missing
+    # before it opens a file dialog -- so the guard stays.
     import openpyxl
-    from openpyxl.styles import Font as XlFont, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-    from openpyxl.cell.rich_text import CellRichText, TextBlock
-    from openpyxl.cell.text import InlineFont
 except ImportError:
     openpyxl = None
 
@@ -44,7 +44,7 @@ from scheduler_app.constants import (
 )
 from scheduler_app.translations import tr, get_language, set_language, is_rtl
 from scheduler_app.core.text_safety import csv_safe
-from scheduler_app.ui.day_keys import (
+from scheduler_app.i18n.day_keys import (
     normalize_state_day_keys, day_label, display_day, format_day_time,
 )
 from scheduler_app.models import (
@@ -81,7 +81,7 @@ from scheduler_app.dialogs import (
     WarningsDialog, OpenSlotsDialog, PostAddDialog,
     BulkAddDialog, BulkResultsDialog, EditClassesDialog,
 )
-from scheduler_app.widgets import Toast, WarningLogPanel
+from scheduler_app.widgets import Toast, WarningLogPanel, YearLegend
 from scheduler_app.ui.bug_report import BugReportButton, BugReportDialog
 from scheduler_app.icons import (
     icon_add_class, icon_placement, icon_reschedule, icon_setup,
@@ -247,7 +247,10 @@ QToolButton:pressed, QToolButton::menu-button:pressed {
     background: #DBEAFE;
 }
 QToolButton::menu-indicator {
-    image: none;
+    /* ST-UI-017: `image: none` was here, which made a toolbar button that
+       opens a MENU pixel-identical to one that performs an action. The user
+       could not tell which of the two a button was until they clicked it.
+       The width/position lines stay, so the layout is unchanged. */
     subcontrol-position: right center;
     subcontrol-origin: padding;
     width: 12px;
@@ -744,10 +747,11 @@ class DraggableUnplacedList(QListWidget):
                 > QApplication.startDragDistance()):
             row = self.row(self.itemAt(self._drag_start_pos))
             self._drag_start_pos = None
-            if row < 0 or row >= len(self.app._unplaced_indices):
+            # ST-ARCH-015: resolve through the uid map, never a stored position.
+            dragged = self._classes_from_rows([row])
+            if not dragged:
                 return
-            idx = self.app._unplaced_indices[row]
-            cls = self.app.state_data["classes"][idx]
+            cls = dragged[0]
             selected = self._classes_from_rows(
                 self.row(sel_item) for sel_item in self.selectedItems()
             )
@@ -771,13 +775,33 @@ class DraggableUnplacedList(QListWidget):
         super().mouseReleaseEvent(event)
 
     def _classes_from_rows(self, rows):
+        """Resolve sidebar rows to class dicts, tolerating a stale panel.
+
+        ST-ARCH-015. This used to index ``state_data["classes"]`` with a
+        position stored when the panel was last built, guarding only the *row*
+        against ``len(_unplaced_indices)``. Both failure modes were live:
+
+        * the list shrank and the stored position was past the end, which
+          raised ``IndexError`` inside a Qt slot — and PyQt6 answers an
+          unhandled exception in a slot with ``qFatal``, so the process died
+          at ``0xC0000409`` with no dialog and no traceback;
+        * the list shrank at the *front* and the stored position still
+          resolved, silently returning a **different class** than the one the
+          user had highlighted, which is worse than the crash.
+
+        Identity, not position: ``class_uid`` exists precisely so it survives
+        list mutations (``models.cls_key``). A uid that no longer resolves is
+        not a selection, because that class is genuinely gone.
+        """
+        by_uid = self.app._unplaced_class_by_uid()
+        uids = self.app._unplaced_uids
         classes = []
         for sel_row in rows:
-            if 0 <= sel_row < len(self.app._unplaced_indices):
-                sel_idx = self.app._unplaced_indices[sel_row]
-                sel_cls = self.app.state_data["classes"][sel_idx]
-                if sel_cls not in classes:
-                    classes.append(sel_cls)
+            if not (0 <= sel_row < len(uids)):
+                continue
+            sel_cls = by_uid.get(uids[sel_row])
+            if sel_cls is not None and sel_cls not in classes:
+                classes.append(sel_cls)
         return classes
 
     def selected_classes(self):
@@ -844,6 +868,10 @@ class SchedulerApp(QMainWindow):
         self._autosave_pending = False
         self._autosave_fingerprint = None
         self._active_tutorial = None
+
+        # ST-ARCH-015: the unplaced sidebar addresses classes by uid, never by
+        # position — a position goes stale the moment the classes list shrinks.
+        self._unplaced_uids = []
 
         # Selection state
         self._selected_class = None
@@ -1306,6 +1334,13 @@ class SchedulerApp(QMainWindow):
         self.group_filter.currentIndexChanged.connect(lambda: self._render_current_tab())
         fb2.addWidget(self.group_filter)
         fb2.addStretch()
+        # ST-UI-006: year colour was the grid's primary grouping cue and
+        # nothing explained it. Goes in the filter row that already exists, so
+        # it costs the grid zero height -- measured natively, a 12-year legend
+        # is 738 px wide and 23 px tall, and the row is 23 px anyway.
+        self.year_legend = YearLegend()
+        fb2.addWidget(self.year_legend)
+        fb2.addSpacing(10)
         self._export_btn2 = QToolButton()
         self._export_btn2.setText("\u21D7  " + tr("buttons.export"))
         self._export_btn2.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -1800,29 +1835,78 @@ class SchedulerApp(QMainWindow):
     # ── Undo / Redo ──────────────────────────────────────────────────────
 
     def _push_undo(self, label=""):
-        """Snapshot current classes state before a change."""
-        snapshot = copy.deepcopy(self.state_data["classes"])
+        """Snapshot the whole application state before a change.
+
+        ST-ARCH-012. This used to deep-copy ``state_data["classes"]`` and
+        nothing else, which made Setup permanently un-undoable: Setup rewrites
+        the day, slot, classroom, lecturer and year axes, so restoring only the
+        classes puts their old placements back onto the NEW grid and
+        resurrects exactly the orphans ST-DATA-003 is about. Phase 4 built that
+        and withdrew it as "a data-corruption bug wearing a safety label".
+
+        The obvious objection to snapshotting everything is cost, and it does
+        not survive measurement. Deep-copying the whole state against the
+        classes alone:
+
+            normal (80 classes)   0.788 -> 0.811 ms   +2.9%   6.1 -> 6.3 MB
+            large  (250 classes)  2.543 -> 2.583 ms   +1.6%  18.7 -> 19.1 MB
+
+        over the entire 50-entry stack, because the classes list is ~97% of the
+        bytes either way. The audit's framing -- "O(classes) deepcopy per
+        action stacked on the per-refresh encryption write" -- is stale: Phase 2
+        removed that write.
+        """
+        snapshot = copy.deepcopy(self.state_data)
         self._undo_stack.append((label, snapshot))
         if len(self._undo_stack) > self._max_undo:
             self._undo_stack.pop(0)
         # Any new action clears the redo stack
         self._redo_stack.clear()
 
+    def _restore_state(self, snapshot):
+        """Replace the live state's CONTENTS with *snapshot*, in place.
+
+        ST-ARCH-012. Rebinding ``self.state_data`` would be the natural way to
+        write this and it silently breaks the app: ``SchedulingWorkflow`` holds
+        an alias to the same dict (``self._workflow.state``, re-bound at three
+        places), and so does the autosave debounce timer, which reads
+        ``self.state_data`` when it fires. Rebinding leaves the workflow
+        pointing at the pre-undo state, so the grid shows one timetable and
+        every validator answers about another.
+
+        The old classes-only undo was accidentally safe here -- it assigned
+        into ``state_data["classes"]`` rather than rebinding the dict. Widening
+        the snapshot removes that accident, so the in-place contract has to be
+        explicit.
+        """
+        self.state_data.clear()
+        self.state_data.update(copy.deepcopy(snapshot))
+
+    def _after_undo_restore(self, label, key):
+        """Re-sync the window after the state was replaced wholesale."""
+        self._clear_class_selection()
+        self._clear_empty_slot_selection()
+        # A full-state restore can change the grid AXES, not just the lessons
+        # on them, so the filters have to be rebuilt from the restored lists
+        # before anything paints. refresh_grid -> _render_current_tab ->
+        # _update_filters does that; invalidating the open-slots fingerprint
+        # keeps the sidebar from reusing a cache keyed on the old axes.
+        self.invalidate_open_slots()
+        self.refresh_grid()
+        desc = tr(key).format(action=label) if label else tr(
+            "actions.undo" if key == "actions.undo_action" else "actions.redo")
+        self._show_toast(desc, "info")
+
     def undo(self):
-        """Restore the previous classes state."""
+        """Restore the previous application state."""
         if not self._undo_stack:
             return
         label, snapshot = self._undo_stack.pop()
         # Save current state to redo stack
-        current = copy.deepcopy(self.state_data["classes"])
+        current = copy.deepcopy(self.state_data)
         self._redo_stack.append((label, current))
-        # Restore
-        self.state_data["classes"] = snapshot
-        self._clear_class_selection()
-        self._clear_empty_slot_selection()
-        self.refresh_grid()
-        desc = tr("actions.undo_action").format(action=label) if label else tr("actions.undo")
-        self._show_toast(desc, "info")
+        self._restore_state(snapshot)
+        self._after_undo_restore(label, "actions.undo_action")
 
     def redo(self):
         """Re-apply an undone action."""
@@ -1830,15 +1914,10 @@ class SchedulerApp(QMainWindow):
             return
         label, snapshot = self._redo_stack.pop()
         # Save current state to undo stack (without clearing redo)
-        current = copy.deepcopy(self.state_data["classes"])
+        current = copy.deepcopy(self.state_data)
         self._undo_stack.append((label, current))
-        # Restore
-        self.state_data["classes"] = snapshot
-        self._clear_class_selection()
-        self._clear_empty_slot_selection()
-        self.refresh_grid()
-        desc = tr("actions.redo_action").format(action=label) if label else tr("actions.redo")
-        self._show_toast(desc, "info")
+        self._restore_state(snapshot)
+        self._after_undo_restore(label, "actions.redo_action")
 
     # ── Auto-save / Auto-load ─────────────────────────────────────────────
 
@@ -2135,6 +2214,12 @@ class SchedulerApp(QMainWindow):
     def _update_filters(self):
         s = self.state_data
 
+        # ST-UI-006: rebuilt from the live year list, so it can never claim a
+        # mapping the palette does not have. Cheap -- it early-returns unless
+        # the year list itself changed.
+        if hasattr(self, "year_legend"):
+            self.year_legend.update_years(s)
+
         self.classroom_filter.blockSignals(True)
         cur = self.classroom_filter.currentData()
         if cur is None:
@@ -2334,15 +2419,23 @@ class SchedulerApp(QMainWindow):
     #  UNPLACED PANEL
     # ══════════════════════════════════════════════════════════════════════
 
+    def _unplaced_class_by_uid(self):
+        """Live uid -> class dict map for the unplaced sidebar.
+
+        ST-ARCH-015. Built from ``state_data["classes"]`` at read time, so it
+        cannot go stale the way a stored position can.
+        """
+        return {cls_key(c): c for c in self.state_data["classes"]}
+
     def _refresh_unplaced_panel(self):
         self.unplaced_list.clear()
-        self._unplaced_indices = []
-        for i, c in enumerate(self.state_data["classes"]):
+        self._unplaced_uids = []
+        for c in self.state_data["classes"]:
             if not c["pinned"] and not c["placed"]:
                 code = c.get("class_code", "")
                 label = f"[{code}] {c['name']}" if code else c["name"]
                 self.unplaced_list.addItem(f"{label}  ({c['lecturer']})")
-                self._unplaced_indices.append(i)
+                self._unplaced_uids.append(cls_key(c))
 
     def _switch_sidebar_tab(self, index):
         """Switch sidebar tab (0 = Open Slots, 1 = Unplaced Classes)."""
@@ -2470,10 +2563,11 @@ class SchedulerApp(QMainWindow):
 
     def _on_unplaced_dblclick(self, item):
         row = self.unplaced_list.row(item)
-        if row < 0 or row >= len(self._unplaced_indices):
+        # ST-ARCH-015: identity, not position — see _classes_from_rows.
+        picked = self.unplaced_list._classes_from_rows([row])
+        if not picked:
             return
-        idx = self._unplaced_indices[row]
-        cls = self.state_data["classes"][idx]
+        cls = picked[0]
         dlg = PostAddDialog(self, self.state_data, cls)
         if dlg.exec() == PostAddDialog.DialogCode.Accepted:
             if dlg.result and dlg.result != "skip":
@@ -2500,6 +2594,12 @@ class SchedulerApp(QMainWindow):
                 self, tr("menus.file_new"),
                 tr("dialogs.new_schedule.confirm")
         ) == QMessageBox.StandardButton.Yes:
+            # ST-ARCH-011/ST-PERF-002: land the pending debounced write BEFORE
+            # state_data points somewhere else. This guard was written and
+            # never called; without it an edit made inside the 1.5 s window and
+            # followed by File > New is lost, because the timer fires later and
+            # persists the empty schedule instead.
+            self._flush_before_state_swap()
             self.state_data = new_state()
             self._workflow.state = self.state_data
             self.current_file = None
@@ -2517,6 +2617,9 @@ class SchedulerApp(QMainWindow):
         if not fname:
             return
         is_legacy = fname.lower().endswith(".uva")
+        # Same swap hazard as new_schedule: flush before rebinding, or the
+        # previous schedule's last edit is written onto the opened one.
+        self._flush_before_state_swap()
         try:
             self.state_data = storage.load_encrypted(fname)
             self._workflow.state = self.state_data
@@ -2673,6 +2776,12 @@ class SchedulerApp(QMainWindow):
         if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
             return
         cls = dlg.result
+        # ST-UI-020: the lecturer combo is editable, so this name may be
+        # one the user just typed. Register it BEFORE the undo snapshot,
+        # or undo restores a class pointing at a lecturer the restored
+        # state does not list -- and the next Setup OK unplaces it.
+        cls["lecturer"] = SchedulingWorkflow.register_lecturer(
+            self.state_data, cls.get("lecturer")) or ""
         snap_before = capture_snapshot(self.state_data)
         self._push_undo(tr("actions.add").format(name=cls["name"]))
         split_classes = split_non_joint(cls)
@@ -3150,6 +3259,9 @@ class SchedulerApp(QMainWindow):
         dlg = AddClassDialog(self, self.state_data, edit_cls=cls)
         if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
             return
+        # ST-UI-020: see add_class. The edited name is in dlg.result.
+        dlg.result["lecturer"] = SchedulingWorkflow.register_lecturer(
+            self.state_data, dlg.result.get("lecturer")) or ""
         self._push_undo(tr("actions.edit").format(name=cls["name"]))
         edit_result = SchedulingWorkflow.apply_class_edit(
             self.state_data, cls, dlg.result)
@@ -3231,30 +3343,33 @@ class SchedulerApp(QMainWindow):
     def edit_setup(self):
         snap_before = capture_snapshot(self.state_data)
         is_initial = not self._has_baseline
-        # ST-UI-014's second clause ("setup edits are irreversible") is real,
-        # and it CANNOT be fixed here. Phase 4 tried: it pushed an undo
-        # snapshot before the dialog and popped it again on cancel. Adversarial
-        # verification showed that made things worse in three ways, so it was
-        # withdrawn.
+        # ST-UI-014's second clause / ST-ARCH-012. Setup IS undoable now, and
+        # the history of this line is worth keeping.
         #
-        # `_push_undo` deep-copies `state_data["classes"]` and nothing else,
-        # while Setup rewrites days, slots, classrooms, lecturers and years. So
-        # undoing a Setup change restores the classes WITH THEIR OLD
-        # PLACEMENTS onto the NEW grid — resurrecting exactly the orphans
-        # ST-DATA-003 is about, from a button labelled "Undo: setup change".
-        # A half-transaction undo is not a partial fix; it is a data-corruption
-        # bug wearing a safety label.
+        # Phase 4 built this and withdrew it. Back then `_push_undo` copied
+        # `state_data["classes"]` and nothing else, while Setup rewrites days,
+        # slots, classrooms, lecturers and years — so "Undo: setup change"
+        # restored the classes WITH THEIR OLD PLACEMENTS onto the NEW grid and
+        # resurrected exactly the orphans ST-DATA-003 is about. A
+        # half-transaction undo is not a partial fix; it is a data-corruption
+        # bug wearing a safety label, and it was right to pull it.
         #
-        # It also clears the redo stack (so Setup+Cancel silently destroyed
-        # redo even though nothing changed) and, at the 50-step cap, evicted
-        # the oldest undo step that popping could not put back.
+        # What makes it safe now is that the snapshot covers the axes too, so
+        # the placements and the grid they refer to are restored together.
         #
-        # Making this genuinely undoable needs full-state snapshots — that is
-        # ST-ARCH-012, Phase 6. Until then Setup stays un-undoable, which is at
-        # least honest.
+        # The snapshot is taken only when the dialog is ACCEPTED. Phase 4's
+        # version pushed before `exec()` and popped on cancel, which silently
+        # destroyed the redo stack on a cancelled Setup and, at the 50-entry
+        # cap, evicted an undo step that popping could not put back.
         dlg = SetupDialog(self, self.state_data)
+        before_setup = copy.deepcopy(self.state_data)
         dlg.exec()
         if dlg.result:
+            self._undo_stack.append(
+                (tr("actions.setup"), before_setup))
+            if len(self._undo_stack) > self._max_undo:
+                self._undo_stack.pop(0)
+            self._redo_stack.clear()
             self._reconcile_after_setup()
         self.refresh_grid()
         if dlg.result:
@@ -4366,6 +4481,12 @@ class SchedulerApp(QMainWindow):
         if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
             return
         cls = dlg.result
+        # ST-UI-020: the lecturer combo is editable, so this name may be
+        # one the user just typed. Register it BEFORE the undo snapshot,
+        # or undo restores a class pointing at a lecturer the restored
+        # state does not list -- and the next Setup OK unplaces it.
+        cls["lecturer"] = SchedulingWorkflow.register_lecturer(
+            self.state_data, cls.get("lecturer")) or ""
         snap_before = capture_snapshot(self.state_data)
         self._push_undo(tr("actions.add").format(name=cls["name"]))
         split_classes = split_non_joint(cls)
@@ -4541,24 +4662,6 @@ class SchedulerApp(QMainWindow):
     #  EXCEL EXPORT
     # ══════════════════════════════════════════════════════════════════════
 
-    def _sheet_name_for_export(self, base, used):
-        invalid = set("[]:*?/\\")
-        default_sheet = tr("labels.sheet")
-        cleaned = "".join(ch for ch in str(base or default_sheet) if ch not in invalid).strip()
-        if not cleaned:
-            cleaned = default_sheet
-        name = cleaned[:31]
-        if name not in used:
-            used.add(name)
-            return name
-        counter = 2
-        while True:
-            suffix = f" ({counter})"
-            candidate = f"{cleaned[:31 - len(suffix)]}{suffix}"
-            if candidate not in used:
-                used.add(candidate)
-                return candidate
-            counter += 1
 
     def _export_to_excel(self):
         # Tier enforcement: Excel export requires feature
@@ -4594,7 +4697,12 @@ class SchedulerApp(QMainWindow):
             return
 
         try:
-            self._write_excel(fname, mode=mode)
+            # ST-ARCH-003: one export entry point for all three formats. The
+            # workbook writer used to live here, beside a second one in
+            # data_io/exporter.py that nothing called; the two drifted, and a
+            # fix applied to the unused copy never reached a user.
+            from scheduler_app.data_io.exporter import export_schedule
+            export_schedule(s, "xlsx", fname, mode=mode)
             QMessageBox.information(self, tr("status.exported"),
                                    f"{tr('status.exported_to')} {os.path.basename(fname)}")
         except Exception as e:
@@ -4659,580 +4767,6 @@ class SchedulerApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, tr("dialogs.error.title"), f"{tr('errors.failed_to_export')}\n{e}")
 
-    def _write_excel(self, fname, mode="everything"):
-        s = self.state_data
-        placed = get_placed_classes(s)
-        days = s["days"]
-        slots = s["slots"]
-        # ST-UI-001: one scan for the whole workbook, so every sheet marks the
-        # same clashes and the file agrees with the screen and the PDF.
-        conflict_partners = conflict_partner_index(find_schedule_conflicts(s))
-
-        wb = openpyxl.Workbook()
-        wb.remove(wb.active)
-        used_sheet_names = set()
-
-        # ── Theme matching the app's blue/slate UI ──
-        grid_side = Side(style="thin", color="CBD5E1")
-        cell_border = Border(left=grid_side, right=grid_side,
-                             top=grid_side, bottom=grid_side)
-        # Day header: dark slate (#334155) with white text
-        day_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
-        day_font = XlFont(name="Segoe UI", size=11, bold=True, color="FFFFFF")
-        # Branch sub-header: slate (#475569) with white text
-        branch_fill = PatternFill(start_color="475569", end_color="475569", fill_type="solid")
-        branch_font = XlFont(name="Segoe UI", size=9, bold=True, color="FFFFFF")
-        # Corner: gray-blue (#94A3B8) with white text
-        corner_fill = PatternFill(start_color="94A3B8", end_color="94A3B8", fill_type="solid")
-        corner_font = XlFont(name="Segoe UI", size=9, bold=True, color="FFFFFF")
-        # Session number: light gray (#F1F5F9) with dark text
-        session_fill = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
-        session_font = XlFont(name="Segoe UI", size=10, bold=True, color="333333")
-        # Time column: slate (#475569) with white text
-        time_fill = PatternFill(start_color="475569", end_color="475569", fill_type="solid")
-        time_font = XlFont(name="Segoe UI", size=9, bold=True, color="FFFFFF")
-        # Empty cell: near-white (#F8FAFC)
-        empty_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
-        center_wrap = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        center_nowrap = Alignment(horizontal="center", vertical="center")
-
-        def _append_rich_cell_blocks(blocks, cls, include_room=False, include_targets=False):
-            """Append rich text fragments for one class into *blocks*."""
-            code = cls.get("class_code", "")
-            if code:
-                blocks.append(TextBlock(
-                    InlineFont(b=True, sz=9, color="1D4ED8"), code + "\n"))
-            blocks.append(TextBlock(
-                InlineFont(b=True, sz=10, color="1E293B"), cls["name"] + "\n"))
-            if cls.get("lecturer"):
-                blocks.append(TextBlock(
-                    InlineFont(sz=9, color="475569"), cls["lecturer"]))
-            if include_room:
-                room = classroom_of(cls)
-                if room:
-                    blocks.append(TextBlock(
-                        InlineFont(sz=9, color="16A34A"), "\n" + room))
-            if include_targets:
-                groups = ", ".join(f"{t['year']}/{t['branch']}" for t in cls.get("targets", []))
-                if groups:
-                    blocks.append(TextBlock(
-                        InlineFont(sz=8, color="6D28D9"), "\n" + groups))
-            # Protection badge
-            badge_text, badge_color = "", ""
-            if cls.get("pinned"):
-                badge_text, badge_color = "\U0001F4CC " + tr("badges.pinned"), "DC2626"
-            else:
-                prot = cls.get("protection", "none")
-                if prot == "locked":
-                    badge_text, badge_color = "\U0001F512 " + tr("badges.locked"), "DC2626"
-                elif prot == "soft":
-                    badge_text, badge_color = "\U0001F6E1 " + tr("badges.protected"), "D97706"
-                elif prot == "same_day":
-                    badge_text, badge_color = "\u2194 " + tr("badges.same_day"), "2563EB"
-                elif prot == "improve_only":
-                    badge_text, badge_color = "\u2191 " + tr("badges.improve_only"), "7C3AED"
-            if badge_text:
-                blocks.append(TextBlock(
-                    InlineFont(b=True, sz=8, color=badge_color), "\n" + badge_text))
-            return blocks
-
-        def _build_rich_cell(cls, include_room=False, include_targets=False):
-            """Build rich text cell with color-coded content matching app view."""
-            blocks = []
-            _append_rich_cell_blocks(
-                blocks, cls, include_room=include_room,
-                include_targets=include_targets,
-            )
-            return CellRichText(*blocks)
-
-        def _build_stacked_rich_cell(classes, include_room=False, include_targets=False):
-            """Build a stacked rich-text cell for multiple overlapping classes."""
-            blocks = []
-            for idx, cls in enumerate(classes):
-                if idx > 0:
-                    blocks.append(TextBlock(
-                        InlineFont(sz=8, color="94A3B8"), "\n---\n"))
-                _append_rich_cell_blocks(
-                    blocks, cls, include_room=include_room,
-                    include_targets=include_targets,
-                )
-            return CellRichText(*blocks)
-
-        def _apply_page_setup(ws):
-            ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(
-                fitToPage=True)
-            ws.page_setup.fitToWidth = 1
-            ws.page_setup.fitToHeight = 0
-            ws.page_setup.orientation = "landscape"
-            ws.page_setup.paperSize = ws.PAPERSIZE_A3
-
-        def _lesson_fill_for_class(cls):
-            year_key = cls["targets"][0]["year"] if cls.get("targets") else None
-            if year_key:
-                yr_hex = get_year_color(s, year_key).lstrip("#")
-                light_hex = lighten_color(f"#{yr_hex}", 0.45).lstrip("#")
-            else:
-                light_hex = "F3F4F6"
-            return PatternFill(
-                start_color=light_hex.upper(),
-                end_color=light_hex.upper(),
-                fill_type="solid",
-            )
-
-        def _apply_lesson_cell(cell, cls, rich):
-            cell.value = rich
-            cell.fill = _lesson_fill_for_class(cls)
-            cell.alignment = center_wrap
-            cell.border = cell_border
-
-        def _write_filtered_sheet(ws, filter_fn, include_room=False, include_targets=False):
-            c = ws.cell(row=1, column=1, value=tr("labels.time"))
-            c.fill = corner_fill
-            c.font = corner_font
-            c.border = cell_border
-            c.alignment = center_nowrap
-
-            for d_idx, day in enumerate(days):
-                col = d_idx + 2
-                dc = ws.cell(row=1, column=col, value=tr(f"weekdays.{day}"))
-                dc.fill = day_fill
-                dc.font = day_font
-                dc.border = cell_border
-                dc.alignment = center_nowrap
-
-            filtered_entries = []
-            slot_claims = {}
-            for order, cls in enumerate(placed):
-                if not filter_fn(cls):
-                    continue
-                c_day = effective_day(cls)
-                c_start = effective_time(cls)
-                if c_day not in days or c_start not in slots:
-                    continue
-                start_si = slots.index(c_start)
-                span = min(total_duration(cls), len(slots) - start_si)
-                if span <= 0:
-                    continue
-                entry = {
-                    "cls": cls,
-                    "day": c_day,
-                    "start_si": start_si,
-                    "span": span,
-                    "order": order,
-                }
-                filtered_entries.append(entry)
-                for off in range(span):
-                    slot_claims.setdefault((start_si + off, c_day), []).append(entry)
-
-            overlapping_ids = set()
-            for entries in slot_claims.values():
-                if len(entries) > 1:
-                    overlapping_ids.update(cls_key(entry["cls"]) for entry in entries)
-
-            occupied_start = {}
-            covered = set()
-            overlap_cells = {}
-            for entry in filtered_entries:
-                cls = entry["cls"]
-                c_day = entry["day"]
-                start_si = entry["start_si"]
-                span = entry["span"]
-                if cls_key(cls) in overlapping_ids:
-                    for off in range(span):
-                        overlap_cells.setdefault((start_si + off, c_day), []).append(entry)
-                    continue
-                key = (start_si, c_day)
-                occupied_start[key] = (cls, span)
-                for off in range(span):
-                    covered.add((start_si + off, c_day))
-
-            for si, slot in enumerate(slots):
-                row = si + 2
-                t_cell = ws.cell(row=row, column=1, value=slot)
-                t_cell.fill = time_fill
-                t_cell.font = time_font
-                t_cell.border = cell_border
-                t_cell.alignment = center_nowrap
-
-                for d_idx, day in enumerate(days):
-                    col = d_idx + 2
-                    key = (si, day)
-                    if key in occupied_start:
-                        cls, span = occupied_start[key]
-                        rich = _build_rich_cell(cls, include_room=include_room,
-                                               include_targets=include_targets)
-                        if span > 1:
-                            ws.merge_cells(start_row=row, start_column=col,
-                                           end_row=row + span - 1, end_column=col)
-                        data_cell = ws.cell(row=row, column=col)
-                        _apply_lesson_cell(data_cell, cls, rich)
-                        for rr in range(row, row + span):
-                            ws.cell(row=rr, column=col).border = cell_border
-                    elif key in overlap_cells:
-                        entries = sorted(overlap_cells[key], key=lambda item: item["order"])
-                        classes = [item["cls"] for item in entries]
-                        rich = _build_stacked_rich_cell(
-                            classes,
-                            include_room=include_room,
-                            include_targets=include_targets,
-                        )
-                        data_cell = ws.cell(row=row, column=col)
-                        _apply_lesson_cell(data_cell, classes[0], rich)
-                        # ST-UI-001: stacking already kept both lessons here --
-                        # what was missing is saying that they clash. A shared
-                        # cell that is NOT a conflict (two online lessons) keeps
-                        # its normal year colour.
-                        keys = {cls_key(x) for x in classes}
-                        if any(conflict_partners.get(cls_key(x), frozenset())
-                               & (keys - {cls_key(x)}) for x in classes):
-                            data_cell.fill = PatternFill(
-                                start_color="FEE2E2", end_color="FEE2E2",
-                                fill_type="solid")
-                    elif key in covered:
-                        ws.cell(row=row, column=col).border = cell_border
-                    else:
-                        blank = ws.cell(row=row, column=col, value="")
-                        blank.fill = empty_fill
-                        blank.border = cell_border
-                        blank.alignment = center_wrap
-
-            ws.column_dimensions["A"].width = 12
-            for c_idx in range(2, len(days) + 2):
-                ws.column_dimensions[get_column_letter(c_idx)].width = 24
-            ws.row_dimensions[1].height = 30
-            for si in range(len(slots)):
-                ws.row_dimensions[si + 2].height = 70
-            _apply_page_setup(ws)
-
-        def _write_virtual_classroom_sheet(ws, filter_fn, include_room=False, include_targets=False):
-            c = ws.cell(row=1, column=1, value=tr("labels.time"))
-            c.fill = corner_fill
-            c.font = corner_font
-            c.border = cell_border
-            c.alignment = center_nowrap
-
-            layout = build_virtual_classroom_day_layout(s, filter_fn)
-            day_groups = layout["day_groups"]
-            blocks = layout["blocks"]
-            occupied_subcolumns = layout["occupied_subcolumns"]
-            starts = {
-                (block["row"], block["subcolumn"]): block
-                for block in blocks
-            }
-            covered = set(occupied_subcolumns)
-
-            for group in day_groups:
-                col_start = 2 + group["subcolumn_start"]
-                col_end = col_start + group["lane_count"] - 1
-                if group["lane_count"] > 1:
-                    ws.merge_cells(
-                        start_row=1, start_column=col_start,
-                        end_row=1, end_column=col_end,
-                    )
-                for col in range(col_start, col_end + 1):
-                    cell = ws.cell(row=1, column=col)
-                    cell.fill = day_fill
-                    cell.font = day_font
-                    cell.border = cell_border
-                    cell.alignment = center_nowrap
-                ws.cell(row=1, column=col_start, value=tr(f"weekdays.{group['day']}"))
-
-            total_subcolumns = layout["total_subcolumns"]
-            for si, slot in enumerate(slots):
-                row = si + 2
-                t_cell = ws.cell(row=row, column=1, value=slot)
-                t_cell.fill = time_fill
-                t_cell.font = time_font
-                t_cell.border = cell_border
-                t_cell.alignment = center_nowrap
-
-                for subcolumn in range(total_subcolumns):
-                    col = 2 + subcolumn
-                    key = (si, subcolumn)
-                    if key in starts:
-                        block = starts[key]
-                        rich = _build_rich_cell(
-                            block["cls"],
-                            include_room=include_room,
-                            include_targets=include_targets,
-                        )
-                        span = block["span"]
-                        if span > 1:
-                            ws.merge_cells(
-                                start_row=row, start_column=col,
-                                end_row=row + span - 1, end_column=col,
-                            )
-                        data_cell = ws.cell(row=row, column=col)
-                        _apply_lesson_cell(data_cell, block["cls"], rich)
-                        # ST-UI-001. This sheet lanes concurrent lessons rather
-                        # than stacking them, so it never had an "overlap"
-                        # branch to hang the marker on -- and marked no clashes
-                        # at all, while the physical sheets in the same
-                        # workbook did. The rule is the same non-geometric one
-                        # the renderer uses: a lesson is marked if the VALIDATOR
-                        # says it cannot coexist with something, not if two
-                        # blocks happen to share a cell (two online lessons at
-                        # one hour is normal and must stay unmarked).
-                        if conflict_partners.get(cls_key(block["cls"])):
-                            data_cell.fill = PatternFill(
-                                start_color="FEE2E2", end_color="FEE2E2",
-                                fill_type="solid")
-                        for rr in range(row, row + span):
-                            ws.cell(row=rr, column=col).border = cell_border
-                    elif key in covered:
-                        ws.cell(row=row, column=col).border = cell_border
-                    else:
-                        blank = ws.cell(row=row, column=col, value="")
-                        blank.fill = empty_fill
-                        blank.border = cell_border
-                        blank.alignment = center_wrap
-
-            ws.column_dimensions["A"].width = 12
-            for c_idx in range(2, total_subcolumns + 2):
-                ws.column_dimensions[get_column_letter(c_idx)].width = 24
-            ws.row_dimensions[1].height = 30
-            for si in range(len(slots)):
-                ws.row_dimensions[si + 2].height = 70
-            _apply_page_setup(ws)
-
-        if mode == "classroom":
-            physical_rooms = set(s.get("classrooms", []))
-            for room in get_classroom_export_labels(s.get("classrooms", []), placed):
-                ws = wb.create_sheet(title=self._sheet_name_for_export(room, used_sheet_names))
-                writer = _write_virtual_classroom_sheet if room not in physical_rooms else _write_filtered_sheet
-                writer(
-                    ws,
-                    filter_fn=lambda c, r=room: classroom_of(c) == r,
-                    include_room=False,
-                    include_targets=True,
-                )
-
-        elif mode == "group":
-            for yr in sorted(s.get("years", {}).keys()):
-                for br in s["years"][yr]:
-                    ws = wb.create_sheet(
-                        title=self._sheet_name_for_export(f"{yr} {br}", used_sheet_names))
-                    _write_filtered_sheet(
-                        ws,
-                        filter_fn=lambda c, y=yr, b=br: any(
-                            t["year"] == y and t["branch"] == b
-                            for t in c.get("targets", [])
-                        ),
-                        include_room=True,
-                        include_targets=False,
-                    )
-
-        elif mode == "lecturer":
-            lecturers = list(s.get("lecturers", []))
-            if not lecturers:
-                lecturers = sorted({c.get("lecturer", "") for c in placed if c.get("lecturer", "")})
-            for lecturer in lecturers:
-                if not lecturer:
-                    continue
-                ws = wb.create_sheet(
-                    title=self._sheet_name_for_export(lecturer, used_sheet_names))
-                _write_filtered_sheet(
-                    ws,
-                    filter_fn=lambda c, l=lecturer: c.get("lecturer", "") == l,
-                    include_room=True,
-                    include_targets=True,
-                )
-
-        else:
-            # Show Everything matrix export (per year), preserving the current matrix layout.
-            for yr in sorted(s["years"].keys()):
-                branches = s["years"][yr]
-                if not branches:
-                    continue
-                n_branches = len(branches)
-                ws = wb.create_sheet(title=self._sheet_name_for_export(yr, used_sheet_names))
-
-                ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
-                c_sn = ws.cell(row=1, column=1, value="")
-                c_sn.fill = corner_fill
-                c_sn.border = cell_border
-
-                ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
-                c_time = ws.cell(row=1, column=2, value=tr("labels.time"))
-                c_time.fill = corner_fill
-                c_time.font = corner_font
-                c_time.border = cell_border
-                c_time.alignment = center_nowrap
-
-                for d_idx, day in enumerate(days):
-                    col_start = 3 + d_idx * n_branches
-                    col_end = col_start + n_branches - 1
-                    if n_branches > 1:
-                        ws.merge_cells(start_row=1, start_column=col_start,
-                                       end_row=1, end_column=col_end)
-                    dc = ws.cell(row=1, column=col_start, value=tr(f"weekdays.{day}"))
-                    dc.fill = day_fill
-                    dc.font = day_font
-                    dc.border = cell_border
-                    dc.alignment = center_nowrap
-                    for mc in range(col_start, col_end + 1):
-                        ws.cell(row=1, column=mc).fill = day_fill
-                        ws.cell(row=1, column=mc).border = cell_border
-
-                ws.cell(row=2, column=1).fill = corner_fill
-                ws.cell(row=2, column=1).border = cell_border
-                ws.cell(row=2, column=2).fill = corner_fill
-                ws.cell(row=2, column=2).border = cell_border
-
-                for d_idx in range(len(days)):
-                    for b_idx, br in enumerate(branches):
-                        col = 3 + d_idx * n_branches + b_idx
-                        bc = ws.cell(row=2, column=col, value=br)
-                        bc.fill = branch_fill
-                        bc.font = branch_font
-                        bc.border = cell_border
-                        bc.alignment = center_nowrap
-
-                occupied = {}
-                claims = {}
-                for c in placed:
-                    c_day = effective_day(c)
-                    c_start = effective_time(c)
-                    if c_day not in days or c_start not in slots:
-                        continue
-                    d_idx = days.index(c_day)
-                    start_si = slots.index(c_start)
-                    is_joint = c.get("joint_session", True)
-                    n_targets = len(c.get("targets", []))
-                    dur = c["duration"]
-                    for t in c["targets"]:
-                        if t["year"] != yr or t["branch"] not in branches:
-                            continue
-                        b_idx = branches.index(t["branch"])
-                        if not is_joint and n_targets > 1:
-                            t_idx = c["targets"].index(t)
-                            slot_off = t_idx * dur
-                        else:
-                            slot_off = 0
-                        actual_start = start_si + slot_off
-                        for d_off in range(dur):
-                            si = actual_start + d_off
-                            if si >= len(slots):
-                                break
-                            okey = (si, d_idx, b_idx)
-                            # Identity, not equality, and not a plain append:
-                            # this runs inside `for t in c["targets"]`, so a
-                            # class carrying two IDENTICAL target dicts (a user
-                            # typing "A, B, A" as a year's branches) claimed the
-                            # same cell twice and was then found "overlapping"
-                            # with ITSELF -- pulled out of occupied_start and
-                            # stacked against its own duplicate, losing its
-                            # merge and its year colour. `is not` because two
-                            # distinct classes can compare equal by value.
-                            bucket = claims.setdefault(okey, [])
-                            if all(x is not c for x in bucket):
-                                bucket.append(c)
-                            if d_off == 0:
-                                span = min(dur, len(slots) - actual_start)
-                                occupied[okey] = ("start", c, span)
-                            else:
-                                occupied[okey] = ("span", None, 0)
-
-                # ST-UI-001. The dict above keeps the LAST writer, so a second
-                # lesson claiming a cell used to erase the first from this
-                # sheet -- while the filtered sheets in the SAME workbook
-                # already stacked both. Pull every contested claimant out and
-                # stack them, exactly as _write_filtered_sheet does.
-                overlapping = {id(c) for cs in claims.values() if len(cs) > 1
-                               for c in cs}
-                overlap_cells = {}
-                for okey, cs in claims.items():
-                    keep = [c for c in cs if id(c) in overlapping]
-                    if keep:
-                        overlap_cells[okey] = keep
-                for okey in overlap_cells:
-                    occupied.pop(okey, None)
-
-                for si, slot in enumerate(slots):
-                    erow = si + 3
-                    sn_cell = ws.cell(row=erow, column=1, value=si + 1)
-                    sn_cell.fill = session_fill
-                    sn_cell.font = session_font
-                    sn_cell.border = cell_border
-                    sn_cell.alignment = center_nowrap
-
-                    t_cell = ws.cell(row=erow, column=2, value=slot)
-                    t_cell.fill = time_fill
-                    t_cell.font = time_font
-                    t_cell.border = cell_border
-                    t_cell.alignment = center_nowrap
-
-                    for d_idx in range(len(days)):
-                        for b_idx in range(n_branches):
-                            col = 3 + d_idx * n_branches + b_idx
-                            okey = (si, d_idx, b_idx)
-                            if okey in overlap_cells:
-                                claimants = overlap_cells[okey]
-                                keys = {cls_key(x) for x in claimants}
-                                conflicted = any(
-                                    conflict_partners.get(cls_key(x), frozenset())
-                                    & (keys - {cls_key(x)})
-                                    for x in claimants)
-                                rich = _build_stacked_rich_cell(
-                                    claimants, include_room=True,
-                                    include_targets=False)
-                                dc = ws.cell(row=erow, column=col, value=rich)
-                                fill_hex = "FEE2E2" if conflicted else "F1F5F9"
-                                dc.fill = PatternFill(
-                                    start_color=fill_hex, end_color=fill_hex,
-                                    fill_type="solid")
-                                dc.border = cell_border
-                                dc.alignment = center_wrap
-                            elif okey in occupied:
-                                kind, cls, span = occupied[okey]
-                                if kind == "span":
-                                    ws.cell(row=erow, column=col).border = cell_border
-                                    continue
-                                rich = _build_rich_cell(cls, include_room=True,
-                                                       include_targets=False)
-                                if span > 1:
-                                    ws.merge_cells(start_row=erow, start_column=col,
-                                                   end_row=erow + span - 1, end_column=col)
-                                    for mr in range(erow, erow + span):
-                                        ws.cell(row=mr, column=col).border = cell_border
-                                yr_hex = get_year_color(s, yr).lstrip("#")
-                                light_hex = lighten_color(f"#{yr_hex}", 0.45).lstrip("#")
-                                cf = PatternFill(start_color=light_hex.upper(),
-                                                 end_color=light_hex.upper(), fill_type="solid")
-                                data_cell = ws.cell(row=erow, column=col, value=rich)
-                                data_cell.fill = cf
-                                data_cell.border = cell_border
-                                data_cell.alignment = center_wrap
-                            else:
-                                ec = ws.cell(row=erow, column=col, value="")
-                                ec.fill = empty_fill
-                                ec.border = cell_border
-
-                ws.column_dimensions["A"].width = 5
-                ws.column_dimensions["B"].width = 12
-                total_cols = 2 + n_branches * len(days)
-                for c_idx in range(3, total_cols + 1):
-                    ws.column_dimensions[get_column_letter(c_idx)].width = 22
-                ws.row_dimensions[1].height = 30
-                ws.row_dimensions[2].height = 22
-                for si in range(len(slots)):
-                    ws.row_dimensions[si + 3].height = 80
-                _apply_page_setup(ws)
-
-        if not wb.worksheets:
-            ws = wb.create_sheet(
-                title=self._sheet_name_for_export(tr("labels.schedule"), used_sheet_names)
-            )
-            ws.cell(row=1, column=1, value=tr("warnings.no_schedule_data"))
-
-        # ST-UI-008, the same sweep data_io/exporter.py runs. This is app.py's
-        # own parallel Excel writer (ST-ARCH-003); until the two are unified it
-        # needs the fix independently, or the two exports disagree.
-        from scheduler_app.data_io.spreadsheet_safety import (
-            neutralize_formula_cells,
-        )
-        neutralize_formula_cells(wb)
-        wb.save(fname)
 
     def _ensure_excel_deps(self):
         """Return True if pandas+openpyxl are available, auto-installing if needed."""

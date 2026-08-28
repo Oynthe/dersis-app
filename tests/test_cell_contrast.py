@@ -109,7 +109,7 @@ CELL_TEXT = {
 
 def badge_colours():
     """The protection/pinned badge colours, read from their single source."""
-    from scheduler_app.ui import badge_formatter as bf
+    from scheduler_app.i18n import badge_formatter as bf
     out = {"pinned": bf._PINNED_COLOR}
     for prot, (_emoji, _key, colour) in bf._BADGE_MAP.items():
         out["badge:" + prot] = colour
@@ -254,3 +254,124 @@ def test_the_palette_has_one_source_for_all_three_surfaces():
         "come from scheduler_app.core.constants so the screen and both exports "
         "cannot drift:\n  " + "\n  ".join(offenders)
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  The workbook the user actually opens
+# ══════════════════════════════════════════════════════════════════════════
+#
+# ST-ARCH-003. The test above scans ``renderer`` and ``exporter`` -- and misses
+# the writer that the Excel menu actually reaches. ``export_schedule`` is called
+# from the app only with ``format="pdf"``; the XLSX a school prints comes from
+# ``ui/app.py``'s own writer, which held a fourth copy of the palette. So Phase
+# 5 fixed the screen and the PDF, the guard confirmed both, and the workbook
+# kept shipping the pre-Phase-5 colours for a whole phase.
+#
+# Measured on the exported file before the fix: room #16A34A at 1.55:1, class
+# code #1D4ED8 at 3.15:1, lecturer #475569 at 3.56:1, branch #6D28D9 at 3.34:1.
+#
+# The lesson is that a source scan guards the modules you remember to list. This
+# one reads the colours back out of a real saved workbook instead, so it cannot
+# be defeated by the writer moving, being renamed, or growing a fifth copy.
+
+
+def _one_class_state():
+    """Smallest state that puts every in-cell text role into one cell."""
+    return {
+        "days": ["monday"], "slots": ["09:00", "10:00"],
+        "classrooms": ["R001"], "classroom_capacities": {"R001": 30},
+        "lecturers": ["Ogretmen"], "lecturer_availability": {},
+        "years": {"Y1": ["A"]},
+        "classes": [{
+            "name": "Matematik", "class_code": "MAT101",
+            "lecturer": "Ogretmen", "duration": 1, "participants": 20,
+            "targets": [{"year": "Y1", "branch": "A"}],
+            "allowed_days": [], "allowed_times": [],
+            "excluded_days": [], "excluded_times": [],
+            "required_classrooms": [], "excluded_classrooms": [],
+            "placed": True, "placed_day": "monday", "placed_time": "09:00",
+            "placed_classroom": "R001", "pinned": False,
+            "protection": "soft", "is_online": False,
+            "joint_class_group": "", "sequential": False,
+        }],
+    }
+
+
+def _cell_text_colours(path):
+    """Every (hex, sample text) the workbook paints rich-text cell runs in."""
+    import openpyxl
+    wb = openpyxl.load_workbook(str(path), rich_text=True)
+    found = {}
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                value = cell.value
+                if isinstance(value, str) or not hasattr(value, "__iter__"):
+                    continue
+                for block in value:
+                    colour = getattr(
+                        getattr(getattr(block, "font", None), "color", None),
+                        "rgb", None)
+                    if not isinstance(colour, str) or len(colour) < 6:
+                        continue
+                    colour = "#" + colour.upper()[-6:]
+                    found.setdefault(colour, set()).add(
+                        (getattr(block, "text", "") or "").strip()[:24])
+    return found
+
+
+@pytest.mark.excel
+@pytest.mark.parametrize("mode", ["classroom", "lecturer", "group"])
+def test_the_exported_workbook_is_legible(tmp_path, mode):
+    """ST-ARCH-003 / ST-UI-005 — the printed timetable must clear AA too.
+
+    A failure means a school exported its timetable to Excel, printed it, and
+    the room assignment on the page is unreadable -- while the same information
+    on screen and in the PDF is fine.
+    """
+    pytest.importorskip("openpyxl")
+    from scheduler_app.data_io.exporter import export_schedule
+
+    out = tmp_path / ("book_%s.xlsx" % mode)
+    export_schedule(_one_class_state(), "xlsx", str(out), mode=mode)
+
+    painted = _cell_text_colours(out)
+    assert painted, "the workbook has no rich-text cells to check"
+
+    failures = []
+    for colour, samples in sorted(painted.items()):
+        ratio, bg = min(
+            (contrast_ratio(colour, bg), bg) for bg in cell_backgrounds())
+        if ratio < AA_NORMAL_TEXT:
+            failures.append("%s (%s) is %.2f:1 on cell background %s"
+                            % (colour, ", ".join(sorted(samples)), ratio, bg))
+    assert not failures, (
+        "the Excel file a user opens paints text that fails WCAG AA:\n  "
+        + "\n  ".join(failures))
+
+
+@pytest.mark.excel
+def test_the_workbook_paints_the_same_palette_as_the_screen(tmp_path):
+    """ST-ARCH-003 — legible is not enough; it must be the SAME source.
+
+    Without this, the writer could keep its own private hexes and simply darken
+    them, which is how the three surfaces drifted apart in the first place.
+    """
+    pytest.importorskip("openpyxl")
+    from scheduler_app.data_io.exporter import export_schedule
+
+    state = _one_class_state()
+    out = tmp_path / "palette.xlsx"
+    export_schedule(state, "xlsx", str(out), mode="lecturer")
+    painted = {c.upper() for c in _cell_text_colours(out)}
+
+    from scheduler_app.i18n.badge_formatter import get_badge
+    expected_badge = get_badge(state["classes"][0])[2]
+    for role, colour in (("class code", CELL_FG_CODE),
+                         ("class name", CELL_FG_NAME),
+                         ("lecturer", CELL_FG_LECTURER),
+                         ("room", CELL_FG_ROOM),
+                         ("protection badge", expected_badge)):
+        assert colour.upper() in painted, (
+            "the workbook does not paint the %s in the shared palette colour "
+            "%s; it painted %s" % (role, colour, sorted(painted)))

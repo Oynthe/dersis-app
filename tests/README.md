@@ -11,9 +11,11 @@ test here that failed before it and passes after.
 .venv-audit/Scripts/python.exe -m pytest              # everything
 .venv-audit/Scripts/python.exe -m pytest -m "not slow"  # what CI runs
 .venv-audit/Scripts/python.exe -m pytest tests/test_scheduler_invariants.py -q
+.venv-audit/Scripts/python.exe -m mypy                # the engine type gate
 ```
 
-CI runs `pytest -m "not slow"` on Ubuntu with `QT_QPA_PLATFORM=offscreen`.
+CI runs `pytest -m "not slow"` on Ubuntu with `QT_QPA_PLATFORM=offscreen`, plus
+`mypy` over the five Qt-free packages (`mypy.ini`), gated at **zero** errors.
 
 ## The one rule you cannot break
 
@@ -46,6 +48,14 @@ throwaway temp directory at conftest-import time, before pytest collects anythin
 | `test_input_escaping.py` | ST-UI-007/008 — user text survives reportlab, Qt and a spreadsheet |
 | `test_translation_coverage.py` | ST-UI-011 — no raw key reaches a user; the locale backlog is a ratchet |
 | `test_ui_affordances.py` | the app must not lie about where things are (toast position, honoured cells) |
+| `test_unplaced_panel_identity.py` | ST-ARCH-015 — the sidebar addresses classes by identity; Ctrl+Z must not kill the app |
+| `test_import_layering.py` | ST-ARCH-009/010 — the engine must not import the interface; four ratchets |
+| `test_domain_shapes.py` | ST-ARCH-013 — `ClassDict`/`StateDict` match their constructors |
+| `test_full_state_undo.py` | ST-ARCH-012 — undo covers the axes, and restores in place |
+| `test_written_but_unwired.py` | ST-UI-007 / ST-ARCH-011 — fixes that existed and were never called |
+| `test_cpsat_subprocess_boundary.py` | what survives `spawn`: the UI language, and a dead child |
+| `test_form_affordances.py` | ST-UI-018/020 — a typed lecturer is registered; every error is shown |
+| `test_year_legend.py` | ST-UI-006 — the colour key groups years that share a swatch |
 | `test_smoke_environment.py` | the harness itself — proves HOME is sandboxed |
 
 ## Fixtures
@@ -94,6 +104,17 @@ title — an unpinned locale makes template round-trip tests irreproducible.
   the class name, which `CellRichText` never makes a formula; a pill-overlap
   assertion that reduced to `f(x) == f(x)`; and a double-scroll test that could
   not fail because the grid fits the viewport offscreen and nothing can scroll.
+- **A ratchet is a ceiling that may only go down.** `test_import_layering.py` and
+  `test_translation_coverage.py` both carry measured maxima. Adding a violation
+  turns the suite red; removing one means lowering the ceiling in the same
+  commit, so ground gained cannot be quietly given back. Raising one is a
+  deliberate act and needs a sentence in the commit saying why.
+- **Ask which copy of the code the user runs.** Phase 6's sharpest lesson:
+  `tests/test_export_smoke.py` had 48 tests against an Excel engine with **no
+  production caller**, while the writer the menu actually reached had three.
+  Phase 5's contrast fix landed on the untested-by-users copy and shipped
+  broken for a phase; two data-loss bugs in the live writer were invisible.
+  Green is not coverage if it is coverage of the wrong module.
 - **Never assert an absolute pixel measurement.** `QT_QPA_PLATFORM=offscreen` has
   no Segoe UI at all — `QFontInfo(QFont("Segoe UI", 9)).family()` is `""` — and
   advances run 1.5–2x native. That changes which cell rows get *dropped*, not

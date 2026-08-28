@@ -162,7 +162,7 @@ def test_toast_is_a_top_level_window_so_the_coordinate_space_matters(qapp):
 import pytest  # noqa: E402,F811
 
 from scheduler_app.core.models import (  # noqa: E402
-    new_state, new_class, LOCATION_ONLINE,
+    new_state, new_class, cls_key, LOCATION_ONLINE,
 )
 from scheduler_app.core.logic import find_valid_options  # noqa: E402
 
@@ -206,7 +206,8 @@ def test_an_online_lesson_has_somewhere_to_go_and_the_panel_says_so(
     window._selected_cells = []
     window.unplaced_list.clear()
     window.unplaced_list.addItem(cls["name"])
-    window._unplaced_indices = [0]
+    # ST-ARCH-015: the sidebar addresses classes by uid, not by position.
+    window._unplaced_uids = [cls_key(cls)]
     window.unplaced_list.setCurrentRow(0)
     window._switch_sidebar_tab(1)
     window._open_slots_fp = None
@@ -229,7 +230,8 @@ def test_the_panel_names_the_online_resource_instead_of_an_empty_room(
     window.state_data = state
     window.unplaced_list.clear()
     window.unplaced_list.addItem(cls["name"])
-    window._unplaced_indices = [0]
+    # ST-ARCH-015: the sidebar addresses classes by uid, not by position.
+    window._unplaced_uids = [cls_key(cls)]
     window.unplaced_list.setCurrentRow(0)
     window._switch_sidebar_tab(1)
     window._open_slots_fp = None

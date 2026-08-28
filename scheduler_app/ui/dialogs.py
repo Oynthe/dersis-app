@@ -26,12 +26,12 @@ from scheduler_app.models import (
 from scheduler_app import storage
 from scheduler_app.logic import (
     find_valid_options, get_placed_classes,
-    occupied_slots_of, classroom_of, batch_schedule,
+    occupied_slots_of, classroom_of,
     parse_slot_lines, slot_meaning_changes,
     SLOT_ERROR_DUPLICATE,
 )
 from scheduler_app.widgets import MultiSelectButton
-from scheduler_app.ui.day_keys import DAY_KEYS, day_label, normalize_day_list, normalize_day_value
+from scheduler_app.i18n.day_keys import DAY_KEYS, day_label, normalize_day_list, normalize_day_value
 
 
 _DIALOG_STYLESHEET_TEMPLATE = """
@@ -2659,7 +2659,15 @@ class AddClassDialog(QDialog):
         # Validate using canonical validator
         errors = validate_class_fields(cls)
         if errors:
-            QMessageBox.critical(self, tr("dialogs.error.title"), errors[0])
+            # ST-UI-018: show all of them. `validate_class_fields` has always
+            # returned a list, and showing only errors[0] turned one round of
+            # corrections into as many rounds as there were mistakes -- the
+            # user fixes the named field, presses OK, and is told about the
+            # next one. The validator already knows them all.
+            QMessageBox.critical(
+                self, tr("dialogs.error.title"),
+                errors[0] if len(errors) == 1
+                else "\n".join("• " + e for e in errors))
             return
 
         cls["allowed_days"] = [d for d, cb in self.allowed_day_cbs.items() if cb.isChecked()]

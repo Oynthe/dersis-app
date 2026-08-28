@@ -14,7 +14,8 @@ from typing import Any
 try:
     from deepdiff import DeepDiff
 except ImportError:
-    DeepDiff = None
+    # Optional dependency; the module degrades to its own comparison.
+    DeepDiff: Any = None   # type: ignore[no-redef]
 
 
 class ImpactLevel(Enum):
@@ -87,7 +88,7 @@ def capture_snapshot(state: dict) -> dict:
     # Capture class constraints (not placement state)
     classes_snap = []
     for cls in state.get("classes", []):
-        c = {}
+        c: dict[str, Any] = {}
         for field in _HARD_CONSTRAINT_CLASS_FIELDS | _SOFT_CLASS_FIELDS:
             val = cls.get(field)
             if isinstance(val, list):

@@ -690,10 +690,11 @@ def test_the_workbook_shows_both_lessons_of_a_contested_cell(
         make_app, tmp_path, mode):
     """ST-UI-001 — the user-facing Excel export must keep both lessons.
 
-    Note this is ``ui/app.py::_write_excel``, NOT
-    ``data_io/exporter.py::_export_excel`` — the app calls ``export_schedule``
-    only for PDF, so the exporter's Excel writer is not what a user gets
-    (ST-ARCH-003 unifies them in Phase 6).
+    This used to reach ``ui/app.py::_write_excel``, because the app called
+    ``export_schedule`` only for PDF and the exporter's own Excel writer was
+    not what a user got. ST-ARCH-003 unified them in Phase 6: there is one
+    writer now and ``export_schedule`` is the way in, so this test exercises
+    the user's path by exercising the public entry point.
 
     Its *filtered* sheets already stacked both lessons; the **everything**
     matrix in the same workbook still kept only the last writer, so one
@@ -701,17 +702,13 @@ def test_the_workbook_shows_both_lessons_of_a_contested_cell(
     timetable is missing a lesson that the sheet next to it shows.
     """
     openpyxl = pytest.importorskip("openpyxl")
+    from scheduler_app.data_io.exporter import export_schedule
     s = _state()
     _add(s, "AAA111", "09:00", "R001", lecturer="Lect-01")
     _add(s, "ZZZ999", "09:00", "R001", lecturer="Lect-02", branch="B")
 
-    app = make_app()
-    try:
-        app.state_data = s
-        out = tmp_path / f"conflict_{mode}.xlsx"
-        app._write_excel(str(out), mode=mode)
-    finally:
-        app.close()
+    out = tmp_path / f"conflict_{mode}.xlsx"
+    export_schedule(s, "xlsx", str(out), mode=mode)
 
     wb = openpyxl.load_workbook(out)
     text = " ".join(
@@ -930,10 +927,9 @@ def test_a_duplicate_target_class_is_not_stacked_against_itself(
         s["years"] = {"Year-1": branches}
         cls = _add(s, "DUP001", "09:00", "R001", lecturer="Lect-01", duration=2)
         cls["targets"] = targets
-        app = make_app()
-        app.state_data = s
+        from scheduler_app.data_io.exporter import export_schedule
         out = tmp_path / f"dup_{len(targets)}.xlsx"
-        app._write_excel(str(out), mode="everything")
+        export_schedule(s, "xlsx", str(out), mode="everything")
         wb = openpyxl.load_workbook(out)
         ws = wb[wb.sheetnames[0]]
         cell = ws.cell(row=3, column=3)

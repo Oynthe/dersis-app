@@ -13,6 +13,7 @@ from typing import Any
 try:
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+    XlFont = Font          # the moved ST-ARCH-003 writer spells it this way
     from openpyxl.utils import get_column_letter
     from openpyxl.cell.rich_text import CellRichText, TextBlock
     from openpyxl.cell.text import InlineFont
@@ -44,9 +45,8 @@ from scheduler_app.models import (
     slot_offset_for_target, cls_key, find_off_grid_placements,
 )
 from scheduler_app.translations import tr
-from scheduler_app.ui.badge_formatter import get_badge
-from scheduler_app.ui.cell_formatter import plain_cell_text
-from scheduler_app.ui.day_keys import display_day
+from scheduler_app.i18n.badge_formatter import get_badge
+from scheduler_app.i18n.day_keys import display_day
 
 
 class FinalSchedule:
@@ -93,6 +93,29 @@ class FinalSchedule:
                 }
                 grid.setdefault((day, slot), []).append(entry)
         return grid
+
+
+def plain_cell_text(entry):
+    """Plain single-line text for a schedule entry (CSV / clipboard).
+
+    ST-ARCH-009. Lived in `ui/cell_formatter.py`, which this module imported --
+    one of the 22 upward layering violations. It needs nothing at all: no
+    translation, no logic, just string assembly over a dict. So it moved to its
+    only caller rather than into the i18n leaf, where it would have been the
+    one member with no language content.
+
+    Expects an entry dict with keys: name, lecturer, room, class_code.
+    """
+    parts = []
+    code = entry.get("class_code", "")
+    if code:
+        parts.append(code)
+    parts.append(entry["name"])
+    if entry["lecturer"]:
+        parts.append(entry["lecturer"])
+    if entry["room"]:
+        parts.append(f"[{entry['room']}]")
+    return "\n".join(parts)
 
 
 def _strip_hash(color):
@@ -143,144 +166,357 @@ def _entry_bg_color(entry, state):
     return _strip_hash(light)
 
 
-def _export_excel(schedule: FinalSchedule, filepath: str):
-    """Export to a multi-sheet Excel workbook."""
+def _sheet_name_for_export(base, used):
+    invalid = set("[]:*?/\\")
+    default_sheet = tr("labels.sheet")
+    cleaned = "".join(ch for ch in str(base or default_sheet) if ch not in invalid).strip()
+    if not cleaned:
+        cleaned = default_sheet
+    name = cleaned[:31]
+    if name not in used:
+        used.add(name)
+        return name
+    counter = 2
+    while True:
+        suffix = f" ({counter})"
+        candidate = f"{cleaned[:31 - len(suffix)]}{suffix}"
+        if candidate not in used:
+            used.add(candidate)
+            return candidate
+        counter += 1
+
+
+def _write_unplaceable_sheet(wb, s, drawn, used_sheet_names, days, slots):
+    """List placed lessons the everything-matrix had no column for.
+
+    ST-ARCH-003 / ST-FUNC-013. The matrix is indexed by ``state["years"]``, so
+    a lesson whose target year has since been deleted -- or which carries no
+    targets at all -- matches no column and used to disappear from the
+    workbook entirely. Silence is the dangerous outcome here: the file looks
+    complete, and a school prints a timetable with a lesson missing.
+
+    Returns the number of rows written (0 when nothing was orphaned, in which
+    case no sheet is created).
+    """
+    from scheduler_app.core.models import effective_day, effective_time
+
+    missing = [c for c in get_placed_classes(s) if cls_key(c) not in drawn]
+    if not missing:
+        return 0
+
+    # Reuses the PDF appendix's own heading rather than minting a key: this is
+    # the workbook's version of that appendix, and the string is already
+    # translated in all 22 locales (adding one would move the ST-UI-011 ratchet
+    # by 21 pairs and need a translator for a sheet tab).
+    ws = wb.create_sheet(
+        title=_sheet_name_for_export(tr("export.appendix_offgrid"),
+                                     used_sheet_names))
+    headers = [
+        tr("labels.class_code"), tr("labels.course"), tr("labels.lecturer"),
+        tr("labels.day"), tr("labels.time"), tr("labels.classroom"),
+        tr("labels.year"), tr("labels.branch"),
+    ]
+    hdr_fill = PatternFill("solid", fgColor="334155")
+    hdr_font = XlFont(name="Segoe UI", size=10, bold=True, color="FFFFFF")
+    for col, text in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col, value=text)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+    for row, c in enumerate(sorted(missing, key=lambda x: x.get("name", "")),
+                            start=2):
+        targets = c.get("targets", [])
+        ws.cell(row=row, column=1, value=c.get("class_code", ""))
+        ws.cell(row=row, column=2, value=c.get("name", ""))
+        ws.cell(row=row, column=3, value=c.get("lecturer", ""))
+        ws.cell(row=row, column=4, value=display_day(effective_day(c) or ""))
+        ws.cell(row=row, column=5, value=effective_time(c) or "")
+        ws.cell(row=row, column=6, value=classroom_of(c) or "")
+        ws.cell(row=row, column=7,
+                value=", ".join(t.get("year", "") for t in targets))
+        ws.cell(row=row, column=8,
+                value=", ".join(t.get("branch", "") for t in targets))
+    for col, width in enumerate((14, 30, 24, 14, 10, 14, 18, 12), start=1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+    return len(missing)
+
+
+def _export_excel(schedule, filepath, mode="everything"):
+    """Write the multi-sheet workbook the Excel menu produces.
+
+    ST-ARCH-003. This is the engine the app has always used; it lived
+    in ``ui/app.py`` as ``SchedulerApp._write_excel`` while this module
+    kept a second, thinner one that nothing called. The duplication was
+    not inert: Phase 5's WCAG fix landed on the copy with no users, so
+    the workbook schools print kept the failing palette for a phase
+    (room text at 1.55:1). The dead copy is gone; this is the only one.
+
+    Touches no Qt and no window state -- measured before the move, it
+    read exactly ``self.state_data`` and ``self._sheet_name_for_export``
+    and used zero Qt symbols, which is what made the move mechanical.
+    """
     if not HAS_OPENPYXL:
         raise RuntimeError(tr("errors.openpyxl_required_install"))
+    s = schedule.state
+    placed = get_placed_classes(s)
+    days = s["days"]
+    slots = s["slots"]
+    # ST-UI-001: one scan for the whole workbook, so every sheet marks the
+    # same clashes and the file agrees with the screen and the PDF.
+    conflict_partners = conflict_partner_index(find_schedule_conflicts(s))
 
     wb = openpyxl.Workbook()
-    grid = schedule.build_grid()
+    wb.remove(wb.active)
+    used_sheet_names = set()
 
-    day_hdr_fill = PatternFill("solid", fgColor="334155")
-    day_hdr_font = Font(bold=True, size=11, color="FFFFFF")
-    day_hdr_align = Alignment(horizontal="center", vertical="center")
-
-    corner_fill = PatternFill("solid", fgColor="94A3B8")
-    corner_font = Font(bold=True, size=11, color="FFFFFF")
-
-    time_fill = PatternFill("solid", fgColor="475569")
-    time_font = Font(bold=True, size=10, color="FFFFFF")
-    time_align = Alignment(horizontal="center", vertical="center")
-
-    cell_align = Alignment(wrap_text=True, vertical="center", horizontal="center")
-    empty_fill = PatternFill("solid", fgColor="F8FAFC")
-
+    # ── Theme matching the app's blue/slate UI ──
     grid_side = Side(style="thin", color="CBD5E1")
-    grid_border = Border(left=grid_side, right=grid_side, top=grid_side, bottom=grid_side)
+    cell_border = Border(left=grid_side, right=grid_side,
+                         top=grid_side, bottom=grid_side)
+    # Day header: dark slate (#334155) with white text
+    day_fill = PatternFill(start_color="334155", end_color="334155", fill_type="solid")
+    day_font = XlFont(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+    # Branch sub-header: slate (#475569) with white text
+    branch_fill = PatternFill(start_color="475569", end_color="475569", fill_type="solid")
+    branch_font = XlFont(name="Segoe UI", size=9, bold=True, color="FFFFFF")
+    # Corner: gray-blue (#94A3B8) with white text
+    corner_fill = PatternFill(start_color="94A3B8", end_color="94A3B8", fill_type="solid")
+    corner_font = XlFont(name="Segoe UI", size=9, bold=True, color="FFFFFF")
+    # Session number: light gray (#F1F5F9) with dark text
+    session_fill = PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid")
+    session_font = XlFont(name="Segoe UI", size=10, bold=True, color="333333")
+    # Time column: slate (#475569) with white text
+    time_fill = PatternFill(start_color="475569", end_color="475569", fill_type="solid")
+    time_font = XlFont(name="Segoe UI", size=9, bold=True, color="FFFFFF")
+    # Empty cell: near-white (#F8FAFC)
+    empty_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+    center_wrap = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    center_nowrap = Alignment(horizontal="center", vertical="center")
 
-    def _write_grid_sheet(ws, title, filter_fn=None):
-        """Write a grid-format sheet: rows=hours, columns=days."""
-        ws.title = title
+    def _append_rich_cell_blocks(blocks, cls, include_room=False, include_targets=False):
+        """Append rich text fragments for one class into *blocks*.
 
-        c = ws.cell(row=1, column=1, value=tr("labels.time"))
-        c.font = corner_font
-        c.fill = corner_fill
-        c.alignment = day_hdr_align
-        c.border = grid_border
-
-        for ci, day in enumerate(schedule.days, start=2):
-            cell = ws.cell(row=1, column=ci, value=tr(f"weekdays.{day}"))
-            cell.font = day_hdr_font
-            cell.fill = day_hdr_fill
-            cell.alignment = day_hdr_align
-            cell.border = grid_border
-            ws.column_dimensions[cell.column_letter].width = 25
-
-        ws.column_dimensions["A"].width = 12
-        ws.row_dimensions[1].height = 30
-
-        for ri, slot in enumerate(schedule.slots, start=2):
-            tc = ws.cell(row=ri, column=1, value=slot)
-            tc.font = time_font
-            tc.fill = time_fill
-            tc.alignment = time_align
-            tc.border = grid_border
-            ws.row_dimensions[ri].height = 70
-
-            for ci, day in enumerate(schedule.days, start=2):
-                entries = grid.get((day, slot), [])
-                if filter_fn:
-                    entries = [e for e in entries if filter_fn(e)]
-                cell = ws.cell(row=ri, column=ci)
-                if entries:
-                    if len(entries) == 1:
-                        cell.value = _rich_cell(entries[0])
-                    else:
-                        parts = []
-                        for idx, e in enumerate(entries):
-                            if idx > 0:
-                                parts.append(TextBlock(
-                                    InlineFont(sz=8, color="94A3B8"),
-                                    "\n---\n"))
-                            code = e.get("class_code", "")
-                            if code:
-                                parts.append(TextBlock(
-                                    InlineFont(b=True, sz=9, color=_strip_hash(CELL_FG_CODE)),
-                                    code + "\n"))
-                            parts.append(TextBlock(
-                                InlineFont(b=True, sz=10, color=_strip_hash(CELL_FG_NAME)),
-                                e["name"] + "\n"))
-                            if e["lecturer"]:
-                                parts.append(TextBlock(
-                                    InlineFont(sz=9, color=_strip_hash(CELL_FG_LECTURER)),
-                                    e["lecturer"] + "\n"))
-                            if e["room"]:
-                                parts.append(TextBlock(
-                                    InlineFont(sz=9, color=_strip_hash(CELL_FG_ROOM)),
-                                    e["room"]))
-                        cell.value = CellRichText(*parts)
-                    bg_hex = _entry_bg_color(entries[0], schedule.state)
-                    cell.fill = PatternFill("solid", fgColor=bg_hex)
-                    cell.alignment = cell_align
-                else:
-                    cell.fill = empty_fill
-                    cell.alignment = cell_align
-                cell.border = grid_border
-
-    def _rich_cell_for_class(cls, include_room=False, include_targets=False):
-        """Build a CellRichText directly from a class dict."""
-        parts = []
+        ST-ARCH-003 / ST-UI-005. These colours used to be literals here, and
+        because this writer is the one the Excel menu actually reaches --
+        ``data_io/exporter.py``'s Excel path has no production caller -- the
+        Phase 5 contrast fix never reached the workbook a school prints.
+        Measured on the exported file: room 1.55:1, class code 3.15:1,
+        lecturer 3.56:1, branch 3.34:1, against a 4.5:1 requirement, while
+        the screen and the PDF were correct. They now come from the same
+        source those two already use.
+        """
         code = cls.get("class_code", "")
         if code:
-            parts.append(TextBlock(
+            blocks.append(TextBlock(
                 InlineFont(b=True, sz=9, color=_strip_hash(CELL_FG_CODE)), code + "\n"))
-        parts.append(TextBlock(
+        blocks.append(TextBlock(
             InlineFont(b=True, sz=10, color=_strip_hash(CELL_FG_NAME)), cls["name"] + "\n"))
         if cls.get("lecturer"):
-            parts.append(TextBlock(
+            blocks.append(TextBlock(
                 InlineFont(sz=9, color=_strip_hash(CELL_FG_LECTURER)), cls["lecturer"]))
         if include_room:
             room = classroom_of(cls)
             if room:
-                parts.append(TextBlock(
+                blocks.append(TextBlock(
                     InlineFont(sz=9, color=_strip_hash(CELL_FG_ROOM)), "\n" + room))
         if include_targets:
-            groups = ", ".join(
-                f"{t['year']}/{t['branch']}" for t in cls.get("targets", []))
+            groups = ", ".join(f"{t['year']}/{t['branch']}" for t in cls.get("targets", []))
             if groups:
-                parts.append(TextBlock(
+                blocks.append(TextBlock(
                     InlineFont(sz=8, color=_strip_hash(CELL_FG_BRANCH)), "\n" + groups))
-        return CellRichText(*parts)
+        # Protection badge -- one source, shared with the screen and the PDF.
+        emoji, label, badge_color = get_badge(cls)
+        if emoji and label:
+            blocks.append(TextBlock(
+                InlineFont(b=True, sz=8, color=_strip_hash(badge_color)),
+                "\n" + emoji + " " + label))
+        return blocks
 
-    def _write_virtual_room_sheet(ws, title, room):
-        """Write a room sheet using fixed day subcolumns for virtual resources."""
-        ws.title = title
+    def _build_rich_cell(cls, include_room=False, include_targets=False):
+        """Build rich text cell with color-coded content matching app view."""
+        blocks = []
+        _append_rich_cell_blocks(
+            blocks, cls, include_room=include_room,
+            include_targets=include_targets,
+        )
+        return CellRichText(*blocks)
 
+    def _build_stacked_rich_cell(classes, include_room=False, include_targets=False):
+        """Build a stacked rich-text cell for multiple overlapping classes."""
+        blocks = []
+        for idx, cls in enumerate(classes):
+            if idx > 0:
+                blocks.append(TextBlock(
+                    InlineFont(sz=8, color="94A3B8"), "\n---\n"))
+            _append_rich_cell_blocks(
+                blocks, cls, include_room=include_room,
+                include_targets=include_targets,
+            )
+        return CellRichText(*blocks)
+
+    def _apply_page_setup(ws):
+        ws.sheet_properties.pageSetUpPr = openpyxl.worksheet.properties.PageSetupProperties(
+            fitToPage=True)
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.paperSize = ws.PAPERSIZE_A3
+
+    def _lesson_fill_for_class(cls):
+        year_key = cls["targets"][0]["year"] if cls.get("targets") else None
+        if year_key:
+            yr_hex = get_year_color(s, year_key).lstrip("#")
+            light_hex = lighten_color(f"#{yr_hex}", 0.45).lstrip("#")
+        else:
+            light_hex = "F3F4F6"
+        return PatternFill(
+            start_color=light_hex.upper(),
+            end_color=light_hex.upper(),
+            fill_type="solid",
+        )
+
+    def _apply_lesson_cell(cell, cls, rich):
+        cell.value = rich
+        cell.fill = _lesson_fill_for_class(cls)
+        cell.alignment = center_wrap
+        cell.border = cell_border
+
+    def _write_filtered_sheet(ws, filter_fn, include_room=False, include_targets=False):
         c = ws.cell(row=1, column=1, value=tr("labels.time"))
-        c.font = corner_font
         c.fill = corner_fill
-        c.alignment = day_hdr_align
-        c.border = grid_border
+        c.font = corner_font
+        c.border = cell_border
+        c.alignment = center_nowrap
 
-        layout = build_virtual_classroom_day_layout(
-            schedule.state, lambda cls, r=room: classroom_of(cls) == r)
+        for d_idx, day in enumerate(days):
+            col = d_idx + 2
+            dc = ws.cell(row=1, column=col, value=tr(f"weekdays.{day}"))
+            dc.fill = day_fill
+            dc.font = day_font
+            dc.border = cell_border
+            dc.alignment = center_nowrap
+
+        filtered_entries = []
+        slot_claims = {}
+        for order, cls in enumerate(placed):
+            if not filter_fn(cls):
+                continue
+            c_day = effective_day(cls)
+            c_start = effective_time(cls)
+            if c_day not in days or c_start not in slots:
+                continue
+            start_si = slots.index(c_start)
+            span = min(total_duration(cls), len(slots) - start_si)
+            if span <= 0:
+                continue
+            entry = {
+                "cls": cls,
+                "day": c_day,
+                "start_si": start_si,
+                "span": span,
+                "order": order,
+            }
+            filtered_entries.append(entry)
+            for off in range(span):
+                slot_claims.setdefault((start_si + off, c_day), []).append(entry)
+
+        overlapping_ids = set()
+        for entries in slot_claims.values():
+            if len(entries) > 1:
+                overlapping_ids.update(cls_key(entry["cls"]) for entry in entries)
+
+        occupied_start = {}
+        covered = set()
+        overlap_cells = {}
+        for entry in filtered_entries:
+            cls = entry["cls"]
+            c_day = entry["day"]
+            start_si = entry["start_si"]
+            span = entry["span"]
+            if cls_key(cls) in overlapping_ids:
+                for off in range(span):
+                    overlap_cells.setdefault((start_si + off, c_day), []).append(entry)
+                continue
+            key = (start_si, c_day)
+            occupied_start[key] = (cls, span)
+            for off in range(span):
+                covered.add((start_si + off, c_day))
+
+        for si, slot in enumerate(slots):
+            row = si + 2
+            t_cell = ws.cell(row=row, column=1, value=slot)
+            t_cell.fill = time_fill
+            t_cell.font = time_font
+            t_cell.border = cell_border
+            t_cell.alignment = center_nowrap
+
+            for d_idx, day in enumerate(days):
+                col = d_idx + 2
+                key = (si, day)
+                if key in occupied_start:
+                    cls, span = occupied_start[key]
+                    rich = _build_rich_cell(cls, include_room=include_room,
+                                           include_targets=include_targets)
+                    if span > 1:
+                        ws.merge_cells(start_row=row, start_column=col,
+                                       end_row=row + span - 1, end_column=col)
+                    data_cell = ws.cell(row=row, column=col)
+                    _apply_lesson_cell(data_cell, cls, rich)
+                    for rr in range(row, row + span):
+                        ws.cell(row=rr, column=col).border = cell_border
+                elif key in overlap_cells:
+                    entries = sorted(overlap_cells[key], key=lambda item: item["order"])
+                    classes = [item["cls"] for item in entries]
+                    rich = _build_stacked_rich_cell(
+                        classes,
+                        include_room=include_room,
+                        include_targets=include_targets,
+                    )
+                    data_cell = ws.cell(row=row, column=col)
+                    _apply_lesson_cell(data_cell, classes[0], rich)
+                    # ST-UI-001: stacking already kept both lessons here --
+                    # what was missing is saying that they clash. A shared
+                    # cell that is NOT a conflict (two online lessons) keeps
+                    # its normal year colour.
+                    keys = {cls_key(x) for x in classes}
+                    if any(conflict_partners.get(cls_key(x), frozenset())
+                           & (keys - {cls_key(x)}) for x in classes):
+                        data_cell.fill = PatternFill(
+                            start_color="FEE2E2", end_color="FEE2E2",
+                            fill_type="solid")
+                elif key in covered:
+                    ws.cell(row=row, column=col).border = cell_border
+                else:
+                    blank = ws.cell(row=row, column=col, value="")
+                    blank.fill = empty_fill
+                    blank.border = cell_border
+                    blank.alignment = center_wrap
+
+        ws.column_dimensions["A"].width = 12
+        for c_idx in range(2, len(days) + 2):
+            ws.column_dimensions[get_column_letter(c_idx)].width = 24
+        ws.row_dimensions[1].height = 30
+        for si in range(len(slots)):
+            ws.row_dimensions[si + 2].height = 70
+        _apply_page_setup(ws)
+
+    def _write_virtual_classroom_sheet(ws, filter_fn, include_room=False, include_targets=False):
+        c = ws.cell(row=1, column=1, value=tr("labels.time"))
+        c.fill = corner_fill
+        c.font = corner_font
+        c.border = cell_border
+        c.alignment = center_nowrap
+
+        layout = build_virtual_classroom_day_layout(s, filter_fn)
+        day_groups = layout["day_groups"]
+        blocks = layout["blocks"]
+        occupied_subcolumns = layout["occupied_subcolumns"]
         starts = {
             (block["row"], block["subcolumn"]): block
-            for block in layout["blocks"]
+            for block in blocks
         }
-        covered = set(layout["occupied_subcolumns"])
+        covered = set(occupied_subcolumns)
 
-        for group in layout["day_groups"]:
+        for group in day_groups:
             col_start = 2 + group["subcolumn_start"]
             col_end = col_start + group["lane_count"] - 1
             if group["lane_count"] > 1:
@@ -290,86 +526,317 @@ def _export_excel(schedule: FinalSchedule, filepath: str):
                 )
             for col in range(col_start, col_end + 1):
                 cell = ws.cell(row=1, column=col)
-                cell.font = day_hdr_font
-                cell.fill = day_hdr_fill
-                cell.alignment = day_hdr_align
-                cell.border = grid_border
-                ws.column_dimensions[get_column_letter(col)].width = 25
+                cell.fill = day_fill
+                cell.font = day_font
+                cell.border = cell_border
+                cell.alignment = center_nowrap
             ws.cell(row=1, column=col_start, value=tr(f"weekdays.{group['day']}"))
 
-        ws.column_dimensions["A"].width = 12
-        ws.row_dimensions[1].height = 30
         total_subcolumns = layout["total_subcolumns"]
+        for si, slot in enumerate(slots):
+            row = si + 2
+            t_cell = ws.cell(row=row, column=1, value=slot)
+            t_cell.fill = time_fill
+            t_cell.font = time_font
+            t_cell.border = cell_border
+            t_cell.alignment = center_nowrap
 
-        for ri, slot in enumerate(schedule.slots, start=2):
-            tc = ws.cell(row=ri, column=1, value=slot)
-            tc.font = time_font
-            tc.fill = time_fill
-            tc.alignment = time_align
-            tc.border = grid_border
-            ws.row_dimensions[ri].height = 70
-
-            row_index = ri - 2
             for subcolumn in range(total_subcolumns):
-                col = subcolumn + 2
-                key = (row_index, subcolumn)
-                cell = ws.cell(row=ri, column=col)
+                col = 2 + subcolumn
+                key = (si, subcolumn)
                 if key in starts:
                     block = starts[key]
+                    rich = _build_rich_cell(
+                        block["cls"],
+                        include_room=include_room,
+                        include_targets=include_targets,
+                    )
                     span = block["span"]
                     if span > 1:
                         ws.merge_cells(
-                            start_row=ri, start_column=col,
-                            end_row=ri + span - 1, end_column=col,
+                            start_row=row, start_column=col,
+                            end_row=row + span - 1, end_column=col,
                         )
-                    cell.value = _rich_cell_for_class(
-                        block["cls"],
-                        include_room=False,
-                        include_targets=True,
-                    )
-                    bg_hex = _entry_bg_color({"cls": block["cls"]}, schedule.state)
-                    cell.fill = PatternFill("solid", fgColor=bg_hex)
-                    cell.alignment = cell_align
-                    cell.border = grid_border
-                    for off in range(span):
-                        ws.cell(row=ri + off, column=col).border = grid_border
+                    data_cell = ws.cell(row=row, column=col)
+                    _apply_lesson_cell(data_cell, block["cls"], rich)
+                    # ST-UI-001. This sheet lanes concurrent lessons rather
+                    # than stacking them, so it never had an "overlap"
+                    # branch to hang the marker on -- and marked no clashes
+                    # at all, while the physical sheets in the same
+                    # workbook did. The rule is the same non-geometric one
+                    # the renderer uses: a lesson is marked if the VALIDATOR
+                    # says it cannot coexist with something, not if two
+                    # blocks happen to share a cell (two online lessons at
+                    # one hour is normal and must stay unmarked).
+                    if conflict_partners.get(cls_key(block["cls"])):
+                        data_cell.fill = PatternFill(
+                            start_color="FEE2E2", end_color="FEE2E2",
+                            fill_type="solid")
+                    for rr in range(row, row + span):
+                        ws.cell(row=rr, column=col).border = cell_border
                 elif key in covered:
-                    cell.border = grid_border
+                    ws.cell(row=row, column=col).border = cell_border
                 else:
-                    cell.fill = empty_fill
-                    cell.alignment = cell_align
-                    cell.border = grid_border
+                    blank = ws.cell(row=row, column=col, value="")
+                    blank.fill = empty_fill
+                    blank.border = cell_border
+                    blank.alignment = center_wrap
 
-    _write_grid_sheet(wb.active, tr("export.master_schedule"))
+        ws.column_dimensions["A"].width = 12
+        for c_idx in range(2, total_subcolumns + 2):
+            ws.column_dimensions[get_column_letter(c_idx)].width = 24
+        ws.row_dimensions[1].height = 30
+        for si in range(len(slots)):
+            ws.row_dimensions[si + 2].height = 70
+        _apply_page_setup(ws)
 
-    for lecturer in schedule.lecturers:
-        if not lecturer:
-            continue
-        safe_name = lecturer[:28]
-        ws = wb.create_sheet(f"T_{safe_name}")
-        _write_grid_sheet(ws, f"T_{safe_name}",
-                          filter_fn=lambda e, l=lecturer: e["lecturer"] == l)
+    if mode == "classroom":
+        physical_rooms = set(s.get("classrooms", []))
+        for room in get_classroom_export_labels(s.get("classrooms", []), placed):
+            ws = wb.create_sheet(title=_sheet_name_for_export(room, used_sheet_names))
+            writer = _write_virtual_classroom_sheet if room not in physical_rooms else _write_filtered_sheet
+            writer(
+                ws,
+                filter_fn=lambda c, r=room: classroom_of(c) == r,
+                include_room=False,
+                include_targets=True,
+            )
 
-    physical_rooms = set(schedule.classrooms)
-    for room in get_classroom_export_labels(schedule.classrooms, schedule.placed_classes()):
-        safe_name = room[:28]
-        ws = wb.create_sheet(f"R_{safe_name}")
-        if room not in physical_rooms:
-            _write_virtual_room_sheet(ws, f"R_{safe_name}", room)
-        else:
-            _write_grid_sheet(ws, f"R_{safe_name}",
-                              filter_fn=lambda e, r=room: e["room"] == r)
+    elif mode == "group":
+        for yr in sorted(s.get("years", {}).keys()):
+            for br in s["years"][yr]:
+                ws = wb.create_sheet(
+                    title=_sheet_name_for_export(f"{yr} {br}", used_sheet_names))
+                _write_filtered_sheet(
+                    ws,
+                    filter_fn=lambda c, y=yr, b=br: any(
+                        t["year"] == y and t["branch"] == b
+                        for t in c.get("targets", [])
+                    ),
+                    include_room=True,
+                    include_targets=False,
+                )
 
-    for year, branches in schedule.years.items():
-        for branch in branches:
-            safe_name = f"{year}_{branch}"[:28]
-            ws = wb.create_sheet(f"B_{safe_name}")
+    elif mode == "lecturer":
+        lecturers = list(s.get("lecturers", []))
+        if not lecturers:
+            lecturers = sorted({c.get("lecturer", "") for c in placed if c.get("lecturer", "")})
+        for lecturer in lecturers:
+            if not lecturer:
+                continue
+            ws = wb.create_sheet(
+                title=_sheet_name_for_export(lecturer, used_sheet_names))
+            _write_filtered_sheet(
+                ws,
+                filter_fn=lambda c, l=lecturer: c.get("lecturer", "") == l,
+                include_room=True,
+                include_targets=True,
+            )
 
-            def branch_filter(e, y=year, b=branch):
-                return any(t["year"] == y and t["branch"] == b
-                           for t in e.get("targets", []))
+    else:
+        # Show Everything matrix export (per year), preserving the current matrix layout.
+        # ST-ARCH-003: remember what actually reached a sheet, so anything the
+        # matrix has no column for can be reported rather than dropped.
+        drawn = set()
+        for yr in sorted(s["years"].keys()):
+            branches = s["years"][yr]
+            if not branches:
+                continue
+            n_branches = len(branches)
+            ws = wb.create_sheet(title=_sheet_name_for_export(yr, used_sheet_names))
 
-            _write_grid_sheet(ws, f"B_{safe_name}", filter_fn=branch_filter)
+            ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+            c_sn = ws.cell(row=1, column=1, value="")
+            c_sn.fill = corner_fill
+            c_sn.border = cell_border
+
+            ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+            c_time = ws.cell(row=1, column=2, value=tr("labels.time"))
+            c_time.fill = corner_fill
+            c_time.font = corner_font
+            c_time.border = cell_border
+            c_time.alignment = center_nowrap
+
+            for d_idx, day in enumerate(days):
+                col_start = 3 + d_idx * n_branches
+                col_end = col_start + n_branches - 1
+                if n_branches > 1:
+                    ws.merge_cells(start_row=1, start_column=col_start,
+                                   end_row=1, end_column=col_end)
+                dc = ws.cell(row=1, column=col_start, value=tr(f"weekdays.{day}"))
+                dc.fill = day_fill
+                dc.font = day_font
+                dc.border = cell_border
+                dc.alignment = center_nowrap
+                for mc in range(col_start, col_end + 1):
+                    ws.cell(row=1, column=mc).fill = day_fill
+                    ws.cell(row=1, column=mc).border = cell_border
+
+            ws.cell(row=2, column=1).fill = corner_fill
+            ws.cell(row=2, column=1).border = cell_border
+            ws.cell(row=2, column=2).fill = corner_fill
+            ws.cell(row=2, column=2).border = cell_border
+
+            for d_idx in range(len(days)):
+                for b_idx, br in enumerate(branches):
+                    col = 3 + d_idx * n_branches + b_idx
+                    bc = ws.cell(row=2, column=col, value=br)
+                    bc.fill = branch_fill
+                    bc.font = branch_font
+                    bc.border = cell_border
+                    bc.alignment = center_nowrap
+
+            occupied = {}
+            claims = {}
+            for c in placed:
+                c_day = effective_day(c)
+                c_start = effective_time(c)
+                if c_day not in days or c_start not in slots:
+                    continue
+                d_idx = days.index(c_day)
+                start_si = slots.index(c_start)
+                is_joint = c.get("joint_session", True)
+                n_targets = len(c.get("targets", []))
+                dur = c["duration"]
+                for t in c["targets"]:
+                    if t["year"] != yr or t["branch"] not in branches:
+                        continue
+                    b_idx = branches.index(t["branch"])
+                    if not is_joint and n_targets > 1:
+                        t_idx = c["targets"].index(t)
+                        slot_off = t_idx * dur
+                    else:
+                        slot_off = 0
+                    actual_start = start_si + slot_off
+                    for d_off in range(dur):
+                        si = actual_start + d_off
+                        if si >= len(slots):
+                            break
+                        okey = (si, d_idx, b_idx)
+                        # Identity, not equality, and not a plain append:
+                        # this runs inside `for t in c["targets"]`, so a
+                        # class carrying two IDENTICAL target dicts (a user
+                        # typing "A, B, A" as a year's branches) claimed the
+                        # same cell twice and was then found "overlapping"
+                        # with ITSELF -- pulled out of occupied_start and
+                        # stacked against its own duplicate, losing its
+                        # merge and its year colour. `is not` because two
+                        # distinct classes can compare equal by value.
+                        bucket = claims.setdefault(okey, [])
+                        if all(x is not c for x in bucket):
+                            bucket.append(c)
+                        drawn.add(cls_key(c))
+                        if d_off == 0:
+                            span = min(dur, len(slots) - actual_start)
+                            occupied[okey] = ("start", c, span)
+                        else:
+                            occupied[okey] = ("span", None, 0)
+
+            # ST-UI-001. The dict above keeps the LAST writer, so a second
+            # lesson claiming a cell used to erase the first from this
+            # sheet -- while the filtered sheets in the SAME workbook
+            # already stacked both. Pull every contested claimant out and
+            # stack them, exactly as _write_filtered_sheet does.
+            overlapping = {id(c) for cs in claims.values() if len(cs) > 1
+                           for c in cs}
+            overlap_cells = {}
+            for okey, cs in claims.items():
+                keep = [c for c in cs if id(c) in overlapping]
+                if keep:
+                    overlap_cells[okey] = keep
+            for okey in overlap_cells:
+                occupied.pop(okey, None)
+
+            for si, slot in enumerate(slots):
+                erow = si + 3
+                sn_cell = ws.cell(row=erow, column=1, value=si + 1)
+                sn_cell.fill = session_fill
+                sn_cell.font = session_font
+                sn_cell.border = cell_border
+                sn_cell.alignment = center_nowrap
+
+                t_cell = ws.cell(row=erow, column=2, value=slot)
+                t_cell.fill = time_fill
+                t_cell.font = time_font
+                t_cell.border = cell_border
+                t_cell.alignment = center_nowrap
+
+                for d_idx in range(len(days)):
+                    for b_idx in range(n_branches):
+                        col = 3 + d_idx * n_branches + b_idx
+                        okey = (si, d_idx, b_idx)
+                        if okey in overlap_cells:
+                            claimants = overlap_cells[okey]
+                            keys = {cls_key(x) for x in claimants}
+                            conflicted = any(
+                                conflict_partners.get(cls_key(x), frozenset())
+                                & (keys - {cls_key(x)})
+                                for x in claimants)
+                            rich = _build_stacked_rich_cell(
+                                claimants, include_room=True,
+                                include_targets=False)
+                            dc = ws.cell(row=erow, column=col, value=rich)
+                            fill_hex = "FEE2E2" if conflicted else "F1F5F9"
+                            dc.fill = PatternFill(
+                                start_color=fill_hex, end_color=fill_hex,
+                                fill_type="solid")
+                            dc.border = cell_border
+                            dc.alignment = center_wrap
+                        elif okey in occupied:
+                            kind, cls, span = occupied[okey]
+                            if kind == "span":
+                                ws.cell(row=erow, column=col).border = cell_border
+                                continue
+                            rich = _build_rich_cell(cls, include_room=True,
+                                                   include_targets=False)
+                            if span > 1:
+                                ws.merge_cells(start_row=erow, start_column=col,
+                                               end_row=erow + span - 1, end_column=col)
+                                for mr in range(erow, erow + span):
+                                    ws.cell(row=mr, column=col).border = cell_border
+                            yr_hex = get_year_color(s, yr).lstrip("#")
+                            light_hex = lighten_color(f"#{yr_hex}", 0.45).lstrip("#")
+                            cf = PatternFill(start_color=light_hex.upper(),
+                                             end_color=light_hex.upper(), fill_type="solid")
+                            data_cell = ws.cell(row=erow, column=col, value=rich)
+                            data_cell.fill = cf
+                            data_cell.border = cell_border
+                            data_cell.alignment = center_wrap
+                        else:
+                            ec = ws.cell(row=erow, column=col, value="")
+                            ec.fill = empty_fill
+                            ec.border = cell_border
+
+            ws.column_dimensions["A"].width = 5
+            ws.column_dimensions["B"].width = 12
+            total_cols = 2 + n_branches * len(days)
+            for c_idx in range(3, total_cols + 1):
+                ws.column_dimensions[get_column_letter(c_idx)].width = 22
+            ws.row_dimensions[1].height = 30
+            ws.row_dimensions[2].height = 22
+            for si in range(len(slots)):
+                ws.row_dimensions[si + 3].height = 80
+            _apply_page_setup(ws)
+
+        # ST-ARCH-003. The matrix draws one column per (year, branch) taken
+        # from ``state["years"]``, so a placed lesson has nowhere to go when
+        # its target year is no longer in that dict, or when it carries no
+        # targets at all. It was silently absent from the workbook -- the
+        # printout looked complete. Two failing suite cases proved it once the
+        # engines were unified ("the group-less lesson was dropped", and
+        # "workbook dropped on-grid lessons: ['Ders02', 'Ders04']" after a year
+        # was removed); neither could fire before, because the suite was
+        # exercising the *other*, unused writer.
+        #
+        # ST-FUNC-013's rule applies: an export never vanishes a placement, it
+        # reports it. Same reasoning as the PDF appendix Phase 4 added.
+        _write_unplaceable_sheet(wb, s, drawn, used_sheet_names, days, slots)
+
+    if not wb.worksheets:
+        ws = wb.create_sheet(
+            title=_sheet_name_for_export(tr("labels.schedule"), used_sheet_names)
+        )
+        ws.cell(row=1, column=1, value=tr("warnings.no_schedule_data"))
 
     # ST-UI-008: the workbook is made to be emailed, so a cell openpyxl typed
     # as a formula must not stay one. Done in memory, on the cell attribute,
@@ -1023,7 +1490,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
         return tbl
 
     # ── Assemble pages ────────────────────────────────────────────────
-    elements = []
+    elements: list = []
 
     if mode == "everything":
         for yr in sorted(schedule.years.keys()):
@@ -1183,7 +1650,11 @@ def export_schedule(schedule, format: str, filepath: str, mode: str = "everythin
 
     fmt = format.lower().strip(".")
     if fmt in ("xlsx", "excel"):
-        _export_excel(schedule, filepath)
+        # ST-ARCH-003: `mode` reaches Excel at last. The docstring above has
+        # promised "PDF/Excel layout mode" since the first release while the
+        # Excel branch silently discarded it -- all four modes produced the
+        # identical sheet set. The writer that honours it is now the only one.
+        _export_excel(schedule, filepath, mode=mode)
     elif fmt == "csv":
         _export_csv(schedule, filepath)
     elif fmt == "pdf":

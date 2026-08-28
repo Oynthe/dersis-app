@@ -359,3 +359,118 @@ class WarningLogPanel(QFrame):
         """Update button texts after language change."""
         self._toggle_btn.setText(f"\u25B2 {tr('buttons.collapse')}" if self._expanded else f"\u25BC {tr('buttons.expand')}")
         self._clear_btn.setText(f"\u2715 {tr('buttons.clear')}")
+
+
+class YearLegend(QWidget):
+    """Says which colour means which year — and admits when it cannot.
+
+    ST-UI-006 (High). Year colour is the timetable's primary grouping cue and
+    nothing anywhere explained it. But the finding's own remedy -- "add a
+    legend mapping swatch to year" -- is only correct below nine years, and
+    quietly wrong above:
+
+        get_year_color = YEAR_COLORS[sorted(years).index(name) % 8]
+
+    with eight colours. A Turkish K-12 school running grades 1-12 therefore has
+    **four** pairs of years painted identically, measured natively on the real
+    year names:
+
+        #3B82F6  1. Sinif + 6. Sinif        #10B981  7. Sinif + 10. Sinif
+        #F59E0B  8. Sinif + 11. Sinif       #EF4444  9. Sinif + 12. Sinif
+
+    (The pairs are not 1-and-9 as the handoff assumed: year names are free
+    text and `sorted()` is lexicographic, so "10. Sinif" sorts between "1." and
+    "2.". Which years collide depends on how the school names them.)
+
+    That is reachable on every tier above Starter -- professional allows 15
+    years, max 40, institutional unlimited -- so a legend claiming a one-to-one
+    mapping would be a confident lie exactly where the user most needs help.
+
+    So this widget groups by COLOUR, not by year. A swatch shared by two years
+    is drawn once, listing both. The ambiguity becomes visible instead of being
+    papered over, which is the finding's real content: above eight years the
+    colour encoding is not merely inaccessible, it is ambiguous for sighted
+    users too.
+
+    Costs no grid height: it lives in the filter row that is already there.
+    """
+
+    SWATCH = 12
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(10)
+        self._signature = None
+
+    def update_years(self, state):
+        """Rebuild from *state*, cheaply skipping an unchanged year list."""
+        from scheduler_app.logic import get_year_color
+
+        years = sorted((state or {}).get("years", {}).keys())
+        signature = tuple(years)
+        if signature == self._signature:
+            return
+        self._signature = signature
+
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        # Group by colour, preserving the order years first appear.
+        groups = []
+        seen = {}
+        for name in years:
+            colour = get_year_color(state, name)
+            if colour in seen:
+                groups[seen[colour]][1].append(name)
+            else:
+                seen[colour] = len(groups)
+                groups.append((colour, [name]))
+
+        for colour, names in groups:
+            self._layout.addWidget(_LegendChip(colour, names, self))
+
+    def year_groups(self):
+        """(colour, [year, ...]) as currently drawn — for tests."""
+        out = []
+        for i in range(self._layout.count()):
+            w = self._layout.itemAt(i).widget()
+            if isinstance(w, _LegendChip):
+                out.append((w.colour, list(w.names)))
+        return out
+
+
+class _LegendChip(QWidget):
+    """One swatch and the year (or years) it stands for."""
+
+    def __init__(self, colour, names, parent=None):
+        super().__init__(parent)
+        self.colour = colour
+        self.names = list(names)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        swatch = QLabel(self)
+        swatch.setFixedSize(YearLegend.SWATCH, YearLegend.SWATCH)
+        swatch.setStyleSheet(
+            "background: %s; border: 1px solid #94A3B8; border-radius: 2px;"
+            % colour)
+        row.addWidget(swatch)
+
+        label = QLabel(" / ".join(self.names), self)
+        # PlainText: year names are user input (ST-UI-007).
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setStyleSheet("font-size: 8pt; color: #334155;")
+        row.addWidget(label)
+
+        if len(self.names) > 1:
+            # No new translation key: listing both names IS the statement.
+            # A sentence saying "these share a colour" would need one, and
+            # would say less than showing it.
+            self.setToolTip(" / ".join(self.names))

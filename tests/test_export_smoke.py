@@ -17,11 +17,17 @@ ST-FUNC-013 (Low)       PDF silently omits placements that fall outside the
 Every state here is hand-built and fully placed via ``mark_placed`` -- the
 optimizer is never invoked, so the whole module is deterministic and fast.
 
-Scope note: the *UI* writes Excel/CSV through ``ui/app.py._write_excel`` and its
-own inline ``csv.writer`` (``app.py:2306``, no ``encoding=``), not through this
-module (ST-ARCH-003, "two export engines"). These tests pin the library exporter
-only; the ``UnicodeEncodeError`` half of ST-FUNC-006 and the ST-UI-008 formula
-injection both live in that other writer and need their own module.
+Scope note: **Excel is now one engine.** ST-ARCH-003 (Phase 6) moved the UI's
+writer into ``data_io/exporter.py`` and deleted the unused one, so
+``export_schedule(state, "xlsx", ...)`` is what a user gets and these tests pin
+the real thing. ``mode`` reaches Excel too, which it never did before.
+
+CSV is still two writers: this module's ``_export_csv`` emits the *timetable*
+(one row per occupied slot), while ``ui/app.py::export_csv`` emits a *class
+list* (one row per class-target, different columns). Those are different
+products, not a duplicate, so unifying them would silently change the file a
+user has been getting -- see PROGRESS.md. The ``UnicodeEncodeError`` half of
+ST-FUNC-006 lives in that UI writer and still needs its own coverage.
 
 Convention: pins that describe *silent* data loss accept either legitimate fix
 -- keep the data, or tell the user it was dropped. Tests that merely read the
@@ -189,6 +195,17 @@ def xlsx_cell_texts(worksheet):
             for c in row if c.value is not None]
 
 
+def xlsx_workbook_texts(wb):
+    """Every non-empty cell of every sheet, as text.
+
+    ST-ARCH-003. Assertions used to read ``wb.sheetnames[0]`` because the dead
+    exporter always wrote a single master sheet first. The engine a user
+    actually gets writes one sheet per year / room / group / lecturer
+    depending on ``mode``, so "is it in the workbook" has to mean the workbook.
+    """
+    return [t for ws in wb.worksheets for t in xlsx_cell_texts(ws)]
+
+
 def accepted_day_cell_values(day_key):
     """Both spellings a CSV day cell may legitimately carry for *day_key*.
 
@@ -229,26 +246,25 @@ def test_xlsx_export_is_a_readable_workbook(state, tmp_path, openpyxl_mod):
     assert out.stat().st_size > 4000, "workbook is implausibly small"
 
     wb = openpyxl_mod.load_workbook(out)
-    # Master sheet plus one sheet per lecturer, room and year/branch group.
-    assert wb.sheetnames[0] == tr("export.master_schedule")
-    for expected in (f"T_{LECT_A}", f"T_{LECT_B}", "R_A-101", "R_B-202",
-                     f"B_{YEAR_1}_A", f"B_{YEAR_1}_B", f"B_{YEAR_2}_A"):
-        assert expected in wb.sheetnames, f"missing sheet {expected!r}"
+    # ST-ARCH-003: the default mode is the everything-matrix, one sheet per
+    # year, named for the year and localized. The `T_`/`R_`/`B_` prefixed
+    # sheets this used to assert belonged to the exporter's own Excel writer,
+    # which had no production caller and has been deleted.
+    assert wb.sheetnames == [YEAR_1, YEAR_2], wb.sheetnames
 
-    master = wb[wb.sheetnames[0]]
-    assert master.cell(row=1, column=1).value == tr("labels.time")
-    header = [master.cell(row=1, column=i).value for i in range(2, 2 + len(DAYS))]
-    assert header == [tr(f"weekdays.{d}") for d in DAYS]
-    # Time column mirrors the grid slots.
-    assert [master.cell(row=i, column=1).value
-            for i in range(2, 2 + len(SLOTS))] == SLOTS
-
-    texts = xlsx_cell_texts(master)
+    # Whatever the layout, nothing the user placed may be missing from it.
+    texts = xlsx_workbook_texts(wb)
     for _code, name, *_rest in PLACEMENTS:
-        assert any(name in t for t in texts), \
-            f"course {name!r} never made it into the master sheet"
-    assert any(LECT_A in t for t in texts)
-    assert any("A-101" in t for t in texts)
+        assert any(name in t for t in texts), (
+            f"course {name!r} never made it into the workbook")
+    assert any(LECT_A in t for t in texts), "lecturer missing from the workbook"
+    assert any("A-101" in t for t in texts), "room missing from the workbook"
+    # The grid the user configured is drawn: every slot and every day appears.
+    for slot in SLOTS:
+        assert any(slot in t for t in texts), f"slot {slot} missing"
+    for day in DAYS:
+        assert any(tr(f"weekdays.{day}") in t for t in texts), (
+            f"day {day} missing")
 
 
 def test_csv_export_parses_with_expected_shape(state, tmp_path):
@@ -376,15 +392,14 @@ def test_export_with_zero_placed_classes(tmp_path, fmt, mode, request):
         assert rows[0][0] == tr("labels.day")
     elif fmt == "xlsx":
         wb = openpyxl_mod.load_workbook(out)
-        assert wb.sheetnames[0] == tr("export.master_schedule")
         # The configured grid must still be drawn, not just an empty sheet.
-        master = wb[wb.sheetnames[0]]
-        assert master.cell(row=1, column=1).value == tr("labels.time")
-        assert [master.cell(row=1, column=i).value
-                for i in range(2, 2 + len(DAYS))] == [
-                    tr(f"weekdays.{d}") for d in DAYS]
-        assert [master.cell(row=i, column=1).value
-                for i in range(2, 2 + len(SLOTS))] == SLOTS
+        # ST-ARCH-003: asserted across the workbook rather than against a
+        # master sheet the surviving engine does not produce.
+        texts = xlsx_workbook_texts(wb)
+        for slot in SLOTS:
+            assert any(slot in t for t in texts),                 f"slot {slot} missing from the empty workbook"
+        for day in DAYS:
+            assert any(tr(f"weekdays.{day}") in t for t in texts),                 f"day {day} missing from the empty workbook"
     else:
         content = pdf_content_text(assert_well_formed_pdf(out))
         # Same requirement for the PDF: the empty grid, with its slot ruler and
@@ -460,7 +475,10 @@ def test_csv_and_xlsx_keep_a_class_with_no_target_groups(tmp_path, fmt, request)
         assert data[0][3:] == ["Serbest Ders", LECT_A, ROOMS[0], "", ""]
     else:
         wb = openpyxl_mod.load_workbook(out)
-        texts = xlsx_cell_texts(wb[wb.sheetnames[0]])
+        # ST-ARCH-003: across the workbook. The everything-matrix has no column
+        # for a lesson with no target group, so the unified engine reports it
+        # on its own sheet rather than dropping it -- the ST-FUNC-013 rule.
+        texts = xlsx_workbook_texts(wb)
         assert any("Serbest Ders" in t for t in texts), \
             "the group-less lesson was dropped from the workbook"
 
@@ -560,14 +578,21 @@ def _state_with_illegal_name(field, char):
     return state
 
 
+# ST-FUNC-005 is CLOSED, and closed by deletion rather than by a fix.
+#
+# The 11 xfail(strict=True) pins that used to sit here all went XPASS the moment
+# ST-ARCH-003 unified the two Excel writers, because the crash never existed in
+# the engine a user could reach. `data_io/exporter.py` built sheet titles
+# straight from the name; `ui/app.py`'s writer -- the one the Excel menu
+# actually called -- has routed every title through `_sheet_name_for_export`,
+# which strips `[]:*?/\` and truncates to 31, since before the audit. The audit
+# attributed the crash to the export the user runs (02-functional-inventory.md
+# "F2 Export Excel"), and it was in the copy with no callers.
+#
+# So the finding as written was never reachable in production. Deleting the dead
+# writer is what removed it. The parametrization stays as a live regression
+# guard on the surviving engine.
 @pytest.mark.excel
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-FUNC-005 — exporter.py:333/340/350 build sheet titles straight "
-           "from lecturer/room/branch names without sanitising Excel's "
-           "forbidden characters; fix is the 'Sanitize xlsx sheet titles' item "
-           "in stress-test/13-improvement-opportunities.md (unphased)",
-)
 @pytest.mark.parametrize("field,char", (
     [("lecturer", c) for c in SHEET_TITLE_ILLEGAL_CHARS]
     + [("room", "/"), ("room", "["), ("branch", "/"), ("branch", ":")]
@@ -579,6 +604,11 @@ def test_xlsx_export_survives_illegal_sheet_title_chars(
     A failure means a school whose room is called "Lab / 1" or whose teacher is
     "Dr. Ayşe [Fen]" simply cannot export to Excel: the app dies on openpyxl's
     raw ``ValueError`` with no explanation and no file.
+
+    Passes since ST-ARCH-003 deleted the writer that had the bug; see the note
+    above. Kept because the surviving engine's sanitisation is one helper, and
+    a refactor that bypasses ``_sheet_name_for_export`` would reintroduce the
+    crash on the path a user can actually reach.
     """
     state = _state_with_illegal_name(field, char)
     out = tmp_path / "illegal.xlsx"

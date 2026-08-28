@@ -62,8 +62,8 @@ import pytest
 # The tier catalogue merges 52 keys into TRANSLATIONS on import. A checker that
 # does not import it reports 11 false failures for keys that resolve fine at
 # runtime -- measured. Import it before reading the catalogue.
-import scheduler_app.ui.tier_translations  # noqa: F401
-from scheduler_app.ui.translations import TRANSLATIONS
+import scheduler_app.i18n.tier_translations  # noqa: F401
+from scheduler_app.i18n.translations import TRANSLATIONS
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGE = os.path.join(REPO_ROOT, "scheduler_app")
@@ -139,7 +139,7 @@ def dynamic_key_domains():
     catalogue again left every assertion green. Any table that pairs a field
     with a translation key belongs here.
     """
-    from scheduler_app.ui.badge_formatter import _BADGE_MAP
+    from scheduler_app.i18n.badge_formatter import _BADGE_MAP
     from scheduler_app.core.explanation_engine import _COMPONENT_INFO
     from scheduler_app.ui.dialogs import _CLASS_IO_FIELDS
     from scheduler_app.data_io.schema import WORKBOOK_SHEETS

@@ -14,7 +14,7 @@ from PyQt6.QtGui import QColor, QPainter, QFont, QPen, QBrush
 
 from scheduler_app.translations import tr
 from scheduler_app.models import effective_day, effective_time, effective_room
-from scheduler_app.ui.day_keys import day_label
+from scheduler_app.i18n.day_keys import day_label
 from scheduler_app.analytics import compute_all_metrics
 from scheduler_app.timetable_scorer import TimetableScorer
 from scheduler_app.schedule_analytics import ScheduleAnalytics

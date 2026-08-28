@@ -38,7 +38,7 @@ All features below are verified from source code. Each entry includes the code l
 - **Duration overflow**: Class duration exceeding available consecutive slots
 - **Capacity violations**: Class size exceeding room capacity
 - Code: `scheduler_app/core/constraint_validator.py` → `check_placement()`, `find_conflicts()`
-- Code: `scheduler_app/core/logic.py` → `find_conflicts()`, `respects_constraints()`
+- Code: `scheduler_app/core/constraint_validator.py` → `ConstraintValidator.check_placement()`, `.respects_constraints()`
 
 ---
 

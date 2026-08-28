@@ -51,7 +51,7 @@ _SHIM_MAP = {
     "scheduler_app.renderer":             "scheduler_app.ui.renderer",
     "scheduler_app.dashboard":            "scheduler_app.ui.dashboard",
     "scheduler_app.icons":                "scheduler_app.ui.icons",
-    "scheduler_app.translations":         "scheduler_app.ui.translations",
+    "scheduler_app.translations":         "scheduler_app.i18n.translations",
     "scheduler_app.tutorial":             "scheduler_app.ui.tutorial",
     "scheduler_app.first_run":            "scheduler_app.ui.first_run",
 }

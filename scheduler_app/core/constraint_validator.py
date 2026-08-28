@@ -21,7 +21,7 @@ from scheduler_app.models import (
     filter_class_days, filter_class_times,
     apply_lecturer_availability_filters,
 )
-from scheduler_app.ui.day_keys import display_day
+from scheduler_app.i18n.day_keys import display_day
 
 
 class ConstraintValidator:

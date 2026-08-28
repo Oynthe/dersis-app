@@ -1,6 +1,7 @@
 """Data model: schedule state and class structure."""
 
 import uuid
+from typing import Any, Optional, TypedDict
 
 from scheduler_app.translations import TRANSLATIONS, tr
 
@@ -288,6 +289,82 @@ def validate_class_fields(cls):
     return errors
 
 
+class TargetDict(TypedDict):
+    """One (year, branch) group a lesson is taught to."""
+    year: str
+    branch: str
+
+
+class ClassDict(TypedDict, total=False):
+    """The 24 fields ``new_class()`` writes.
+
+    ST-ARCH-013. Read this as **documentation with a test behind it**, not as a
+    safety net, because it is worth being precise about what a TypedDict does
+    and does not buy on a codebase shaped like this one:
+
+    * It does **not** catch the failure the finding cites. A missing key raises
+      ``KeyError`` at runtime at either totality -- mypy has no such check --
+      so the ``lecturer_available_at`` crash on a malformed availability dict
+      is untouched by this declaration. That dict is a *third* shape
+      (``new_lecturer_availability``) the proposed remedy never mentions.
+    * It is blind to ``.get()``, which is over half of all class-dict reads.
+    * ``total=False`` because the domain genuinely is partial: the optimizer
+      and the exporters attach their own keys to class dicts in flight, and
+      ``models.cls_key`` writes ``class_uid`` on *read* for legacy data. A
+      ``total=True`` declaration would be a claim the code does not honour.
+
+    What it does buy is a single written-down answer to "what is a class?",
+    which the audit found nowhere, and
+    ``tests/test_domain_shapes.py::test_the_classdict_matches_new_class`` keeps
+    it honest -- adding a field to ``new_class`` without adding it here turns
+    the suite red. Before this, the 24-field shape existed only as a dict
+    literal, and drift was invisible.
+    """
+    class_uid: str
+    class_code: str
+    name: str
+    lecturer: str
+    targets: list[TargetDict]
+    duration: int
+    participants: int
+    location_type: str
+    joint_session: bool
+    pinned: bool
+    pinned_day: Optional[str]
+    pinned_time: Optional[str]
+    pinned_classroom: Optional[str]
+    protection: str
+    allowed_days: list[str]
+    allowed_times: list[str]
+    excluded_days: list[str]
+    excluded_times: list[str]
+    required_classrooms: list[str]
+    excluded_classrooms: list[str]
+    placed: bool
+    placed_day: Optional[str]
+    placed_time: Optional[str]
+    placed_classroom: Optional[str]
+
+
+class StateDict(TypedDict, total=False):
+    """The 8 keys ``new_state()`` writes — the whole application state.
+
+    Every dialog, exporter, scorer and solver is handed this one object by
+    reference (ST-ARCH-007). ``total=False`` for the same reason as
+    ``ClassDict``: ``_auto_load`` back-fills ``lecturers`` and
+    ``classroom_capacities`` for files that predate them, so a loaded state is
+    legitimately missing keys until it has been normalized.
+    """
+    days: list[str]
+    slots: list[str]
+    classrooms: list[str]
+    classroom_capacities: dict[str, int]
+    lecturers: list[str]
+    lecturer_availability: dict[str, dict[str, list[str]]]
+    years: dict[str, list[str]]
+    classes: list[ClassDict]
+
+
 def new_state():
     return {
         "days": [],
@@ -312,9 +389,30 @@ def new_lecturer_availability():
 
 
 def get_lecturer_availability(state, lecturer_name):
-    """Return the availability dict for a lecturer, or defaults (fully available)."""
-    return state.get("lecturer_availability", {}).get(
-        lecturer_name, new_lecturer_availability())
+    """Return the availability dict for a lecturer, or defaults (fully available).
+
+    ST-ARCH-013 / ST-DATA-003. The fallback used to fire only when the lecturer
+    key was *absent*. A key present with a partial record -- ``{}``, or one
+    missing a single field -- was returned as-is, and ``lecturer_available_at``
+    then did a bare ``avail["excluded_days"]`` and raised ``KeyError``. That is
+    the exact crash the audit cites as ST-ARCH-013's motivating example, and it
+    was still live.
+
+    Neither in-app writer can produce a partial record: ``SetupDialog._ok`` and
+    the Excel importer both build from ``new_lecturer_availability()``. The
+    exposure is *stored* data -- a file written by an older build, hand-edited,
+    or damaged -- which is precisely the case Phase 1 made every stored-data
+    reader total for. Missing fields now fall back field by field, so an
+    unspecified axis means "no restriction", exactly as an absent record does.
+    """
+    stored = state.get("lecturer_availability", {}).get(lecturer_name)
+    if not isinstance(stored, dict):
+        return new_lecturer_availability()
+    record = new_lecturer_availability()
+    for field, value in stored.items():
+        if field in record:
+            record[field] = value
+    return record
 
 
 def lecturer_available_at(state, lecturer_name, day, slot):
