@@ -11,22 +11,33 @@ required/excluded rooms, room capacity, and lecturer availability across the
 class's *whole* duration.
 
 **B — the deprecated weaker pair** in ``scheduler_app/core/logic.py``:
-``respects_constraints`` (:328, its own docstring says ``.. deprecated::``)
-skips grid membership and lecturer availability entirely and only checks room
-capacity when a ``state`` is handed in; ``find_conflicts`` (:287) checks
-occupancy and availability but explicitly *not* the class's own constraints.
-Production drag-and-drop and the class editor use this pair, through
-``SchedulingWorkflow.find_drop_classroom`` (workflow.py:620),
-``validate_drop_constraints`` (:653), ``apply_class_edit`` (:692) and
-``validate_placements_after_edit`` (:728).
+``respects_constraints`` (its own docstring said ``.. deprecated::``) skipped
+grid membership and lecturer availability entirely and only checked room
+capacity when a ``state`` was handed in; ``find_conflicts`` checks occupancy
+and availability but explicitly *not* the class's own constraints. Production
+drag-and-drop and the class editor used this pair, through
+``SchedulingWorkflow.find_drop_classroom``, ``validate_drop_constraints``,
+``apply_class_edit`` and ``validate_placements_after_edit``.
 
-**C — the legacy solver family**, also in ``logic.py``: ``_check_placement_fast``
-(:610), ``_get_valid_slots`` (:664), ``_solve_backtrack`` (:774), driving
-``batch_schedule`` (:868), ``auto_place_class`` (:989) and ``reschedule_all``
-(:1118). It filters candidate cells with ``filter_class_days`` /
-``filter_class_times`` / ``get_room_candidates`` and then tests them with
-``_check_placement_fast``, which looks at occupancy only — so lecturer
-availability is never consulted anywhere in that pipeline.
+Phase 3 routed all four of those through ``ConstraintValidator``;
+**Phase 6 (ST-ARCH-011) deleted ``logic.respects_constraints`` outright**, so
+the weaker half of the pair no longer exists to be called back. ``logic``
+still owns ``find_conflicts``, which is live and deliberately narrower —
+Trap 3 below is about exactly that.
+
+**C — the legacy solver family**, formerly in ``logic.py``:
+``_check_placement_fast``, ``_get_valid_slots`` and ``_solve_backtrack``,
+driving ``batch_schedule``, ``auto_place_class`` and ``reschedule_all``. It
+filtered candidate cells and then tested them with ``_check_placement_fast``,
+which looked at occupancy only — so lecturer availability was never consulted
+anywhere in that pipeline.
+
+**Deleted in Phase 6 (ST-ARCH-011).** Phase 3 had already reduced the three
+entry points to one-line forwards onto the optimized engine, so the divergence
+was closed; Phase 6 removed the ~200 lines. Section 5 below now drives
+``optimized_reschedule_all`` / ``optimized_auto_place`` /
+``optimized_batch_schedule`` directly, which is what it was reaching through
+the forwards anyway.
 
 **D — CP-SAT's independent re-encoding** in ``cpsat_scheduler.py``. Deliberately
 out of scope for this module; another agent owns it.
@@ -42,22 +53,22 @@ What this module pins
    authority's verdict on every cell.
 3. The class editor must not leave a lesson parked on a cell its own freshly
    edited constraints forbid (ST-ARCH-004's sharpest user-visible edge).
-4. The legacy solver family must not place a lecturer who is unavailable and
+4. The solver entry points must not place a lecturer who is unavailable and
    must not move a ``protection="locked"`` lesson (ST-SCHED-007).
 5. ``check_placement`` returning False must always be *explainable*
    (ST-SCHED-009).
 
 How to read a failure here
 --------------------------
-These entry points are not equally live, and the docstrings say which is which:
+Everything here is live. Drag-and-drop (§3) and the class editor (§4) run on
+every mouse gesture; the §5 entry points are what Generate calls.
 
-* drag-and-drop (§3) and the class editor (§4) run on every mouse gesture —
-  a failure there is something a user hits today;
-* ``batch_schedule`` / ``auto_place_class`` / ``reschedule_all`` (§5) are
-  **latent**: ``grep`` finds no live call site — the workflow layer routes
-  everything through ``optimized_batch_schedule`` instead — but they are still
-  exported and ``scheduler_app/ui/dialogs.py:28`` still imports
-  ``batch_schedule``. A failure there is a loaded gun, not a wound.
+This was not always so. Until Phase 6, §5 drove the deprecated
+``batch_schedule`` / ``auto_place_class`` / ``reschedule_all`` names, and a
+failure there was **latent** — a loaded gun rather than a wound, since nothing
+called them but one unused import. ST-ARCH-011 unloaded the gun by deleting
+them, so those cases now point at the optimized engine and a failure is
+something a user hits today.
 
 Traps this module has to defend against
 ---------------------------------------
@@ -93,7 +104,7 @@ from scheduler_app.core.models import (
     new_state,
 )
 from scheduler_app.core.workflow import SchedulingWorkflow
-import scheduler_app.core.logic as legacy
+import scheduler_app.core.logic as engine
 
 
 _T_A = {"year": "Year-1", "branch": "A"}
@@ -644,42 +655,53 @@ def test_placement_sweep_after_an_edit_catches_own_constraint_violations():
 
 
 # ===========================================================================
-# 5. ST-SCHED-007 — the legacy solver family
+# 5. ST-SCHED-007 — the solver entry points
 #
-# NOTE ON LIVENESS: batch_schedule / auto_place_class / reschedule_all have no
-# live caller today (workflow.py routes through optimized_batch_schedule and
-# optimized_reschedule_all). They remain public and scheduler_app/ui/dialogs.py
-# line 28 still imports batch_schedule, so a failure here is LATENT — it
-# describes what a user would get the moment any of these is wired back up,
-# not what they get now.
+# NOTE ON LIVENESS, revised in Phase 6. These cases used to drive
+# `logic.batch_schedule` / `auto_place_class` / `reschedule_all`, and carried a
+# note saying a failure was LATENT: those names had no live caller, so they
+# described what a user *would* get if the family were ever rewired.
+#
+# ST-ARCH-011 deleted the family, which removes the hazard rather than guarding
+# it. And since Phase 3 the three names had been one-line forwards, so these
+# tests were already exercising the optimized engine through an alias — the
+# "legacy" in their name was the only thing legacy about them.
+#
+# They now name the optimized entry points directly. The assertions are
+# unchanged and they are no longer latent: this is the engine that runs when a
+# user clicks Generate.
 # ===========================================================================
-def _legacy_placements(entry, state, classes):
-    """Run one legacy entry point; return {class name: (day, slot, room)}."""
+def _engine_placements(entry, state, classes):
+    """Run one engine entry point; return {class name: (day, slot, room)}."""
     by_uid = {cls_key(c): c for c in state["classes"]}
-    if entry == "reschedule_all":
-        placed, _unplaced, _changes = legacy.reschedule_all(state)
+    if entry == "optimized_reschedule_all":
+        # The shim these cases used to call dropped the 4th value; the
+        # optimized entry point also returns the run summary.
+        placed, _unplaced, _changes, _summary = (
+            engine.optimized_reschedule_all(state))
         return {c["name"]: (d, s, r) for c, d, s, r in placed}
-    if entry == "batch_schedule":
-        placed, _unplaced, _rescheduled = legacy.batch_schedule(
+    if entry == "optimized_batch_schedule":
+        placed, _unplaced, _rescheduled = engine.optimized_batch_schedule(
             state, list(classes))
         return {c["name"]: (d, s, r) for c, d, s, r in placed}
-    if entry == "auto_place_class":
+    if entry == "optimized_auto_place":
         out = {}
         for cls in classes:
-            placed_ok, placements, _rescheduled = legacy.auto_place_class(
+            placed_ok, placements, _rescheduled = engine.optimized_auto_place(
                 state, cls)
             if placed_ok:
                 for uid, position in placements.items():
                     out[by_uid[uid]["name"]] = position
         return out
-    raise AssertionError(f"unknown legacy entry point {entry!r}")
+    raise AssertionError(f"unknown entry point {entry!r}")
 
 
 @pytest.mark.engine
 @pytest.mark.parametrize(
-    "entry", ["reschedule_all", "auto_place_class", "batch_schedule"])
-def test_legacy_solvers_never_place_an_unavailable_lecturer(entry):
-    """ST-SCHED-007 (latent — no live caller; see the section note).
+    "entry", ["optimized_reschedule_all", "optimized_auto_place",
+              "optimized_batch_schedule"])
+def test_solvers_never_place_an_unavailable_lecturer(entry):
+    """ST-SCHED-007 — the engine Generate runs (see the section note).
 
     A failure means that if this solver family is ever reconnected, DERSİS will
     hand a lecturer who marked the entire week unavailable a Monday 09:00
@@ -690,7 +712,7 @@ def test_legacy_solvers_never_place_an_unavailable_lecturer(entry):
     _unavailable(state, "Lect-A", excluded_days=["monday", "tuesday"])
     companion = _mk(state, "Ordinary", lecturer="Lect-B", target=_T_B)
 
-    placements = _legacy_placements(entry, state, [blocked, companion])
+    placements = _engine_placements(entry, state, [blocked, companion])
 
     # Trap 2: "the unavailable lecturer was not placed" is free if the solver
     # placed nobody. The companion has no restrictions at all and must land.
@@ -708,7 +730,7 @@ def test_legacy_solvers_never_place_an_unavailable_lecturer(entry):
 
 @pytest.mark.engine
 def test_reschedule_all_never_moves_a_locked_class():
-    """ST-SCHED-007 (latent — no live caller; see the section note).
+    """ST-SCHED-007 — the engine Generate runs (see the section note).
 
     "Fully locked" is the strongest promise the protection dropdown makes. A
     failure means the user locks a lesson to Tuesday 11:00, runs a global
@@ -722,7 +744,7 @@ def test_reschedule_all_never_moves_a_locked_class():
     movable = _mk(state, "Movable", lecturer="Lect-B", target=_T_B)
     mark_placed(movable, "monday", "09:00", "R001")
 
-    placed, _unplaced, changes = legacy.reschedule_all(state)
+    placed, _unplaced, changes, _summary = engine.optimized_reschedule_all(state)
     placements = {c["name"]: (d, s, r) for c, d, s, r in placed}
 
     # Trap 2: a solver that returned nothing would satisfy "Locked did not
@@ -740,7 +762,7 @@ def test_reschedule_all_never_moves_a_locked_class():
 
 @pytest.mark.engine
 def test_auto_place_class_never_displaces_a_locked_class():
-    """ST-SCHED-007 (latent — no live caller; see the section note).
+    """ST-SCHED-007 — the engine Generate runs (see the section note).
 
     Adding one new lesson must not silently rearrange a lesson the user marked
     "fully locked". A failure means the same broken promise as
@@ -772,7 +794,7 @@ def test_auto_place_class_never_displaces_a_locked_class():
                    allowed_days=["monday"], allowed_times=["09:00"],
                    required_classrooms=["R002"])
 
-    placed_ok, placements, _rescheduled = legacy.auto_place_class(
+    placed_ok, placements, _rescheduled = engine.optimized_auto_place(
         state, newcomer)
 
     assert placed_ok, (
@@ -811,7 +833,7 @@ def test_batch_schedule_keeps_locked_classes_put():
     newcomer = _mk(state, "Newcomer", lecturer="Lect-B", target=_T_B,
                    allowed_days=["monday"], allowed_times=["10:00"])
 
-    placed, _unplaced, _rescheduled = legacy.batch_schedule(state, [newcomer])
+    placed, _unplaced, _rescheduled = engine.optimized_batch_schedule(state, [newcomer])
     placements = {c["name"]: (d, s, r) for c, d, s, r in placed}
 
     # Trap 2 again: prove the solver did real work.

@@ -142,7 +142,7 @@ User Input (Setup + Classes)
 | Lecturer conflict | `check_placement()` | `lect_occ` |
 | Student group conflict | `check_placement()` | `group_occ` |
 | Duration overflow | `slots_fit()` | Direct slot list check |
-| Room capacity | `respects_constraints()` | Room metadata |
+| Room capacity | `ConstraintValidator.respects_constraints()` | Room metadata |
 | Allowed days filter | Pre-filtered in `CandidateGenerator` | Class metadata |
 | Allowed times filter | Pre-filtered in `CandidateGenerator` | Class metadata |
 | Lecturer availability | `apply_lecturer_availability_filters()` | Lecturer metadata |

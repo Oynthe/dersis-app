@@ -419,32 +419,6 @@ def find_conflicts(state, candidate, day, start_slot, classroom):
     return conflicts
 
 
-def respects_constraints(candidate, day, slot, room, state=None):
-    """Check if (day, slot, room) satisfies the class's own constraints.
-
-    .. deprecated::
-        Use ``ConstraintValidator.respects_constraints()`` instead, which
-        also checks room capacity and lecturer availability.
-    """
-    if candidate["allowed_days"] and day not in candidate["allowed_days"]:
-        return False
-    if candidate.get("excluded_days") and day in candidate["excluded_days"]:
-        return False
-    if candidate["allowed_times"] and slot not in candidate["allowed_times"]:
-        return False
-    if candidate.get("excluded_times") and slot in candidate["excluded_times"]:
-        return False
-    # Classroom constraints only apply to face-to-face classes
-    if needs_physical_room(candidate):
-        if candidate["required_classrooms"] and room not in candidate["required_classrooms"]:
-            return False
-        if candidate["excluded_classrooms"] and room in candidate["excluded_classrooms"]:
-            return False
-        if state is not None and not room_fits_class(state, room, candidate):
-            return False
-    return True
-
-
 def find_valid_options(state, candidate):
     options = []
     days = filter_class_days(candidate, state["days"])
@@ -465,42 +439,6 @@ def find_valid_options(state, candidate):
                 if not find_conflicts(state, candidate, day, slot, room):
                     options.append((day, slot, room))
     return options
-
-
-def find_conflicting_classes(state, candidate, day, start_slot, classroom):
-    """Return placed/pinned classes that conflict with *candidate*
-    if it were placed at (day, start_slot, classroom).
-
-    Checks room, lecturer, target, AND lecturer availability conflicts.
-    """
-    conflicting = set()
-    td = total_duration(candidate)
-    if not slots_fit(state, start_slot, td):
-        return []
-
-    # Occupancy conflicts via shared detection
-    for existing, ns, conflict_type in _detect_occupancy_conflicts(
-            state, candidate, day, start_slot, classroom):
-        conflicting.add(cls_key(existing))
-
-    # Lecturer availability: if lecturer is unavailable at any needed slot,
-    # mark the candidate itself as conflicting (no existing class to blame,
-    # but caller should know placement is invalid).
-    lecturer = candidate.get("lecturer", "")
-    if lecturer:
-        needed_slots = get_consecutive_slots(state, start_slot, td)
-        for ns in needed_slots:
-            if not lecturer_available_at(state, lecturer, day, ns):
-                # Lecturer unavailable — add sentinel to signal infeasibility
-                conflicting.add(cls_key(candidate))
-                break
-
-    # Return actual class dicts (preserving identity)
-    result = [c for c in get_placed_classes(state) if cls_key(c) in conflicting]
-    # Include candidate itself if lecturer unavailability was detected
-    if cls_key(candidate) in conflicting and candidate not in result:
-        result.append(candidate)
-    return result
 
 
 def find_schedule_conflicts(state):
@@ -962,28 +900,6 @@ def build_occupancy(state, exclude_ids=None):
     return room_occ, lect_occ, group_occ
 
 
-def _check_placement_fast(state, cls, day, start_slot, room,
-                          room_occ, lect_occ, group_occ):
-    """Fast conflict check using pre-built occupancy maps. Returns True if OK."""
-    td = total_duration(cls)
-    si = slot_index(state, start_slot)
-    if si + td > len(state["slots"]):
-        return False
-    check_room = needs_physical_room(cls) and room is not None
-    slots_list = state["slots"][si:si + td]
-    for off, s in enumerate(slots_list):
-        key = (day, s)
-        if check_room and room in room_occ.get(key, set()):
-            return False
-        if cls["lecturer"] in lect_occ.get(key, set()):
-            return False
-        active = _active_targets(cls, off)
-        for t in active:
-            if (t["year"], t["branch"]) in group_occ.get(key, set()):
-                return False
-    return True
-
-
 def _add_to_occupancy(state, cls, day, start_slot, room,
                       room_occ, lect_occ, group_occ):
     """Add a class placement to occupancy maps."""
@@ -1014,21 +930,6 @@ def _remove_from_occupancy(state, cls, day, start_slot, room,
         occ_release(lect_occ, key, cls["lecturer"])
         for t in _active_targets(cls, off):
             occ_release(group_occ, key, (t["year"], t["branch"]))
-
-
-def _get_valid_slots(state, cls, room_occ, lect_occ, group_occ):
-    """Get all valid (day, slot, room) for cls respecting constraints + occupancy."""
-    days = filter_class_days(cls, state["days"])
-    times = filter_class_times(cls, state["slots"])
-    rooms = get_room_candidates(state, cls)
-    options = []
-    for day in days:
-        for slot in times:
-            for room in rooms:
-                if _check_placement_fast(state, cls, day, slot, room,
-                                         room_occ, lect_occ, group_occ):
-                    options.append((day, slot, room))
-    return options
 
 
 def _compactness_gap(state, day, slot_idx, entity_key, occ_map, entity_getter):
@@ -1126,76 +1027,6 @@ def _constraint_tightness(state, cls):
     return len(days) * valid_time_count * len(rooms)
 
 
-def _solve_backtrack(state, flexible, room_occ, lect_occ, group_occ,
-                     max_iterations=50000, preferred=None):
-    """Core backtracking solver.
-
-    Args:
-        flexible: List of classes to place.
-        room_occ/lect_occ/group_occ: Occupancy maps (pinned classes pre-loaded).
-        max_iterations: Iteration cap to avoid hanging.
-        preferred: Optional dict {id(cls): (day, slot, room)} of preferred
-                   placements to try first (used to preserve existing positions).
-
-    Returns:
-        List of (day, slot, room) or None per class in flexible.
-    """
-    preferred = preferred or {}
-    n = len(flexible)
-    assignments = [None] * n
-    best_solution = [None]
-    best_count = [0]
-    iterations = [0]
-
-    def solve(idx):
-        if iterations[0] >= max_iterations:
-            return False
-        iterations[0] += 1
-
-        if idx == n:
-            placed_count = sum(1 for a in assignments if a is not None)
-            if placed_count > best_count[0]:
-                best_count[0] = placed_count
-                best_solution[0] = list(assignments)
-            return placed_count == n
-
-        cls = flexible[idx]
-        options = _get_valid_slots(state, cls, room_occ, lect_occ, group_occ)
-
-        # Score and sort options
-        scored = [(opt, _score_placement(state, cls, opt[0], opt[1], opt[2],
-                                          room_occ, lect_occ, group_occ))
-                  for opt in options]
-        scored.sort(key=lambda x: x[1])
-
-        # If this class has a preferred slot, try it first
-        pref = preferred.get(cls_key(cls))
-        if pref and pref in options:
-            # Move preferred to front with best score
-            scored = [(pref, -1)] + [(o, s) for o, s in scored if o != pref]
-
-        for (day, slot, room), _ in scored:
-            assignments[idx] = (day, slot, room)
-            _add_to_occupancy(state, cls, day, slot, room,
-                              room_occ, lect_occ, group_occ)
-
-            if solve(idx + 1):
-                return True
-
-            _remove_from_occupancy(state, cls, day, slot, room,
-                                    room_occ, lect_occ, group_occ)
-            assignments[idx] = None
-
-        # Try skipping this class (leave unplaced) — still try remaining
-        if solve(idx + 1):
-            return True
-
-        return False
-
-    solve(0)
-    return best_solution[0] if best_solution[0] else [None] * n
-
-
 def _unplaced_reason(state, cls, room_occ, lect_occ, group_occ):
     """Determine why a class couldn't be placed."""
     options = _get_valid_slots(state, cls, room_occ, lect_occ, group_occ)
@@ -1221,68 +1052,18 @@ def _unplaced_reason(state, cls, room_occ, lect_occ, group_occ):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  LEGACY SOLVER ENTRY POINTS  (ST-SCHED-007, ST-ARCH-004, ST-ARCH-011)
-# ══════════════════════════════════════════════════════════════════════════
-# These three names are the app's original solver. They have no live caller —
-# `batch_schedule` is imported by ui/dialogs.py:28 and never invoked — but they
-# are exported and importable, so they are a loaded gun: re-wire any of them and
-# you get a solver that silently enforces a different, weaker rule set.
-#
-# The audit measured exactly that (ST-SCHED-007). Driving a fully-unavailable
-# lecturer through all three placed the class at monday/09:00, because their
-# shared candidate generator `_get_valid_slots` never applied the lecturer
-# availability filters at all; and `reschedule_all` treated every non-pinned
-# placed class as movable, so it relocated a `protection="locked"` class from
-# friday/11:00 to monday/09:00. The optimized path got both right.
-#
-# Rather than teach the old rules the missing checks — which would have created
-# a fifth copy of the constraint logic, the very thing ST-ARCH-004 is about —
-# each entry point now forwards to its optimized counterpart, which validates
-# through ConstraintValidator like everything else. Return signatures are
-# unchanged; `optimized_auto_place` and `optimized_batch_schedule` already
-# documented themselves as drop-in replacements.
-#
-# Deleting them outright, along with the now-unreferenced `_solve_backtrack` /
-# `_get_valid_slots` / `_check_placement_fast` helpers, is ST-ARCH-011's job in
-# Phase 6. This phase closes the behavioural hole; that one removes the code.
-
-
-def batch_schedule(state, new_classes):
-    """Deprecated. Forwards to :func:`optimized_batch_schedule`.
-
-    .. deprecated::
-        Kept only so existing imports resolve. Call
-        ``optimized_batch_schedule`` directly.
-
-    Returns (placed_list, unplaced_list, rescheduled) — unchanged.
-    """
-    return optimized_batch_schedule(state, new_classes)
-
-
-def auto_place_class(state, new_cls):
-    """Deprecated. Forwards to :func:`optimized_auto_place`.
-
-    .. deprecated::
-        Kept only so existing imports resolve. Call ``optimized_auto_place``
-        directly.
-
-    Returns (success, placements, rescheduled) — unchanged.
-    """
-    return optimized_auto_place(state, new_cls)
-
-
-def reschedule_all(state):
-    """Deprecated. Forwards to :func:`optimized_reschedule_all`.
-
-    .. deprecated::
-        Kept only so existing imports resolve. Call
-        ``optimized_reschedule_all`` directly — it also returns a summary,
-        which this signature has no room for.
-
-    Returns (placed_list, unplaced_list, changes) — unchanged.
-    """
-    placed, unplaced, changes, _summary = optimized_reschedule_all(state)
-    return placed, unplaced, changes
+#  (removed)  ST-ARCH-011
+# ------------------------------------------------------------------
+# The app's original solver family -- `batch_schedule`,
+# `auto_place_class`, `reschedule_all` and the `_solve_backtrack` /
+# `_get_valid_slots` / `_check_placement_fast` helpers behind them -- used to
+# live here. Phase 3 found they enforced a weaker rule set than the optimized
+# path (ST-SCHED-007: they placed a fully-unavailable lecturer at monday/09:00
+# and relocated a `protection="locked"` class) and made each entry point a
+# one-line forward rather than teaching the old rules the missing checks.
+# Phase 6 removes the code. Nothing imported them but one unused import in
+# ui/dialogs.py; `optimized_batch_schedule`, `optimized_auto_place` and
+# `optimized_reschedule_all` are the entry points, and always were.
 
 
 def lighten_color(hex_color, factor=0.45):
@@ -1519,19 +1300,6 @@ def score_placement_explained(state, cls, day, slot, room, weights=None):
     engine = ExplanationEngine()
     explanation = engine.explain_placement(cls, day, slot, room, breakdown)
     return score, breakdown, explanation
-
-
-def check_placement_explained(state, cls, day, slot, room):
-    """Check placement validity with descriptive reasons.
-
-    Returns:
-        (bool, list[str]) — validity and list of reason strings.
-    """
-    from scheduler_app.constraint_validator import ConstraintValidator
-
-    exclude = {cls_key(cls)}
-    validator = ConstraintValidator(state, exclude_ids=exclude)
-    return validator.check_placement_explained(cls, day, slot, room)
 
 
 def analyze_schedule(state, placements=None):

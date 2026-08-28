@@ -26,7 +26,7 @@ from scheduler_app.models import (
 from scheduler_app import storage
 from scheduler_app.logic import (
     find_valid_options, get_placed_classes,
-    occupied_slots_of, classroom_of, batch_schedule,
+    occupied_slots_of, classroom_of,
     parse_slot_lines, slot_meaning_changes,
     SLOT_ERROR_DUPLICATE,
 )
