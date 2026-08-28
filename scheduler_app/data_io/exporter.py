@@ -1490,7 +1490,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
         return tbl
 
     # ── Assemble pages ────────────────────────────────────────────────
-    elements = []
+    elements: list = []
 
     if mode == "everything":
         for yr in sorted(schedule.years.keys()):

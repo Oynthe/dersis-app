@@ -145,6 +145,14 @@ jobs:
       - name: Install test dependencies
         run: pip install -r requirements-dev.txt
 
+      # ── Static typing (ST-ARCH-013) ───────────────────────────────────
+      # The Qt-free layers only, gated at zero errors rather than a baseline,
+      # because they start at zero. Scope and rationale are in mypy.ini.
+      # This also fails if a Qt import reaches the engine, which is the
+      # ST-ARCH-009 property caught through a second mechanism.
+      - name: Type-check the engine
+        run: mypy
+
       - name: Install Qt runtime libraries
         run: |
           sudo apt-get update

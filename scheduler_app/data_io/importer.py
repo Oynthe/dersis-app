@@ -499,7 +499,7 @@ def load_scheduler_data_from_excel(filepath: str) -> SchedulerDataset:
 
 def _resolve_joint_groups(dataset: SchedulerDataset):
     """Merge classes sharing the same joint_class_group into joint sessions."""
-    groups = {}
+    groups: dict = {}
     for entry in dataset.raw_classes:
         cls = entry["cls"]
         jg = cls.pop("_joint_group", "")

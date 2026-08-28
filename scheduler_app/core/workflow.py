@@ -676,7 +676,13 @@ class SchedulingWorkflow:
         This is pure validation — no state mutation.
         """
         td = total_duration(cls)
-        reasons = []
+        # ST-ARCH-013: variable-arity on purpose. Each record is
+        # (key, *args), and ui/app.py dispatches on reasons[0] to pick the
+        # sentence and its placeholders -- "not_enough_slots" carries three
+        # extra values, "placement_invalid" none. mypy infers the narrowest
+        # tuple from the first append without this, and then rejects every
+        # other shape.
+        reasons: list[tuple] = []
 
         # Same-day protection
         if cls.get("protection") == "same_day" and drag_backup:
@@ -786,7 +792,7 @@ class SchedulingWorkflow:
         """
         validator = SchedulingWorkflow._drop_validator(state, cls)
         if not validator.respects_constraints(cls, day, slot, room):
-            reasons = []
+            reasons: list[tuple] = []   # variable-arity; see validate_drop
             if needs_physical_room(cls):
                 if cls["required_classrooms"] and room not in cls["required_classrooms"]:
                     reasons.append(("classroom_not_required", room,
