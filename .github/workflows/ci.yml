@@ -193,6 +193,12 @@ jobs:
   # against the production optimizer, including the `slow` presets that the
   # Validate job skips. Separate job so a multi-minute solve never delays the
   # fast feedback. Needs no Qt: core/ and data_io/ import no PyQt6.
+  #
+  # ST-PERF-001: this job used to run tests/test_scheduler_invariants.py and
+  # nothing else, which left 13 of the suite's 19 `slow` tests executing in no
+  # CI job at all — including the solver-quality floors that were written for
+  # exactly this purpose. See the step at the bottom for the module list and
+  # the measured budget.
   engine:
     name: Scheduling invariants
     runs-on: ubuntu-latest
@@ -214,5 +220,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Run the invariant oracle (including slow presets)
-        run: pytest tests/test_scheduler_invariants.py
+      # ST-PERF-001 / ST-ARCH-001. Every module here is `slow`-marked in part,
+      # so `pytest -m "not slow"` in the Validate job skips exactly the halves
+      # that matter, and before Phase 7 nothing else collected them:
+      #
+      #   test_scheduler_invariants.py   the hard-constraint oracle (was the
+      #                                  only module this job ran)
+      #   test_greedy_bounds.py          ST-PERF-004's placement floors
+      #                                  (_PLACEMENT_FLOORS: small >= 20,
+      #                                  normal >= 72) and ST-SCHED-001's
+      #                                  repaired_conflicts == 0, at 80 classes
+      #   test_optimizer_determinism.py  ST-SCHED-013's slow reproducibility
+      #                                  pins
+      #   test_solver_work.py            the check_placement work ratchet, plus
+      #                                  the strict-xfail on the shipped
+      #                                  80-class configuration
+      #
+      # Budget, measured end to end rather than summed: this exact command runs
+      # 47 passed + 1 xfailed in 633 s on the audit machine. ubuntu-latest runs
+      # this workload 1.87x faster (measured over 11 runs), so the step should
+      # land near 6 minutes; the step it replaces ran 206 s. Against a 25-minute
+      # timeout that is roughly 3 added minutes of 21.6 minutes spare.
+      #
+      # There is no wall-clock assertion anywhere in it. Runner variance on
+      # identical code is 1.36-1.49x, which no useful threshold survives. The
+      # gates are counts, and counts measured 1.000.
+      - name: Run the invariant oracle and the engine gates (including slow presets)
+        run: |
+          pytest \
+            tests/test_scheduler_invariants.py \
+            tests/test_greedy_bounds.py \
+            tests/test_optimizer_determinism.py \
+            tests/test_solver_work.py
