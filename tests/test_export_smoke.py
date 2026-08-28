@@ -26,8 +26,14 @@ CSV is still two writers: this module's ``_export_csv`` emits the *timetable*
 (one row per occupied slot), while ``ui/app.py::export_csv`` emits a *class
 list* (one row per class-target, different columns). Those are different
 products, not a duplicate, so unifying them would silently change the file a
-user has been getting -- see PROGRESS.md. The ``UnicodeEncodeError`` half of
-ST-FUNC-006 lives in that UI writer and still needs its own coverage.
+user has been getting -- see PROGRESS.md.
+
+**Which one does a user reach?** Measured in Phase 7: only the second.
+``export_schedule(..., "csv", ...)`` is called nowhere in production -- the
+menu at ``ui/app.py:1000`` is wired to ``ui/app.py::export_csv``. So every CSV
+assertion in *this* module is a library guard, not a user-facing pin, and
+ST-FUNC-006's real pins moved to ``tests/test_export_csv_live.py``, which
+drives the writer a user actually gets.
 
 Convention: pins that describe *silent* data loss accept either legitimate fix
 -- keep the data, or tell the user it was dropped. Tests that merely read the
@@ -715,19 +721,19 @@ def test_csv_and_pdf_tolerate_illegal_sheet_title_chars(tmp_path, fmt, request):
 #  4. ST-FUNC-006 — CSV day column + encoding
 # ══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-FUNC-006 — exporter.py:385 writes the raw internal day key "
-           "instead of tr('weekdays.<day>'); fix is the 'CSV: UTF-8 BOM + "
-           "localized day names' item in "
-           "stress-test/13-improvement-opportunities.md (unphased)",
-)
 def test_csv_day_column_is_localized(state, tmp_path):
     """ST-FUNC-006 — the CSV day column must read "Pazartesi", not "monday".
 
     A failure means the exported CSV a school hands to a colleague is written
     half in Turkish (the headers) and half in English programmer keys (the day
     column), so it cannot be read or re-imported without hand-editing.
+
+    **This is not the pin any more.** Measured in Phase 7:
+    ``export_schedule(..., "csv", ...)`` has no production caller, so a green
+    mark here proves nothing about the file a user gets -- exactly the shape of
+    ST-ARCH-003, one format later. The user-facing pin now drives the live
+    writer and lives in ``tests/test_export_csv_live.py``. This one stays as a
+    guard on the library entry point so the two writers cannot drift apart.
     """
     out = tmp_path / "days.csv"
     export_schedule(state, "csv", str(out))
@@ -747,8 +753,12 @@ def test_csv_is_utf8_with_turkish_characters_intact(state, tmp_path):
     """ST-FUNC-006 (encoding half) — regression guard on the exporter's CSV.
 
     A failure means Turkish names come back mangled or the file cannot be
-    decoded at all -- the ``UnicodeEncodeError`` on non-Turkish Windows that
-    the audit recorded against the *UI's* separate CSV writer.
+    decoded at all.
+
+    Same caveat as the test above: the ``UnicodeEncodeError`` the audit
+    recorded is only reachable through ``ui/app.py::export_csv``, which is a
+    different function and was never covered here. It is now, in
+    ``tests/test_export_csv_live.py``.
     """
     out = tmp_path / "utf8.csv"
     export_schedule(state, "csv", str(out))

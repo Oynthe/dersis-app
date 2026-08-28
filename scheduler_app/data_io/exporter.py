@@ -847,7 +847,16 @@ def _export_excel(schedule, filepath, mode="everything"):
 # CSV export
 
 def _export_csv(schedule: FinalSchedule, filepath: str):
-    """Export to a flat CSV file."""
+    """Export to a flat CSV file.
+
+    Scope note, measured in Phase 7: ``export_schedule(..., "csv", ...)`` has
+    **no production caller**. The CSV a user gets comes from
+    ``ui/app.py::export_csv``, a separate writer emitting a different product
+    (a class list, not a timetable), wired to the menu at ``ui/app.py:1000``.
+    ST-FUNC-006's user-facing pin therefore lives against *that* function; this
+    one is fixed to match so the two writers cannot drift again, and so that
+    wiring this entry point up later does not reintroduce the defect.
+    """
     grid = schedule.build_grid()
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -871,18 +880,23 @@ def _export_csv(schedule: FinalSchedule, filepath: str):
                 # rather than dropping it (ST-DATA-003).
                 cells = [(effective_day(cls), effective_time(cls))]
             for day, slot in cells:
+                # ST-FUNC-006: the header row is Turkish, so the day column
+                # must be too. display_day rather than tr("weekdays.<key>") so
+                # a day the grid no longer defines prints its stored value
+                # instead of the lookup key.
+                day_text = display_day(day)
                 targets = cls.get("targets", [])
                 if targets:
                     for t in targets:
                         writer.writerow([
-                            day, csv_safe(slot), csv_safe(code),
+                            day_text, csv_safe(slot), csv_safe(code),
                             csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
                             csv_safe(room), csv_safe(t["year"]),
                             csv_safe(t["branch"]),
                         ])
                 else:
                     writer.writerow([
-                        day, csv_safe(slot), csv_safe(code),
+                        day_text, csv_safe(slot), csv_safe(code),
                         csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
                         csv_safe(room), "", "",
                     ])

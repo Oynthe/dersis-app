@@ -2698,15 +2698,39 @@ class SchedulerApp(QMainWindow):
         if not fname:
             return
         try:
-            with open(fname, "w", newline="") as f:
+            # ST-FUNC-006. This is the CSV a user actually gets -- the menu is
+            # wired here, not to data_io.export_schedule(..., "csv", ...),
+            # which has no production caller at all. Both halves of the finding
+            # lived on these two lines and nowhere else:
+            #
+            #   * no `encoding=`, so the file was written in the OS codepage.
+            #     Measured on this machine: locale.getpreferredencoding(False)
+            #     is cp1254, so colleagues abroad got mojibake -- and on a
+            #     cp1252 host "Işık Öğretmen".encode() raises
+            #     UnicodeEncodeError, which the bare `except Exception` below
+            #     turns into an unexplained "export failed".
+            #   * the raw internal day key ("monday") in a Turkish-headed file.
+            #
+            # utf-8-sig because the file is opened in Excel, which reads a
+            # BOM-less UTF-8 CSV in the local codepage; the suite's own
+            # read_csv_rows already decodes with utf-8-sig.
+            with open(fname, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
                 writer.writerow([tr("labels.class_item"), tr("labels.lecturer"), tr("labels.year"), tr("labels.branch"),
                                  tr("labels.day"), tr("labels.start_time"), tr("labels.duration"), tr("labels.classroom")])
                 for c in placed:
-                    day = effective_day(c)
+                    # display_day rather than tr("weekdays.<key>"): it falls
+                    # back to the stored value verbatim for a day the grid no
+                    # longer defines, instead of printing the lookup key.
+                    day = display_day(effective_day(c))
                     start = effective_time(c)
                     room = classroom_of(c)
-                    for t in c["targets"]:
+                    # ST-FUNC-013. `targets` is [] for every freshly created
+                    # class (core/models.py:578) and no class editor requires
+                    # one, so iterating it alone wrote NO row for a lesson the
+                    # user had placed -- the same silent drop the PDF had, in
+                    # the file that gets emailed. A flat file has room for it.
+                    for t in c["targets"] or [{"year": "", "branch": ""}]:
                         # ST-UI-008. The .csv is emailed to colleagues and a
                         # leading "=" is executed by their spreadsheet. Safe to
                         # prefix here and ONLY here: nothing in DERSIS reads a
