@@ -8,10 +8,9 @@ from scheduler_app.constants import YEAR_COLORS
 # `logic` back; that is what keeps the module-level graph acyclic.
 from scheduler_app.models import (
     PROTECTION_NONE,
-    room_fits_class, lecturer_available_at, needs_physical_room, display_room,
-    get_room_candidates, get_physical_room_candidates,
+    lecturer_available_at, needs_physical_room, display_room,
+    get_room_candidates,
     effective_day, effective_time,
-    mark_placed, mark_unplaced,
     filter_class_days, filter_class_times,
     apply_lecturer_availability_filters,
     cls_key,
@@ -340,8 +339,8 @@ def _detect_occupancy_conflicts(state, candidate, day, start_slot, classroom):
 
     Yields (existing, slot_name, conflict_type) tuples where conflict_type is
     one of 'room', 'lecturer', or 'target'. This is the single source of truth
-    for occupancy conflict detection, used by both find_conflicts() and
-    find_conflicting_classes().
+    for occupancy conflict detection, used by find_conflicts() and by
+    find_schedule_conflicts().
     """
     td = total_duration(candidate)
     if not slots_fit(state, start_slot, td):
@@ -448,7 +447,7 @@ def find_valid_options(state, candidate):
 def find_schedule_conflicts(state):
     """Every hard occupancy conflict in the timetable **as it stands**.
 
-    ST-UI-001. ``find_conflicting_classes`` answers "would this candidate clash
+    ST-UI-001. ``find_conflicts`` answers "would this candidate clash
     if I put it here?". This answers "what is already double-booked?" — the
     question the grid, the warning log and the exports need, and the only one an
     engine that deliberately commits an infeasible pin (ST-SCHED-002) can be
@@ -468,14 +467,14 @@ def find_schedule_conflicts(state):
     name, and targets per slot offset via ``_active_targets``, so a non-joint
     class only blocks the group whose sub-block covers that hour.
 
-    Four deliberate divergences from ``find_conflicting_classes``, each because
+    Four deliberate divergences from ``find_conflicts``, each because
     that function answers "may I put this candidate here?" and this one answers
     "what is already wrong?":
 
-    1. **No lecturer-availability sentinel.** That function lists a class as its
-       own conflict partner when its lecturer is unavailable. This returns
-       *pairs*, and "the lecturer is not available" is not a pair; it is
-       reported by the negotiator and by the validator's reasons.
+    1. **No lecturer-availability entry.** That function reports an unavailable
+       lecturer as one more line in its list. This returns *pairs*, and "the
+       lecturer is not available" is not a pair; it is reported by the
+       negotiator and by the validator's reasons.
     2. **A blank lecturer is not a lecturer clash, and a blank room is not a
        room clash.** ``_detect_occupancy_conflicts`` compares
        ``existing["lecturer"] == candidate["lecturer"]`` with no truthiness
@@ -483,10 +482,10 @@ def find_schedule_conflicts(state):
        harmless when screening one candidate and wrong when reporting a defect
        to the user.
     3. **A block that overruns the end of the day is still scanned**, for the
-       hours it does cover. ``find_conflicting_classes`` returns ``[]`` outright
-       when ``slots_fit`` fails. A lesson can end up overrunning after the user
-       shortens the day in Setup, and it really does occupy — and double-book —
-       the hours that remain.
+       hours it does cover. ``find_conflicts`` reports the overflow and returns
+       at once when ``slots_fit`` fails, scanning nothing. A lesson can end up
+       overrunning after the user shortens the day in Setup, and it really does
+       occupy — and double-book — the hours that remain.
     4. **A placement on a day the grid does not have is skipped.** It occupies
        no cell anyone can see, so reporting it would put a red conflict in the
        warning log for two lessons that are drawn nowhere. Those are reported
@@ -706,114 +705,24 @@ def assign_component_lanes(entries):
             e["lane_count"] = n
 
 
-def _unplace(cls):
-    """Remove placement from a class (does not touch pinned fields)."""
-    mark_unplaced(cls)
-
-
-def _find_candidate_slots(state, cls, visited_ids):
-    """Find candidate (day, slot, room) tuples for *cls* respecting its constraints.
-
-    Returns a list of (day, slot, room, conflicting_classes) tuples sorted so
-    conflict-free slots come first, then slots with fewer displaceable conflicts.
-    Slots that conflict with pinned or already-visited classes are excluded.
-    """
-    days = filter_class_days(cls, state["days"])
-    times = filter_class_times(cls, state["slots"])
-    rooms = get_room_candidates(state, cls)
-
-    candidates = []
-    for day in days:
-        for slot in times:
-            for room in rooms:
-                blockers = find_conflicting_classes(state, cls, day, slot, room)
-                # Skip if any blocker is pinned or already being relocated
-                if any(b["pinned"] or cls_key(b) in visited_ids for b in blockers):
-                    continue
-                # Also skip if duration overflows
-                if not slots_fit(state, slot, total_duration(cls)):
-                    continue
-                candidates.append((day, slot, room, blockers))
-    # Prefer conflict-free, then fewest conflicts
-    candidates.sort(key=lambda c: len(c[3]))
-    return candidates
-
-
-def cascade_relocate(state, new_cls):
-    """Place *new_cls* (must be pinned) and cascade-relocate any displaced classes.
-
-    Returns (success: bool, relocations: list[dict]) where each relocation dict
-    has keys: cls, old_day, old_time, old_room, new_day, new_time, new_room.
-    On failure the state is fully rolled back.
-    """
-    day = new_cls["pinned_day"]
-    time_ = new_cls["pinned_time"]
-    room = new_cls["pinned_classroom"]
-
-    # Find who currently conflicts with the new pinned class
-    displaced = find_conflicting_classes(state, new_cls, day, time_, room)
-
-    # Pinned classes cannot be displaced
-    for d in displaced:
-        if d["pinned"]:
-            return False, []
-
-    # Save original placements so we can roll back
-    snapshots = {}
-    for d in displaced:
-        snapshots[cls_key(d)] = (d["placed"], d["placed_day"],
-                            d["placed_time"], d["placed_classroom"])
-
-    # Unplace all displaced classes so they don't block each other's search
-    for d in displaced:
-        _unplace(d)
-
-    relocations = []
-    queue = list(displaced)
-    visited = {cls_key(c) for c in queue}  # prevent infinite loops
-
-    success = True
-    while queue:
-        cls = queue.pop(0)
-        candidates = _find_candidate_slots(state, cls, visited)
-        if not candidates:
-            success = False
-            break
-
-        # Pick best candidate (fewest new displacements, conflict-free first)
-        chosen_day, chosen_slot, chosen_room, newly_displaced = candidates[0]
-
-        # Save snapshots and unplace newly displaced classes
-        for nd in newly_displaced:
-            if cls_key(nd) not in snapshots:
-                snapshots[cls_key(nd)] = (nd["placed"], nd["placed_day"],
-                                     nd["placed_time"], nd["placed_classroom"])
-            _unplace(nd)
-            visited.add(cls_key(nd))
-            queue.append(nd)
-
-        # Place the current displaced class in its new slot
-        old = snapshots[cls_key(cls)]
-        mark_placed(cls, chosen_day, chosen_slot, chosen_room)
-        relocations.append({
-            "cls": cls,
-            "old_day": old[1], "old_time": old[2], "old_room": old[3],
-            "new_day": chosen_day, "new_time": chosen_slot, "new_room": chosen_room,
-        })
-
-    if not success:
-        # Roll back all changes
-        for cid, (placed, pday, ptime, proom) in snapshots.items():
-            for c in state["classes"]:
-                if cls_key(c) == cid:
-                    c["placed"] = placed
-                    c["placed_day"] = pday
-                    c["placed_time"] = ptime
-                    c["placed_classroom"] = proom
-                    break
-        return False, []
-
-    return True, relocations
+# ═══════════════════════════════════════════════════════════════════════
+#  (removed)  ST-ARCH-011  --  the cascade-relocation cluster
+# ------------------------------------------------------------------
+# `_unplace`, `_find_candidate_slots` and `cascade_relocate` lived here.
+# Both search functions called `find_conflicting_classes`, which Phase 6
+# deleted along with the rest of the original solver family -- so every
+# path through this cluster raised `NameError` on its first call. Nothing
+# invoked it: `cascade_relocate` had no caller in `scheduler_app/`, in
+# `tests/` or in `stress-test/`, and `_find_candidate_slots` was reached
+# only from inside it.
+#
+# It is the inverse of the case `tests/test_written_but_unwired.py` pins.
+# There, a helper with no callers was a fix someone forgot to wire, and
+# wiring it repaired a defect. Here, wiring any of this crashes, so it was
+# never the fix it looked like -- a pinned-class cascade the app has not
+# owned since Phase 6 replaced pinning with `optimized_auto_place`.
+# `tests/test_calls_resolve.py` makes a third one impossible to leave
+# behind.
 
 
 def get_year_color(state, year_name):
@@ -1031,30 +940,6 @@ def _constraint_tightness(state, cls):
     return len(days) * valid_time_count * len(rooms)
 
 
-def _unplaced_reason(state, cls, room_occ, lect_occ, group_occ):
-    """Determine why a class couldn't be placed."""
-    options = _get_valid_slots(state, cls, room_occ, lect_occ, group_occ)
-    if options:
-        return tr("negotiation.batch_displacement_required")
-    all_days = filter_class_days(cls, state["days"])
-    all_times = filter_class_times(cls, state["slots"])
-    if needs_physical_room(cls):
-        all_rooms = get_physical_room_candidates(state, cls, apply_capacity=False)
-        rooms_before_cap = list(all_rooms)
-        all_rooms = get_physical_room_candidates(state, cls)
-        if not all_rooms:
-            if rooms_before_cap:
-                return tr("negotiation.no_room_capacity")
-            return tr("negotiation.no_matching_classrooms")
-    else:
-        all_rooms = [None]
-    if not all_days:
-        return tr("negotiation.no_allowed_days_configured")
-    if not all_times:
-        return tr("negotiation.no_allowed_times_configured")
-    return tr("negotiation.all_slots_occupied")
-
-
 # ══════════════════════════════════════════════════════════════════════════
 #  (removed)  ST-ARCH-011
 # ------------------------------------------------------------------
@@ -1068,6 +953,13 @@ def _unplaced_reason(state, cls, room_occ, lect_occ, group_occ):
 # Phase 6 removes the code. Nothing imported them but one unused import in
 # ui/dialogs.py; `optimized_batch_schedule`, `optimized_auto_place` and
 # `optimized_reschedule_all` are the entry points, and always were.
+#
+# ST-ARCH-011 / Phase 7: `_unplaced_reason` went with them. It sat here on its
+# own, calling the `_get_valid_slots` named above and therefore raising
+# `NameError` on its first line, and nothing called it. Its live twin is
+# `CandidateGenerator.unplaced_reason` in `core/candidate_generator.py`, which
+# returns the same six `negotiation.*` strings from the same six branches --
+# so this copy was a duplicate that could not run, not a behaviour anyone lost.
 
 
 def lighten_color(hex_color, factor=0.45):
