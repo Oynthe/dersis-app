@@ -83,7 +83,21 @@ EN = TRANSLATIONS["en"]
 # The ratchet caught both additions on the very commits that introduced them,
 # which is the behaviour wanted: adding an English string is normal work, and
 # the test asks for an explicit acknowledgement rather than failing the build.
-MAX_MISSING_LOCALE_KEY_PAIRS = 2508
+#
+# Phase 7 adds one key to en+tr — `bug_report.no_mail_client`, the last
+# hardcoded English message box in `scheduler_app/ui` — so the bound moves by
+# exactly 1 x 20 = 20, to 2528.
+#
+# **Measured, and it corrects a figure that has been repeated in briefings:**
+# the backlog is *not* 1660. That number comes from reading `TRANSLATIONS`
+# without importing `scheduler_app.i18n.tier_translations`, which merges 52
+# further `en` keys into the catalogue on import. This module imports it (see
+# above) precisely because a checker that does not import it reports false
+# failures. Counted the way this test counts, the backlog stood at **2508
+# against a 2508 ceiling — zero slack**, not the ~848 pairs of headroom the
+# unmerged count suggests. Anyone planning a batch of new English strings
+# should measure with the tier catalogue imported before assuming room exists.
+MAX_MISSING_LOCALE_KEY_PAIRS = 2528
 MAX_PLACEHOLDER_SUBSETS = 1
 
 

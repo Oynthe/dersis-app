@@ -515,3 +515,50 @@ def test_the_url_and_the_clipboard_carry_the_same_report(
 
     decoded = QUrl.ComponentFormattingOption.FullyDecoded
     assert QUrlQuery(opened[0]).queryItemValue("body", decoded) == clip.value
+
+
+# ══ 6. The fallback dialog speaks the user's language ══════════════════════
+
+
+@pytest.mark.ui
+def test_the_no_mail_client_dialog_is_translated(qapp, sentinel_home,
+                                                 monkeypatch):
+    """The one hardcoded English message box left in ``scheduler_app/ui``.
+
+    A Turkish teacher on a lab PC with no mail handler got three English
+    sentences and an English title. Both are compared across two languages
+    rather than against a literal, so this stays true when the wording changes.
+    """
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from scheduler_app.i18n import translations
+    from scheduler_app.ui import bug_report
+
+    monkeypatch.setattr(bug_report.QDesktopServices, "openUrl",
+                        staticmethod(lambda url: False))
+    monkeypatch.setattr(QApplication, "clipboard", staticmethod(_FakeClipboard))
+    shown = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda parent, title, text, *a, **k:
+                     shown.append((title, text))))
+
+    seen = {}
+    for lang in ("en", "tr"):
+        monkeypatch.setattr(translations, "_current_lang", lang)
+        shown.clear()
+        bug_report._open_mailto("subject", "body")
+        assert shown, "the fallback dialog did not open for %r" % lang
+        seen[lang] = shown[0]
+
+    for lang, (title, text) in seen.items():
+        assert bug_report.BUG_REPORT_EMAIL in text, (
+            "%r lost the address the whole dialog exists to give" % lang)
+        assert "bug_report." not in text and "bug_report." not in title, (
+            "%r shows a raw translation key" % lang)
+
+    assert seen["tr"][1] != seen["en"][1], (
+        "the fallback body is the same string in Turkish and English, so it "
+        "never went through tr()")
+    assert seen["tr"][0] != seen["en"][0], (
+        "the fallback title is the same string in Turkish and English; "
+        "BUG_REPORT_SUBJECT is an untranslated constant")

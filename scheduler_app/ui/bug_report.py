@@ -219,10 +219,8 @@ def _open_mailto(subject, body, parent=None):
         pass
     QMessageBox.information(
         parent,
-        BUG_REPORT_SUBJECT,
-        "Could not open your email app automatically.\n\n"
-        f"Please email your report to:\n{BUG_REPORT_EMAIL}\n\n"
-        "The report text has been copied to your clipboard.",
+        tr('bug_report.title'),
+        tr('bug_report.no_mail_client', email=BUG_REPORT_EMAIL),
     )
     return False
 
