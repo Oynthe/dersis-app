@@ -42,6 +42,24 @@ _COMPONENT_INFO = {
     "tidiness": {
         "label_key": "explanation.component.tidiness.label",
     },
+    # ST-UI-011. `PlacementScorer` writes a "stability" component whenever a
+    # candidate moves a class off its previous placement, and this table had no
+    # entry for it — so `tr(info.get("label_key", key))` fell through to
+    # `tr("stability")`, which resolves to nothing and renders the bare Python
+    # identifier `stability` as a user-facing label, in all 22 languages.
+    #
+    # Latent rather than live today: the only scorer constructed with
+    # `previous_placements` is the optimizer's (schedule_optimizer.py), and the
+    # only reachable caller of `explain_placement` is
+    # `logic.score_placement_explained`, which builds its own scorer without
+    # them. So the branch cannot currently fire through the UI. It is filled in
+    # anyway because the gap is one wiring change away from being visible, and
+    # because a missing entry here degrades to a raw key rather than to
+    # anything a reader would notice.
+    "stability": {
+        "label_key": "explanation.component.stability.label",
+        "positive_key": "explanation.component.stability.positive",
+    },
 }
 
 _REASON_CATEGORY_KEYS = {

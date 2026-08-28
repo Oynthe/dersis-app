@@ -6,7 +6,9 @@ from PyQt6.QtWidgets import (
     QMenu, QWidgetAction, QCheckBox, QScrollArea, QFrame,
     QTextEdit, QSizePolicy,
 )
-from PyQt6.QtCore import QTimer, Qt, QPropertyAnimation, QEasingCurve, QEvent
+from PyQt6.QtCore import (
+    QTimer, Qt, QPropertyAnimation, QEasingCurve, QEvent, QPoint,
+)
 from PyQt6.QtGui import QColor, QAction, QPainter, QBrush, QPen
 
 from scheduler_app.translations import tr
@@ -37,20 +39,41 @@ class Toast(QWidget):
         layout.setContentsMargins(15, 10, 15, 10)
         icon_text = _toast_icons.get(kind, "")
         lbl = QLabel(f"{icon_text}  {message}" if icon_text else message)
+        # ST-UI-007. A QLabel defaults to AutoText, which means Qt decides
+        # PER STRING whether to parse markup — True for `<` plus a tag it knows,
+        # False otherwise. So a toast about a class called "9-A <B> Subesi"
+        # renders as markup while the next one renders literally, decided by the
+        # user's own data. Measured: QLabel('R&D <b>Lab</b>') has sizeHint width
+        # 84 as AutoText and 168 as PlainText — Qt was eating half the message.
+        # Removing Qt's choice is the fix here, NOT escaping: html.escape on a
+        # string Qt would have shown literally puts '&amp;' on the screen.
+        lbl.setTextFormat(Qt.TextFormat.PlainText)
         lbl.setStyleSheet(f"color: {fg}; font-weight: bold; font-size: 10pt; border: none;")
         lbl.setWordWrap(True)
         lbl.setMaximumWidth(350)
         layout.addWidget(lbl)
         self.adjustSize()
 
-        # Position at bottom-right of parent
+        # Position at bottom-right of parent.
+        #
+        # ST-UI-010: the flag goes on FIRST, and the move is mapped through the
+        # parent. ``Qt.WindowType.ToolTip`` makes this a *top-level window*, and
+        # ``QWidget.move`` on a window takes **global** coordinates — while
+        # ``pw - tw - 20`` is expressed in the parent's **local** ones. Moving
+        # before the flag (which is what this did) therefore pinned the toast to
+        # one fixed point on the *screen* rather than to the window's corner:
+        # measured at 929,650 for every window origin, i.e. displaced by exactly
+        # the window's own screen offset — (-502, -332) for a window at
+        # (500, 330) — and off the window altogether once it is moved right or
+        # onto a second monitor. The two agreed only for a window at the display
+        # origin, which is why it reads as correct on a maximised single screen.
+        self.setWindowFlags(Qt.WindowType.ToolTip)
         pw = parent.width()
         ph = parent.height()
         tw = self.width()
         th = self.height()
-        self.move(pw - tw - 20, ph - th - 20)
+        self.move(parent.mapToGlobal(QPoint(pw - tw - 20, ph - th - 20)))
 
-        self.setWindowFlags(Qt.WindowType.ToolTip)
         self.show()
         self.raise_()
 
@@ -214,6 +237,11 @@ class WarningLogPanel(QFrame):
         self._icon_label.setFixedWidth(16)
         header.addWidget(self._icon_label)
         self._latest_label = QLabel("—")
+        # ST-UI-007, same reason as Toast above. This label shows the newest
+        # warning, which interpolates class and branch names the user typed.
+        # `_line()` already escapes on the way into the QTextEdit body; the
+        # header is the half that was left.
+        self._latest_label.setTextFormat(Qt.TextFormat.PlainText)
         self._latest_label.setStyleSheet("font-size: 9pt; color: #475569;")
         self._latest_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)

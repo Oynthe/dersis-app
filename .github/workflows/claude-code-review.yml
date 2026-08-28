@@ -25,13 +25,40 @@ jobs:
       issues: read
       id-token: write
 
+    env:
+      # This repository has no secrets configured, so
+      # `secrets.CLAUDE_CODE_OAUTH_TOKEN` is empty and the action falls back to
+      # direct-Anthropic-API mode, where it aborts with:
+      #
+      #   Environment variable validation failed:
+      #   - Either ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, or workload
+      #     identity federation ... is required when using direct Anthropic API.
+      #
+      # That made every pull request carry a permanently red check for a job
+      # that never had the credentials to run — noise that says nothing about
+      # the change under review. The steps below are gated so the job SKIPS
+      # instead, and starts working on its own the moment the token is added
+      # under Settings → Secrets and variables → Actions.
+      #
+      # The `secrets` context is not available in a job-level `if:`, but it is
+      # available here; the comparison yields a plain "true"/"false" string
+      # rather than the secret itself, so branching on it leaks nothing.
+      HAS_CLAUDE_CREDENTIAL: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+
     steps:
+      - name: Explain why the review did not run
+        if: env.HAS_CLAUDE_CREDENTIAL != 'true'
+        run: |
+          echo "::notice title=Claude Code Review skipped::No CLAUDE_CODE_OAUTH_TOKEN secret is configured for this repository, so the automated review cannot run. Add it under Settings > Secrets and variables > Actions to enable it. Skipping rather than failing, so the check does not report a problem with the pull request itself."
+
       - name: Checkout repository
+        if: env.HAS_CLAUDE_CREDENTIAL == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: Run Claude Code Review
+        if: env.HAS_CLAUDE_CREDENTIAL == 'true'
         id: claude-review
         uses: anthropics/claude-code-action@v1
         with:

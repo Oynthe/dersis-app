@@ -25,6 +25,18 @@ from scheduler_app.logic import (
     get_year_color, lighten_color, build_virtual_classroom_day_layout,
     find_schedule_conflicts, conflict_partner_index,
 )
+# ST-UI-005. The XLSX and PDF cells paint this text on the SAME
+# lighten_color(year, 0.45) background the screen uses, so they carried the
+# identical WCAG failure -- in print, where it is worst. One source, three
+# surfaces; fixing only the renderer would have created a fresh
+# screen-vs-export divergence, which is the shape Phase 4 spent a whole batch
+# closing.
+from scheduler_app.constants import (
+    CELL_FG_CODE, CELL_FG_NAME, CELL_FG_LECTURER, CELL_FG_ROOM,
+    CELL_FG_BRANCH,
+)
+from scheduler_app.core.text_safety import escape_pdf_markup, csv_safe
+from scheduler_app.data_io.spreadsheet_safety import neutralize_formula_cells
 from scheduler_app.models import (
     get_classroom_export_labels,
     get_protection_label,
@@ -99,15 +111,15 @@ def _rich_cell(entry):
     code = entry.get("class_code", "")
     if code:
         blocks.append(TextBlock(
-            InlineFont(b=True, sz=9, color="1D4ED8"), code + "\n"))
+            InlineFont(b=True, sz=9, color=_strip_hash(CELL_FG_CODE)), code + "\n"))
     blocks.append(TextBlock(
-        InlineFont(b=True, sz=10, color="1E293B"), entry["name"] + "\n"))
+        InlineFont(b=True, sz=10, color=_strip_hash(CELL_FG_NAME)), entry["name"] + "\n"))
     if entry["lecturer"]:
         blocks.append(TextBlock(
-            InlineFont(sz=9, color="475569"), entry["lecturer"] + "\n"))
+            InlineFont(sz=9, color=_strip_hash(CELL_FG_LECTURER)), entry["lecturer"] + "\n"))
     if entry["room"]:
         blocks.append(TextBlock(
-            InlineFont(sz=9, color="16A34A"), entry["room"]))
+            InlineFont(sz=9, color=_strip_hash(CELL_FG_ROOM)), entry["room"]))
 
     cls = entry.get("cls", {})
     emoji, label, color = get_badge(cls)
@@ -203,18 +215,18 @@ def _export_excel(schedule: FinalSchedule, filepath: str):
                             code = e.get("class_code", "")
                             if code:
                                 parts.append(TextBlock(
-                                    InlineFont(b=True, sz=9, color="1D4ED8"),
+                                    InlineFont(b=True, sz=9, color=_strip_hash(CELL_FG_CODE)),
                                     code + "\n"))
                             parts.append(TextBlock(
-                                InlineFont(b=True, sz=10, color="1E293B"),
+                                InlineFont(b=True, sz=10, color=_strip_hash(CELL_FG_NAME)),
                                 e["name"] + "\n"))
                             if e["lecturer"]:
                                 parts.append(TextBlock(
-                                    InlineFont(sz=9, color="475569"),
+                                    InlineFont(sz=9, color=_strip_hash(CELL_FG_LECTURER)),
                                     e["lecturer"] + "\n"))
                             if e["room"]:
                                 parts.append(TextBlock(
-                                    InlineFont(sz=9, color="16A34A"),
+                                    InlineFont(sz=9, color=_strip_hash(CELL_FG_ROOM)),
                                     e["room"]))
                         cell.value = CellRichText(*parts)
                     bg_hex = _entry_bg_color(entries[0], schedule.state)
@@ -231,23 +243,23 @@ def _export_excel(schedule: FinalSchedule, filepath: str):
         code = cls.get("class_code", "")
         if code:
             parts.append(TextBlock(
-                InlineFont(b=True, sz=9, color="1D4ED8"), code + "\n"))
+                InlineFont(b=True, sz=9, color=_strip_hash(CELL_FG_CODE)), code + "\n"))
         parts.append(TextBlock(
-            InlineFont(b=True, sz=10, color="1E293B"), cls["name"] + "\n"))
+            InlineFont(b=True, sz=10, color=_strip_hash(CELL_FG_NAME)), cls["name"] + "\n"))
         if cls.get("lecturer"):
             parts.append(TextBlock(
-                InlineFont(sz=9, color="475569"), cls["lecturer"]))
+                InlineFont(sz=9, color=_strip_hash(CELL_FG_LECTURER)), cls["lecturer"]))
         if include_room:
             room = classroom_of(cls)
             if room:
                 parts.append(TextBlock(
-                    InlineFont(sz=9, color="16A34A"), "\n" + room))
+                    InlineFont(sz=9, color=_strip_hash(CELL_FG_ROOM)), "\n" + room))
         if include_targets:
             groups = ", ".join(
                 f"{t['year']}/{t['branch']}" for t in cls.get("targets", []))
             if groups:
                 parts.append(TextBlock(
-                    InlineFont(sz=8, color="6D28D9"), "\n" + groups))
+                    InlineFont(sz=8, color=_strip_hash(CELL_FG_BRANCH)), "\n" + groups))
         return CellRichText(*parts)
 
     def _write_virtual_room_sheet(ws, title, room):
@@ -359,6 +371,10 @@ def _export_excel(schedule: FinalSchedule, filepath: str):
 
             _write_grid_sheet(ws, f"B_{safe_name}", filter_fn=branch_filter)
 
+    # ST-UI-008: the workbook is made to be emailed, so a cell openpyxl typed
+    # as a formula must not stay one. Done in memory, on the cell attribute,
+    # never by prefixing the string -- this app re-imports its own workbooks.
+    neutralize_formula_cells(wb)
     wb.save(filepath)
 
 # CSV export
@@ -392,13 +408,16 @@ def _export_csv(schedule: FinalSchedule, filepath: str):
                 if targets:
                     for t in targets:
                         writer.writerow([
-                            day, slot, code, cls["name"], cls["lecturer"],
-                            room, t["year"], t["branch"],
+                            day, csv_safe(slot), csv_safe(code),
+                            csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
+                            csv_safe(room), csv_safe(t["year"]),
+                            csv_safe(t["branch"]),
                         ])
                 else:
                     writer.writerow([
-                        day, slot, code, cls["name"], cls["lecturer"],
-                        room, "", "",
+                        day, csv_safe(slot), csv_safe(code),
+                        csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
+                        csv_safe(room), "", "",
                     ])
 
 
@@ -423,23 +442,23 @@ def _pdf_rich_markup(cls, include_room=False, include_targets=False):
     code = cls.get("class_code", "")
     if code:
         parts.append(
-            f'<font color="#1D4ED8" size="7"><b>{esc(str(code))}</b></font>')
+            f'<font color="{CELL_FG_CODE}" size="7"><b>{esc(str(code))}</b></font>')
     parts.append(
-        f'<font color="#1E293B" size="8"><b>{esc(str(cls["name"]))}</b></font>')
+        f'<font color="{CELL_FG_NAME}" size="8"><b>{esc(str(cls["name"]))}</b></font>')
     if cls.get("lecturer"):
         parts.append(
-            f'<font color="#475569" size="7">{esc(str(cls["lecturer"]))}</font>')
+            f'<font color="{CELL_FG_LECTURER}" size="7">{esc(str(cls["lecturer"]))}</font>')
     if include_room:
         room = classroom_of(cls)
         if room:
             parts.append(
-                f'<font color="#16A34A" size="7">{esc(str(room))}</font>')
+                f'<font color="{CELL_FG_ROOM}" size="7">{esc(str(room))}</font>')
     if include_targets:
         groups = ", ".join(
             f"{t['year']}/{t['branch']}" for t in cls.get("targets", []))
         if groups:
             parts.append(
-                f'<font color="#6D28D9" size="6">{esc(groups)}</font>')
+                f'<font color="{CELL_FG_BRANCH}" size="6">{esc(groups)}</font>')
     # Protection badge
     emoji, label, b_color = get_badge(cls)
     if emoji:
@@ -645,7 +664,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
         for si, slot in enumerate(slots):
             data_row_idx = si + 1
-            row = [Paragraph(slot, time_style)]
+            row = [Paragraph(escape_pdf_markup(slot), time_style)]
             style_cmds.append(
                 ("BACKGROUND", (0, data_row_idx), (0, data_row_idx), COL_TIME))
 
@@ -762,7 +781,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
         row_heights = [24]
         for si, slot in enumerate(slots):
             data_row_idx = si + 1
-            row = [Paragraph(slot, time_style)]
+            row = [Paragraph(escape_pdf_markup(slot), time_style)]
             style_cmds.append(
                 ("BACKGROUND", (0, data_row_idx), (0, data_row_idx), COL_TIME))
 
@@ -833,7 +852,8 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
         row1 = ["", ""]
         for _d in range(n_days):
             for br in branches:
-                row1.append(Paragraph(br, branch_hdr_style))
+                row1.append(
+                    Paragraph(escape_pdf_markup(br), branch_hdr_style))
 
         table_data = [row0, row1]
 
@@ -931,7 +951,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             data_row = si + 2  # after 2 header rows
             row = [
                 Paragraph(str(si + 1), session_style),
-                Paragraph(slot, time_style),
+                Paragraph(escape_pdf_markup(slot), time_style),
             ]
             style_cmds.append(
                 ("BACKGROUND", (0, data_row), (0, data_row), COL_SESSION))
@@ -1013,7 +1033,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             if elements:
                 elements.append(PageBreak())
             elements.append(
-                Paragraph(f"{yr}", title_style))
+                Paragraph(escape_pdf_markup(yr), title_style))
             elements.append(_build_everything_table(yr))
 
     elif mode == "classroom":
@@ -1022,7 +1042,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             if elements:
                 elements.append(PageBreak())
             elements.append(
-                Paragraph(room, title_style))
+                Paragraph(escape_pdf_markup(room), title_style))
             if room not in physical_rooms:
                 elements.append(_build_virtual_room_table(room))
             else:
@@ -1035,7 +1055,8 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                 if elements:
                     elements.append(PageBreak())
                 elements.append(
-                    Paragraph(f"{yr} / {br}", title_style))
+                    Paragraph(escape_pdf_markup(yr) + " / "
+                              + escape_pdf_markup(br), title_style))
                 elements.append(_build_filtered_table(
                     filter_fn=lambda c, y=yr, b=br: any(
                         t["year"] == y and t["branch"] == b
@@ -1053,7 +1074,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             if elements:
                 elements.append(PageBreak())
             elements.append(
-                Paragraph(lecturer, title_style))
+                Paragraph(escape_pdf_markup(lecturer), title_style))
             elements.append(_build_filtered_table(
                 filter_fn=lambda c, l=lecturer: c.get("lecturer", "") == l,
                 include_room=True, include_targets=True))

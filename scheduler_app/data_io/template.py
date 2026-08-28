@@ -225,4 +225,10 @@ def generate_excel_template(filepath: str):
 
         ws.freeze_panes = "A3"
 
+    from scheduler_app.data_io.spreadsheet_safety import (
+        neutralize_formula_cells,
+    )
+    # ST-UI-008. The generated template is the file users hand to colleagues to
+    # fill in, so it travels further than any export.
+    neutralize_formula_cells(wb)
     wb.save(filepath)

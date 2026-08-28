@@ -12,7 +12,180 @@ what has changed since. Per-finding state also lives in the
 | **2 — Performance foundations** | ✅ Complete | `fix/phase-2-performance` |
 | **3 — Scheduling engine hardening** | ✅ Complete | `fix/phase-3-engine-hardening` |
 | **4 — Core workflow UX** | ✅ Complete | `fix/phase-4-workflow-ux` |
-| 5–7 | Not started | — |
+| **5 — UI consistency & accessibility** | 🟡 Mostly complete | `fix/phase-5-consistency` |
+| 6–7 | Not started | — |
+
+---
+
+## Phase 5 — mostly complete
+
+**Suite: 671 tests — 647 pass, 24 known-defect pins, 0 failures.** Both lanes
+exit 0. (515 pass at the start of the phase; +132 new tests, no pins added and
+none removed.)
+
+Five of the roadmap's six rows are done. **ST-UI-013 (the responsive shell) is
+deliberately not implemented** — see "The row that was not built" below; its
+headline numbers do not survive measurement, and what remains of it needs its
+own pass. The form-UX row (ST-UI-016…020) is triaged but only partly built.
+
+### Findings closed
+
+| ID | Sev | What changed |
+|---|---|---|
+| [ST-UI-004](12-findings-register.md#st-ui-004) | 🟠 High | The grid has a lane-aware keyboard cursor, a focus ring, and an accessible description. Both halves of a contested cell are reachable; the cursor follows its lesson across a scene rebuild. |
+| [ST-UI-005](12-findings-register.md#st-ui-005) | 🟠 High | Every in-cell text colour clears WCAG AA against all 24 cell backgrounds, from one source consumed by the screen, the XLSX and the PDF. |
+| [ST-UI-007](12-findings-register.md) | 🟡 Medium | The PDF no longer dies or drops text on a school's own labels; Qt labels carrying user text are `PlainText`. |
+| [ST-UI-008](12-findings-register.md) | 🟡 Medium | No exported cell is a formula, and neutralising one does not rename it. |
+| [ST-UI-010](12-findings-register.md) | 🟡 Medium | The toast follows its window instead of a fixed screen point. |
+| [ST-UI-011](12-findings-register.md) | 🟡 Medium | No raw key reaches a user; a coverage check now guards three separate properties. |
+| [ST-ARCH-004](12-findings-register.md) | 🟠 High | **New surface.** The open-slots panel and `_add_class_at` now honour the cell they name. |
+
+Two defects **not in the register** were found while measuring and fixed: the
+ÇAKIŞMA pill painting over the pinned badge, and three pairs of same-colour
+text in one cell.
+
+### Where the register was not enough
+
+As in Phases 1–4, each was proved by building the naive version and watching it
+fail, or by measuring rather than assuming.
+
+1. **ST-UI-005 is 13 failing elements, not 5, and two of them straddle the
+   threshold.** The audit computed against "the four common cell backgrounds";
+   there are **24** — eight `YEAR_COLORS` at each of the three lighten factors
+   the code uses. The register reports the class code as "3.40:1" and the
+   lecturer as "3.84:1"; the real quantities are ranges of 3.15–4.56 and
+   3.56–5.16, which **cross 4.5**. The same element was compliant or not
+   depending on which year a class belonged to, and a fix validated against one
+   background would have passed while half the palette still failed.
+2. **ST-UI-005's own recommendation ships two new AA failures.** "Render badges
+   as filled pills with white text" is 3.30:1 on the current green and 3.19:1 on
+   the current amber. It is also geometrically impossible where the badge lives,
+   because the bottom-right band is already the conflict pill's.
+3. **The right instrument matters more than the right question.** "Are the
+   darkened colours still distinguishable?" was first answered with contrast
+   ratio, which is luminance-only and scores two different hues of equal
+   lightness at 1.00:1 — it produced a confident, wrong "the palette collapses".
+   Redone in CIE Lab: darkening costs mean pairwise ΔE76 95.7 → 55.7, hue
+   survives, and the register's "darken the text" is right after all.
+4. **ST-UI-007 and ST-UI-008 both blame the class name, and the class name is
+   the field that is already safe.** In the PDF, the injectable fields are the
+   slot label, branch, year, room and lecturer — **10 of 24** (field × mode)
+   combinations raised `ValueError` and wrote **no file at all**, while the
+   class name was 0 of 4 because Phase 4 escaped it. In the XLSX the same
+   asymmetry: a class name goes through `CellRichText` and is never a formula;
+   the **slot label** is, in column A of every sheet.
+5. **ST-UI-008's own recommendation is a data-corruption bug where it points.**
+   Prefixing the value with an apostrophe renamed **5 of 8** round-tripped
+   values, including `-9A Matematik`. DERSİS re-imports its own workbooks.
+   `quotePrefix` renames 0 of 8.
+6. **ST-UI-011 names a key that has never existed.** `labels.protection` is in
+   no catalogue and no Python file. And the fallback the code already had was
+   dead: `tr(k) or fallback` can never select the fallback, because `tr` returns
+   the *key* on a miss and a key is truthy — which is precisely why
+   `labels.targets` reached the user.
+7. **The i18n gap is 130 keys, not the ~30 the handoff recorded**, and what is
+   missing is the error channel: `errors.settings_write_failed`,
+   `errors.key_file_damaged`, `conflicts.cell_pair`.
+8. **ST-UI-004's inference is backwards.** `TimetableView` already has
+   `StrongFocus` and is already in the tab chain. The problem is the opposite —
+   the arrows are *already consumed* to scroll, so a naive handler moves the
+   cursor **and** scrolls.
+9. **The audit's per-cell accessible names cannot be built at any effort.**
+   `QGraphicsItem` is not a `QObject`, and PyQt6 exposes **no** `QAccessible`
+   bindings anywhere. What shipped is the view describing its cursor cell, and
+   the phase record says so rather than claiming the proposal was met.
+
+### The row that was not built
+
+**ST-UI-013 (responsive shell) is not implemented, on purpose.** Measured
+natively, its headline numbers are wrong: the sidebar is a flat **350 px** (never
+430), tab truncation begins at **W < 1159** (not 1400), the dashboard's inner tabs
+**never** collapse to an icon, and the "2.5 day columns" figure comes from the
+online filter's sub-column layout rather than from the sidebar. The proposal's
+own fix — a 25 % proportional sidebar — buys **zero** extra columns, because Qt
+clamps a splitter section to the sidebar's `minimumSizeHint` of 301 px.
+
+Two claims made *against* those measurements were also checked and are also
+wrong: the "`_expand_panel` leaves a 0 px splitter handle" defect does not
+reproduce on the real window (0 → 5 px, draggable, three cycles — the reading was
+taken before the event loop re-laid it out), and "truncation at 1400×860" is an
+**offscreen artifact** (1148 px against 947 available offscreen; 789 against
+~1030 natively).
+
+What is left of the finding is real — the sidebar does not shrink, and the tab
+bar does truncate below ~1159 — but the fix needs a user-intent state machine
+for auto-collapse (a plain `resizeEvent` breakpoint re-collapses the sidebar on
+the next 1 px nudge after the user opens it), `setMaximumWidth` rather than
+`setSizes` as the lever, and re-application of the cap inside `_expand_panel`,
+which resets both constraints. None of it can be calibrated from CI. It wants
+its own pass rather than a half-build on numbers that do not hold.
+
+### Behaviour changes worth knowing
+
+- **The timetable is keyboard-operable.** Arrows move a cursor, `Alt+←/→` walks
+  the lanes of a contested cell, `Space` selects, `Enter`/`F2` edits,
+  `Menu`/`Shift+F10` opens the cell's context menu. Arrows deliberately do not
+  select: `_select_class_gfx` rebuilds the whole open-slots sidebar.
+- **Enter activates; it does not open the context menu**, contrary to the
+  audit's proposal, because left-click selects and right-click menus — binding
+  the keyboard's primary activation to the secondary mouse action inverts the
+  mapping Qt's own item views use.
+- **In-cell text is darker**, and the same values now reach the XLSX and the PDF.
+  The ARDIŞIK marker is slate rather than violet: it is structural information
+  like the branch letter, not a statement about what the scheduler may do.
+- **A conflicted cell is ~14 px taller**, reserving the pill's strip so the
+  pinned badge survives.
+- **The open-slots panel lists online lessons.** It previously told every one of
+  them it had nowhere to go.
+- **A CSV cell beginning with `=` is prefixed; an XLSX cell is not** — it gets
+  Excel's `quotePrefix` attribute instead, so re-import reads the name back
+  unchanged.
+
+### Known gaps left behind
+
+1. **ST-UI-013 is not implemented.** See above; the finding needs re-measuring
+   into the register before it is worked.
+2. **The form-UX row (ST-UI-016…020) is triaged, not built.** Much of it is
+   already false: the tutorial does not fire over a modal, the language switch is
+   not flag-only, and half of ST-UI-019 was closed by Phase 2. The live items
+   are the first-error-only validation in `AddClassDialog`, the suppressed
+   toolbar menu caret, and a typed lecturer name that never joins
+   `state['lecturers']`.
+3. **ST-UI-006's legend is not built.** `get_year_color` wraps at 8, so a school
+   with 9+ years — reachable on every tier above Starter, and the norm for a
+   Turkish K–12 — paints two different years the same colour. A legend mapping
+   swatch → year would be *wrong* there, which is the finding's real content and
+   is stronger than "there is no legend".
+4. **P4 defers Ctrl+X/Ctrl+V lift-and-place and a cursor for the Show Everything
+   matrix**, both with reasons; the matrix emits one block per matching target,
+   so a two-target class has no single address.
+5. **`cell_at` has 1-px dead bands** and a span-2 lesson's centre lands in one.
+   Harmless to the cursor (which never consults it) and latent for drag/drop.
+6. **Dialog-context contrast still fails** — `#16A34A` at 3.30:1 and `#D97706`
+   at 3.19:1 on white, ~20 sites. Outside ST-UI-005's scope, and several of the
+   same literals are background fills, so it needs its own inventory.
+7. **The translation backlog is 2508 (locale, key) pairs** and needs a
+   translator. Machine translation is not available as a shortcut: 174
+   `tr(key).format(...)` sites are unguarded, 26 of them in
+   `ConstraintValidator`, and a drifted placeholder raises rather than degrades.
+8. **`Claude Code Review` CI no longer fails — but it does not run either.**
+   Carried as an unexplained gap since Phase 3; the cause turned out to be
+   trivial and worth writing down. `gh secret list` returns **nothing** — the
+   repository has no secrets at all — so
+   `secrets.CLAUDE_CODE_OAUTH_TOKEN` interpolates to an empty string, the
+   action falls back to direct-Anthropic-API mode, and it aborts on credential
+   validation after 21 s. It never had the credentials to run.
+
+   Both Claude workflows now gate their steps on the token being present, so
+   the job **skips** with a `::notice::` naming the missing secret instead of
+   reporting failure. A check that is red for every change, regardless of the
+   change, teaches everyone to ignore the checks. Adding the token under
+   *Settings → Secrets and variables → Actions* switches the review on with no
+   further edit.
+
+   The two checks that actually exercise this repository both pass on Linux /
+   Python 3.11 — `Validate` 647 passed / 24 xfailed, `Scheduling invariants`
+   16 passed — identical to the local Windows / 3.12 result.
 
 ---
 

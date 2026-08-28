@@ -40,6 +40,12 @@ throwaway temp directory at conftest-import time, before pytest collects anythin
 | `test_storage_roundtrip.py` · `test_import_roundtrip.py` · `test_export_smoke.py` | persistence and I/O |
 | `test_grid_integrity.py` · `test_setup_reconcile.py` · `test_state_transactions.py` | ST-DATA family |
 | `test_solver_worker.py` · `test_refresh_cost.py` · `test_reschedule_overhead.py` · `test_warning_log_growth.py` · `test_feedback_log_scaling.py` | ST-PERF family |
+| `test_cell_contrast.py` | ST-UI-005 — every painted colour clears WCAG AA on all 24 cell backgrounds, from one source |
+| `test_cell_layout.py` | the conflict pill must not paint over the protection badge |
+| `test_grid_keyboard.py` | ST-UI-004 — the lane-aware cursor, key handling, and what a screen reader is told |
+| `test_input_escaping.py` | ST-UI-007/008 — user text survives reportlab, Qt and a spreadsheet |
+| `test_translation_coverage.py` | ST-UI-011 — no raw key reaches a user; the locale backlog is a ratchet |
+| `test_ui_affordances.py` | the app must not lie about where things are (toast position, honoured cells) |
 | `test_smoke_environment.py` | the harness itself — proves HOME is sandboxed |
 
 ## Fixtures
@@ -81,3 +87,15 @@ title — an unpinned locale makes template round-trip tests irreproducible.
   and say why in a comment.
 - Never weaken an assertion to make a test pass. A test that passes for the wrong
   reason is worse than no test.
+- **Mutation-test every new test against the defect it names.** Phase 5 wrote four
+  that pinned nothing and only found out this way: an ST-UI-011 test that stayed
+  green with the finding fully restored (the key lives in a data table, invisible
+  to an AST scan for `tr("literal")`); an ST-UI-008 test whose payload went into
+  the class name, which `CellRichText` never makes a formula; a pill-overlap
+  assertion that reduced to `f(x) == f(x)`; and a double-scroll test that could
+  not fail because the grid fits the viewport offscreen and nothing can scroll.
+- **Never assert an absolute pixel measurement.** `QT_QPA_PLATFORM=offscreen` has
+  no Segoe UI at all — `QFontInfo(QFont("Segoe UI", 9)).family()` is `""` — and
+  advances run 1.5–2x native. That changes which cell rows get *dropped*, not
+  only their size, so a layout constant measured in CI is wrong on a desktop.
+  Assert relations between two quantities measured in the same process.

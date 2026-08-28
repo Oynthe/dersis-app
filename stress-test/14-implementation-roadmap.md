@@ -115,18 +115,29 @@ Proposals P1/P2 from [09](09-ui-ux-audit.md):
 | Structured time-slot entry with validation | [ST-UI-014](12-findings-register.md) | 3/3/3/M | M |
 | Reschedule dialog: plain-language modes + progress | [ST-PERF-001](12-findings-register.md#st-perf-001), UX | 3/3/2/S | S |
 
-## Phase 5 — UI consistency & accessibility
+## Phase 5 — UI consistency & accessibility 🟡 MOSTLY COMPLETE
+
+*Five of the six rows are done on `fix/phase-5-consistency`; see
+[`PROGRESS.md`](PROGRESS.md#phase-5--mostly-complete) for what the register got
+wrong and [`HANDOFF-PHASE6.md`](HANDOFF-PHASE6.md) for what is left.*
+
+> **P5 (responsive shell) is deliberately not built.** Its numbers do not
+> survive measurement on the native platform — the sidebar is a flat 350 px and
+> never 430, truncation begins at W < 1159 rather than 1400, the dashboard's
+> inner tabs never collapse, and the proposal's own fix buys zero extra columns
+> because Qt clamps a splitter section to the sidebar's `minimumSizeHint`. The
+> residual defect is real; it needs re-measuring into the register first.
 
 Proposals P3/P4/P5:
 
 | Task | Findings | I/U/R/E | Effort |
 |---|---|---|---|
-| **P4** Keyboard grid navigation + accessible names | [ST-UI-004](12-findings-register.md) | 4/3/3/L | L |
-| **P3** Contrast fixes + year legend + redundant encodings | [ST-UI-005](12-findings-register.md), [ST-UI-006](12-findings-register.md) | 4/3/2/M | M |
-| **P5** Responsive shell | [ST-UI-013](12-findings-register.md) | 3/3/2/M | M |
-| Translation key-coverage CI check + fill gaps | [ST-UI-011](12-findings-register.md) | 3/3/2/S | S |
-| Escape HTML/CSV/PDF inputs (injection) | [ST-UI-007](12-findings-register.md), [ST-UI-008](12-findings-register.md) | 3/3/3/S | S |
-| Form UX (all errors, inline markers, QFormLayout); light-theme dialogs; warning-log polish; empty-state CTAs | [ST-UI-015](12-findings-register.md)…020 | 3/2/2/M | M |
+| **P4** Keyboard grid navigation + accessible names ✅ | [ST-UI-004](12-findings-register.md) | 4/3/3/L | L |
+| **P3** Contrast fixes ✅ · year legend + redundant encodings ⬜ | [ST-UI-005](12-findings-register.md) ✅, [ST-UI-006](12-findings-register.md) ⬜ | 4/3/2/M | M |
+| **P5** Responsive shell ⬜ *(numbers corrected, not built)* | [ST-UI-013](12-findings-register.md) | 3/3/2/M | M |
+| Translation key-coverage CI check + fill gaps ✅ | [ST-UI-011](12-findings-register.md) | 3/3/2/S | S |
+| Escape HTML/CSV/PDF inputs (injection) ✅ | [ST-UI-007](12-findings-register.md), [ST-UI-008](12-findings-register.md) | 3/3/3/S | S |
+| Form UX (all errors, inline markers, QFormLayout); light-theme dialogs; warning-log polish; empty-state CTAs ⬜ *(triaged; much of it is already false — see HANDOFF-PHASE6)* | [ST-UI-015](12-findings-register.md) ✅ (Phase 4)…020 | 3/2/2/M | M |
 
 ## Phase 6 — Architecture & maintainability
 

@@ -176,13 +176,29 @@ def _translated_bool(value):
     return tr("common.yes") if value else tr("common.no")
 
 
+def _tr_or(label_key, fallback):
+    """``tr(label_key)``, or *fallback* when the catalogue has no such key.
+
+    ST-UI-011. The idiom this replaces — ``tr(label_key) or fallback`` — is dead
+    code: ``tr`` returns the *key itself* when it cannot resolve one, and a key
+    is a non-empty string, so ``or`` never selects the fallback. That is exactly
+    why ``labels.targets`` reached the user as the literal text
+    ``labels.targets`` instead of the ``"Targets"`` sitting right beside it in
+    ``_CLASS_IO_FIELDS``. ``tier_enforcement._display_name`` already had the
+    working form; this is it.
+    """
+    translated = tr(label_key)
+    return fallback if translated == label_key else translated
+
+
 def _class_io_headers():
-    return [_trim_label(tr(label_key) or fallback) for _, label_key, fallback in _CLASS_IO_FIELDS]
+    return [_trim_label(_tr_or(label_key, fallback))
+            for _, label_key, fallback in _CLASS_IO_FIELDS]
 
 
 def _class_io_header_map():
     return {
-        field: _trim_label(tr(label_key) or fallback)
+        field: _trim_label(_tr_or(label_key, fallback))
         for field, label_key, fallback in _CLASS_IO_FIELDS
     }
 
@@ -190,7 +206,16 @@ def _class_io_header_map():
 def _class_io_reverse_header_map():
     reverse = {}
     for field, label_key, fallback in _CLASS_IO_FIELDS:
-        for label in (_trim_label(fallback), _trim_label(tr(label_key))):
+        # ST-UI-011, backward compatibility. The RAW KEY is a permanent import
+        # alias, and dropping it would be a silent data loss the fix itself
+        # caused. While `labels.targets` was missing from the catalogue,
+        # `tr()` returned the key, so every workbook DERSİS exported wrote
+        # `labels.targets` as its Targets header — and re-imported it, because
+        # this same expression registered that string. Now that the key
+        # resolves, the literal would vanish from the map and every previously
+        # exported file would import its classes with no target groups at all.
+        for label in (_trim_label(fallback), _trim_label(label_key),
+                      _trim_label(_tr_or(label_key, fallback))):
             if label:
                 reverse[label.casefold()] = field
         for lang_dict in TRANSLATIONS.values():

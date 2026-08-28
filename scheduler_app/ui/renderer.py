@@ -29,6 +29,8 @@ from scheduler_app.constants import (
     MATRIX_BORDER, MATRIX_DAY_BG, MATRIX_DAY_FG, MATRIX_BRANCH_BG,
     MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CELL_FG,
     MATRIX_CORNER_BG,
+    CELL_FG_CODE, CELL_FG_NAME, CELL_FG_LECTURER, CELL_FG_ROOM,
+    CELL_FG_BRANCH, CELL_FG_SEQUENTIAL,
 )
 from scheduler_app.translations import tr
 from scheduler_app.logic import (
@@ -334,10 +336,14 @@ def _measure_text_height(text, font, width, wrap=True):
     return br.height()
 
 
-def _needed_height_for_class(cls, cell_w, is_matrix=False):
+def _needed_height_for_class(cls, cell_w, is_matrix=False, conflict=False):
     """Compute the minimum pixel height to display *cls* content.
 
     *cell_w* is the available cell width (before internal margin/padding).
+
+    *conflict* reserves the strip the ÇAKIŞMA pill will occupy, so the pill gets
+    its own space instead of being painted over the protection badge — see
+    :func:`_conflict_pill_band`.
     """
     m = 4 if is_matrix else 6
     pad = 3 if is_matrix else 4
@@ -375,6 +381,9 @@ def _needed_height_for_class(cls, cell_w, is_matrix=False):
         f_badge = QFont("Segoe UI", 7)
         f_badge.setBold(True)
         total += _measure_text_height(bt, f_badge, inner_w, wrap=False) + 2
+
+    if conflict:
+        total += _conflict_pill_band(cell_w)
 
     total += m  # bottom margin
     return total
@@ -437,21 +446,27 @@ def _conflict_tooltip(base_tip, conflict, partner_labels):
             + nl + bullets)
 
 
-def _paint_conflict_pill(painter, rect):
-    """Draw the ÇAKIŞMA pill in the BOTTOM-right of *rect*.
+def _conflict_pill_geometry(rect):
+    """Where the ÇAKIŞMA pill goes in *rect*, as ``(QRectF | None, label, font)``.
 
-    Bottom, not top, and that is the whole point. Both paint methods draw the
-    class code first, centred, at ``rect.y() + 6`` — and at ``COL_DAY_W`` 150 a
-    full pill spans roughly x 86..146 against a centred five-character code at
+    Split out from the painter so the *height* calculation and the *paint* agree
+    by construction. They used not to, and the badge paid for it: see
+    :func:`_conflict_pill_band`.
+
+    Bottom-right, and that is the whole point. Both paint methods draw the class
+    code first, centred, at ``rect.y() + 6`` — and at ``COL_DAY_W`` 150 a full
+    pill spans roughly x 86..146 against a centred five-character code at
     x 57..92, so a top-right pill overlaps it; at ``lane_count`` 2 the lane is
     74 px and the pill covers the code completely. The class code is the
     identifier the warning log, the exports and every test key on, and it would
     be destroyed on exactly the cells that matter most.
 
-    ``QPainter.drawText`` does **not** clip to its rect either, so a pill wider
-    than its lane bleeds onto the neighbouring lesson and the user reads the
-    label on the wrong one. Measure first, shorten, then give up and let the
-    red border carry the signal alone.
+    A pill wider than its lane also bleeds onto the neighbouring lesson, so the
+    user reads the label on the wrong one — hence measure, shorten, then give up
+    and let the red border carry the signal alone. (The bleed is the graphics
+    *item* overflowing its own rect, not ``QPainter.drawText`` failing to clip;
+    ``drawText`` does clip. The earlier note here blamed the wrong mechanism,
+    which matters because it is what the next reader reasons from.)
     """
     from PyQt6.QtGui import QFontMetrics
 
@@ -464,12 +479,46 @@ def _paint_conflict_pill(painter, rect):
         label = tr("badges.conflict_short")
         pill_w = fm.horizontalAdvance(label) + 10
     if rect.width() < pill_w + 2:
-        return  # nothing legible fits; the red border still carries the signal
+        # nothing legible fits; the red border still carries the signal
+        return None, label, font
     pill_h = fm.height() + 2
     if rect.height() < pill_h + 8:
+        return None, label, font
+    return (QRectF(rect.right() - pill_w - 4,
+                   rect.bottom() - pill_h - 3, pill_w, pill_h),
+            label, font)
+
+
+def _conflict_pill_band(cell_w):
+    """Vertical strip at the bottom of a conflicted cell the pill will occupy.
+
+    ST-UI-005 / ST-UI-001. The pill is drawn *last*, over everything, and the
+    protection badge is the last line of cell text — so on a lesson that is both
+    conflicted and pinned they landed on top of each other. Measured before this
+    fix, badge rect against pill rect:
+
+        lane_count 1  cell 150.00x93   badge y 75..87   pill y 79..90   67x8 px
+        lane_count 2  cell  74.50x124  badge y 106..118 pill y 110..121 13x8 px
+        lane_count 3  cell  49.33x139  badge y 121..133 pill y 125..136 13x8 px
+
+    The pin marker was destroyed on exactly the cells where it explains the most
+    — an infeasible pin is committed deliberately (ST-SCHED-002) and the badge is
+    what tells the user the clash is theirs rather than the planner's.
+
+    Reserving the strip in both the height calculation and the paint keeps the
+    badge; it is not enough to move the badge, because the cell is grown to fit
+    its content and the pill would then overlap whatever became last.
+    """
+    probe = QRectF(0, 0, cell_w, 10_000)
+    pill, _label, _font = _conflict_pill_geometry(probe)
+    return 0.0 if pill is None else pill.height() + 3
+
+
+def _paint_conflict_pill(painter, rect):
+    """Draw the ÇAKIŞMA pill in the bottom-right of *rect*."""
+    pill, label, font = _conflict_pill_geometry(rect)
+    if pill is None:
         return
-    pill = QRectF(rect.right() - pill_w - 4,
-                  rect.bottom() - pill_h - 3, pill_w, pill_h)
     painter.setPen(QPen(Qt.PenStyle.NoPen))
     painter.setBrush(QBrush(QColor(CONFLICT_BORDER)))
     painter.drawRoundedRect(pill, 5, 5)
@@ -590,6 +639,10 @@ class LessonItem(QGraphicsRectItem):
         x, w = rect.x() + m + pad, rect.width() - 2 * m - 2 * pad
         y = rect.y() + m
         bottom_limit = rect.bottom() - m
+        if self._conflict:
+            # Keep the cell's own text out of the ÇAKIŞMA pill's strip; the pill
+            # is painted last and would otherwise cover the protection badge.
+            bottom_limit -= _conflict_pill_band(rect.width())
         center = Qt.AlignmentFlag.AlignHCenter
         wrap_center = center | Qt.TextFlag.TextWordWrap
         fm = painter.fontMetrics()
@@ -598,13 +651,13 @@ class LessonItem(QGraphicsRectItem):
         code = cls.get("class_code", "")
         if code:
             f = QFont("Segoe UI", 8); f.setBold(True)
-            painter.setFont(f); painter.setPen(QColor("#1D4ED8"))
+            painter.setFont(f); painter.setPen(QColor(CELL_FG_CODE))
             painter.drawText(QRectF(x, y, w, 14), center, code)
             y += 14
 
         # name (wrapped, centered)
         f = QFont("Segoe UI", 9); f.setBold(True)
-        painter.setFont(f); painter.setPen(QColor("#1E293B"))
+        painter.setFont(f); painter.setPen(QColor(CELL_FG_NAME))
         name_rect = QRectF(x, y, w, bottom_limit - y)
         br = painter.fontMetrics().boundingRect(
             int(x), int(y), int(w), int(bottom_limit - y),
@@ -615,7 +668,7 @@ class LessonItem(QGraphicsRectItem):
         # lecturer
         if y < bottom_limit:
             f.setBold(False); f.setPointSize(8); painter.setFont(f)
-            painter.setPen(QColor("#475569"))
+            painter.setPen(QColor(CELL_FG_LECTURER))
             lec_rect = QRectF(x, y, w, bottom_limit - y)
             br = painter.fontMetrics().boundingRect(
                 int(x), int(y), int(w), int(bottom_limit - y),
@@ -626,7 +679,7 @@ class LessonItem(QGraphicsRectItem):
         # room / location
         room = classroom_of(cls)
         if room and y < bottom_limit:
-            painter.setPen(QColor("#16A34A"))
+            painter.setPen(QColor(CELL_FG_ROOM))
             painter.drawText(QRectF(x, y, w, 13), center, room)
             y += 13
 
@@ -691,23 +744,23 @@ class LessonItem(QGraphicsRectItem):
             code = cls.get("class_code", "")
             if code:
                 f = QFont("Segoe UI", 7); f.setBold(True)
-                painter.setFont(f); painter.setPen(QColor("#1D4ED8"))
+                painter.setFont(f); painter.setPen(QColor(CELL_FG_CODE))
                 painter.drawText(QRectF(mx, my, mw, 11), center, code)
                 my += 11
 
             f = QFont("Segoe UI", 7); f.setBold(True)
-            painter.setFont(f); painter.setPen(QColor("#6D28D9"))
+            painter.setFont(f); painter.setPen(QColor(CELL_FG_BRANCH))
             painter.drawText(QRectF(mx, my, mw, 11), center, t["branch"])
             my += 11
 
             f.setPointSize(9)
-            painter.setFont(f); painter.setPen(QColor("#1E293B"))
+            painter.setFont(f); painter.setPen(QColor(CELL_FG_NAME))
             painter.drawText(QRectF(mx, my, mw, 14),
                              center | Qt.TextFlag.TextWordWrap, cls["name"])
             my += 14
 
             f.setPointSize(8); f.setBold(False)
-            painter.setFont(f); painter.setPen(QColor("#475569"))
+            painter.setFont(f); painter.setPen(QColor(CELL_FG_LECTURER))
             painter.drawText(QRectF(mx, my, mw, 12), center, cls["lecturer"])
             my += 14
 
@@ -722,7 +775,7 @@ class LessonItem(QGraphicsRectItem):
 
             if i == n - 1:
                 f.setPointSize(7); f.setBold(True); painter.setFont(f)
-                painter.setPen(QColor("#7C3AED"))
+                painter.setPen(QColor(CELL_FG_SEQUENTIAL))
                 painter.drawText(QRectF(mx, my, mw, 11),
                                  Qt.AlignmentFlag.AlignLeft, tr("badges.sequential"))
 
@@ -911,6 +964,8 @@ class MatrixLessonItem(QGraphicsRectItem):
         x, w = rect.x() + m + pad, rect.width() - 2 * m - 2 * pad
         y = rect.y() + m
         bottom_limit = rect.bottom() - m
+        if self._conflict:
+            bottom_limit -= _conflict_pill_band(rect.width())
         center = Qt.AlignmentFlag.AlignHCenter
         wrap_center = center | Qt.TextFlag.TextWordWrap
 
@@ -918,13 +973,13 @@ class MatrixLessonItem(QGraphicsRectItem):
         code = cls.get("class_code", "")
         if code and y < bottom_limit:
             f = QFont("Segoe UI", 7); f.setBold(True)
-            painter.setFont(f); painter.setPen(QColor("#1D4ED8"))
+            painter.setFont(f); painter.setPen(QColor(CELL_FG_CODE))
             painter.drawText(QRectF(x, y, w, 12), center, code)
             y += 12
 
         # name (wrapped, centered)
         f = QFont("Segoe UI", 8); f.setBold(True)
-        painter.setFont(f); painter.setPen(QColor("#1E293B"))
+        painter.setFont(f); painter.setPen(QColor(CELL_FG_NAME))
         name_avail = QRectF(x, y, w, bottom_limit - y)
         br = painter.fontMetrics().boundingRect(
             int(x), int(y), int(w), int(bottom_limit - y),
@@ -935,7 +990,7 @@ class MatrixLessonItem(QGraphicsRectItem):
         # lecturer
         if y < bottom_limit:
             f.setBold(False); painter.setFont(f)
-            painter.setPen(QColor("#475569"))
+            painter.setPen(QColor(CELL_FG_LECTURER))
             lec_avail = QRectF(x, y, w, bottom_limit - y)
             br = painter.fontMetrics().boundingRect(
                 int(x), int(y), int(w), int(bottom_limit - y),
@@ -945,7 +1000,7 @@ class MatrixLessonItem(QGraphicsRectItem):
 
         # room
         if self._room and y < bottom_limit:
-            painter.setPen(QColor("#16A34A"))
+            painter.setPen(QColor(CELL_FG_ROOM))
             painter.drawText(QRectF(x, y, w, 13), center, self._room)
             y += 13
 
@@ -1065,6 +1120,18 @@ class TimetableScene(QGraphicsScene):
         self._grid_mode = "filtered"  # "filtered" or "everything"
         self._app = None          # app ref for view-level drops
         self._grid_day_groups = []
+        # ST-UI-004. The keyboard cursor's coordinate system.
+        #
+        # It is (col, row, LANE), not (col, row), and the lane is the whole
+        # point. Phase 4 splits a contested cell into lanes inside one column,
+        # so `cell_at` — which answers (day, slot) — maps BOTH lessons of a
+        # double-booking to the same address: measured, two LessonItems at
+        # x=85.5 and x=161.0 both round-trip to ('monday', '09:00'). A cursor
+        # keyed on the cell could therefore never reach lane 1, which would
+        # reintroduce ST-UI-001 (a lesson on the timetable that the user cannot
+        # get to) for keyboard users only.
+        self._cursor_index = {}      # {(col, row): [item, ...]} left-to-right
+        self._cursor_uid_index = {}  # {cls_key: (col, row, lane)}
 
     def cell_at(self, scene_pos):
         """Return (day, slot) at *scene_pos*, or (None, None) if outside grid."""
@@ -1149,14 +1216,16 @@ class TimetableScene(QGraphicsScene):
         for b in blocks:
             block_w = _filtered_block_width(b, FILTER_MODE_DEFAULT)
             if b["span"] == 1:
-                needed = _needed_height_for_class(b["cls"], block_w)
+                needed = _needed_height_for_class(
+                    b["cls"], block_w, conflict=bool(b.get("conflict")))
                 if needed > row_heights[b["row"]]:
                     row_heights[b["row"]] = needed
 
         for b in blocks:
             if b["span"] > 1:
                 block_w = _filtered_block_width(b, FILTER_MODE_DEFAULT)
-                needed = _needed_height_for_class(b["cls"], block_w)
+                needed = _needed_height_for_class(
+                    b["cls"], block_w, conflict=bool(b.get("conflict")))
                 existing = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
                 if needed > existing:
                     extra = needed - existing
@@ -1212,6 +1281,7 @@ class TimetableScene(QGraphicsScene):
                                    app)
                 self.addItem(ei)
                 self.empty_items.append(ei)
+                self._cursor_index.setdefault((j, i), []).append(ei)
 
         for b in blocks:
             # ST-UI-001: lane 0 sits where the single block used to, and a
@@ -1230,8 +1300,37 @@ class TimetableScene(QGraphicsScene):
                 conflict_labels=b.get("conflict_labels", ()))
             self.addItem(item)
             self.lesson_items.append(item)
+            # A multi-hour lesson is reachable from every row it covers, so
+            # arrowing down through a 2-hour block does not fall through it.
+            for r in range(b["row"], b["row"] + b["span"]):
+                self._cursor_index.setdefault((b["col"], r), []).append(item)
+            self._cursor_uid_index[cls_key(b["cls"])] = (
+                b["col"], b["row"], b["lane"])
 
+        self._sort_cursor_lanes()
         self.setSceneRect(0, 0, total_w, total_h)
+
+    def _sort_cursor_lanes(self):
+        """Order each cell's targets left-to-right, so lane N is the Nth block.
+
+        Sorted by painted position rather than by the adapter's ``lane`` field
+        because a cell can mix lessons (which carry a lane) with an empty slot
+        (which does not), and because the two filtered builders assign lanes by
+        different rules.
+        """
+        for targets in self._cursor_index.values():
+            targets.sort(key=lambda it: it.sceneBoundingRect().left())
+
+    def cursor_targets(self, col, row):
+        """Everything the cursor can address at *(col, row)*, left to right."""
+        return list(self._cursor_index.get((col, row), ()))
+
+    def cursor_lane_count(self, col, row):
+        return len(self._cursor_index.get((col, row), ()))
+
+    def cursor_locate(self, uid):
+        """``(col, row, lane)`` of the lesson with *uid*, or None."""
+        return self._cursor_uid_index.get(uid)
 
     def _build_filtered_virtual_subcolumns(self, state, app, days, slots, layout, g):
         blocks = layout["blocks"]
@@ -1242,13 +1341,15 @@ class TimetableScene(QGraphicsScene):
         row_heights = [ROW_SLOT_H] * ns
         for b in blocks:
             if b["span"] == 1:
-                needed = _needed_height_for_class(b["cls"], COL_DAY_W)
+                needed = _needed_height_for_class(
+                    b["cls"], COL_DAY_W, conflict=bool(b.get("conflict")))
                 if needed > row_heights[b["row"]]:
                     row_heights[b["row"]] = needed
 
         for b in blocks:
             if b["span"] > 1:
-                needed = _needed_height_for_class(b["cls"], COL_DAY_W)
+                needed = _needed_height_for_class(
+                    b["cls"], COL_DAY_W, conflict=bool(b.get("conflict")))
                 existing = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
                 if needed > existing:
                     extra = needed - existing
@@ -1314,6 +1415,14 @@ class TimetableScene(QGraphicsScene):
                     )
                     self.addItem(ei)
                     self.empty_items.append(ei)
+                    # ST-UI-004: keyed on the DAY, not the sub-column, so the
+                    # cursor's col axis is `_grid_days` in both filtered modes
+                    # and one key map serves both. A day with several
+                    # sub-columns simply has several lanes here — which is also
+                    # what makes the two empty slots of a two-lane Monday
+                    # separately reachable instead of colliding on one address.
+                    self._cursor_index.setdefault(
+                        (days.index(group["day"]), i), []).append(ei)
 
         group_by_day = {group["day"]: group for group in day_groups}
         for b in blocks:
@@ -1336,7 +1445,13 @@ class TimetableScene(QGraphicsScene):
                 conflict_labels=b.get("conflict_labels", ()))
             self.addItem(item)
             self.lesson_items.append(item)
+            col = days.index(b["day"])
+            for r in range(b["row"], b["row"] + b["span"]):
+                self._cursor_index.setdefault((col, r), []).append(item)
+            self._cursor_uid_index[cls_key(b["cls"])] = (
+                col, b["row"], b["lane"])
 
+        self._sort_cursor_lanes()
         self.setSceneRect(0, 0, total_w, total_h)
 
     def build_filtered(self, state, filter_fn, app, mode=FILTER_MODE_DEFAULT,
@@ -1344,6 +1459,8 @@ class TimetableScene(QGraphicsScene):
         self.clear()
         self.lesson_items.clear()
         self.empty_items.clear()
+        self._cursor_index = {}
+        self._cursor_uid_index = {}
         self._app = app
         self._grid_day_groups = []
 
@@ -1369,6 +1486,12 @@ class TimetableScene(QGraphicsScene):
         self.clear()
         self.lesson_items.clear()
         self.empty_items.clear()
+        # ST-UI-004: the matrix has its own geometry (session/time/branch
+        # columns, day header rows) and no cursor coordinate system yet, so the
+        # index is emptied rather than left stale. `_restore_cursor` reads the
+        # empty index as "no addressable cells" and parks the cursor.
+        self._cursor_index = {}
+        self._cursor_uid_index = {}
         self._grid_mode = "everything"
         self._app = app
         self._grid_day_groups = []
@@ -1420,7 +1543,9 @@ class TimetableScene(QGraphicsScene):
                     n_lanes = max(1, b.get("lane_count", 1))
                     lane_w = ((COL_BRANCH_W - (n_lanes - 1) * g) / n_lanes
                               if n_lanes > 1 else COL_BRANCH_W)
-                    needed = _needed_height_for_class(b["cls"], lane_w, is_matrix=True)
+                    needed = _needed_height_for_class(
+                        b["cls"], lane_w, is_matrix=True,
+                        conflict=bool(b.get("conflict")))
                     if needed > row_heights[b["row"]]:
                         row_heights[b["row"]] = needed
 
@@ -1430,7 +1555,9 @@ class TimetableScene(QGraphicsScene):
                     n_lanes = max(1, b.get("lane_count", 1))
                     lane_w = ((COL_BRANCH_W - (n_lanes - 1) * g) / n_lanes
                               if n_lanes > 1 else COL_BRANCH_W)
-                    needed = _needed_height_for_class(b["cls"], lane_w, is_matrix=True)
+                    needed = _needed_height_for_class(
+                        b["cls"], lane_w, is_matrix=True,
+                        conflict=bool(b.get("conflict")))
                     existing = sum(row_heights[b["row"]:b["row"] + b["span"]]) + (b["span"] - 1) * g
                     if needed > existing:
                         extra = needed - existing
@@ -1537,6 +1664,13 @@ class TimetableView(QGraphicsView):
     _VALID_BD = QColor(22, 163, 74)
     _INVALID_BG = QColor(254, 202, 202, 140)  # semi-transparent red
     _INVALID_BD = QColor(220, 38, 38)
+    # ST-UI-004. The keyboard focus ring: #1D4ED8, the colour the audit named,
+    # kept after checking rather than on trust. Measured against every cell tint
+    # the palette produces plus EMPTY_BG and the grid gutter, it is 3.15:1 at
+    # worst — clearing WCAG 1.4.11's 3:1 for a UI-component boundary across the
+    # whole range, which is the same thing the in-cell text had to do for
+    # ST-UI-005. One step lighter (#2563EB) would be 2.43:1 and would fail.
+    _CURSOR_RING = QColor(29, 78, 216)
 
     ZOOM_MIN = 25
     ZOOM_MAX = 300
@@ -1566,6 +1700,18 @@ class TimetableView(QGraphicsView):
         # Overlay highlight state
         self._drop_highlight = None   # (day, slot, valid) or None
 
+        # ST-UI-004. Keyboard cursor: (col, row, lane) into the scene's
+        # `_cursor_index`, plus the uid of whatever it sits on so it can follow
+        # that lesson across a rebuild instead of staying on a coordinate whose
+        # occupant has changed.
+        #
+        # No setFocusPolicy call: QAbstractScrollArea already gives this widget
+        # StrongFocus (measured focusPolicy() == 11, and it is reachable by Tab
+        # today). The audit's "no focus handling" is right about keyPressEvent
+        # and wrong about focus.
+        self._cursor = None
+        self._cursor_uid = None
+
     # ── zoom ───────────────────────────────────────────────────────
 
     def zoom_pct(self):
@@ -1578,6 +1724,280 @@ class TimetableView(QGraphicsView):
         self.setTransform(QTransform().scale(scale, scale))
         if self._zoom_callback:
             self._zoom_callback(pct)
+
+    # ── keyboard cursor (ST-UI-004) ────────────────────────────────
+
+    def setScene(self, scene):
+        """Re-anchor the cursor whenever the scene is swapped.
+
+        ``_render_grid`` builds a **brand-new** ``TimetableScene`` and calls
+        ``setScene`` on every refresh — after an add, a move, a selection, a
+        protection change, an autosave. A cursor holding an item reference
+        would point into a discarded scene; one holding a bare coordinate would
+        silently change which lesson it means. So the coordinate is kept and
+        the *identity* is preferred on restore.
+        """
+        super().setScene(scene)
+        self._restore_cursor()
+
+    def _restore_cursor(self):
+        scene = self.scene()
+        if (scene is None
+                or not getattr(scene, "_grid_days", None)
+                or not getattr(scene, "_grid_slots", None)):
+            self._cursor = None
+            self._cursor_uid = None
+            return
+        if self._cursor is None:
+            return
+
+        # 1. Follow the lesson, if it is still on this scene at all.
+        if self._cursor_uid is not None:
+            found = scene.cursor_locate(self._cursor_uid)
+            if found is not None:
+                self._cursor = found
+                return
+
+        # 2. Otherwise hold the coordinate, clamped into the new grid.
+        col, row, lane = self._cursor
+        col = max(0, min(col, len(scene._grid_days) - 1))
+        row = max(0, min(row, len(scene._grid_slots) - 1))
+        count = scene.cursor_lane_count(col, row)
+        if count == 0:
+            # Nothing addressable here (the everything matrix, which has no
+            # cursor coordinates yet). Park rather than point at nothing.
+            self._cursor = None
+            self._cursor_uid = None
+            return
+        self._cursor = (col, row, max(0, min(lane, count - 1)))
+        self._cursor_uid = self._uid_at(self._cursor)
+
+    def _uid_at(self, cursor):
+        item = self.cursor_item(cursor)
+        cls = getattr(item, "cls", None)
+        if cls is None:
+            return None
+        return cls_key(cls)
+
+    def cursor_item(self, cursor=None):
+        """The item the cursor is on, or None."""
+        cursor = self._cursor if cursor is None else cursor
+        scene = self.scene()
+        if cursor is None or scene is None:
+            return None
+        col, row, lane = cursor
+        try:
+            return scene.cursor_targets(col, row)[lane]
+        except (IndexError, AttributeError, RuntimeError):
+            return None
+
+    def set_cursor(self, col, row, lane=0, announce=True):
+        """Move the cursor, clamped to what the current scene can address.
+
+        Deliberately does **not** touch the app's selection. Arrows move a
+        cursor; selecting stays an explicit act (Space), because
+        ``_select_class_gfx`` rebuilds the entire open-slots sidebar and doing
+        that per keystroke would make the grid unusable to hold an arrow down
+        in — the opposite of what this finding is for.
+        """
+        scene = self.scene()
+        if scene is None or not scene._grid_days or not scene._grid_slots:
+            return False
+        col = max(0, min(col, len(scene._grid_days) - 1))
+        row = max(0, min(row, len(scene._grid_slots) - 1))
+        count = scene.cursor_lane_count(col, row)
+        if count == 0:
+            return False
+        self._cursor = (col, row, max(0, min(lane, count - 1)))
+        self._cursor_uid = self._uid_at(self._cursor)
+        item = self.cursor_item()
+        if item is not None:
+            self.ensureVisible(item.sceneBoundingRect(), 20, 20)
+        if announce:
+            self._announce_cursor()
+        self.viewport().update()
+        return True
+
+    def _first_addressable_cell(self):
+        scene = self.scene()
+        if scene is None:
+            return None
+        for row in range(len(scene._grid_slots)):
+            for col in range(len(scene._grid_days)):
+                if scene.cursor_lane_count(col, row):
+                    return (col, row, 0)
+        return None
+
+    def focusInEvent(self, event):
+        """Give the cursor a home the first time the grid takes focus."""
+        super().focusInEvent(event)
+        if self._cursor is None:
+            start = self._first_addressable_cell()
+            if start is not None:
+                self.set_cursor(*start)
+        self.viewport().update()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self.viewport().update()
+
+    def _announce_cursor(self):
+        """Publish the cursor cell to the accessibility layer.
+
+        On the VIEW, because the cells cannot carry it: ``QGraphicsItem`` is not
+        a ``QObject`` and has no ``setAccessibleName`` (calling it raises
+        ``AttributeError`` — it does not silently do nothing), and PyQt6 ships
+        **no** ``QAccessible`` bindings at all, verified across every module. So
+        a per-cell ``QAccessibleInterface`` — the standard Qt answer for
+        custom-painted content, and what the audit's proposal implies — cannot
+        be written in this binding at any effort.
+
+        This is therefore less than the audit asked for, and worth stating
+        plainly: one AT node whose description changes as the cursor moves,
+        rather than N addressable nodes. It is still the difference between a
+        screen reader announcing the focused lesson and announcing nothing —
+        today ``accessibleName()`` is empty and the package makes zero
+        accessibility calls.
+
+        Deliberately does NOT write to ``app.status_label``: that widget is the
+        ST-UI-002 placement vocabulary (file, counts, pinned subset), rebuilt by
+        ``_update_status`` on every refresh, and borrowing it for cursor
+        announcements would both destroy those counts and flicker.
+
+        The sentence comes from ``cell_formatter``, which the tooltip already
+        uses, so the keyboard and the mouse describe a cell the same way.
+        """
+        from scheduler_app.ui.day_keys import format_day_time
+
+        item = self.cursor_item()
+        if item is None:
+            self.setAccessibleDescription("")
+            return
+        where = format_day_time(item.day, item.slot)
+        cls = getattr(item, "cls", None)
+        if cls is None:
+            what = tr("labels.empty_slot")
+        else:
+            what = ", ".join(
+                part for part in tooltip_text(cls).splitlines() if part)
+        text = "%s: %s" % (where, what)
+
+        col, row, lane = self._cursor
+        count = self.scene().cursor_lane_count(col, row)
+        if count > 1:
+            text += "  " + tr("a11y.lane_position").format(
+                n=lane + 1, total=count)
+        self.setAccessibleDescription(text)
+
+    def keyPressEvent(self, event):
+        """Move the cursor, or act on it.
+
+        Every handled key calls ``event.accept()`` and returns without calling
+        ``super()``: ``QAbstractScrollArea`` already consumes the arrows to
+        scroll the viewport (measured — Key_Down returns accepted=True and moves
+        the vertical scrollbar), so falling through would move the cursor *and*
+        scroll.
+        """
+        if self._cursor is None:
+            start = self._first_addressable_cell()
+            if start is None:
+                super().keyPressEvent(event)
+                return
+            self.set_cursor(*start)
+            if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right,
+                               Qt.Key.Key_Up, Qt.Key.Key_Down):
+                event.accept()
+                return
+
+        col, row, lane = self._cursor
+        key = event.key()
+        mods = event.modifiers()
+        scene = self.scene()
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+
+        if key == Qt.Key.Key_Left:
+            # Alt+Left/Right walks the lanes of a contested cell. Without it,
+            # lane 1 of a double-booking is unreachable by keyboard — ST-UI-001
+            # again, for keyboard users only.
+            if alt:
+                self.set_cursor(col, row, lane - 1)
+            else:
+                self.set_cursor(col - 1, row, 0)
+        elif key == Qt.Key.Key_Right:
+            if alt:
+                self.set_cursor(col, row, lane + 1)
+            else:
+                self.set_cursor(col + 1, row, 0)
+        elif key == Qt.Key.Key_Up:
+            self.set_cursor(col, row - 1, lane)
+        elif key == Qt.Key.Key_Down:
+            self.set_cursor(col, row + 1, lane)
+        elif key == Qt.Key.Key_Home:
+            self.set_cursor(0, 0 if ctrl else row, 0)
+        elif key == Qt.Key.Key_End:
+            self.set_cursor(len(scene._grid_days) - 1,
+                            len(scene._grid_slots) - 1 if ctrl else row, 0)
+        elif key == Qt.Key.Key_Space:
+            self._activate_cursor(select_only=True, modifiers=mods)
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_F2):
+            self._activate_cursor(select_only=False, modifiers=mods)
+        elif key == Qt.Key.Key_Menu or (
+                key == Qt.Key.Key_F10
+                and mods & Qt.KeyboardModifier.ShiftModifier):
+            self._context_menu_at_cursor()
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+
+    def _activate_cursor(self, select_only, modifiers):
+        """Space selects; Enter/F2 opens — the same verdicts the mouse reaches.
+
+        Deliberately NOT the audit's "Enter opens the context menu". Left-click
+        selects and right-click opens the menu, so binding Enter — the
+        keyboard's primary activation — to the *secondary* mouse action inverts
+        the mapping; Qt's own item views bind Enter to activation and leave the
+        context menu on Menu/Shift+F10. Keeping Enter=activate is what makes
+        "the keyboard and the mouse reach one verdict" true rather than claimed.
+        """
+        item = self.cursor_item()
+        scene = self.scene()
+        app = getattr(scene, "_app", None) if scene is not None else None
+        if item is None or app is None:
+            return
+        cls = getattr(item, "cls", None)
+        if select_only:
+            if cls is not None:
+                app._select_class_gfx(cls, item, modifiers)
+            elif hasattr(app, "_select_empty_slot"):
+                app._select_empty_slot(item)
+            return
+        if cls is not None:
+            app._edit_class(cls)
+        else:
+            app._add_class_at(item.day, item.slot)
+
+    def _context_menu_at_cursor(self):
+        """Open the cursor cell's own context menu.
+
+        ``QGraphicsSceneContextMenuEvent`` cannot be constructed from Python
+        ("cannot be instantiated or sub-classed"), so the event is posted to the
+        viewport at the cell's centre and Qt's own
+        ``QGraphicsView::contextMenuEvent`` builds the scene event and routes
+        it — reaching the same ``contextMenuEvent`` a right-click reaches, on
+        the correct lane.
+        """
+        from PyQt6.QtGui import QContextMenuEvent
+
+        item = self.cursor_item()
+        if item is None:
+            return
+        centre = item.sceneBoundingRect().center()
+        vp_pos = self.mapFromScene(centre)
+        QApplication.sendEvent(self.viewport(), QContextMenuEvent(
+            QContextMenuEvent.Reason.Keyboard, vp_pos,
+            self.viewport().mapToGlobal(vp_pos)))
 
     def wheelEvent(self, event):
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -1661,6 +2081,39 @@ class TimetableView(QGraphicsView):
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        # ST-UI-004. Two INDEPENDENT overlays. The cursor ring must be painted
+        # outside the drop-highlight branch, because that branch begins with
+        # `if self._drop_highlight is None: return` — and no drag is in progress
+        # for the entire time the keyboard cursor matters, so anything appended
+        # after it would never run.
+        self._paint_cursor_ring()
+        self._paint_drop_highlight()
+
+    def _paint_cursor_ring(self):
+        """A focus ring on the cursor cell, drawn only while the grid has focus.
+
+        On the item's own rect rather than the cell's, so on a contested cell it
+        surrounds the LANE the cursor is in — a ring around the whole column
+        would not say which of two double-booked lessons is about to be edited.
+        """
+        if self._cursor is None or not self.hasFocus():
+            return
+        item = self.cursor_item()
+        if item is None:
+            return
+        rect = item.sceneBoundingRect()
+        tl = self.mapFromScene(rect.topLeft())
+        br = self.mapFromScene(rect.bottomRight())
+        from PyQt6.QtCore import QRect
+
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        p.setPen(QPen(self._CURSOR_RING, 2))
+        p.drawRoundedRect(QRect(tl, br).adjusted(1, 1, -1, -1), 5, 5)
+        p.end()
+
+    def _paint_drop_highlight(self):
         if self._drop_highlight is None:
             return
         day, slot, valid = self._drop_highlight
