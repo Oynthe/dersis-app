@@ -1,5 +1,6 @@
 """Main application window: SchedulerApp (QMainWindow subclass) — PyQt6."""
 
+import base64
 import copy
 import json
 import csv
@@ -830,6 +831,28 @@ class DraggableUnplacedList(QListWidget):
 # short enough that a crash loses at most this much; every exit path flushes.
 AUTOSAVE_DEBOUNCE_MS = 1500
 
+# ST-UI-013. The size the window opened at for every user on every launch,
+# because nothing ever saved or restored a geometry. Measured natively at that
+# exact size, Turkish, 5 days x 8 periods: scene 841x607 into a viewport
+# 769x457 — both scrollbars, before the user has touched anything. It survives
+# only as the fallback a maximized first run starts from, so that un-maximizing
+# lands somewhere sane.
+DEFAULT_WINDOW_W = 1150
+DEFAULT_WINDOW_H = 720
+
+# Keys in the settings container (the same one the language flag uses).
+WINDOW_GEOMETRY_KEY = "window_geometry"
+SIDEBAR_INTENT_KEY = "sidebar_intent"
+
+# How much of a restored window frame must land on a connected screen before
+# the geometry is believed. A laptop undocked from a second monitor restores a
+# frame nobody can reach; a quarter on screen is enough to drag back.
+MIN_ON_SCREEN_FRACTION = 0.25
+
+# Extra width demanded before an auto-collapsed sidebar reopens, so a window
+# sitting exactly on the threshold does not flicker as it is dragged.
+SIDEBAR_REOPEN_HYSTERESIS = 24
+
 
 class SchedulerApp(QMainWindow):
     def __init__(self, session=None, server_url=''):
@@ -841,7 +864,9 @@ class SchedulerApp(QMainWindow):
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "docs", "dersis.png")
         if os.path.exists(_icon_path):
             self.setWindowIcon(QIcon(_icon_path))
-        self.resize(1150, 720)
+        # Provisional only — _restore_window_geometry() overrides this at the
+        # end of __init__, once there are widgets for a restored size to fit.
+        self.resize(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H)
         self.setMinimumSize(850, 550)
 
         # Apply global stylesheet
@@ -928,6 +953,13 @@ class SchedulerApp(QMainWindow):
         self._build_toolbar()
         self._build_main()
         self._build_status()
+
+        # ST-UI-013: after the widgets exist, so the restored sidebar intent
+        # has something to act on, and before show(), so the user never sees
+        # the window jump from the default size to the remembered one. Before
+        # the flush below, because this reads the settings container too and a
+        # problem it found would otherwise have nowhere to go.
+        self._restore_window_geometry()
 
         # _auto_load runs above, before any of these widgets exist, so a
         # settings problem found during load had nowhere to go. Flush it now
@@ -1046,6 +1078,13 @@ class SchedulerApp(QMainWindow):
         self._toggle_sidebar_action = QAction(tr("menus.toggle_sidebar"), view_menu)
         self._toggle_sidebar_action.setCheckable(True)
         self._toggle_sidebar_action.setChecked(True)
+        # ST-UI-013: the sidebar is worth a flat 314 px of grid — two day
+        # columns at 1000 px — and until now the only ways to reclaim them
+        # were a 26 px icon and an unaccelerated menu item. Ctrl+B is free;
+        # Ctrl+Shift+B (Bulk Add) is the one already taken.
+        self._toggle_sidebar_action.setShortcut(QKeySequence("Ctrl+B"))
+        self._toggle_sidebar_action.setShortcutContext(
+            Qt.ShortcutContext.WindowShortcut)
         self._toggle_sidebar_action.triggered.connect(self._toggle_sidebar_panel)
         view_menu.addAction(self._toggle_sidebar_action)
         self._menu_actions.append(self._toggle_sidebar_action)
@@ -1447,7 +1486,7 @@ class SchedulerApp(QMainWindow):
             "  border-radius: 5px; padding: 2px; }"
             "QPushButton:hover { background: #E2E8F0; }")
         self._sidebar_collapse_btn.clicked.connect(
-            lambda: self._collapse_panel("sidebar"))
+            lambda: self._collapse_panel("sidebar", by_user=True))
         sidebar_header_row.addWidget(self._sidebar_collapse_btn)
         sidebar_layout.addLayout(sidebar_header_row)
 
@@ -1567,7 +1606,7 @@ class SchedulerApp(QMainWindow):
             "  border-radius: 6px; padding: 2px; }"
             "QPushButton:hover { background: #CBD5E1; }")
         self._sidebar_expand_btn.clicked.connect(
-            lambda: self._expand_panel("sidebar"))
+            lambda: self._expand_panel("sidebar", by_user=True))
         self._sidebar_expand_btn.setVisible(False)
 
         # Sidebar collapse state tracking
@@ -1577,6 +1616,16 @@ class SchedulerApp(QMainWindow):
         self._collapsed_width = 36
         self._collapse_threshold = 60
         self._in_collapse_sync = False
+        # ST-UI-013. Who last decided whether the sidebar is open:
+        #   "auto"   — nobody has said; the window width decides
+        #   "open"   — the user opened it and it stays open
+        #   "closed" — the user closed it and it stays closed
+        # A plain resizeEvent breakpoint without this was built and measured:
+        # at 1000 px the user clicks Expand and the next 1 px of drag closes it
+        # again. Hysteresis does not help, because the window is genuinely
+        # still below the threshold. Persisted, so the decision outlives the
+        # session that made it.
+        self._sidebar_intent = "auto"
 
         # Detect splitter-drag collapse
         self.splitter.splitterMoved.connect(self._on_splitter_moved)
@@ -2458,9 +2507,9 @@ class SchedulerApp(QMainWindow):
     def _toggle_sidebar_panel(self, checked):
         """Toggle entire sidebar visibility from View menu."""
         if checked:
-            self._expand_panel("sidebar")
+            self._expand_panel("sidebar", by_user=True)
         else:
-            self._collapse_panel("sidebar")
+            self._collapse_panel("sidebar", by_user=True)
 
     def _init_splitter_sizes(self):
         """Set initial splitter sizes once the window is laid out."""
@@ -2469,7 +2518,16 @@ class SchedulerApp(QMainWindow):
         nb = total - sw
         if nb < 400:
             nb = 400
-        self.splitter.setSizes([nb, sw])
+        # This setSizes() emits splitterMoved exactly as a drag does, and a
+        # startup layout is not the user saying anything about the sidebar.
+        self._in_collapse_sync = True
+        try:
+            self.splitter.setSizes([nb, sw])
+        finally:
+            self._in_collapse_sync = False
+        # ST-UI-013: decide once, here, rather than waiting for the first
+        # resize the user happens to perform.
+        self._apply_sidebar_intent()
 
     def _on_splitter_moved(self):
         """Detect when a splitter drag shrinks the sidebar below threshold."""
@@ -2480,14 +2538,24 @@ class SchedulerApp(QMainWindow):
         if not self._sidebar_is_collapsed and sizes[1] <= thresh:
             self._sidebar_saved_width = max(self._sidebar_saved_width, 150)
             self._in_collapse_sync = True
-            self._collapse_panel("sidebar")
+            # Dragging the handle shut is the user closing the sidebar, and it
+            # has to stick for the same reason the button does.
+            self._collapse_panel("sidebar", by_user=True)
             self._in_collapse_sync = False
         elif not self._sidebar_is_collapsed and sizes[1] > thresh:
             self._sidebar_saved_width = sizes[1]
 
-    def _collapse_panel(self, which):
-        """Collapse the sidebar by shrinking it in the splitter."""
-        if which != "sidebar" or self._sidebar_is_collapsed:
+    def _collapse_panel(self, which, *, by_user=False):
+        """Collapse the sidebar by shrinking it in the splitter.
+
+        ``by_user`` records *whose* decision this was. Only a person's decision
+        becomes an intent that outranks the window width (ST-UI-013).
+        """
+        if which != "sidebar":
+            return
+        if by_user:
+            self._sidebar_intent = "closed"
+        if self._sidebar_is_collapsed:
             return
         cw = self._collapsed_width
         sizes = self.splitter.sizes()
@@ -2513,9 +2581,18 @@ class SchedulerApp(QMainWindow):
         self._update_collapsed_handles()
         self._position_expand_buttons()
 
-    def _expand_panel(self, which):
-        """Expand the collapsed sidebar back to its previous width."""
-        if which != "sidebar" or not self._sidebar_is_collapsed:
+    def _expand_panel(self, which, *, by_user=False):
+        """Expand the collapsed sidebar back to its previous width.
+
+        Note for anyone adding a width cap here later: the two lines below that
+        reset ``setMinimumWidth(0)`` / ``setMaximumWidth(16777215)`` throw any
+        such cap away on the first expand, so it has to be re-applied.
+        """
+        if which != "sidebar":
+            return
+        if by_user:
+            self._sidebar_intent = "open"
+        if not self._sidebar_is_collapsed:
             return
         sizes = self.splitter.sizes()
         self._sidebar_is_collapsed = False
@@ -2560,6 +2637,181 @@ class SchedulerApp(QMainWindow):
                 handle.setMinimumWidth(0)
                 handle.setMaximumWidth(16777215)
                 handle.resize(self.splitter.handleWidth(), handle.height())
+
+    # ── The window fits the screen, the sidebar fits the grid (ST-UI-013) ──
+
+    def _splitter_handle_width(self):
+        """The live handle width. ``handleWidth()`` is -1 under Fusion."""
+        handle = self.splitter.handle(1) if self.splitter.count() > 1 else None
+        if handle is not None and handle.width() > 0:
+            return handle.width()
+        return max(self.splitter.handleWidth(), 0)
+
+    def _grid_content_width(self):
+        """Notebook width that would show the visible timetable whole.
+
+        Read straight off the scene that is already on screen. This runs from
+        ``resizeEvent``, which fires on every frame of a window drag, so it must
+        never re-render anything — ``sceneRect()`` is current by the time any
+        resize arrives.
+        """
+        views = [self.grid_view1, self.grid_view2,
+                 self.grid_view3, self.grid_view4]
+        idx = self.notebook.currentIndex()
+        view = views[idx] if 0 <= idx < len(views) else self.grid_view1
+        scene = view.scene()
+        if scene is None:
+            return 0
+        zoom = getattr(view, "_zoom_pct", 100) or 100
+        scene_w = scene.sceneRect().width() * zoom / 100.0
+        # Everything between the notebook's own edge and the viewport the scene
+        # is painted into: tab-widget frame, page margins, vertical scrollbar.
+        chrome = max(self.notebook.width() - view.viewport().width(), 0)
+        return int(round(scene_w + chrome))
+
+    def _sidebar_open_width(self):
+        """The width the sidebar will actually take when it is open.
+
+        ``_sidebar_saved_width`` is only what we would *ask* for. The splitter
+        floors it at the panel's own ``minimumSizeHint``, which is
+        locale-dependent — ``12 + minSizeHint(open-slots) + 4 +
+        minSizeHint(unplaced)``, both buttons bold, padded and emoji-prefixed,
+        giving ko 210 ... tr 301 ... ru 362 natively — and exceeds the
+        hard-coded 350 in pl and ru, where it silently widens the sidebar.
+
+        Measured cost of using the remembered number instead: switching to
+        Azerbaijani after Arabic decided with 350 against a panel that then
+        took 564, and the sidebar kept 201 px the tab bar needed.
+
+        The hint reads as the layout's minimum, so it only means anything while
+        the panel's contents are visible; collapsed, the remembered width is
+        the best estimate there is, and ``_apply_sidebar_intent`` re-checks
+        once the panel is open again.
+        """
+        return max(self._sidebar_saved_width,
+                   self._sidebar_panel.minimumSizeHint().width())
+
+    def _sidebar_needed_width(self):
+        """Splitter width at which the sidebar costs the user nothing.
+
+        Two things compete for the notebook and the wider one wins:
+
+        *The tab bar.* It does not elide (``ElideNone``); a tab that does not
+        fit is a tab behind a scroll arrow, and the Quality Dashboard is the
+        last one. Its size hint spans 319 px across the 22 shipped locales —
+        ko 913 to id 1232 once the 359 px of sidebar and chrome are added — so
+        any constant here is 48 px short in Turkish and 132 short in
+        Indonesian.
+
+        *The timetable.* 5 days x 8 periods wants 1212 px with the sidebar
+        open and 898 with it closed; 6 x 10 wants 1377 and 1063.
+
+        Both are measured live, which is what makes this locale-correct and
+        day-count-correct by construction rather than by a table someone has to
+        maintain.
+        """
+        tab_w = self.notebook.tabBar().sizeHint().width()
+        return (max(tab_w, self._grid_content_width())
+                + self._sidebar_open_width() + self._splitter_handle_width())
+
+    def _apply_sidebar_intent(self):
+        """Give the grid the sidebar's 314 px when it needs them — if allowed.
+
+        Does nothing at all unless nobody has expressed an intent. The measured
+        cost of getting that wrong: with a bare breakpoint, expanding the
+        sidebar at 1000 px survives exactly until the window moves one pixel.
+        """
+        if self._sidebar_intent != "auto":
+            return
+        if self._in_collapse_sync or not self.isVisible():
+            return
+        # A window that has never been shown reports a splitter at its own
+        # 640 px size hint no matter what resize() was called with, so nothing
+        # measured off it is worth acting on.
+        total = self.splitter.width()
+        if total <= self._collapsed_width * 4:
+            return  # not laid out yet — _init_splitter_sizes has not run
+        needed = self._sidebar_needed_width()
+        if not self._sidebar_is_collapsed:
+            if total < needed:
+                self._collapse_panel("sidebar")
+        elif total > needed + 2 * self._splitter_handle_width() \
+                + SIDEBAR_REOPEN_HYSTERESIS:
+            self._expand_panel("sidebar")
+            # How wide the panel insists on being is only readable once its
+            # contents are visible, so the estimate that opened it may have
+            # been the previous language's. Re-check exactly once; the branch
+            # above cannot run again from here.
+            if self.splitter.width() < self._sidebar_needed_width():
+                self._collapse_panel("sidebar")
+
+    @staticmethod
+    def _rect_is_on_a_screen(frame, screen_rects,
+                             minimum=MIN_ON_SCREEN_FRACTION):
+        """True when enough of *frame* lands on one of *screen_rects*.
+
+        A geometry saved while a second monitor was plugged in restores to
+        coordinates no screen covers once it is unplugged, and the window opens
+        where nobody can reach it. Each screen is measured separately and the
+        best one wins: a frame straddling two monitors is on screen once, not
+        half on screen twice.
+        """
+        area = frame.width() * frame.height()
+        if area <= 0:
+            return False
+        best = 0
+        for rect in screen_rects:
+            overlap = frame.intersected(rect)
+            best = max(best, overlap.width() * overlap.height())
+        return best >= area * minimum
+
+    def _available_screen_rects(self):
+        app = QApplication.instance()
+        if app is None:
+            return []
+        return [screen.availableGeometry() for screen in app.screens()]
+
+    def _restore_window_geometry(self):
+        """Reopen where the user left the window, or maximized on a first run.
+
+        The alternative, and what shipped until now, is a hard-coded 1150x720
+        on every launch on every machine — measured to put an 841x607 timetable
+        into a 769x457 viewport in Turkish at 5 days x 8 periods, and to clear
+        the Turkish tab bar by exactly 0 px while failing id, pl and ru.
+        """
+        try:
+            data = self._read_settings_container() or {}
+        except Exception:
+            data = {}     # already reported; a bad container costs a size only
+        intent = data.get(SIDEBAR_INTENT_KEY)
+        if intent in ("auto", "open", "closed"):
+            self._sidebar_intent = intent
+        restored = False
+        blob = data.get(WINDOW_GEOMETRY_KEY)
+        if isinstance(blob, str) and blob:
+            try:
+                restored = bool(self.restoreGeometry(base64.b64decode(blob)))
+            except Exception:
+                restored = False   # truncated, re-encoded, hand-edited: ignore
+        if restored and not self._rect_is_on_a_screen(
+                self.frameGeometry(), self._available_screen_rects()):
+            restored = False
+        if not restored:
+            self.resize(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H)
+            self.setWindowState(
+                self.windowState() | Qt.WindowState.WindowMaximized)
+
+    def _save_window_geometry(self):
+        """Remember the window and the sidebar decision for the next launch."""
+        from scheduler_app.first_run import _write_flag
+        try:
+            blob = base64.b64encode(bytes(self.saveGeometry())).decode("ascii")
+        except Exception:
+            return False
+        ok = _write_flag(self._config_path, WINDOW_GEOMETRY_KEY, blob)
+        ok = _write_flag(self._config_path, SIDEBAR_INTENT_KEY,
+                         self._sidebar_intent) and ok
+        return ok
 
     def _on_unplaced_dblclick(self, item):
         row = self.unplaced_list.row(item)
@@ -5295,10 +5547,26 @@ class SchedulerApp(QMainWindow):
         # Retranslate impact badge
         self._update_impact_badge()
         self.refresh_grid()
+        # ST-UI-013: the tab bar's size hint is the locale-dependent number
+        # that decides whether all five tabs are reachable — 913 px in Korean,
+        # 1232 in Indonesian. Changing the language changes the threshold, so
+        # the sidebar decision has to be taken again here.
+        #
+        # activate() first, and it is load-bearing: setText() on the two
+        # sidebar buttons only *posts* a layout request, so the panel's
+        # minimumSizeHint still reports the previous language's number until it
+        # is applied. Measured without it, switching to Azerbaijani after
+        # Arabic decided against 350 and got a 564 px panel, and 201 px of tab
+        # bar went behind the scroll arrow.
+        sidebar_layout = self._sidebar_panel.layout()
+        if sidebar_layout is not None:
+            sidebar_layout.activate()
+        self._apply_sidebar_intent()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, '_sidebar_is_collapsed'):
+            self._apply_sidebar_intent()
             self._position_expand_buttons()
 
     def _on_quit(self):
@@ -5313,6 +5581,10 @@ class SchedulerApp(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
+        # ST-UI-013: before anything that can fail or ask a question, because
+        # a geometry written for a close the user then cancels is simply the
+        # current geometry, and costs nothing.
+        self._save_window_geometry()
         # ST-DATA-005: quitting is the moment an unsaved change becomes
         # permanently lost, so a failure here is the one worth interrupting the
         # user for, even though _report_settings_problem has rate-limited it.
