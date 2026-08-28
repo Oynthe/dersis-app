@@ -22,6 +22,7 @@ except ImportError:
 
 from scheduler_app.logic import (
     get_placed_classes, occupied_slots_of, classroom_of, total_duration,
+    target_for_slot_offset,
     get_year_color, lighten_color, build_virtual_classroom_day_layout,
     find_schedule_conflicts, conflict_partner_index,
 )
@@ -828,32 +829,54 @@ def _export_csv(schedule: FinalSchedule, filepath: str):
             room = classroom_of(cls)
             code = cls.get("class_code", "")
             cells = occupied_slots_of(schedule.state, cls)
-            if not cells:
+            on_grid = bool(cells)
+            if not on_grid:
                 # Orphaned by a deleted hour. A flat file has room for it even
                 # though a grid does not, so write it at its stored position
                 # rather than dropping it (ST-DATA-003).
                 cells = [(effective_day(cls), effective_time(cls))]
-            for day, slot in cells:
+            targets = cls.get("targets", [])
+            unreported = set(range(len(targets)))
+
+            def _row(day_text, slot, t):
+                writer.writerow([
+                    day_text, csv_safe(slot), csv_safe(code),
+                    csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
+                    csv_safe(room),
+                    csv_safe(t["year"]) if t else "",
+                    csv_safe(t["branch"]) if t else "",
+                ])
+
+            for offset, (day, slot) in enumerate(cells):
                 # ST-FUNC-006: the header row is Turkish, so the day column
                 # must be too. display_day rather than tr("weekdays.<key>") so
                 # a day the grid no longer defines prints its stored value
                 # instead of the lookup key.
                 day_text = display_day(day)
-                targets = cls.get("targets", [])
-                if targets:
-                    for t in targets:
-                        writer.writerow([
-                            day_text, csv_safe(slot), csv_safe(code),
-                            csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
-                            csv_safe(room), csv_safe(t["year"]),
-                            csv_safe(t["branch"]),
-                        ])
+                # One hour of a non-joint lesson belongs to ONE group, not to
+                # all of them: this loop used to emit the cross product, so a
+                # two-group lesson claimed each group met in both hours. Half
+                # of those rows were false. target_for_slot_offset returns
+                # None for a joint session, where every group really does
+                # share every hour.
+                owner = target_for_slot_offset(cls, offset) if on_grid else None
+                if owner is not None:
+                    indexed = [(owner, targets[owner])]
                 else:
-                    writer.writerow([
-                        day_text, csv_safe(slot), csv_safe(code),
-                        csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
-                        csv_safe(room), "", "",
-                    ])
+                    indexed = list(enumerate(targets))
+                if not indexed:
+                    _row(day_text, slot, None)
+                    continue
+                for idx, t in indexed:
+                    unreported.discard(idx)
+                    _row(day_text, slot, t)
+
+            # A group whose own hour ran off the end of the grid has no cell to
+            # be named in. Same rule as above: reported at the stored start
+            # rather than dropped (ST-DATA-003).
+            for idx in sorted(unreported):
+                _row(display_day(effective_day(cls)), effective_time(cls),
+                     targets[idx])
 
 
 # ── PDF export (optional) ───────────────────────────────────────────────────

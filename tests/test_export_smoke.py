@@ -1249,6 +1249,63 @@ def test_pdf_does_not_silently_drop_offgrid_placements(
     )
 
 
+def _sequential_state(slots=None):
+    """A non-joint two-group lesson: A at 09:00, B at 10:00, one hour each."""
+    state = _empty_state(lecturers=[LECT_A], rooms=["A-101"],
+                         years={YEAR_1: ["A", "B"]})
+    if slots is not None:
+        state["slots"] = list(slots)
+    cls = _place(state, "D001", "Beden Eğitimi", LECT_A, "monday", "09:00",
+                 "A-101", YEAR_1, "A", 1)
+    cls["targets"] = [{"year": YEAR_1, "branch": "A"},
+                      {"year": YEAR_1, "branch": "B"}]
+    cls["joint_session"] = False
+    return state
+
+
+def test_csv_gives_each_group_of_a_non_joint_lesson_its_own_hour(tmp_path):
+    """This writer's version of the live CSV's ST-FUNC-006 defect.
+
+    ``_export_csv`` emits one row per occupied slot and, inside each, one row
+    per target -- a cross product. For a non-joint lesson that is two rows too
+    many and two of them are false: it says group A meets in the hour that
+    belongs to B, and B in A's.
+
+    This entry point has no production caller, so this is a library guard, not
+    a user-facing pin (that one lives in ``tests/test_export_csv_live.py``).
+    It is here because the two writers are kept in step deliberately -- the
+    docstring on ``_export_csv`` says so -- and because whoever wires this one
+    up later inherits whatever it does today.
+    """
+    out = tmp_path / "sequential.csv"
+    export_schedule(_sequential_state(), "csv", str(out))
+
+    rows = read_csv_rows(out)
+    seen = {(r[7], r[1]) for r in rows[1:] if r[2] == "D001"}  # branch, time
+    assert seen == {("A", "09:00"), ("B", "10:00")}, (
+        "each group of a non-joint lesson gets exactly its own hour; the file "
+        f"says {sorted(seen)}"
+    )
+
+
+def test_csv_reports_a_group_whose_hour_ran_off_the_grid(tmp_path):
+    """ST-DATA-003 for the second group of a non-joint lesson.
+
+    With one hour left on the grid, group B's hour does not exist. A grid can
+    only drop that; this file has a row for it, and dropping the group here
+    would be the silent data loss the whole ST-FUNC-013 appendix exists to
+    stop.
+    """
+    out = tmp_path / "sequential_offgrid.csv"
+    export_schedule(_sequential_state(slots=["09:00"]), "csv", str(out))
+
+    rows = read_csv_rows(out)
+    branches = {r[7] for r in rows[1:] if r[2] == "D001"}
+    assert branches == {"A", "B"}, (
+        f"the group with no hour left on the grid was dropped: {branches}"
+    )
+
+
 def test_csv_still_reports_offgrid_placements(tmp_path):
     """Companion evidence for ST-FUNC-013: the CSV keeps what the PDF drops.
 
