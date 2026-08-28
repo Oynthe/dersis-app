@@ -1,9 +1,14 @@
 """Scheduling logic: conflict detection, slot fitting, color helpers."""
 
 from scheduler_app.constants import YEAR_COLORS
+# ST-ARCH-010: ExplanationEngine is imported at module scope because
+# explanation_engine imports nothing from logic -- measured, one of only
+# two of logic.py's 21 deferrals that is not load-bearing. The other 19
+# genuinely do raise ImportError if promoted.
+from scheduler_app.explanation_engine import ExplanationEngine
 from scheduler_app.models import (
     DEFAULT_OPTIMIZER_SEED,
-    PROTECTION_NONE,
+    PROTECTION_NONE, PROTECTION_LOCKED,
     room_fits_class, lecturer_available_at, needs_physical_room, display_room,
     get_room_candidates, get_physical_room_candidates,
     effective_day, effective_time, effective_room,
@@ -1149,7 +1154,6 @@ def optimized_batch_schedule(state, new_classes, weights=None):
     from scheduler_app.candidate_generator import CandidateGenerator
     from scheduler_app.placement_scorer import PlacementScorer
 
-    from scheduler_app.models import PROTECTION_LOCKED
 
     new_ids = {cls_key(c) for c in new_classes}
     # ST-SCHED-007: a `protection="locked"` class is not flexible. Phase 2
@@ -1291,7 +1295,6 @@ def score_placement_explained(state, cls, day, slot, room, weights=None):
     """
     from scheduler_app.constraint_validator import ConstraintValidator
     from scheduler_app.placement_scorer import PlacementScorer
-    from scheduler_app.explanation_engine import ExplanationEngine
 
     exclude = {cls_key(cls)}
     validator = ConstraintValidator(state, exclude_ids=exclude)
@@ -1322,93 +1325,6 @@ def analyze_schedule(state, placements=None):
 
     analytics = ScheduleAnalytics(state)
     return analytics.analyze(placements)
-
-
-def analyze_conflict_graph(state):
-    """Build and analyze the conflict graph for flexible classes.
-
-    Returns:
-        dict with graph metrics: total_nodes, total_edges,
-        components_count, per-class degrees, and density stats.
-    """
-    from scheduler_app.conflict_graph import ConflictGraphBuilder, ConflictAnalyzer
-    from scheduler_app.constraint_validator import ConstraintValidator
-
-    flexible = [c for c in state.get("classes", [])
-                if not c.get("pinned", False)]
-    if not flexible:
-        return {"total_nodes": 0, "total_edges": 0, "components_count": 0,
-                "degrees": {}, "avg_degree": 0.0}
-
-    builder = ConflictGraphBuilder(state, flexible)
-    graph = builder.build()
-
-    validator = ConstraintValidator(state,
-                                    exclude_ids={cls_key(c) for c in flexible})
-    analyzer = ConflictAnalyzer(graph, validator)
-    components = analyzer.connected_components()
-
-    degrees = {}
-    total_degree = 0
-    for i, cls in enumerate(flexible):
-        deg = graph.degree(i)
-        degrees[cls["name"]] = deg
-        total_degree += deg
-
-    avg_degree = total_degree / max(len(flexible), 1)
-
-    return {
-        "total_nodes": len(flexible),
-        "total_edges": graph.total_edges(),
-        "components_count": len(components),
-        "degrees": degrees,
-        "avg_degree": avg_degree,
-    }
-
-
-def analyze_constraint_propagation(state):
-    """Build constraint propagation state and return per-class valid counts.
-
-    Returns:
-        dict with per-class valid placement counts and summary stats.
-    """
-    from scheduler_app.constraint_validator import ConstraintValidator
-    from scheduler_app.candidate_generator import CandidateGenerator
-    from scheduler_app.constraint_propagator import (
-        ConstraintState, ConstraintPropagator)
-
-    flexible = [c for c in state.get("classes", [])
-                if not c.get("pinned", False)]
-    if not flexible:
-        return {"total_classes": 0, "valid_counts": {},
-                "min_count": 0, "max_count": 0, "avg_count": 0.0}
-
-    exclude_ids = {cls_key(c) for c in flexible}
-    validator = ConstraintValidator(state, exclude_ids=exclude_ids)
-    generator = CandidateGenerator(state, validator=validator)
-    cs = ConstraintState(state, validator, generator, flexible)
-    propagator = ConstraintPropagator(cs)
-
-    valid_counts = {}
-    total = 0
-    min_count = float("inf")
-    max_count = 0
-    for cls in flexible:
-        count = propagator.get_valid_count(cls)
-        valid_counts[cls["name"]] = count
-        total += count
-        min_count = min(min_count, count)
-        max_count = max(max_count, count)
-
-    avg = total / max(len(flexible), 1)
-
-    return {
-        "total_classes": len(flexible),
-        "valid_counts": valid_counts,
-        "min_count": min_count if min_count != float("inf") else 0,
-        "max_count": max_count,
-        "avg_count": avg,
-    }
 
 
 def negotiate_after_optimization(state, placed_list, unplaced_list):
