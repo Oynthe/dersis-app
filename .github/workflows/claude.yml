@@ -24,13 +24,27 @@ jobs:
       issues: read
       id-token: write
       actions: read # Required for Claude to read CI results on PRs
+    env:
+      # Same gate as claude-code-review.yml: without the token the action
+      # aborts on credential validation. This job only runs when someone
+      # writes "@claude", so it does not redden every pull request the way the
+      # review job did — but it would fail the same way, having told the person
+      # who summoned it nothing useful. See that file for the full reasoning.
+      HAS_CLAUDE_CREDENTIAL: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
     steps:
+      - name: Explain why Claude did not respond
+        if: env.HAS_CLAUDE_CREDENTIAL != 'true'
+        run: |
+          echo "::notice title=Claude Code skipped::No CLAUDE_CODE_OAUTH_TOKEN secret is configured for this repository, so @claude cannot respond. Add it under Settings > Secrets and variables > Actions to enable it."
+
       - name: Checkout repository
+        if: env.HAS_CLAUDE_CREDENTIAL == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
       - name: Run Claude Code
+        if: env.HAS_CLAUDE_CREDENTIAL == 'true'
         id: claude
         uses: anthropics/claude-code-action@v1
         with:
