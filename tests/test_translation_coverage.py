@@ -83,7 +83,20 @@ EN = TRANSLATIONS["en"]
 # The ratchet caught both additions on the very commits that introduced them,
 # which is the behaviour wanted: adding an English string is normal work, and
 # the test asks for an explicit acknowledgement rather than failing the build.
-MAX_MISSING_LOCALE_KEY_PAIRS = 2508
+#
+# 2508 -> 2528 in Phase 7: `export.unprintable_note` lands in en+tr, so it is
+# absent from the other 20 locales and the bound moves by exactly 20. It is
+# the one string that says which characters the printed timetable could not
+# draw -- see ST-FUNC-004 in data_io/exporter.py. There is no existing key
+# that means this (the appendix reuse trick a few lines away in that file does
+# not apply: "Not on the timetable" is about lessons, not glyphs), and the
+# alternative to minting it was hardcoded English in a Turkish-first app.
+#
+# Measured while doing so, and it contradicts a figure circulating in the
+# Phase 7 notes: the backlog is AT this ceiling, not 848 pairs below it. There
+# is no slack to spend, so the next English string added also has to move this
+# number deliberately.
+MAX_MISSING_LOCALE_KEY_PAIRS = 2528
 MAX_PLACEHOLDER_SUBSETS = 1
 
 

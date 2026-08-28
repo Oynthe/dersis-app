@@ -51,6 +51,7 @@ import pytest
 from scheduler_app.core.models import mark_placed, new_class, new_state
 from scheduler_app.data_io.exporter import FinalSchedule, export_schedule
 from scheduler_app.translations import tr
+from scheduler_app.i18n.translations import TRANSLATIONS
 
 MODES = ("everything", "classroom", "group", "lecturer")
 
@@ -915,6 +916,133 @@ def test_pdf_text_layer_keeps_every_turkish_letter(tmp_path, reportlab_mod):
         f"these letters have no /ToUnicode mapping in the exported PDF and so "
         f"cannot be searched or copied out of it: {missing}"
     )
+
+
+# ── The other 21 languages ──────────────────────────────────────────────────
+#
+# ST-FUNC-004 was closed on twelve Turkish letters, and the three tests above
+# run only in the pinned default locale. The product ships 22 languages and
+# offers all of them in the first-run gate, while the bundled face (Vera, 283
+# glyphs) covers Latin-1 and nothing else -- so ru, ar, fa, hi, zh, ja, ko, pl
+# and az printed their weekday names as empty boxes with nothing saying so.
+
+def _ascii_state_for_locale():
+    """A schedule whose only non-ASCII text is the locale's own weekday names.
+
+    Deliberately ASCII everywhere else: this isolates the question "can the
+    document draw the language the user picked", instead of asking whether one
+    face happens to cover Turkish lesson names AND Korean day names at once.
+    """
+    state = _empty_state(lecturers=["Teacher A"], rooms=["A-101"],
+                         years={"Year 1": ["A"]})
+    _place(state, "D001", "Lesson", "Teacher A", "monday", "09:00",
+           "A-101", "Year 1", "A", 1)
+    return state
+
+
+def pdf_page_count(raw):
+    """Number of page objects in *raw*."""
+    return len(re.findall(rb"/Type\s*/Page[^s]", raw))
+
+
+@pytest.mark.pdf
+@pytest.mark.parametrize("locale", sorted(TRANSLATIONS))
+def test_pdf_either_draws_a_locales_weekday_names_or_says_it_cannot(
+        locale, tmp_path, reportlab_mod, monkeypatch):
+    """Every shipped language: no character is drawn as a silent empty box.
+
+    A failure means a school that picked this language in the first-run gate
+    gets a printed timetable whose day headers are rectangles, with no hint on
+    the page that anything went wrong -- and an archived PDF that cannot be
+    searched for them either, because a .notdef glyph carries no /ToUnicode
+    entry.
+
+    The assertion is the honest invariant, not "every locale renders": the
+    exporter may draw the characters (they must then be recoverable from the
+    /ToUnicode CMap, which is what Ctrl-F and copy-paste resolve through), or
+    it may say it cannot draw them -- but not neither. Which of the two
+    happens depends on the host's fonts, so this passes on a machine with no
+    Cyrillic face and on one with Arial, without asserting either.
+    """
+    from scheduler_app.translations import get_language, set_language
+
+    monkeypatch.setattr("scheduler_app.data_io.exporter._pdf_font_names", None)
+    previous = get_language()
+    set_language(locale)
+    try:
+        wanted = {ord(ch)
+                  for d in DAYS
+                  for ch in tr(f"weekdays.{d}") if ord(ch) > 127}
+        out = tmp_path / f"{locale}.pdf"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            export_schedule(_ascii_state_for_locale(), "pdf", str(out),
+                            mode="everything")
+        control = tmp_path / f"{locale}_control.pdf"
+        set_language("en")
+        export_schedule(_ascii_state_for_locale(), "pdf", str(control),
+                        mode="everything")
+    finally:
+        set_language(previous)
+
+    raw = assert_well_formed_pdf(out)
+    recoverable = pdf_text_layer_codepoints(raw)
+    admitted = set()
+    for w in caught:
+        admitted |= {int(m, 16) for m in re.findall(r"U\+([0-9A-F]{4,6})",
+                                                    str(w.message))}
+
+    unaccounted = wanted - recoverable - admitted
+    assert not unaccounted, (
+        f"locale {locale}: {sorted(hex(c) for c in unaccounted)} are drawn "
+        f"into the PDF with no /ToUnicode mapping (i.e. as .notdef boxes) and "
+        f"the document says nothing about them"
+    )
+
+    if admitted:
+        # It said so on the page too, not only in a warning nobody reads: the
+        # printout is what gets pinned to a noticeboard.
+        assert pdf_page_count(raw) > pdf_page_count(
+            assert_well_formed_pdf(control)), (
+            f"locale {locale}: the exporter knows it cannot draw "
+            f"{sorted(hex(c) for c in admitted)} but the document has no more "
+            f"pages than the fully drawable control -- the note is missing"
+        )
+
+
+@pytest.mark.pdf
+def test_pdf_reports_a_shaped_script_instead_of_drawing_it_unshaped(
+        reportlab_mod, monkeypatch):
+    """An RTL or Indic script is admitted, never substituted into place.
+
+    A failure means the exporter reached for a font that covers Arabic and
+    drew the word with it. Measured: registering ``arial.ttf`` and drawing
+    "العربية" emits ``(\\001\\002\\003\\004\\005\\006\\007) Tj`` -- the seven
+    codepoints in LOGICAL order, each as its isolated form, because reportlab
+    has no bidi and no shaping engine. That prints an Arabic word backwards in
+    disconnected letters, which reads as a real word and is not one; the empty
+    box plus the note says the same thing without pretending.
+
+    Asserted against ``_register_covering_font`` not being consulted, rather
+    than against the produced PDF: whether this machine even has a face that
+    covers Arabic is not something a test may depend on.
+    """
+    from scheduler_app.data_io import exporter
+
+    consulted = []
+    monkeypatch.setattr(
+        exporter, "_register_covering_font",
+        lambda text: consulted.append(text) or ("Fake", "Fake-Bold"))
+    monkeypatch.setattr(exporter, "_pdf_font_names", None)
+
+    _regular, _bold, unprintable = exporter._resolve_pdf_fonts(
+        "Pazartesi العربية")
+
+    assert not consulted, (
+        "the exporter went looking for a font to draw an Arabic run with; "
+        "reportlab would lay it out left to right in isolated forms"
+    )
+    assert unprintable, "the Arabic characters were neither drawn nor reported"
 
 
 @pytest.mark.pdf
