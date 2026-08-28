@@ -390,6 +390,13 @@ class ScheduleOptimizer:
             run = 0
             greedy_stats = {}
             lns_stats = {}
+            # Restarts that actually finished. NOT `run + 1`: the emergency cap
+            # below breaks at the TOP of iteration `run`, before that iteration
+            # does any work, so `run + 1` counts a restart that never happened
+            # and the user is shown one more than they got. This number reaches
+            # them twice -- the post-reschedule toast (ui/app.py) and the
+            # explanation dialog (core/explanation_engine.py).
+            completed_runs = 0
 
             for run in range(n_runs):
                 # Emergency wall-clock cap. `run > 0` guarantees at least one
@@ -548,6 +555,11 @@ class ScheduleOptimizer:
                     global_best_ordered = ordered
                     global_best_generator = generator
 
+                # Last statement of the body: reached only by an iteration that
+                # produced and evaluated a solution. A run whose greedy or LNS
+                # phase was truncated by `_clock_capped` still did, so it counts.
+                completed_runs += 1
+
             # Build heuristic result for potential CP-SAT seeding
             ordered = global_best_ordered
             solution = global_best_solution
@@ -679,8 +691,7 @@ class ScheduleOptimizer:
             after_detailed = tt_scorer.score_detailed(placed_list)
 
             summary = {
-                "runs_completed": min(n_runs, run + 1)
-                                  if global_best_solution else 0,
+                "runs_completed": completed_runs if global_best_solution else 0,
                 "total_time": time.time() - global_start,
                 "before": before_detailed,
                 "after": after_detailed,

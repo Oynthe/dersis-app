@@ -721,3 +721,93 @@ def test_the_lns_phase_stops_at_the_solve_wide_deadline():
         "the same replayed call does no work with an hour of budget either, so "
         "the zero above was not the deadline stopping the search — this test "
         "would pass against an LNS phase that had been stubbed out")
+
+
+# ===========================================================================
+# 7. THE RESTART COUNT THE USER IS SHOWN (ST-SCHED-013)
+# ===========================================================================
+def _count_restarts(preset, **overrides):
+    """Run the production reschedule, counting real greedy-construction phases.
+
+    One ``_greedy_construct`` call is one restart: it is the first thing a
+    multi-start iteration does, and the emergency clock cap breaks *before* it.
+    Returns ``(greedy_phases, summary)``.
+    """
+    from scheduler_app.core import facade
+    from scheduler_app.core.schedule_optimizer import ScheduleOptimizer
+
+    calls = []
+    original = ScheduleOptimizer._greedy_construct
+
+    def spy(self, *args, **kwargs):
+        calls.append(1)
+        return original(self, *args, **kwargs)
+
+    state = make_preset(preset, seed=42)
+    ScheduleOptimizer._greedy_construct = spy
+    try:
+        *_rest, summary = facade.optimized_reschedule_all(
+            state, weights={}, **overrides)
+    finally:
+        ScheduleOptimizer._greedy_construct = original
+    return len(calls), summary
+
+
+@pytest.mark.engine
+def test_runs_completed_counts_restarts_that_actually_ran():
+    """The restart count in the toast must be a count of restarts that happened.
+
+    ``summary['runs_completed']`` is not a diagnostic. ``ui/app.py`` puts it in
+    the post-reschedule toast and ``core/explanation_engine.py`` puts it in the
+    explanation dialog, both as a plain number of search restarts, and it is the
+    user's only evidence for how much search their timetable got.
+
+    It was ``min(n_runs, run + 1)``. The emergency clock cap breaks at the *top*
+    of iteration ``run``, before that iteration does any work, so exactly
+    ``run`` restarts completed and the reported figure was one too many —
+    measured, on every capped configuration: small/1.0 s reported 2 for 1,
+    small/2.0-3.0 s reported 3 for 2, small/5.0 s reported 4 for 3, normal/4.0,
+    8.0 and 21.0 s reported 2 for 1. Uncapped at the shipped 120 s budget it was
+    correct (5 for 5), which is why nothing caught it: the error appears only on
+    the machines that got the least search, and it overstates what they got.
+
+    One consequence worth recording, because it is cited as evidence elsewhere
+    in this tree: the "runs_completed 3-4 of 5" figures in the xfail reason
+    above were produced by this expression, so whatever their author measured
+    was 2-3 restarts, not 3-4.
+
+    Both directions are asserted. A capped solve must report what it ran, and an
+    uncapped one must still report all of them — an off-by-one is as easy to
+    introduce in the other direction, and the uncapped case is the one every
+    user on adequate hardware sees.
+    """
+    # ── Capped: a budget far below what five restarts of `small` cost ──
+    # (measured ~1.0-1.4 s per restart on this machine, so 2 s cannot fit five;
+    # ubuntu-latest is 1.87x faster and still cannot.)
+    phases, summary = _count_restarts("small", multi_start_time_limit=2.0)
+
+    assert summary["deterministic"] is False, (
+        f"the {phases}-restart solve given a 2 s budget reports "
+        "deterministic=True, i.e. the clock cap never fired — this instance "
+        "cannot say anything about how a capped run counts its restarts. "
+        "Lower the budget rather than deleting the assertion.")
+    assert summary["runs_completed"] == phases, (
+        f"the solve ran {phases} greedy-construction phases, i.e. {phases} "
+        f"restarts, and reports runs_completed="
+        f"{summary['runs_completed']}. The user is told they got "
+        f"{summary['runs_completed']} restarts of search when they got "
+        f"{phases}.")
+
+    # ── Uncapped: the same count must survive when nothing is truncated ──
+    phases, summary = _count_restarts(
+        "tiny", multi_start_time_limit=1e9, parallel_workers=-1)
+
+    assert summary["deterministic"] is True, (
+        "the uncapped `tiny` solve reports deterministic=False, so it was "
+        "truncated after all and cannot check the uncapped count")
+    assert summary["runs_completed"] == phases, (
+        f"an uncapped solve ran {phases} restarts and reports "
+        f"runs_completed={summary['runs_completed']}")
+    assert phases > 1, (
+        f"only {phases} restart ran, so this half cannot tell a count of "
+        "restarts apart from a hardcoded 1")
