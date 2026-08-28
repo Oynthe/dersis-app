@@ -66,8 +66,10 @@ from scheduler_app.logic import (
     schedule_counts,
     find_valid_options,
     get_year_color, lighten_color,
-    apply_negotiation_suggestion,
 )
+# ST-ARCH-010: moved out of `logic.py` with the rest of the optimization
+# bridge; see `scheduler_app/core/facade.py`.
+from scheduler_app.core.facade import apply_negotiation_suggestion
 from scheduler_app.feedback_logger import FeedbackLogger
 from scheduler_app.preference_learner import PreferenceLearner
 from scheduler_app import storage

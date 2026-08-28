@@ -1,4 +1,23 @@
-"""Visual constants: colors, dimensions, theme values."""
+"""Shared constants: the search budget, colors, dimensions, theme values.
+
+This module imports nothing, from `scheduler_app` or anywhere else, and that
+is the point: it is where a number goes when two modules that must not import
+each other both need it.
+"""
+
+# ── The shipped search budget (ST-ARCH-010, ST-PERF-001) ─────────────
+# Named because the progress UI needs the same denominators the optimizer
+# actually runs: a second copy of these numbers elsewhere means the bar stops
+# short of the end, or saturates early, the moment the two drift.
+#
+# They live here rather than in `schedule_optimizer` because `solver_worker`
+# needs them too, and `schedule_optimizer` imports `solver_worker` for
+# `SolveCancelled`. Reading them back out of the optimizer meant a deferred
+# import inside `run_reschedule` and the last mutually importing pair in
+# `core`. `schedule_optimizer` re-exports both names, so
+# `schedule_optimizer.DEFAULT_MULTI_START_RUNS` still resolves.
+DEFAULT_MULTI_START_RUNS = 5
+DEFAULT_LNS_ITERATIONS = 200
 
 YEAR_COLORS = [
     "#3B82F6",  # blue
