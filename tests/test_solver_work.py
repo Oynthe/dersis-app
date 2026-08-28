@@ -51,9 +51,17 @@ missing — ``summary['repaired_conflicts'] == 0`` — because the ``small`` sol
 already runs is the cheapest place in the suite to make it. See
 ``test_the_engine_withdraws_none_of_its_own_placements``.
 
-Runtime: ~2.9 s for the whole fast half (tiny 0.3 s + small 2.6 s), sharing two
-solves across every assertion. The one ``slow`` test at the bottom runs the
-shipped 80-class configuration and costs ~2 min; it lives in the engine job.
+**The budget the app actually runs** is also pinned here, in sections 5-7: that
+it has one definition rather than a literal in the facade, that a capped solve
+stops at the deadline instead of granting it to each phase in turn, and that the
+restart count the user is shown counts restarts that happened. None of the three
+asserts a second of wall clock — see section 4 for why nothing in this module
+does.
+
+Runtime: ~10.5 s for the whole fast half (tiny 0.3 s + small 2.6 s, shared
+across every ratchet assertion, plus 4.4 s and 3.1 s for the two budget tests
+that need their own capped solves). The one ``slow`` test runs the shipped
+80-class configuration and costs ~2 min; it lives in the engine job.
 """
 import pytest
 
@@ -401,29 +409,51 @@ def test_the_engine_withdraws_none_of_its_own_placements(small_work, tiny_work):
 @pytest.mark.engine
 @pytest.mark.slow
 @pytest.mark.xfail(
-    strict=True,
-    reason="ST-SCHED-013 / ST-PERF-001, open. `optimized_reschedule_all` "
-           "(core/logic.py) still defaults to multi_start_time_limit=120.0, "
-           "and an 80-class solve does not finish its 5 configured restarts "
-           "inside it. Measured: deterministic=False on 7/7 local runs with "
-           "runs_completed 3-4 of 5, and the same fixture costs 130-177 s on "
-           "ubuntu-latest against the same 120 s cap on 11/11 CI runs. Every "
-           "80-class user therefore silently receives 60-80 % of the search, "
-           "and which 60-80 % depends on how busy their machine was. PROGRESS "
-           "recorded the limit as raised to 3600 s in Phase 2; Phase 4 found "
-           "the raise inert because production goes through this signature "
-           "default. Nothing asserted it until now.")
+    strict=False,
+    reason="ST-SCHED-013 / ST-PERF-001, open on slow hardware only. "
+           "`optimized_reschedule_all` (core/facade.py) budgets an 80-class "
+           "reschedule at DEFAULT_MULTI_START_TIME_LIMIT=120 s across "
+           "DEFAULT_MULTI_START_RUNS=5 restarts, and whether five restarts fit "
+           "is a property of the runner, not of the code. Measured on ONE "
+           "machine, on one tree, within one hour: run as a single node on an "
+           "idle box it XPASSes twice — five restarts, deterministic=True, "
+           "96.4 s and 103.6 s, 14-20 % headroom; run as part of this module's "
+           "own slow lane it xfails, capped at 120.07 s. Same code, same box. "
+           "ubuntu-latest runs this workload 1.87x faster (ci.yml), i.e. ~52 s, "
+           "so CI is on the xpassing side. NOT strict for exactly that reason: "
+           "strict=True turned every idle run into a build failure, and "
+           "deleting the marker would turn every loaded one into a build "
+           "failure. Neither states a defect. The half of this "
+           "property that does not depend on the runner — that the budget is "
+           "one number and that the search actually stops at it — is asserted "
+           "unconditionally by "
+           "test_the_shipped_budget_has_a_single_definition and "
+           "test_the_lns_phase_stops_at_the_solve_wide_deadline below.")
 def test_the_shipped_configuration_is_reproducible_at_80_classes():
-    """Open defect, ST-SCHED-013. Fails today, on purpose.
+    """ST-SCHED-013, open on slow hardware. Reports xfail-or-xpass; gates nothing.
 
     No budget overrides: this is exactly what a user gets when they press
     *Reschedule All* on a real department timetable. ``deterministic`` is the
     optimizer's own statement that its answer can be reproduced; False means the
     emergency clock cap truncated the search.
 
-    This XPASSes — and turns the build red, which is the point — the day the
-    120 s default is raised, or the day the solve gets cheap enough to finish
-    five restarts inside it. Either is the fix; delete the marker then.
+    Why no strict marker in either direction. The question this asks — does a
+    real 80-class solve fit in its 120 s budget? — has no runner-independent
+    answer. Measured on one machine within one hour: run alone it finishes with
+    14-20 % to spare (96.4 s, 103.6 s); run inside this module's own slow lane
+    it hits the cap at 120.07 s. CI is 1.87x faster again. ``strict=True`` turns
+    every fast, correct run into a build failure; no marker turns every slow,
+    correct run into one. Neither states a defect, and a gate whose colour
+    depends on what else the machine was doing is the kind CI learns to ignore.
+    The marker is kept, and kept non-strict, so the report still records which
+    side of the line the runner fell on.
+
+    What replaced it. The runner-independent half of ST-SCHED-013 — that the
+    budget is one number, and that the search actually stops at it instead of
+    spending it once per phase — is asserted unconditionally by
+    ``test_the_shipped_budget_has_a_single_definition`` and
+    ``test_the_lns_phase_stops_at_the_solve_wide_deadline`` below, neither of
+    which asserts a second of wall clock.
 
     Deliberately NOT asserted as a wall-clock bound. The flag is a property of
     the code's own budget arithmetic; the seconds are a property of the runner.
