@@ -8,10 +8,13 @@ safety net for that pipeline.  It covers three separate concerns:
 * **fidelity** — everything the user typed (Turkish characters, nested structures,
   empty containers, placements) must survive a save/load cycle byte-for-byte
   equal at the Python-object level;
-* **confidentiality + integrity** — the bytes on disk must not contain the
-  plaintext, and any damage to them must be *detected* (including damage that
-  carries a valid checksum, which only the AES-GCM tag can catch), reported as
-  the right kind of problem, and never guessed around;
+* **opacity + integrity** — the bytes on disk must not contain the plaintext,
+  and any damage to them must be *detected* (including damage that carries a
+  valid checksum, which only the AES-GCM tag can catch), reported as the right
+  kind of problem, and never guessed around.  Note the word: *opacity*, not
+  *confidentiality*.  The master key is written to ``keys/key.bin`` beside the
+  saves, so these tests say nothing about whether a person with access to the
+  folder can read a timetable — measured, they can (ST-SEC-002);
 * **failure honesty** — a failed load must not mutate, truncate, relocate, or
   delete the very file (or key) the user is trying to recover, and a failed
   *save* must leave the copy it was replacing untouched.
@@ -247,7 +250,15 @@ def test_saved_file_is_encrypted_and_carries_the_egu1_magic(dersis_home, make_pr
     """Guard: the .egu container must be an EGU1 blob with no readable plaintext.
 
     A failure means the "encrypted" save is storing student and staff names in
-    the clear, readable by anyone with access to the Documents folder.
+    the clear, so `strings`, a text editor, or a backup indexer would show them.
+
+    Green does **not** mean the file is confidential.  ``keys/key.bin`` sits in
+    the same ``Documents/Dersis/`` tree as the ciphertext, and a from-scratch
+    container parser using only files under that root recovers the plaintext in
+    about ten lines.  What this test pins is opacity and the container shape —
+    integrity is pinned by the corruption tests below.  See ST-SEC-002 and
+    ``tests/test_readme_claims.py``, which keeps the READMEs from promising more
+    than that.
     """
     state = _realistic_state(make_preset)
     path = _save_path(dersis_home, "encrypted.egu")

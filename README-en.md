@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <sub>Windows installer · macOS <code>.dmg</code> · for the command line, see <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
+  <sub>Windows installer · for the command line, see <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
 </p>
 
 ---
@@ -144,13 +144,18 @@ coordinators, and anyone who needs conflict-free weekly schedules.
 - **Export** the finished timetable to **Excel** (color-coded, multi-sheet), **CSV**, and
   **PDF**.
 
-### Experience and privacy
+### Experience and data handling
 - **Multilingual interface** — more than 20 languages, chosen on first run from a flag-based
   picker (22 flag options), including right-to-left support for Arabic and Persian.
 - **Interactive tutorial** — a guided, spotlight-style walkthrough for new users.
 - **Fully offline** — no network calls of any kind; all features are unlocked locally.
 - **Encrypted local storage** — schedules are saved in an encrypted `.egu` file format
-  (AES-256-GCM) under your `Documents/Dersis/` folder, with autosave.
+  (AES-256-GCM) under your `Documents/Dersis/` folder, with autosave. What that buys you is
+  integrity and opacity: a damaged or edited file is detected instead of silently loaded, and
+  the saves are not readable in a text editor. It is **not** a lock on your data. The key is
+  stored next to the saves, in `Documents/Dersis/keys/key.bin`, so anyone who can open that
+  folder can read the schedules. If you need to keep other people out, use your operating
+  system's account and folder permissions.
 - **In-app bug reporting** — a built-in form prepares an email for you (see
   [Reporting Bugs](#reporting-bugs)); the app itself never transmits anything.
 
@@ -176,20 +181,20 @@ This section is for users who just want to **use** DERSİS, with no programming 
 
 ### On macOS
 
-1. From the [latest release](https://github.com/Oynthe/dersis-app/releases/latest), download
-   the `.dmg` for your Mac:
-   - **Apple Silicon** (M1/M2/M3/M4): `Dersis-<version>-mac-arm64.dmg`
-   - **Intel**: `Dersis-<version>-mac-x64.dmg`
+**There is no ready-made Mac download yet.** Every release published so far carries a single
+file — the Windows installer — and no Mac bundle has ever been attached to one. Earlier
+versions of this README listed Mac files that were never there.
 
-   Not sure? Apple menu →  **About This Mac**: "Apple silicon" → arm64, "Intel" → x64.
-2. Open the `.dmg` and drag **DERSİS** onto the **Applications** folder.
-3. Launch it from Applications or Launchpad.
+The macOS build itself is real and works: on a Mac you can produce a native `Dersis.app` and
+package it, in a few minutes, from the source in this repository. See
+[Running From Source](#running-from-source) for the build steps and
+[`docs/MACOS.md`](docs/MACOS.md) for the Mac-specific guidance.
 
-> **First launch — security warning:** Because DERSİS is currently distributed outside the
-> Mac App Store and may not yet be notarized by Apple, macOS may show a security warning on
-> first launch. Users can open it via **System Settings → Privacy & Security**, or by
-> **right-clicking the app and selecting Open**. Full guidance (including the
-> `xattr -dr com.apple.quarantine` fix) is in [`docs/MACOS.md`](docs/MACOS.md).
+> **First launch — security warning:** an app you built yourself is unsigned, so macOS may
+> show a security warning the first time you open it. Open it via **System Settings →
+> Privacy & Security**, or by **right-clicking the app and selecting Open**. Full guidance
+> (including the `xattr -dr com.apple.quarantine` fix) is in
+> [`docs/MACOS.md`](docs/MACOS.md).
 
 ### On other systems
 
@@ -301,7 +306,7 @@ this exact setup — here is what DERSİS is made of and how the pieces fit toge
 | Heuristic search | Custom heuristic + Large Neighborhood Search | Simulated annealing, genetic algorithms, tabu search |
 | Spreadsheet I/O | openpyxl + pandas | xlsxwriter, csv module only |
 | PDF output | reportlab | WeasyPrint, fpdf2 |
-| Encryption at rest | `cryptography` (AES-256-GCM) | SQLCipher, OS keychain integration |
+| At-rest obfuscation + integrity | `cryptography` (AES-256-GCM), key stored beside the data | SQLCipher, OS keychain integration |
 | Windows packaging | Embeddable Python + Inno Setup | PyInstaller, Nuitka, MSIX |
 | macOS packaging | PyInstaller `.app` → `.dmg` | py2app, Briefcase |
 
@@ -329,9 +334,10 @@ You are welcome to study the structure for your own learning. Note the
 These are **realistic, not-yet-committed** directions, listed so you can judge feasibility.
 Items here are possibilities (*to be confirmed*), not promises.
 
-- **Native Linux package.** Windows (Inno Setup) and macOS (PyInstaller `.dmg`) are now
-  supported; a native Linux package (AppImage / .deb) is a feasible next step since the app
-  code is cross-platform.
+- **Published Mac and Linux builds.** Build scripts exist for Windows (Inno Setup) and macOS
+  (PyInstaller), but only the Windows installer is attached to releases today; publishing the
+  Mac build, and adding a native Linux package (AppImage / .deb), are both feasible next
+  steps since the app code is cross-platform.
 - **macOS notarization.** macOS builds are currently unsigned/ad-hoc; signing with an Apple
   Developer ID and notarizing (to remove the Gatekeeper prompt) is wired for credentials but
   not yet automated in CI.
