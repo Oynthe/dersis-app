@@ -51,9 +51,17 @@ missing — ``summary['repaired_conflicts'] == 0`` — because the ``small`` sol
 already runs is the cheapest place in the suite to make it. See
 ``test_the_engine_withdraws_none_of_its_own_placements``.
 
-Runtime: ~2.9 s for the whole fast half (tiny 0.3 s + small 2.6 s), sharing two
-solves across every assertion. The one ``slow`` test at the bottom runs the
-shipped 80-class configuration and costs ~2 min; it lives in the engine job.
+**The budget the app actually runs** is also pinned here, in sections 5-7: that
+it has one definition rather than a literal in the facade, that a capped solve
+stops at the deadline instead of granting it to each phase in turn, and that the
+restart count the user is shown counts restarts that happened. None of the three
+asserts a second of wall clock — see section 4 for why nothing in this module
+does.
+
+Runtime: ~10.5 s for the whole fast half (tiny 0.3 s + small 2.6 s, shared
+across every ratchet assertion, plus 4.4 s and 3.1 s for the two budget tests
+that need their own capped solves). The one ``slow`` test runs the shipped
+80-class configuration and costs ~2 min; it lives in the engine job.
 """
 import pytest
 
@@ -401,29 +409,51 @@ def test_the_engine_withdraws_none_of_its_own_placements(small_work, tiny_work):
 @pytest.mark.engine
 @pytest.mark.slow
 @pytest.mark.xfail(
-    strict=True,
-    reason="ST-SCHED-013 / ST-PERF-001, open. `optimized_reschedule_all` "
-           "(core/logic.py) still defaults to multi_start_time_limit=120.0, "
-           "and an 80-class solve does not finish its 5 configured restarts "
-           "inside it. Measured: deterministic=False on 7/7 local runs with "
-           "runs_completed 3-4 of 5, and the same fixture costs 130-177 s on "
-           "ubuntu-latest against the same 120 s cap on 11/11 CI runs. Every "
-           "80-class user therefore silently receives 60-80 % of the search, "
-           "and which 60-80 % depends on how busy their machine was. PROGRESS "
-           "recorded the limit as raised to 3600 s in Phase 2; Phase 4 found "
-           "the raise inert because production goes through this signature "
-           "default. Nothing asserted it until now.")
+    strict=False,
+    reason="ST-SCHED-013 / ST-PERF-001, open on slow hardware only. "
+           "`optimized_reschedule_all` (core/facade.py) budgets an 80-class "
+           "reschedule at DEFAULT_MULTI_START_TIME_LIMIT=120 s across "
+           "DEFAULT_MULTI_START_RUNS=5 restarts, and whether five restarts fit "
+           "is a property of the runner, not of the code. Measured on ONE "
+           "machine, on one tree, within one hour: run as a single node on an "
+           "idle box it XPASSes twice — five restarts, deterministic=True, "
+           "96.4 s and 103.6 s, 14-20 % headroom; run as part of this module's "
+           "own slow lane it xfails, capped at 120.07 s. Same code, same box. "
+           "ubuntu-latest runs this workload 1.87x faster (ci.yml), i.e. ~52 s, "
+           "so CI is on the xpassing side. NOT strict for exactly that reason: "
+           "strict=True turned every idle run into a build failure, and "
+           "deleting the marker would turn every loaded one into a build "
+           "failure. Neither states a defect. The half of this "
+           "property that does not depend on the runner — that the budget is "
+           "one number and that the search actually stops at it — is asserted "
+           "unconditionally by "
+           "test_the_shipped_budget_has_a_single_definition and "
+           "test_the_lns_phase_stops_at_the_solve_wide_deadline below.")
 def test_the_shipped_configuration_is_reproducible_at_80_classes():
-    """Open defect, ST-SCHED-013. Fails today, on purpose.
+    """ST-SCHED-013, open on slow hardware. Reports xfail-or-xpass; gates nothing.
 
     No budget overrides: this is exactly what a user gets when they press
     *Reschedule All* on a real department timetable. ``deterministic`` is the
     optimizer's own statement that its answer can be reproduced; False means the
     emergency clock cap truncated the search.
 
-    This XPASSes — and turns the build red, which is the point — the day the
-    120 s default is raised, or the day the solve gets cheap enough to finish
-    five restarts inside it. Either is the fix; delete the marker then.
+    Why no strict marker in either direction. The question this asks — does a
+    real 80-class solve fit in its 120 s budget? — has no runner-independent
+    answer. Measured on one machine within one hour: run alone it finishes with
+    14-20 % to spare (96.4 s, 103.6 s); run inside this module's own slow lane
+    it hits the cap at 120.07 s. CI is 1.87x faster again. ``strict=True`` turns
+    every fast, correct run into a build failure; no marker turns every slow,
+    correct run into one. Neither states a defect, and a gate whose colour
+    depends on what else the machine was doing is the kind CI learns to ignore.
+    The marker is kept, and kept non-strict, so the report still records which
+    side of the line the runner fell on.
+
+    What replaced it. The runner-independent half of ST-SCHED-013 — that the
+    budget is one number, and that the search actually stops at it instead of
+    spending it once per phase — is asserted unconditionally by
+    ``test_the_shipped_budget_has_a_single_definition`` and
+    ``test_the_lns_phase_stops_at_the_solve_wide_deadline`` below, neither of
+    which asserts a second of wall clock.
 
     Deliberately NOT asserted as a wall-clock bound. The flag is a property of
     the code's own budget arithmetic; the seconds are a property of the runner.
@@ -447,3 +477,367 @@ def test_the_shipped_configuration_is_reproducible_at_80_classes():
         "the shipped 80-class reschedule reports deterministic=False "
         f"(runs_completed={summary.get('runs_completed')} of 5). The user got "
         "a partial search whose result depends on their machine's speed.")
+
+
+# ===========================================================================
+# 5. THE SHIPPED BUDGET IS ONE DEFINITION (ST-ARCH-010)
+# ===========================================================================
+def _facade_reschedule_defaults():
+    """The AST of ``optimized_reschedule_all``'s two budget defaults.
+
+    Read from source, not from ``inspect.signature``. A signature reports the
+    *value* 5, which is 5 whether it came from ``DEFAULT_MULTI_START_RUNS`` or
+    from a literal typed next to it — and a literal that happens to agree is
+    precisely the defect this guards. Only the source says which.
+    """
+    import ast
+    import pathlib
+
+    import scheduler_app.core.facade as facade
+
+    tree = ast.parse(pathlib.Path(facade.__file__).read_text(encoding="utf-8"))
+    for node in tree.body:
+        if (isinstance(node, ast.FunctionDef)
+                and node.name == "optimized_reschedule_all"):
+            args = node.args
+            defaults = dict(zip([a.arg for a in args.args][-len(args.defaults):],
+                                args.defaults))
+            return node, defaults
+    raise AssertionError(
+        "optimized_reschedule_all is no longer a module-level def in "
+        "core/facade.py; this guard cannot read its defaults")
+
+
+@pytest.mark.engine
+def test_the_shipped_budget_has_a_single_definition():
+    """ST-ARCH-010 — the budget the app runs must not be a literal in the facade.
+
+    ``core/constants.py`` exists so that the optimizer and the progress bar read
+    one copy of the search budget. But the app does not construct
+    ``ScheduleOptimizer`` directly: every solve a user starts goes
+    ``ui/app.py`` -> ``SolverTask`` -> ``core/solver_worker.run_solve`` ->
+    ``workflow.reschedule`` -> ``facade.optimized_reschedule_all``, with **no
+    budget keywords anywhere on that path**. So the numbers that actually run
+    are this function's signature defaults, and while they were literals there
+    were three copies, not one.
+
+    Measured consequence of the drift that made this test necessary: with
+    ``DEFAULT_MULTI_START_RUNS`` moved to 8 and the facade literal left at 5,
+    ``solver_worker`` scales the bar to 8 runs while the optimizer runs 5, so a
+    solve that completed left the progress bar at 62.5 % — and
+    ``pytest tests/test_solver_worker.py`` stayed green through all of it,
+    because its own guard reads ``ScheduleOptimizer.__init__``'s signature,
+    which follows the constant, and never reaches the facade.
+
+    Asserted from the AST rather than from the values, because equal values are
+    exactly what a shadowing literal looks like from the outside.
+    """
+    import ast
+
+    from scheduler_app.core import constants
+
+    _node, defaults = _facade_reschedule_defaults()
+    expected = {
+        "multi_start_runs": "DEFAULT_MULTI_START_RUNS",
+        "multi_start_time_limit": "DEFAULT_MULTI_START_TIME_LIMIT",
+    }
+    for param, const_name in expected.items():
+        assert param in defaults, (
+            f"`{param}` has no default in optimized_reschedule_all, so the "
+            "production call shape no longer decides the budget; this guard "
+            "cannot see what the app runs")
+        default = defaults[param]
+        assert isinstance(default, ast.Name), (
+            f"optimized_reschedule_all's `{param}` default is a literal "
+            f"({ast.dump(default)}) in core/facade.py. That is the copy the "
+            "app runs and it shadows "
+            f"core.constants.{const_name}; the progress bar in "
+            "core/solver_worker.py is scaled off the constant, so the two "
+            "drift silently and the bar lies. Use the constant.")
+        assert default.id == const_name, (
+            f"optimized_reschedule_all's `{param}` default is `{default.id}`, "
+            f"not `{const_name}` — the budget has a second name again")
+        assert hasattr(constants, const_name), (
+            f"core/constants.py does not define {const_name}")
+
+
+@pytest.mark.engine
+def test_the_budget_constants_are_what_the_optimizer_is_built_with():
+    """Anti-vacuity half of the test above.
+
+    The AST check forbids a second *definition*; this one proves the single
+    definition is the number that reaches ``ScheduleOptimizer``. A facade that
+    imported the constant and then passed something else would satisfy the
+    other test.
+
+    The optimizer is replaced by a recorder that aborts before any search runs,
+    so this costs no solve.
+    """
+    from scheduler_app.core import constants, facade
+    from scheduler_app.core.solver_worker import run_solve
+
+    class _Stop(Exception):
+        pass
+
+    seen = {}
+
+    def _recorder(state, **kwargs):
+        seen.update(kwargs)
+        raise _Stop
+
+    class _FakeWorkflow:
+        """Only what ``run_solve`` touches: it forwards to the facade."""
+
+        def reschedule(self, weights, **kwargs):
+            return facade.optimized_reschedule_all(
+                {"classes": []}, weights=weights, **kwargs)
+
+    original = facade.ScheduleOptimizer
+    facade.ScheduleOptimizer = _recorder
+    try:
+        # The production call shape: solver_worker passes no budget keywords.
+        with pytest.raises(_Stop):
+            run_solve(_FakeWorkflow(), {}, on_progress=None, seed=None,
+                      use_cpsat=False)
+    finally:
+        facade.ScheduleOptimizer = original
+
+    assert seen["multi_start_runs"] == constants.DEFAULT_MULTI_START_RUNS, (
+        f"the app builds the optimizer with multi_start_runs="
+        f"{seen['multi_start_runs']}, but core/constants.py — which "
+        "core/solver_worker.py uses as the progress bar's denominator — says "
+        f"{constants.DEFAULT_MULTI_START_RUNS}")
+    assert (seen["multi_start_time_limit"]
+            == constants.DEFAULT_MULTI_START_TIME_LIMIT), (
+        f"the app builds the optimizer with multi_start_time_limit="
+        f"{seen['multi_start_time_limit']}, but core/constants.py says "
+        f"{constants.DEFAULT_MULTI_START_TIME_LIMIT}. ui/dialogs.py quotes the "
+        "constant to the user as the production budget.")
+
+
+# ===========================================================================
+# 6. THE BUDGET BOUNDS THE WHOLE SOLVE, NOT EACH PHASE (ST-PERF-008)
+# ===========================================================================
+def _capture_lns_calls(preset, budget):
+    """Run the production reschedule, recording every ``_lns_improve`` call.
+
+    Returns ``(solve_start, captured, summary)`` where each entry of
+    ``captured`` is ``(optimizer, args, kwargs, entered_at)``.
+    """
+    import time
+
+    from scheduler_app.core import facade
+    from scheduler_app.core.schedule_optimizer import ScheduleOptimizer
+
+    captured = []
+    original = ScheduleOptimizer._lns_improve
+
+    def spy(self, *args, **kwargs):
+        captured.append((self, args, dict(kwargs), time.time()))
+        return original(self, *args, **kwargs)
+
+    state = make_preset(preset, seed=42)
+    ScheduleOptimizer._lns_improve = spy
+    try:
+        solve_start = time.time()
+        *_rest, summary = facade.optimized_reschedule_all(
+            state, weights={}, multi_start_time_limit=budget)
+    finally:
+        ScheduleOptimizer._lns_improve = original
+    return solve_start, captured, summary, original
+
+
+@pytest.mark.engine
+def test_the_lns_phase_stops_at_the_solve_wide_deadline():
+    """ST-PERF-008's remaining half — a capped solve must not overrun its budget.
+
+    ``multi_start_time_limit`` is documented as "Total time limit across all
+    runs", and PROGRESS recorded the shape of this bug once already in Phase 3:
+    a wall-clock bound sampled every N nodes is not a wall-clock bound. The
+    greedy phase was fixed then and receives an absolute ``deadline``. The LNS
+    phase was not: its emergency check compared ``time.time() - start_time``,
+    a stopwatch started at the top of *that phase*, against
+    ``multi_start_time_limit``, the budget for the *whole solve* — so every
+    phase was entitled to spend the entire budget again.
+
+    Measured through ``optimized_reschedule_all``, the exact signature
+    ``workflow.reschedule`` calls, before the fix:
+
+        normal / 8 s budget    LNS entered at 1.58 s, ran to 9.71 s (1.22x)
+        normal / 21 s budget   LNS entered at 21.01 s, i.e. after the deadline
+        small / 5 s budget     ran to 6.12 s (1.22x)
+
+    and the reporting verifier measured 34.97 s against a 21 s budget (1.66x)
+    on a loaded box. Worst case is ~2x: reach the deadline, then start one more
+    phase and give it the whole budget over again. After the fix the same four
+    configurations overran by 0.00-0.40 s.
+
+    **Why this asserts no number of seconds.** A wall-clock ceiling here would
+    be a gate whose threshold is a property of the runner: ubuntu-latest is
+    1.87x faster than the machine any threshold would be calibrated on and
+    runner variance on identical code is 1.36-1.49x. The two things that are
+    *not* runner-dependent are asserted instead — that the phase is handed the
+    solve-wide deadline, and that it stops when that deadline has passed.
+    """
+    import time
+
+    budget = 4.0
+    solve_start, captured, _summary, real_lns = _capture_lns_calls(
+        "small", budget)
+
+    assert captured, (
+        "the LNS phase never ran on this instance, so it says nothing about "
+        "whether LNS respects the budget")
+
+    # ── 1. The phase is handed the deadline, and it is the SOLVE's ──
+    for i, (_opt, _args, kwargs, _entered) in enumerate(captured):
+        assert kwargs.get("deadline") is not None, (
+            f"LNS phase {i} was started with no `deadline` "
+            f"(kwargs: {sorted(kwargs)}). It can therefore only compare its "
+            "own stopwatch against the whole solve's budget, which is how a "
+            "phase entered one second before the deadline goes on to spend "
+            "the entire budget again.")
+
+    deadlines = {kwargs["deadline"] for _o, _a, kwargs, _e in captured}
+    assert len(deadlines) == 1, (
+        f"the {len(captured)} LNS phases were given {len(deadlines)} different "
+        "deadlines. `multi_start_time_limit` is documented as the total across "
+        "all runs; a per-phase deadline is the defect wearing the fix's name.")
+
+    deadline = deadlines.pop()
+    first_entry = captured[0][3]
+    assert solve_start + budget <= deadline <= first_entry + budget, (
+        f"the deadline is {deadline - solve_start:.2f}s after the solve "
+        f"started, against a {budget}s budget. It must be the solve's own "
+        "start plus the budget — measured between the call into the facade "
+        f"({solve_start - solve_start:.2f}s) and the first LNS phase "
+        f"({first_entry - solve_start:.2f}s).")
+
+    # ── 2. The phase stops when that deadline has passed ──
+    #
+    # Replayed with the arguments the first real phase was given, so this
+    # exercises the shipped call shape rather than a hand-built one. An expired
+    # deadline is checked at the top of the loop, before any occupancy is
+    # touched, so replaying costs nothing and mutates nothing.
+    opt, args, kwargs, _entered = captured[0]
+    opt._clock_capped = False
+    started = time.perf_counter()
+    _solution, stats = real_lns(
+        opt, *args, **{**kwargs, "deadline": time.time() - 1.0})
+    replayed = time.perf_counter() - started
+
+    assert stats["strategy_stats"], (
+        "the replayed phase returned before reaching its loop at all (fewer "
+        "than 3 placements to work with), so this replay proves nothing about "
+        "the deadline")
+    uses = sum(s["uses"] for s in stats["strategy_stats"])
+    assert uses == 0, (
+        f"handed a deadline that passed a second ago, the LNS phase still ran "
+        f"{uses} destroy-repair iterations in {replayed:.2f}s. The budget does "
+        "not bound it.")
+    assert opt._clock_capped is True, (
+        "the LNS phase stopped at the deadline without setting `_clock_capped`, "
+        "so summary['deterministic'] stays True and a truncated, "
+        "machine-speed-dependent timetable claims to be reproducible "
+        "(ST-SCHED-013).")
+
+    # ── 3. Anti-vacuity: it is the deadline that stopped it, not the replay ──
+    opt._clock_capped = False
+    opt.lns_iterations = 3
+    _solution2, stats2 = real_lns(
+        opt, *args, **{**kwargs, "deadline": time.time() + 3600.0})
+    uses2 = sum(s["uses"] for s in stats2["strategy_stats"])
+    assert uses2 > 0, (
+        "the same replayed call does no work with an hour of budget either, so "
+        "the zero above was not the deadline stopping the search — this test "
+        "would pass against an LNS phase that had been stubbed out")
+
+
+# ===========================================================================
+# 7. THE RESTART COUNT THE USER IS SHOWN (ST-SCHED-013)
+# ===========================================================================
+def _count_restarts(preset, **overrides):
+    """Run the production reschedule, counting real greedy-construction phases.
+
+    One ``_greedy_construct`` call is one restart: it is the first thing a
+    multi-start iteration does, and the emergency clock cap breaks *before* it.
+    Returns ``(greedy_phases, summary)``.
+    """
+    from scheduler_app.core import facade
+    from scheduler_app.core.schedule_optimizer import ScheduleOptimizer
+
+    calls = []
+    original = ScheduleOptimizer._greedy_construct
+
+    def spy(self, *args, **kwargs):
+        calls.append(1)
+        return original(self, *args, **kwargs)
+
+    state = make_preset(preset, seed=42)
+    ScheduleOptimizer._greedy_construct = spy
+    try:
+        *_rest, summary = facade.optimized_reschedule_all(
+            state, weights={}, **overrides)
+    finally:
+        ScheduleOptimizer._greedy_construct = original
+    return len(calls), summary
+
+
+@pytest.mark.engine
+def test_runs_completed_counts_restarts_that_actually_ran():
+    """The restart count in the toast must be a count of restarts that happened.
+
+    ``summary['runs_completed']`` is not a diagnostic. ``ui/app.py`` puts it in
+    the post-reschedule toast and ``core/explanation_engine.py`` puts it in the
+    explanation dialog, both as a plain number of search restarts, and it is the
+    user's only evidence for how much search their timetable got.
+
+    It was ``min(n_runs, run + 1)``. The emergency clock cap breaks at the *top*
+    of iteration ``run``, before that iteration does any work, so exactly
+    ``run`` restarts completed and the reported figure was one too many —
+    measured, on every capped configuration: small/1.0 s reported 2 for 1,
+    small/2.0-3.0 s reported 3 for 2, small/5.0 s reported 4 for 3, normal/4.0,
+    8.0 and 21.0 s reported 2 for 1. Uncapped at the shipped 120 s budget it was
+    correct (5 for 5), which is why nothing caught it: the error appears only on
+    the machines that got the least search, and it overstates what they got.
+
+    One consequence worth recording, because it is cited as evidence elsewhere
+    in this tree: the "runs_completed 3-4 of 5" figures in the xfail reason
+    above were produced by this expression, so whatever their author measured
+    was 2-3 restarts, not 3-4.
+
+    Both directions are asserted. A capped solve must report what it ran, and an
+    uncapped one must still report all of them — an off-by-one is as easy to
+    introduce in the other direction, and the uncapped case is the one every
+    user on adequate hardware sees.
+    """
+    # ── Capped: a budget far below what five restarts of `small` cost ──
+    # (measured ~1.0-1.4 s per restart on this machine, so 2 s cannot fit five;
+    # ubuntu-latest is 1.87x faster and still cannot.)
+    phases, summary = _count_restarts("small", multi_start_time_limit=2.0)
+
+    assert summary["deterministic"] is False, (
+        f"the {phases}-restart solve given a 2 s budget reports "
+        "deterministic=True, i.e. the clock cap never fired — this instance "
+        "cannot say anything about how a capped run counts its restarts. "
+        "Lower the budget rather than deleting the assertion.")
+    assert summary["runs_completed"] == phases, (
+        f"the solve ran {phases} greedy-construction phases, i.e. {phases} "
+        f"restarts, and reports runs_completed="
+        f"{summary['runs_completed']}. The user is told they got "
+        f"{summary['runs_completed']} restarts of search when they got "
+        f"{phases}.")
+
+    # ── Uncapped: the same count must survive when nothing is truncated ──
+    phases, summary = _count_restarts(
+        "tiny", multi_start_time_limit=1e9, parallel_workers=-1)
+
+    assert summary["deterministic"] is True, (
+        "the uncapped `tiny` solve reports deterministic=False, so it was "
+        "truncated after all and cannot check the uncapped count")
+    assert summary["runs_completed"] == phases, (
+        f"an uncapped solve ran {phases} restarts and reports "
+        f"runs_completed={summary['runs_completed']}")
+    assert phases > 1, (
+        f"only {phases} restart ran, so this half cannot tell a count of "
+        "restarts apart from a hardcoded 1")

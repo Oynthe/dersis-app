@@ -124,14 +124,21 @@ before the Phase 3 bounds landed and were stale by 2x to 20x):
 ``pytest tests/test_greedy_bounds.py -m "not slow"``   ~5 s
 ``pytest tests/test_greedy_bounds.py``                 ~135 s
 
-The slow half is `test_bounding_does_not_cost_placements` (``small`` ~7 s,
-``normal`` ~123 s — the latter still clock-capped at 120 s by
-``optimized_reschedule_all``'s ``multi_start_time_limit=120.0``) and
-``test_pathological_preset_does_not_exhaust_the_stack`` (~90 s; it raised
+The slow half is `test_bounding_does_not_cost_placements` (``small`` ~12 s,
+``normal`` ~120 s — the latter clock-capped at the shipped
+``DEFAULT_MULTI_START_TIME_LIMIT`` of 120 s) and
+``test_pathological_preset_does_not_exhaust_the_stack`` (~99 s; it raised
 RecursionError at HEAD). The wall-clock pin is now ~5-6 s against its 5 s
-budget, down from 125-291 s at HEAD — it is in the non-slow lane for that
-reason. The bands are machine load, not variance in the code. CI runs
-``-m "not slow"``.
+budget, down from 125-291 s at HEAD. The bands are machine load, not variance in
+the code.
+
+**Which lane this module runs in.** Not the one an earlier version of this
+paragraph claimed. ``test_greedy_phase_respects_the_wall_clock_budget`` carries
+``@pytest.mark.slow`` (line 482) and so does everything else expensive here, so
+the Validate job's ``-m "not slow"`` skips exactly the halves that matter. Since
+ac4ac17 the whole module — slow half included — is collected unfiltered by the
+engine job in ``.github/workflows/ci.yml``, which is where its wall-clock
+assertion and its placement floors actually run.
 """
 import sys
 import time
@@ -576,6 +583,14 @@ def test_greedy_phase_respects_the_wall_clock_budget():
         "— it did not actually solve this instance, so its elapsed time says "
         "nothing")
 
+    # The floor is a fixed 50, NOT a fraction of a measured baseline, and it
+    # must stay that way: a floor derived from a baseline re-introduces the
+    # machine dependence a fixed value avoids. Margin, measured on the audit
+    # machine: 158-159 nodes idle (spread of one), 137-149 under concurrent
+    # load, i.e. 2.7-3.2x. The budget sweep says the same thing from the other
+    # side — the floor survives down to an effective budget of ~1.0 s against
+    # this 5.0 s one, a 5x slowdown, and only collapses below ~0.5 s, where the
+    # pre-search setup (~0.9 s) swallows the budget whole.
     nodes = summary["greedy_stats"]["iterations_used"]
     assert nodes >= 50, (
         f"the greedy phase visited only {nodes} search nodes before stopping. "

@@ -19,6 +19,17 @@ each other both need it.
 DEFAULT_MULTI_START_RUNS = 5
 DEFAULT_LNS_ITERATIONS = 200
 
+# The wall-clock budget one press of *Generate* is allowed to spend, in
+# seconds. It is NOT `ScheduleOptimizer`'s own default (3600.0): the library
+# default is deliberately effectively-unbounded for scripted callers, and the
+# 120 s the app runs was, until now, a literal in `core/facade.py`'s signature
+# -- a third copy that neither this module nor the optimizer could see. It is
+# named here because `ui/dialogs.py` quotes it to the user as "the production
+# budget" and `solver_worker` scales the progress bar against the same
+# arithmetic; `tests/test_solver_work.py` fails if the facade goes back to a
+# literal.
+DEFAULT_MULTI_START_TIME_LIMIT = 120.0
+
 YEAR_COLORS = [
     "#3B82F6",  # blue
     "#10B981",  # green
