@@ -783,6 +783,60 @@ def test_lecturer_names_differing_only_in_case_are_not_silently_split(tmp_path):
         f"lecturers={lecturers}, report={messages(ds.report)}")
 
 
+@pytest.mark.parametrize("first,second", [
+    ("Ada Lovelace", "ada lovelace"),
+    ("AYŞE YILMAZ", "Ayşe Yılmaz"),
+    ("DILEK KAYA", "Dilek Kaya"),
+    ("IRIS MURDOCH", "Iris Murdoch"),
+])
+def test_the_importer_and_the_class_form_agree_on_what_counts_as_one_teacher(
+        tmp_path, first, second):
+    """ST-FUNC-012 — one rule for "same teacher", not two.
+
+    ``state['lecturers']`` is a list of display names and ``cls['lecturer']``
+    holds one of those names, so whatever counts as the same teacher has to
+    count the same way wherever a name is typed. The class form's rule lives in
+    ``SchedulingWorkflow.register_lecturer``; the importer's lives in
+    ``_process_teachers``. This asserts they return the same verdict rather
+    than asserting either verdict, so it stays true whichever way the rule is
+    later sharpened — and goes red the moment only one side is sharpened.
+
+    That is not hypothetical. ``casefold()`` misses the Turkish dotted/dotless
+    I, so ``AYŞE YILMAZ`` and ``Ayşe Yılmaz`` are two teachers on both sides
+    today. Making just the importer Turkish-aware was proposed and measured
+    here: a Turkish fold merges that pair, and also *splits* ``DILEK KAYA`` from
+    ``Dilek Kaya`` and ``IRIS MURDOCH`` from ``Iris Murdoch``, which are one
+    person on both sides today — an ASCII ``I`` folds to ``ı``. So the fold is
+    not a strict improvement, it is a different set of mistakes, and a
+    locale-dependent fold would make one roster merge or split according to a
+    UI setting. Closing it means changing both sides together, with a rule that
+    handles all four rows; the register entry is "name-keyed lecturer identity
+    has no canonical form".
+    """
+    from scheduler_app.core.workflow import SchedulingWorkflow
+
+    probe = {"lecturers": [first]}
+    SchedulingWorkflow.register_lecturer(probe, second)
+    class_form_says_one = len(probe["lecturers"]) == 1
+
+    teachers = [{"teacher_id": "T001", "name": first},
+                {"teacher_id": "T002", "name": second}]
+    path = build_workbook(tmp_path / "agreement.xlsx", teachers=teachers,
+                          classes=[klass("C001"), klass("C002", teacher_id="T002")])
+    ds = load_scheduler_data_from_excel(path)
+    lecturers = ds.state["lecturers"]
+    importer_says_one = (
+        len({n for n in lecturers}) == 1
+        or any(first in line or second in line for line in messages(ds.report))
+    )
+
+    assert importer_says_one == class_form_says_one, (
+        f"the importer and the class form disagree about {first!r} / "
+        f"{second!r}: class form says one teacher = {class_form_says_one}, "
+        f"importer says one teacher = {importer_says_one} "
+        f"(lecturers={lecturers}, report={messages(ds.report)})")
+
+
 # ── Known-defect pins (later phases) ────────────────────────────────────────
 
 @pytest.mark.xfail(strict=True, reason=(
