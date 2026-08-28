@@ -447,3 +447,139 @@ def test_the_shipped_configuration_is_reproducible_at_80_classes():
         "the shipped 80-class reschedule reports deterministic=False "
         f"(runs_completed={summary.get('runs_completed')} of 5). The user got "
         "a partial search whose result depends on their machine's speed.")
+
+
+# ===========================================================================
+# 5. THE SHIPPED BUDGET IS ONE DEFINITION (ST-ARCH-010)
+# ===========================================================================
+def _facade_reschedule_defaults():
+    """The AST of ``optimized_reschedule_all``'s two budget defaults.
+
+    Read from source, not from ``inspect.signature``. A signature reports the
+    *value* 5, which is 5 whether it came from ``DEFAULT_MULTI_START_RUNS`` or
+    from a literal typed next to it — and a literal that happens to agree is
+    precisely the defect this guards. Only the source says which.
+    """
+    import ast
+    import pathlib
+
+    import scheduler_app.core.facade as facade
+
+    tree = ast.parse(pathlib.Path(facade.__file__).read_text(encoding="utf-8"))
+    for node in tree.body:
+        if (isinstance(node, ast.FunctionDef)
+                and node.name == "optimized_reschedule_all"):
+            args = node.args
+            defaults = dict(zip([a.arg for a in args.args][-len(args.defaults):],
+                                args.defaults))
+            return node, defaults
+    raise AssertionError(
+        "optimized_reschedule_all is no longer a module-level def in "
+        "core/facade.py; this guard cannot read its defaults")
+
+
+@pytest.mark.engine
+def test_the_shipped_budget_has_a_single_definition():
+    """ST-ARCH-010 — the budget the app runs must not be a literal in the facade.
+
+    ``core/constants.py`` exists so that the optimizer and the progress bar read
+    one copy of the search budget. But the app does not construct
+    ``ScheduleOptimizer`` directly: every solve a user starts goes
+    ``ui/app.py`` -> ``SolverTask`` -> ``core/solver_worker.run_solve`` ->
+    ``workflow.reschedule`` -> ``facade.optimized_reschedule_all``, with **no
+    budget keywords anywhere on that path**. So the numbers that actually run
+    are this function's signature defaults, and while they were literals there
+    were three copies, not one.
+
+    Measured consequence of the drift that made this test necessary: with
+    ``DEFAULT_MULTI_START_RUNS`` moved to 8 and the facade literal left at 5,
+    ``solver_worker`` scales the bar to 8 runs while the optimizer runs 5, so a
+    solve that completed left the progress bar at 62.5 % — and
+    ``pytest tests/test_solver_worker.py`` stayed green through all of it,
+    because its own guard reads ``ScheduleOptimizer.__init__``'s signature,
+    which follows the constant, and never reaches the facade.
+
+    Asserted from the AST rather than from the values, because equal values are
+    exactly what a shadowing literal looks like from the outside.
+    """
+    import ast
+
+    from scheduler_app.core import constants
+
+    _node, defaults = _facade_reschedule_defaults()
+    expected = {
+        "multi_start_runs": "DEFAULT_MULTI_START_RUNS",
+        "multi_start_time_limit": "DEFAULT_MULTI_START_TIME_LIMIT",
+    }
+    for param, const_name in expected.items():
+        assert param in defaults, (
+            f"`{param}` has no default in optimized_reschedule_all, so the "
+            "production call shape no longer decides the budget; this guard "
+            "cannot see what the app runs")
+        default = defaults[param]
+        assert isinstance(default, ast.Name), (
+            f"optimized_reschedule_all's `{param}` default is a literal "
+            f"({ast.dump(default)}) in core/facade.py. That is the copy the "
+            "app runs and it shadows "
+            f"core.constants.{const_name}; the progress bar in "
+            "core/solver_worker.py is scaled off the constant, so the two "
+            "drift silently and the bar lies. Use the constant.")
+        assert default.id == const_name, (
+            f"optimized_reschedule_all's `{param}` default is `{default.id}`, "
+            f"not `{const_name}` — the budget has a second name again")
+        assert hasattr(constants, const_name), (
+            f"core/constants.py does not define {const_name}")
+
+
+@pytest.mark.engine
+def test_the_budget_constants_are_what_the_optimizer_is_built_with():
+    """Anti-vacuity half of the test above.
+
+    The AST check forbids a second *definition*; this one proves the single
+    definition is the number that reaches ``ScheduleOptimizer``. A facade that
+    imported the constant and then passed something else would satisfy the
+    other test.
+
+    The optimizer is replaced by a recorder that aborts before any search runs,
+    so this costs no solve.
+    """
+    from scheduler_app.core import constants, facade
+    from scheduler_app.core.solver_worker import run_solve
+
+    class _Stop(Exception):
+        pass
+
+    seen = {}
+
+    def _recorder(state, **kwargs):
+        seen.update(kwargs)
+        raise _Stop
+
+    class _FakeWorkflow:
+        """Only what ``run_solve`` touches: it forwards to the facade."""
+
+        def reschedule(self, weights, **kwargs):
+            return facade.optimized_reschedule_all(
+                {"classes": []}, weights=weights, **kwargs)
+
+    original = facade.ScheduleOptimizer
+    facade.ScheduleOptimizer = _recorder
+    try:
+        # The production call shape: solver_worker passes no budget keywords.
+        with pytest.raises(_Stop):
+            run_solve(_FakeWorkflow(), {}, on_progress=None, seed=None,
+                      use_cpsat=False)
+    finally:
+        facade.ScheduleOptimizer = original
+
+    assert seen["multi_start_runs"] == constants.DEFAULT_MULTI_START_RUNS, (
+        f"the app builds the optimizer with multi_start_runs="
+        f"{seen['multi_start_runs']}, but core/constants.py — which "
+        "core/solver_worker.py uses as the progress bar's denominator — says "
+        f"{constants.DEFAULT_MULTI_START_RUNS}")
+    assert (seen["multi_start_time_limit"]
+            == constants.DEFAULT_MULTI_START_TIME_LIMIT), (
+        f"the app builds the optimizer with multi_start_time_limit="
+        f"{seen['multi_start_time_limit']}, but core/constants.py says "
+        f"{constants.DEFAULT_MULTI_START_TIME_LIMIT}. ui/dialogs.py quotes the "
+        "constant to the user as the production budget.")

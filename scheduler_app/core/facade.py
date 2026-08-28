@@ -37,6 +37,10 @@ deferrals load-bearing, and this module has no reason to route through it.
 """
 
 from scheduler_app.core.candidate_generator import CandidateGenerator
+from scheduler_app.core.constants import (
+    DEFAULT_MULTI_START_RUNS,
+    DEFAULT_MULTI_START_TIME_LIMIT,
+)
 from scheduler_app.core.constraint_negotiator import ConstraintNegotiator
 from scheduler_app.core.constraint_validator import ConstraintValidator
 from scheduler_app.core.explanation_engine import ExplanationEngine
@@ -70,8 +74,8 @@ def optimized_auto_place(state, new_cls, weights=None):
 
 def optimized_reschedule_all(state, weights=None, protected_ids=None,
                              progress_callback=None,
-                             multi_start_runs=5,
-                             multi_start_time_limit=120.0,
+                             multi_start_runs=DEFAULT_MULTI_START_RUNS,
+                             multi_start_time_limit=DEFAULT_MULTI_START_TIME_LIMIT,
                              use_cpsat=False, cpsat_time_limit=15.0,
                              parallel_workers=0,
                              seed=DEFAULT_OPTIMIZER_SEED,
@@ -85,6 +89,16 @@ def optimized_reschedule_all(state, weights=None, protected_ids=None,
     Optionally refines with Google OR-Tools CP-SAT constraint solver.
 
     Args:
+        multi_start_runs / multi_start_time_limit: the shipped search budget.
+                          These defaults ARE the budget the app runs — this is
+                          the signature `SchedulingWorkflow.reschedule` calls
+                          with no overrides — so they must not be literals
+                          here. `core.constants` is the one definition;
+                          `solver_worker` scales the progress bar off the same
+                          two names, and a literal reintroduced here would
+                          shadow them silently (measured: the bar stops at
+                          62.5 % on a solve that ran to completion).
+                          `tests/test_solver_work.py` fails on a literal.
         parallel_workers: Number of worker processes for parallel
                           candidate evaluation. 0 = auto, negative = disabled.
         seed: RNG seed; the default makes the result reproducible
