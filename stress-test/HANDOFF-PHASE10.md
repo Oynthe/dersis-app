@@ -195,10 +195,18 @@ adding for parity.
 
 ### 5. The probe files are named after a phase, not a behaviour
 
-Twelve permanent regression tests are called `tests/test_phase9_*.py`. Nothing
-outside them references the names (checked), so renaming is safe and mechanical.
+Twelve permanent regression tests are called `tests/test_phase9_*.py`.
 `test_phase9_b7.py` tells a future reader nothing; `test_feedback_log_health.py`
-would. Low value, zero risk, do it when touching them anyway.
+would.
+
+No *code* references the names (checked with grep across `tests/` and
+`scheduler_app/`), so a rename is mechanical. What does reference them is prose:
+this file, the Phase 9 section of `PROGRESS.md`, and the four Phase 9 commit
+messages — which is the whole argument for renaming them soon rather than
+eventually. Every phase that passes makes the phase-numbered name more useful as
+history and less useful as a description, and the mapping only lives in commits
+someone has to go looking for. If you rename, put the old → new mapping in the
+commit message so `git log -S` still finds the reasoning.
 
 ---
 
