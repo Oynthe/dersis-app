@@ -84,21 +84,31 @@ datas = [
 # open its window.
 #
 # (That 13/45/58 is the reading taken on the tree of the day and is left as
-# recorded — the arithmetic is its own. The package has since grown by one
-# module; do not "fix" the historical figures to match the current count.)
+# recorded — the arithmetic is its own. The package has since grown by two
+# modules; do not "fix" the historical figures to match the current count.)
 #
 # collect_submodules walks the package on disk, so it sees all of them
-# regardless of how they are imported. The count today is 59: measured
-# 2026-08-29, `find scheduler_app -name "*.py"` is 59 files, and an on-disk
-# walk reproducing collect_submodules' semantics yields 8 package names + 51
-# module names = 59, so every .py lives inside a real package and there are no
-# namespace-package orphans. It was already 59 at the Phase 7 merge (82f558e),
-# so this is a stale figure rather than a drift.
+# regardless of how they are imported. The count today is 60: measured
+# 2026-08-29 at ca781f1, `find scheduler_app -name "*.py"` is 60 files, and an
+# on-disk walk reproducing collect_submodules' semantics yields 8 package names
+# + 52 module names = 60, so every .py lives inside a real package and there
+# are no namespace-package orphans.
+#
+# TREAT THAT INTEGER AS A SNAPSHOT, NOT AS STATE. It is true at the commit that
+# writes it and a merge alone can invalidate it without anyone editing this
+# file: 2d060ae wrote "59" and 59 was correct on 2d060ae's tree, but the Phase
+# 8 merge brought in i18n/text_fold.py and made it 60 with this file untouched
+# (`git log --oneline 82f558e..ca781f1 -- Dersis-mac.spec` is that one commit).
+# Re-date it when you re-measure it, or delete it and keep only the sentence
+# below, which is the half that cannot rot.
 #
 # No test asserts the literal count, deliberately: it is a function of the tree
 # and pinning it would turn every new module into a red suite for no gain.
-# tests/test_packaging_manifest.py pins the PROPERTY instead — that every
-# shimmed module is reachable through collect_submodules.
+# tests/test_packaging_manifest.py pins the ONE PROPERTY that makes the count
+# irrelevant — that this spec calls collect_submodules("scheduler_app") at all,
+# rather than naming modules by hand. That is all it checks; it does not walk
+# the package and it does not verify that any particular shimmed module is
+# reachable, so do not read it as a coverage guarantee.
 hiddenimports = [
     "PyQt6",
     "cryptography",

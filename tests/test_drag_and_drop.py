@@ -5,7 +5,7 @@ Why this module exists
 Drag-and-drop is the app's primary editing gesture and, before this file, it
 had **no test at all**. Two measurements, both reproduced in Phase 7:
 
-1. Replace the body of ``SchedulerApp._execute_drop`` (``ui/app.py``:4630) with
+1. Replace the body of ``SchedulerApp._execute_drop`` (``ui/app.py``) with
    a bare ``return`` and the whole CI lane — 859 passed — stays **green**. Every
    drag the user makes could commit nothing and nothing in the suite would say
    so.
@@ -21,7 +21,7 @@ had **no test at all**. Two measurements, both reproduced in Phase 7:
      never fire from it. A protected lesson dropped on another day: production
      ``valid=False``, replica ``valid=True``;
    * it calls ``find_drop_classroom`` with **no ``preferred_rooms``**, while
-     production derives them in ``_get_preferred_rooms`` (``ui/app.py``:4579)
+     production derives them in ``_get_preferred_rooms`` (``ui/app.py``)
      from ``notebook.currentIndex()`` and ``classroom_filter.currentData()``.
      Same lesson, same cell: replica picks the first candidate room, production
      honours the filter.
@@ -29,6 +29,18 @@ had **no test at all**. Two measurements, both reproduced in Phase 7:
    So both ST-ARCH-004 regression guards run against a hand copy. That is
    Phase 6's own lesson — *ask which copy of the code the user runs* — one
    layer down, inside ``tests/``.
+
+Symbol names, never ``file:line``
+---------------------------------
+Measurement 2 above is about a stale line reference, and this module then
+carried seven of its own. Re-measured 2026-08-29 at ca781f1, every
+``ui/app.py`` line number written here was wrong, by +33, +33, +33, +33, +41,
++47 and +117 lines — and the worst of them had been *refreshed* one phase
+earlier, which is the point: re-numbering restores exactly the failure it is
+meant to fix. They are gone; the symbols are stable and greppable, so name
+those. (The two references to other files — ``core/workflow.py``:696-699 for
+the ``same_day`` branch and ``ui/renderer.py``:2052 for ``dragLeaveEvent`` —
+were re-measured too and are both exact, so they stand as written.)
 
 Every test below drives the real ``SchedulerApp`` through the ``make_app``
 fixture, with no refactor of any kind. Nothing here asserts a pixel: the
@@ -40,9 +52,9 @@ Simulating the drag
 -------------------
 ``_execute_drop`` is the *end* of a gesture that Qt starts. The three fields it
 reads — ``_dragging_cls``, ``_dragging_classes``, ``_drag_backup`` and
-``_drag_undo_pushed`` — are set by ``_start_drag_gfx`` (:4416, dragging a
-placed lesson out of the grid) and ``_start_drag_unplaced`` (:4514, dragging
-from the sidebar). Driving those needs a live ``QDrag`` and a rendered
+``_drag_undo_pushed`` — are set by ``_start_drag_gfx`` (dragging a placed
+lesson out of the grid) and ``_start_drag_unplaced`` (dragging from the
+sidebar). Driving those needs a live ``QDrag`` and a rendered
 ``LessonItem``, so the two helpers below reproduce exactly the field
 assignments each of them makes, including ``_start_drag_gfx``'s pre-emptive
 undo snapshot and its ``mark_unplaced`` — the lesson is already off the grid by
@@ -101,7 +113,7 @@ def _add_class(win, name):
 
 
 def _arm_drag_from_grid(win, cls, also=()):
-    """Reproduce `_start_drag_gfx` (app.py:4408) for a placed lesson.
+    """Reproduce `_start_drag_gfx` in `ui/app.py` for a placed lesson.
 
     Order matters and is production's: snapshot the placement, push the
     pre-emptive "unplace" undo entry, raise `_drag_undo_pushed`, *then*
@@ -129,7 +141,7 @@ def _arm_drag_from_grid(win, cls, also=()):
 
 
 def _arm_drag_from_sidebar(win, cls):
-    """Reproduce `_start_drag_unplaced` (app.py:4500).
+    """Reproduce `_start_drag_unplaced` in `ui/app.py`.
 
     The backup is all-None here, which is the case that leaves
     `_get_preferred_rooms` with nothing but the classroom filter to go on.
@@ -243,7 +255,7 @@ def test_the_classroom_filter_is_honoured_by_a_drop(win):
     """ST-ARCH-004 — the second half of the replica's drift.
 
     Production derives an ordered room preference in `_get_preferred_rooms`
-    (app.py:4495) from the classroom tab's filter combo; the replica calls
+    (`ui/app.py`) from the classroom tab's filter combo; the replica calls
     `find_drop_classroom` with none. Both R001 and R002 fit this lesson, so the
     two answers differ: filtered to R002 production must land in R002, and
     anything that stops reading the filter lands in R001, the first candidate.

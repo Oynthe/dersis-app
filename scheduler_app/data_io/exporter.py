@@ -966,7 +966,7 @@ def _register_unicode_fonts() -> "tuple[str, str]":
 # you mean; earlier notes did not, and "9 of 22 locales cannot print their
 # weekday names" was carried forward as a product claim. Driving
 # _resolve_pdf_fonts per locale on a stock Windows install (measured
-# 2026-08-29, weekday names plus the 11 UI keys _pdf_document_text collects)
+# 2026-08-29, weekday names plus the 10 UI keys _pdf_document_text collects)
 # recovers 6 of the 9 from host faces with an EMPTY unprintable set:
 #
 #     az, pl, ru -> arial.ttf      ja -> msgothic.ttc

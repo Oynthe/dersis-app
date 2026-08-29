@@ -11,7 +11,9 @@ sheet headers.
 **Why this module exists, and why it is mostly a falsification harness.** The
 Phase 7 handoff prescribed a *Turkish* fold ('İ'->'i', 'I'->'ı' before the
 ordinary fold) as the fix. It was built and measured and it is a net
-regression: it breaks 43 locale/weekday pairs, plain ASCII ``FRIDAY``,
+regression: it breaks 42 locale/weekday pairs — 84 of this module's 770
+sweep probes; the two figures are in different units and "43" matched
+neither — plain ASCII ``FRIDAY``,
 ``DIENSTAG``, ``LUNDI``, ``DOMINGO`` and the Portuguese ``-FEIRA`` days among
 them, plus ``PAZARTESI`` and ``CUMARTESI``, which the suite already pins green.
 The next agent to read the handoff will reach for that fix. The sweep below is
@@ -203,13 +205,34 @@ def test_the_fold_sends_every_dotted_and_dotless_i_to_a_plain_ascii_i(
 def test_the_fold_is_idempotent_and_blank_safe():
     """Guards the function's own contract (no finding ID).
 
-    Idempotence matters because ``_auto_save`` normalizes on the way out and
-    ``_auto_load`` on the way back in, so every open/save cycle applies the
-    rule twice; a second pass that changed anything would make a file drift a
-    little further every time it was opened. Blank-safety matters because
-    ``fold_text("")`` must never be usable as a dictionary key — it is what
-    ``schema.py`` keys its header map on, and a blank header that folded to a
-    real value would claim a column it does not name.
+    **Scope, because the seven probes below cannot fail.** Measured
+    2026-08-29, exhaustively over 0..0x30000 × {c, c+U+0307, c+U+0307+U+0307}:
+    ``fold_text`` is non-idempotent on exactly EIGHT inputs, and all eight are
+    an i-family letter or an fi/ffi ligature followed by a stray U+0307
+    COMBINING DOT ABOVE — ``'I'``+dot+dot, ``'i'``+dot+dot, U+0130 and U+0131
+    each followed by one or two dots, and U+FB01/U+FB03 followed by two. None
+    of the seven strings here contains a combining mark next to an i-family
+    letter, so what this half pins is *the contract as callers exercise it*,
+    not idempotence in general. Adding a counterexample here would be a
+    request to change the function, not a stronger test of it.
+
+    Idempotence is worth pinning at all because ``_auto_save`` normalizes on
+    the way out and ``_auto_load`` on the way back in — both run
+    ``normalize_state_day_keys`` — so an open/save cycle applies the rule
+    twice. What that cycle cannot do is make a file drift, and the earlier
+    wording here claimed it could: ``normalize_day_value`` returns a member of
+    ``DAY_KEYS`` or ``None`` and nothing else, so the only fold output that is
+    ever persisted is one of the seven ASCII keys, which
+    ``test_the_seven_day_keys_are_fold_stable`` pins as fold-stable
+    separately. No other call site stores a folded value either:
+    ``schema.py`` uses them as in-memory dict keys, importer's
+    ``_room_names_by_type`` and ``_process_teachers`` keep them in locals, and
+    ``register_lecturer`` returns an unfolded spelling.
+
+    Blank-safety matters because ``fold_text("")`` must never be usable as a
+    dictionary key — it is what ``schema.py`` keys its header map on, and a
+    blank header that folded to a real value would claim a column it does not
+    name.
     """
     for raw in ("PAZARTESİ", "SALI", "Çarşamba", "İlhan Demir",
                 "  CUMARTESİ  ", "FRIDAY", "Bazar ertəsi"):

@@ -343,8 +343,13 @@ echo   Total files: %TOTAL%
 echo.
 :: ERRORS was counted above and then only warned about: this script printed its
 :: warning and exited 0, so a CI step calling it saw success. build_nuitka.bat
-:: has always exited 1 here, and its comment claimed both lanes did; that claim
-:: is now true rather than aspirational.
+:: has exited 1 here since Phase 7 (666b160) -- before that it had no ERRORS
+:: branch at all, so "always" was wrong. This script HAS branched on ERRORS
+:: since the first release (d7953a4:271); it only ever echoed a warning and
+:: fell through to exit 0, which is the half this change fixes. Phase 7's
+:: comment in build_nuitka.bat ("build_embed.bat already branches on it; now
+:: both do") was accurate about the branch and said nothing about the exit
+:: code; do not read it as a claim that both lanes already failed.
 if %ERRORS% GTR 0 (
     echo ============================================
     echo  BUILD INCOMPLETE: %ERRORS% critical file^(s^) missing.
