@@ -23,9 +23,16 @@ Findings guarded here
 * **ST-FUNC-010** (fixed in Phase 7) — the row-2 help-text heuristic guessed
   from shape, so a class id written ``9 A`` was eaten as help text and the
   Chinese and Japanese templates' help text was imported as real data.
-* **ST-FUNC-009** — pinned with ``xfail(strict=True)``; scheduled for a later
-  phase, and the suite must go red the moment it starts passing so the pin
-  gets flipped.
+* **ST-FUNC-009** (fixed in Phase 8) — ``required_room_type`` was advertised in
+  the template and whitelisted by the import schema, then discarded, so the
+  app's own shipped template imported its lab class with no room constraint at
+  all and a physics lab could be scheduled into a lecture hall. It is now
+  resolved to room names at import time against the ``room_type`` column of the
+  *same* workbook. The 22-locale sweep below carries the half no single-locale
+  test can: a fix that matches the room's *name* instead of its type is right in
+  Turkish by accident (the lab room is called ``Laboratuvar A`` and typed
+  ``Laboratuvar``, so the name contains the type) and wrong in ``nl`` and
+  ``az``, where the lab room is called ``Lab A`` and typed ``Practicum``.
 * **The generated template must re-import in all 22 shipped languages** —
   Spanish could not (two languages disagree about what a sheet titled *Aulas*
   holds) and Chinese and Japanese imported phantom rows.
@@ -56,6 +63,8 @@ from scheduler_app.core.models import (  # noqa: E402
     LOCATION_LECTURER_OFFICE,
     LOCATION_ONLINE,
     get_location_label,
+    new_class,
+    new_state,
 )
 from scheduler_app.data_io import schema  # noqa: E402
 from scheduler_app.data_io.importer import load_scheduler_data_from_excel  # noqa: E402
@@ -122,19 +131,35 @@ def build_workbook(path, *, classes, teachers=None, rooms=None, branches=None,
     return str(path)
 
 
-def _room_type(kind):
-    return tr(f"template.workbook_example.room_type_{kind}")
-
+# Room types are LITERALS here, not ``tr(...)`` lookups, and that is
+# load-bearing rather than lazy (ST-FUNC-009). ``room_type`` is free text the
+# app never translates: the importer matches a class's type against the Rooms
+# sheet of the *same workbook*, so both sides of the comparison must be the
+# same string, and a school that writes "Atölye" must match too. Pulling these
+# from the catalogue also read the language at *import* time, before conftest's
+# session-wide ``_pinned_language`` fixture switches to Turkish, so the fixture
+# said "Lab" while every test body asking for the same value said
+# "Laboratuvar" — two clocks that could never agree. The xfail on
+# ``test_required_room_type_constrains_the_class_to_matching_rooms`` hid that:
+# the test was red for the fixture's reason, not the importer's.
+ROOM_TYPE_LECTURE = "Derslik"
+ROOM_TYPE_LAB = "Laboratuvar"
 
 DEFAULT_TEACHERS = [
     {"teacher_id": "T001", "name": "Ada Lovelace"},
     {"teacher_id": "T002", "name": "Bora Yildiz"},
 ]
+# Two rooms share the lab type on purpose (ST-FUNC-009). With only one lab,
+# "the type narrows allowed_rooms" and "the type replaces allowed_rooms" produce
+# the same list for every input, so both readings pass every assertion and the
+# intersection rule is untested. Lab 2 is what separates them.
 DEFAULT_ROOMS = [
     {"room_id": "R001", "name": "Oda 1", "capacity": 30,
-     "room_type": _room_type("lecture")},
+     "room_type": ROOM_TYPE_LECTURE},
     {"room_id": "R002", "name": "Lab 1", "capacity": 20,
-     "room_type": _room_type("lab")},
+     "room_type": ROOM_TYPE_LAB},
+    {"room_id": "R003", "name": "Lab 2", "capacity": 20,
+     "room_type": ROOM_TYPE_LAB},
 ]
 DEFAULT_BRANCHES = [
     {"branch_id": "B001", "name": "Grup A"},
@@ -200,7 +225,7 @@ def test_builder_produces_a_clean_importable_workbook(tmp_path):
     assert [e["class_id"] for e in ds.raw_classes] == ["C001", "C002", "C003"]
     assert len(ds.state["classes"]) == 3
     assert ds.state["lecturers"] == ["Ada Lovelace", "Bora Yildiz"]
-    assert ds.state["classrooms"] == ["Oda 1", "Lab 1"]
+    assert ds.state["classrooms"] == ["Oda 1", "Lab 1", "Lab 2"]
 
 
 def test_builder_row_two_description_row_is_skipped(tmp_path):
@@ -656,6 +681,21 @@ def test_the_generated_template_reimports_in_every_shipped_locale(
     Asserted as an exact round-trip rather than "no errors": the zh failure
     mode was extra data, not missing data, and a count-free assertion would
     have passed straight over three phantom entities.
+
+    ST-FUNC-009 rides along here, and this is the only place the *shipped
+    template* is checked. The template's first class asks for the lab *type* and
+    lists no rooms, so the importer has to find the lab room through the Rooms
+    sheet's ``room_type`` column. Matching the room's *name* instead — or
+    matching by substring — is right in Turkish and English purely by accident:
+    there the lab room is called "Laboratuvar A"/"Lab A" and typed
+    "Laboratuvar"/"Lab", so the name contains the type. In ``nl`` the same room
+    is called "Lab A" and typed "Practicum", and ``az`` disagrees the same way.
+
+    Measured, on the substring-of-room-name mutation: this sweep goes red on
+    ``nl`` and ``az`` while its own ``tr`` and ``en`` rows stay green. The
+    hand-built fixture below also catches that mutation, so this is not the sole
+    guard — but it is the only one that would notice the app shipping a template
+    its own importer misreads, and the only one that reads more than one locale.
     """
     ui_language(lang)
 
@@ -683,6 +723,16 @@ def test_the_generated_template_reimports_in_every_shipped_locale(
     assert len(ds.state["classes"]) == 4, (
         f"{lang}: expected the five template rows to merge into four classes, "
         f"got {[c['name'] for c in ds.state['classes']]}")
+
+    # ST-FUNC-009 — the template's class 1 carries required_room_type=lab and a
+    # blank allowed_rooms, and room 2 is the lab room in all 22 locales.
+    by_name = {c["name"]: c for c in ds.state["classes"]}
+    lab_class = by_name[tr("template.workbook_example.class_1_name")]
+    assert lab_class["required_classrooms"] == [
+        tr("template.workbook_example.room_2_name")], (
+        f"{lang}: the template's lab class must be restricted to the room the "
+        f"Rooms sheet types as {tr('template.workbook_example.room_type_lab')!r}, "
+        f"got {lab_class['required_classrooms']}")
 
 
 @pytest.mark.parametrize("workbook_lang", TEMPLATE_LOCALES)
@@ -924,19 +974,17 @@ def test_a_turkish_roster_header_typed_in_capitals_still_names_the_roster(
         f"capitalised header row is rejected as if it were a budget sheet")
 
 
-# ── Known-defect pins (later phases) ────────────────────────────────────────
+# ── Room type constrains the class (ST-FUNC-009) ────────────────────────────
 
-@pytest.mark.xfail(strict=True, reason=(
-    "ST-FUNC-009 — required_room_type is advertised in the template and the "
-    "import schema but never consumed by the importer; fixed in a later phase"))
 def test_required_room_type_constrains_the_class_to_matching_rooms(tmp_path):
     """ST-FUNC-009 — ``required_room_type`` must actually restrict rooms.
 
-    The template tells the user to write "Laboratory" here; today the value is
-    read, validated as a known column, and thrown away, so a physics lab can be
-    scheduled into a lecture hall.
+    The template tells the user to write "Laboratory" here; the value used to be
+    read, validated as a known column, and thrown away, so a physics lab could
+    be scheduled into a lecture hall. A failure here means the user filled in a
+    column the app told them to fill in and the solver ignored it.
     """
-    rows = [klass("C001", required_room_type=_room_type("lab"))]
+    rows = [klass("C001", required_room_type=ROOM_TYPE_LAB)]
     path = build_workbook(tmp_path / "req_type.xlsx", classes=rows)
     ds = load_scheduler_data_from_excel(path)
 
@@ -944,6 +992,130 @@ def test_required_room_type_constrains_the_class_to_matching_rooms(tmp_path):
     required = ds.state["classes"][0]["required_classrooms"]
     assert "Lab 1" in required
     assert "Oda 1" not in required
+
+
+def test_required_room_type_narrows_allowed_rooms_rather_than_replacing_it(tmp_path):
+    """ST-FUNC-009 — two room columns are two restrictions on one set.
+
+    ``allowed_rooms`` narrows from all rooms and ``required_room_type`` narrows
+    by type; neither claims precedence, so they compose by intersection. A
+    failure means the user's hand-typed room list was either widened behind
+    their back (a lab class becomes schedulable in a lecture hall again, which
+    is ST-FUNC-009 itself) or silently replaced by rooms they never listed.
+
+    The exact equality is what does the work: with Lab 2 in the fixture, union
+    gives ``["Oda 1", "Lab 1", "Lab 2"]``, allowed_rooms-wins gives
+    ``["Oda 1", "Lab 1"]`` and type-wins gives ``["Lab 1", "Lab 2"]``. Only
+    intersection gives ``["Lab 1"]``.
+    """
+    rows = [klass("C001", allowed_rooms="Oda 1, Lab 1",
+                  required_room_type=ROOM_TYPE_LAB)]
+    path = build_workbook(tmp_path / "narrow.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    assert ds.state["classes"][0]["required_classrooms"] == ["Lab 1"]
+
+
+def test_a_room_type_no_room_has_is_reported_and_never_widens_the_class(tmp_path):
+    """ST-FUNC-009 — an unmatchable type is a warning, never an empty list.
+
+    Both halves are one invariant, so they are one test. An empty
+    ``required_classrooms`` means "any room" to ``get_physical_room_candidates``,
+    so writing the empty match would take a class the user *restricted* and
+    hand the solver every room in the building — the exact inversion of what
+    the column says. A failure in half (a) means the user is never told their
+    room type matched nothing; a failure in half (b) means a typo in one column
+    silently deleted the rooms they typed in the other.
+    """
+    rows = [klass("C001", required_room_type="Atölye"),
+            klass("C002", required_room_type="Atölye", allowed_rooms="Oda 1")]
+    path = build_workbook(tmp_path / "unknown_type.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    # (a) A warning, not an error — an error refuses the whole workbook.
+    assert ds.report.is_valid, ds.report.summary()
+    assert ds.state["classes"][0]["required_classrooms"] == []
+    reported = [m for m in messages(ds.report)
+                if "Atölye" in m and row_prefix("classes", 2) in m]
+    assert reported, messages(ds.report)
+
+    # (b) The unmatchable type did not empty a list the user typed by hand.
+    assert ds.state["classes"][1]["required_classrooms"] == ["Oda 1"]
+
+
+def test_required_room_type_and_allowed_rooms_that_disagree_keep_the_named_rooms(
+        tmp_path):
+    """ST-FUNC-009 — a naive intersection re-creates the finding right here.
+
+    Both columns are valid and their intersection is empty: the user allowed
+    only ``Oda 1`` (a lecture room) and required the lab type. Writing the empty
+    intersection would mean "any room", so the one class the user constrained
+    twice would end up the *least* constrained class in the file. A failure here
+    means exactly that.
+    """
+    rows = [klass("C001", allowed_rooms="Oda 1",
+                  required_room_type=ROOM_TYPE_LAB)]
+    path = build_workbook(tmp_path / "disagree.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    assert ds.state["classes"][0]["required_classrooms"] == ["Oda 1"]
+    assert [m for m in messages(ds.report) if row_prefix("classes", 2) in m], \
+        messages(ds.report)
+
+
+@pytest.mark.parametrize("shouted,expected", [
+    # Plain ASCII shouting: 'LABORATUVAR' has no I in it at all.
+    (ROOM_TYPE_LAB.upper(), ["Lab 1", "Lab 2"]),
+    # The one that matters in the shipped default language. A Turkish keyboard
+    # with caps lock produces the dotted capital 'İ', and bare str.casefold()
+    # turns it into 'i' + U+0307 COMBINING DOT ABOVE, which does *not* equal the
+    # 'i' in 'Derslik'. Only fold_text collapses the pair.
+    ("DERSLİK", ["Oda 1"]),
+    # Python's own locale-free upper() gives the ASCII I instead, and that must
+    # match the same room — the user cannot tell the two capitals apart.
+    (ROOM_TYPE_LECTURE.upper(), ["Oda 1"]),
+])
+def test_required_room_type_matches_across_letter_case(tmp_path, shouted, expected):
+    """ST-FUNC-009 — a shouted room type is the same room type.
+
+    A user who types LABORATUVAR or DERSLİK in the Classes sheet and
+    Laboratuvar / Derslik in the Rooms sheet means one thing. A failure here
+    means their class quietly lost its room constraint over letter case alone —
+    and for the Turkish rows, over which of the two capital I's their keyboard
+    happens to emit, which no user can be expected to notice.
+
+    Both sides go through ``scheduler_app.i18n.text_fold.fold_text``, the one
+    case rule this app compares user-typed text with; ``tests/test_text_fold.py``
+    owns the rule itself.
+    """
+    rows = [klass("C001", required_room_type=shouted)]
+    path = build_workbook(tmp_path / "shouted.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    assert ds.state["classes"][0]["required_classrooms"] == expected
+
+
+def test_the_room_type_fix_adds_no_new_state_or_class_field(tmp_path):
+    """ST-FUNC-009 — the fix must not smuggle a field past the shape tests.
+
+    ``required_room_type`` is resolved into the existing ``required_classrooms``
+    precisely so that nothing new has to be taught to save/load, to the Edit
+    Class dialog, or to the solver. A later "improvement" that stashes
+    ``cls["required_room_type"]`` or ``state["classroom_types"]`` would reach
+    production invisibly: ``tests/test_domain_shapes.py`` compares the TypedDicts
+    to ``new_class``/``new_state``, so it cannot see a key the *importer* bolts
+    on afterwards. For a user, that key is a constraint that survives import and
+    then vanishes on the first save, with no message.
+    """
+    rows = [klass("C001", required_room_type=ROOM_TYPE_LAB)]
+    path = build_workbook(tmp_path / "no_new_field.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert set(ds.state) == set(new_state())
+    assert set(ds.state["classes"][0]) == set(new_class())
 
 
 def test_class_id_containing_a_space_is_not_silently_dropped(tmp_path):

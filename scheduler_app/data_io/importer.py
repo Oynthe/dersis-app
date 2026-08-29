@@ -158,6 +158,32 @@ def _parse_comma_list(value) -> list:
     return [x.strip() for x in str(value).split(",") if x.strip()]
 
 
+def _room_names_by_type(dataset) -> dict:
+    """``{folded room type: [room names]}`` for the rooms in *this* workbook.
+
+    Built from ``dataset.raw_rooms`` -- the Rooms sheet of the file being read
+    -- and never from the translation catalogues, because the type is free
+    text: the template only *suggests* "Lecture or Lab", and a school that
+    writes "Atolye" must match too, which is only possible when both sides of
+    the comparison come from the same file. Matching the room's *name* instead
+    would appear to work in Turkish, where the lab room is called
+    "Laboratuvar A" and its type is "Laboratuvar"; it fails in Dutch, where the
+    lab room is called "Lab A" and its type is "Practicum" -- and in az, af,
+    da, id and pl for the same reason.
+
+    Both sides go through ``fold_text``, the one case rule this app compares
+    user-typed text with, so a shouted "LABORATUVAR" still finds the room typed
+    "Laboratuvar". Nothing folded here is ever stored: the fold is applied at
+    comparison time only.
+    """
+    index = {}
+    for room in dataset.raw_rooms:
+        folded = fold_text(room.get("room_type"))
+        if folded:
+            index.setdefault(folded, []).append(room["name"])
+    return index
+
+
 def _validate_schema(df, sheet_name: str, required: set, all_cols: set,
                      report: DataValidationReport) -> bool:
     """Validate that a DataFrame has the required columns."""
@@ -329,6 +355,12 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
     _check_duplicates(df, "class_id", tr("labels.classes"), report)
 
     room_names = set(dataset.state.get("classrooms", []))
+    # `_process_rooms` runs before `_process_classes`, so `raw_rooms` is
+    # populated by the time this reads it. `known_types` keeps the user's own
+    # spelling, unfolded, because it goes into a message they read.
+    rooms_by_type = _room_names_by_type(dataset)
+    known_types = sorted({_cell_text(r.get("room_type")) for r in dataset.raw_rooms
+                          if _cell_text(r.get("room_type"))})
 
     for idx, row in df.iterrows():
         row_num = idx + 2
@@ -402,7 +434,24 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
         if target_year:
             cls["targets"] = [{"year": target_year, "branch": branch_name}]
 
-        # Room constraints
+        # Room constraints.
+        #
+        # ST-FUNC-009: `required_room_type` was declared in the schema, written
+        # into the shipped template ("put Laboratuvar here") and then thrown
+        # away, so the template's own C001 -- a lab class -- imported with an
+        # empty `required_classrooms`, which `get_physical_room_candidates`
+        # reads as "any room", and the physics lab was free to land in a
+        # lecture hall. It is resolved to room *names* here rather than carried
+        # into state as a new field: `required_classrooms` is the one room
+        # constraint the solver, the conflict graph, the negotiator and the
+        # class dialog all already read, and a second field would have to be
+        # taught to every one of them, and to save/load, before it meant
+        # anything.
+        #
+        # The type may only *narrow*. Every case where it cannot narrow leaves
+        # the list exactly as `allowed_rooms` left it and says so in the report
+        # -- it never writes an empty list, because empty means "any room",
+        # which is the opposite of what the column says.
         allowed_rooms = _parse_comma_list(row.get("allowed_rooms"))
         excluded_rooms = _parse_comma_list(row.get("excluded_rooms"))
         if allowed_rooms:
@@ -412,6 +461,35 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
                                    tr("errors.unknown_rooms").format(
                                        rooms=", ".join(invalid)))
             cls["required_classrooms"] = [r for r in allowed_rooms if r in room_names]
+
+        required_type = _cell_text(row.get("required_room_type"))
+        if required_type:
+            matching = [r for r in rooms_by_type.get(fold_text(required_type), [])
+                        if r in room_names]
+            if not matching:
+                report.add_warning(
+                    tr("labels.classes"), row_num,
+                    tr("warnings.unknown_room_type").format(
+                        type=required_type,
+                        field=_column_label("classes", "required_room_type"),
+                        # A workbook can type no room at all, and then the list
+                        # is empty; an em dash keeps the sentence from ending on
+                        # a bare colon in all 22 locales without a 23rd key.
+                        known=", ".join(known_types) or "—"))
+            elif not cls["required_classrooms"]:
+                cls["required_classrooms"] = matching
+            else:
+                narrowed = [r for r in cls["required_classrooms"] if r in matching]
+                if narrowed:
+                    cls["required_classrooms"] = narrowed
+                else:
+                    report.add_warning(
+                        tr("labels.classes"), row_num,
+                        tr("warnings.room_type_excludes_allowed_rooms").format(
+                            type=required_type,
+                            type_field=_column_label("classes", "required_room_type"),
+                            rooms_field=_column_label("classes", "allowed_rooms")))
+
         if excluded_rooms:
             cls["excluded_classrooms"] = excluded_rooms
 
