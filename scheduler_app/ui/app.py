@@ -4531,10 +4531,27 @@ class SchedulerApp(QMainWindow):
             for k, v in self._drag_backup.items():
                 cls[k] = v
             # Drag was cancelled — discard the pre-emptive undo snapshot.
-            # Guarded by the flag, not by `if self._undo_stack`: once
-            # _execute_drop has consumed the entry, the top of the stack is
-            # the committed move, and popping it would silently undo the drag
-            # the user just made.
+            #
+            # The flag is belt-and-braces HERE and the old comment overstated
+            # it. It claimed the guard stops us popping an entry
+            # `_execute_drop` has already consumed; measured 2026-08-29, the
+            # enclosing `if not self._drag_success` already excludes that —
+            # `_execute_drop` sets `_drag_success = True` on the only path that
+            # consumes the entry, so control never reaches this line in the
+            # state the old text described. Within `_start_drag_gfx`,
+            # `_drag_undo_pushed` is assigned True above and never cleared
+            # before this read, so `if self._drag_undo_pushed and
+            # self._undo_stack` cannot differ from a bare `if self._undo_stack`
+            # on any path the user can reach.
+            #
+            # It stays because it states the entry's OWNERSHIP rather than its
+            # existence: the flag is this drag's claim on the top of the stack,
+            # and it is what keeps the guard correct if the outer
+            # `if not self._drag_success` is ever refactored or if a second
+            # starter learns to reach this code. `_start_drag_unplaced` pushes
+            # nothing, and a bare `if` there popped an unrelated action —
+            # depth unchanged, which is why it went unnoticed. One cheap
+            # attribute read; no test can tell it from being absent.
             if self._drag_undo_pushed and self._undo_stack:
                 self._undo_stack.pop()
 
@@ -4741,6 +4758,20 @@ class SchedulerApp(QMainWindow):
         #
         # pop + append keeps the depth, so nothing is evicted at _max_undo;
         # the redo clear that _push_undo would have done is made explicit.
+        #
+        # That clear is INERT on every path production reaches, and stays
+        # anyway. Measured 2026-08-29 by instrumenting `_redo_stack.clear`
+        # through a real drag: plant a genuine redo entry (an action, then
+        # Ctrl+Z) — depth 1 — arm a grid drag, and depth is already 0 by the
+        # time control gets here, because `_start_drag_gfx`'s pre-emptive
+        # `_push_undo` cleared it one statement before raising
+        # `_drag_undo_pushed`. No arrangement of the shipped code can leave a
+        # pending redo entry at this line, so no test can tell it from being
+        # absent — one that hand-poked `_redo_stack` in between would pin a
+        # state production cannot produce. It is kept because it makes this
+        # branch's postcondition match `_push_undo`'s in the `else` below
+        # rather than depending on an invariant held in another method; it is
+        # one call on an empty list.
         move_label = tr("actions.move").format(name=cls["name"])
         if self._drag_undo_pushed and self._undo_stack:
             _stale_label, snapshot = self._undo_stack.pop()

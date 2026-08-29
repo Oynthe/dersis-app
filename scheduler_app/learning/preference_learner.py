@@ -111,8 +111,29 @@ class PreferenceLearner:
                 # 12-record log with one flipped bit, cursor 0 every time — and
                 # every future pass re-decrypted and re-discarded the same
                 # bytes (27.8 ms burned per call on a 2 000-record log, on
-                # every manual move). Damaged bytes do not heal and the log is
-                # append-only, so stepping past them loses nothing.
+                # every manual move).
+                #
+                # The log is append-only, so advancing costs nothing NEW. It
+                # is not free, and the earlier claim here -- "damaged bytes do
+                # not heal, so stepping past them loses nothing" -- is false in
+                # the one case this app's own message invites. Measured
+                # 2026-08-29: write 8 records, keep a copy, flip one bit in
+                # each payload (4953 bytes before and after -- the damage does
+                # not change the length), learn() -> cursor 8 / lost 8; then
+                # restore the user's copy and relaunch -> entry_count 8,
+                # 8 readable, persisted cursor 8, learn() returns 0 signals.
+                # Eight intact records, learned from never. And
+                # errors.feedback_log_damaged ends "The file has NOT been
+                # changed", which is precisely an invitation to restore from a
+                # backup, OneDrive history, or a keys/ directory that did not
+                # travel with a copied Dersis folder.
+                #
+                # Open, and deliberately not closed by re-reading from 0, which
+                # is the O(n) cost ST-PERF-005 removed. Detecting a restore
+                # needs a fingerprint of the skipped BYTES (a hash of the span
+                # -- cheap, since it needs no AES-GCM decrypt). A fingerprint
+                # over their LENGTH does not work: the measurement above is the
+                # counterexample.
                 self._learned_through = total
                 self._learned_size = self.feedback_logger.log_size()
                 self._save_weights()

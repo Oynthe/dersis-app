@@ -168,8 +168,15 @@ def _room_names_by_type(dataset) -> dict[str, list[str]]:
     the comparison come from the same file. Matching the room's *name* instead
     would appear to work in Turkish, where the lab room is called
     "Laboratuvar A" and its type is "Laboratuvar"; it fails in Dutch, where the
-    lab room is called "Lab A" and its type is "Practicum" -- and in az, af,
-    da, id and pl for the same reason.
+    lab room is called "Lab A" and its type is "Practicum", and in az, where
+    the room is still "Lab A" and the type is "Laboratoriya". Measured
+    2026-08-29 over all 22 shipped locales, those two are the ONLY ones a
+    name-match loses: in the other 20 it would happen to work. af, da, id and
+    pl were previously listed here with nl and az and do not belong -- their
+    room is "Lab A" *and* their type is "Lab", so a name-match succeeds. That
+    those 20 work is precisely why a name-match is the wrong rule: it is right
+    by coincidence of the template fixtures, and the type column is free text
+    a school fills in itself.
 
     Both sides go through ``fold_text``, the one case rule this app compares
     user-typed text with, so a shouted "LABORATUVAR" still finds the room typed
