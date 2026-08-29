@@ -900,6 +900,14 @@ class SchedulerApp(QMainWindow):
         self._dragging_classes = []
         self._drag_backup = None
         self._drag_success = False
+        # ST-ARCH-012. True between _start_drag_gfx's pre-emptive _push_undo
+        # and whoever consumes it. _execute_drop has to know whether the
+        # entry on top of the stack is THIS drag's: a drag that starts in the
+        # unplaced sidebar (_start_drag_unplaced) pushes nothing, and popping
+        # there destroyed an unrelated action's only snapshot. Measured: the
+        # previous 'unplace' entry was replaced by the drag's, depth unchanged
+        # at 1, and that unplace became permanently un-undoable.
+        self._drag_undo_pushed = False
 
         # Undo / Redo stacks (snapshot-based)
         self._undo_stack = []   # list of (label, classes_snapshot)
@@ -4435,6 +4443,7 @@ class SchedulerApp(QMainWindow):
         # Push undo BEFORE the pre-emptive mark_unplaced so the snapshot
         # captures the original placed state.  Popped later if drag fails.
         self._push_undo(tr("actions.unplace").format(name=cls["name"]))
+        self._drag_undo_pushed = True
         mark_unplaced(cls)
 
         self._dragging_cls = cls
@@ -4488,10 +4497,15 @@ class SchedulerApp(QMainWindow):
         if not self._drag_success:
             for k, v in self._drag_backup.items():
                 cls[k] = v
-            # Drag was cancelled — discard the pre-emptive undo snapshot
-            if self._undo_stack:
+            # Drag was cancelled — discard the pre-emptive undo snapshot.
+            # Guarded by the flag, not by `if self._undo_stack`: once
+            # _execute_drop has consumed the entry, the top of the stack is
+            # the committed move, and popping it would silently undo the drag
+            # the user just made.
+            if self._drag_undo_pushed and self._undo_stack:
                 self._undo_stack.pop()
 
+        self._drag_undo_pushed = False
         self._dragging_cls = None
         self._dragging_classes = []
         self._drag_backup = None
@@ -4518,6 +4532,10 @@ class SchedulerApp(QMainWindow):
             "placed_time": None,
             "placed_classroom": None,
         }
+        # A sidebar drag pushes NO pre-emptive snapshot: nothing has been
+        # unplaced, so there is nothing to restore if it is cancelled.
+        # _execute_drop therefore has to PUSH a new entry, not pop one.
+        self._drag_undo_pushed = False
         self._dragging_cls = drag_classes[0]
         self._dragging_classes = drag_classes
         self._drag_success = False
@@ -4673,12 +4691,31 @@ class SchedulerApp(QMainWindow):
         self._workflow.log_manual_move(
             cls, old_day, old_slot, old_room, day, slot, room)
 
-        # Replace the pre-emptive undo snapshot (pushed by _start_drag_gfx
-        # with an "unplace" label) with a proper "move" snapshot.  The
-        # snapshot data is identical — only the label differs.
-        if self._undo_stack:
-            self._undo_stack.pop()
-        self._push_undo(tr("actions.move").format(name=cls["name"]))
+        # ST-ARCH-012. RE-LABEL the pre-emptive snapshot; do not push a fresh
+        # one. _start_drag_gfx took its snapshot BEFORE its own
+        # mark_unplaced, so it is the only record of where the lesson was --
+        # by the time control gets here mark_unplaced has already run, and a
+        # fresh _push_undo deep-copies the lesson as UNPLACED. That is why one
+        # Ctrl+Z after a drag unplaced the lesson instead of putting it back.
+        # The old comment here claimed "the snapshot data is identical";
+        # measured, the popped entry held (True, 'monday', '09:00', 'R001')
+        # and the replacement held (False, None, None, None).
+        #
+        # The FLAG decides, not `if self._undo_stack`. A drag that started in
+        # the unplaced sidebar pushed nothing, and the bare `if` popped
+        # whatever unrelated action was on top and destroyed it -- depth
+        # unchanged, which is why it went unnoticed.
+        #
+        # pop + append keeps the depth, so nothing is evicted at _max_undo;
+        # the redo clear that _push_undo would have done is made explicit.
+        move_label = tr("actions.move").format(name=cls["name"])
+        if self._drag_undo_pushed and self._undo_stack:
+            _stale_label, snapshot = self._undo_stack.pop()
+            self._undo_stack.append((move_label, snapshot))
+            self._redo_stack.clear()
+        else:
+            self._push_undo(move_label)
+        self._drag_undo_pushed = False
         mark_placed(cls, day, slot, room)
         self._drag_success = True
         self._show_toast(
