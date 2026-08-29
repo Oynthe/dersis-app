@@ -158,7 +158,7 @@ def _parse_comma_list(value) -> list:
     return [x.strip() for x in str(value).split(",") if x.strip()]
 
 
-def _room_names_by_type(dataset) -> dict:
+def _room_names_by_type(dataset) -> dict[str, list[str]]:
     """``{folded room type: [room names]}`` for the rooms in *this* workbook.
 
     Built from ``dataset.raw_rooms`` -- the Rooms sheet of the file being read
@@ -176,7 +176,7 @@ def _room_names_by_type(dataset) -> dict:
     "Laboratuvar". Nothing folded here is ever stored: the fold is applied at
     comparison time only.
     """
-    index = {}
+    index: dict[str, list[str]] = {}
     for room in dataset.raw_rooms:
         folded = fold_text(room.get("room_type"))
         if folded:
