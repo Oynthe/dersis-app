@@ -78,7 +78,8 @@ def _cls(**fields):
     # Turkish labels — the shipped default language, and the case that reaches
     # a real user through an Excel workbook written in Turkish
     ("Pazartesi", "monday"),
-    ("PAZARTESI", "monday"),  # ASCII-I uppercase; see the Turkish-İ xfail below
+    ("PAZARTESI", "monday"),  # ASCII-I uppercase; the dotted-İ spelling is
+                              # covered by the dotted/dotless-I test below
     ("Salı", "tuesday"),
     ("Çarşamba", "wednesday"),
     ("Perşembe", "thursday"),
@@ -104,32 +105,38 @@ def test_a_day_written_any_way_a_user_might_write_it_becomes_one_key(raw, expect
     assert normalize_day_value(raw) == expected
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-ARCH-001 item 9, found by this module — normalize_day_value "
-           "folds case with str.casefold(), which is locale-independent and "
-           "does not implement the Turkish dotted/dotless I. Measured on this "
-           "tree: 'PAZARTESİ'.casefold() == 'pazartesi\\u0307' and "
-           "'SALI'.casefold() == 'sali', neither of which equals the stored "
-           "label 'pazartesi' / 'salı', so both return None. The fix belongs "
-           "in scheduler_app/i18n/day_keys.py and is not in this cluster's "
-           "file set.")
 @pytest.mark.parametrize("raw,expected", [
+    # Turkish, uppercased on a Turkish keyboard or by Excel's UPPER() in a tr
+    # locale: 'i' becomes the dotted 'İ' and 'ı' becomes a plain ASCII 'I'.
     ("PAZARTESİ", "monday"),
     ("SALI", "tuesday"),
+    ("CUMARTESİ", "saturday"),
+    # Azerbaijani, the other shipped Turkic locale. These two need NO Turkish
+    # keyboard: ordinary ASCII str.upper() turns the dotless 'ı' of 'axşamı'
+    # into 'I', which casefold() then sends to a dotted ASCII 'i'.
+    ("ÇƏRŞƏNBƏ AXŞAMI", "tuesday"),
+    ("CÜMƏ AXŞAMI", "thursday"),
 ])
 def test_a_turkish_day_typed_in_capitals_is_still_that_day(raw, expected):
-    """Open defect, ST-ARCH-001 item 9 — the Turkish-İ half. Fails today.
+    """Pins ST-ARCH-001 item 9 — the dotted/dotless-I half.
 
-    Turkish uppercases ``ı`` to ``I`` and ``i`` to ``İ``. A Turkish user (or an
-    Excel workbook with capitalised headers) writing ``SALI`` or ``PAZARTESİ``
-    means Tuesday and Monday; the app resolves both to ``None``, which the
-    normalizer treats exactly like a day that is not on the grid — the
-    allow-list entry is dropped, the placement is un-placed, the pin released.
-    Silent, and only for Turkish, which is the shipped default language.
+    Turkish uppercases ``ı`` to ``I`` and ``i`` to ``İ``. A user (or an Excel
+    workbook with capitalised cells) writing ``SALI`` or ``PAZARTESİ`` means
+    Tuesday and Monday; before the fix the app resolved both to ``None``, which
+    the normalizer treats exactly like a day that is not on the grid — the
+    allow-list entry is dropped, the placement un-placed, the pin released. And
+    because ``normalize_state_day_keys`` runs from ``_auto_save``, the shrunken
+    week is written back to disk on the next debounce tick: a Turkish week
+    typed in capitals came back from open as three days instead of six.
 
-    Ordinary ASCII uppercase already works (``PAZARTESI`` and ``SATURDAY`` are
-    in the table above), so this is specifically the two letters, not casing.
+    It is not "specifically the two letters" and not only Turkish, which is
+    what this docstring used to claim. Measured on this tree: THREE Turkish
+    labels break, not the two that were pinned, and two Azerbaijani ones break
+    under plain ASCII ``.upper()`` on an English-locale machine with no Turkish
+    keyboard anywhere in the story. Ordinary ASCII uppercase does already work
+    (``PAZARTESI`` and ``SATURDAY`` are in the table above), so the axis is the
+    dotted/dotless I specifically — which is exactly what
+    ``scheduler_app.i18n.text_fold.fold_text`` folds, and nothing else.
     """
     assert normalize_day_value(raw) == expected
 

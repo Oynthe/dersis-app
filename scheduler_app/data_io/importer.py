@@ -13,9 +13,10 @@ except ImportError:
     HAS_PANDAS = False
 
 from scheduler_app.models import (
-    new_class, new_state, new_lecturer_availability,
+    class_uses_physical_room, new_class, new_state, new_lecturer_availability,
     normalize_class_data, normalize_state_classes, parse_location_type_label,
 )
+from scheduler_app.i18n.text_fold import fold_text
 from scheduler_app.translations import tr
 from scheduler_app.data_io.schema import (
     canonicalize_workbook_columns,
@@ -157,6 +158,39 @@ def _parse_comma_list(value) -> list:
     return [x.strip() for x in str(value).split(",") if x.strip()]
 
 
+def _room_names_by_type(dataset) -> dict[str, list[str]]:
+    """``{folded room type: [room names]}`` for the rooms in *this* workbook.
+
+    Built from ``dataset.raw_rooms`` -- the Rooms sheet of the file being read
+    -- and never from the translation catalogues, because the type is free
+    text: the template only *suggests* "Lecture or Lab", and a school that
+    writes "Atolye" must match too, which is only possible when both sides of
+    the comparison come from the same file. Matching the room's *name* instead
+    would appear to work in Turkish, where the lab room is called
+    "Laboratuvar A" and its type is "Laboratuvar"; it fails in Dutch, where the
+    lab room is called "Lab A" and its type is "Practicum", and in az, where
+    the room is still "Lab A" and the type is "Laboratoriya". Measured
+    2026-08-29 over all 22 shipped locales, those two are the ONLY ones a
+    name-match loses: in the other 20 it would happen to work. af, da, id and
+    pl were previously listed here with nl and az and do not belong -- their
+    room is "Lab A" *and* their type is "Lab", so a name-match succeeds. That
+    those 20 work is precisely why a name-match is the wrong rule: it is right
+    by coincidence of the template fixtures, and the type column is free text
+    a school fills in itself.
+
+    Both sides go through ``fold_text``, the one case rule this app compares
+    user-typed text with, so a shouted "LABORATUVAR" still finds the room typed
+    "Laboratuvar". Nothing folded here is ever stored: the fold is applied at
+    comparison time only.
+    """
+    index: dict[str, list[str]] = {}
+    for room in dataset.raw_rooms:
+        folded = fold_text(room.get("room_type"))
+        if folded:
+            index.setdefault(folded, []).append(room["name"])
+    return index
+
+
 def _validate_schema(df, sheet_name: str, required: set, all_cols: set,
                      report: DataValidationReport) -> bool:
     """Validate that a DataFrame has the required columns."""
@@ -207,11 +241,13 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
     # (T001's excluded day vanished), the name appeared twice in the lecturer
     # list, and both teachers' classes came back carrying the same string, so
     # the core reads them as one person and refuses to schedule them in
-    # parallel. Names are folded with `casefold()`, the same rule
-    # `SchedulingWorkflow.register_lecturer` uses (ST-UI-020), so the importer
-    # and the class form agree on what counts as a second teacher.
+    # parallel. Names are folded with `scheduler_app.i18n.text_fold.fold_text`,
+    # the same rule `SchedulingWorkflow.register_lecturer` uses (ST-UI-020), so
+    # the importer and the class form agree on what counts as a second teacher.
+    # Both sides must move together or they disagree; that is why the fold
+    # lives in a leaf module both layers can import rather than in either one.
     first_spelling: dict[str, str] = {}
-    duplicate_names: dict[str, list[str]] = {}
+    duplicate_names: list[tuple[int, str, str]] = []
     for idx, row in df.iterrows():
         row_num = idx + 2  # Excel row (1-indexed header + 1-indexed data)
         tid = _cell_text(row["teacher_id"])
@@ -220,9 +256,9 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
             report.add_error(tr("labels.teachers"), row_num, tr("errors.teacher_id_required"))
             continue
 
-        folded = name.casefold()
+        folded = fold_text(name)
         if folded in first_spelling:
-            duplicate_names.setdefault(folded, [first_spelling[folded]]).append(name)
+            duplicate_names.append((row_num, first_spelling[folded], name))
         else:
             first_spelling[folded] = name
 
@@ -244,11 +280,23 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
     # whole (`_import_from_excel` returns on `not report.is_valid`) — a roster
     # imported with one teacher's hours silently overwritten is worse than a
     # roster the user is asked to give two distinct names.
-    for spellings in duplicate_names.values():
-        report.add_error(tr("labels.teachers"), None,
-                         tr("errors.duplicate_values").format(
-                             id_col=_column_label("teachers", "name"),
-                             values=", ".join(spellings)))
+    #
+    # It gets its own key rather than reusing `errors.duplicate_values`, which
+    # `_check_duplicates` uses for genuinely identical teacher_id cells. There
+    # the two printed values are the same string and the word "duplicate"
+    # explains itself; here they are visibly different — "Sıla Kaya, Sila Kaya"
+    # — and the generic message asserts an equality the user can see is false,
+    # which reads as the app being broken rather than as something to fix. The
+    # message therefore names both spellings, states the rule that merged them,
+    # and asks for the remedy the comment above only ever stated to other
+    # programmers. The row number is the colliding row, not None: every other
+    # error in this function carries one (see `errors.teacher_id_required`
+    # above), and without it a 200-row roster gives the user nowhere to look.
+    for row_num, first, second in duplicate_names:
+        report.add_error(tr("labels.teachers"), row_num,
+                         tr("errors.teacher_names_fold_together").format(
+                             field=_column_label("teachers", "name"),
+                             first=first, second=second))
 
     dataset.state["lecturers"] = lecturers
     dataset.state["lecturer_availability"] = availability
@@ -326,6 +374,12 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
     _check_duplicates(df, "class_id", tr("labels.classes"), report)
 
     room_names = set(dataset.state.get("classrooms", []))
+    # `_process_rooms` runs before `_process_classes`, so `raw_rooms` is
+    # populated by the time this reads it. `known_types` keeps the user's own
+    # spelling, unfolded, because it goes into a message they read.
+    rooms_by_type = _room_names_by_type(dataset)
+    known_types = sorted({_cell_text(r.get("room_type")) for r in dataset.raw_rooms
+                          if _cell_text(r.get("room_type"))})
 
     for idx, row in df.iterrows():
         row_num = idx + 2
@@ -399,7 +453,24 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
         if target_year:
             cls["targets"] = [{"year": target_year, "branch": branch_name}]
 
-        # Room constraints
+        # Room constraints.
+        #
+        # ST-FUNC-009: `required_room_type` was declared in the schema, written
+        # into the shipped template ("put Laboratuvar here") and then thrown
+        # away, so the template's own C001 -- a lab class -- imported with an
+        # empty `required_classrooms`, which `get_physical_room_candidates`
+        # reads as "any room", and the physics lab was free to land in a
+        # lecture hall. It is resolved to room *names* here rather than carried
+        # into state as a new field: `required_classrooms` is the one room
+        # constraint the solver, the conflict graph, the negotiator and the
+        # class dialog all already read, and a second field would have to be
+        # taught to every one of them, and to save/load, before it meant
+        # anything.
+        #
+        # The type may only *narrow*. Every case where it cannot narrow leaves
+        # the list exactly as `allowed_rooms` left it and says so in the report
+        # -- it never writes an empty list, because empty means "any room",
+        # which is the opposite of what the column says.
         allowed_rooms = _parse_comma_list(row.get("allowed_rooms"))
         excluded_rooms = _parse_comma_list(row.get("excluded_rooms"))
         if allowed_rooms:
@@ -409,6 +480,221 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
                                    tr("errors.unknown_rooms").format(
                                        rooms=", ".join(invalid)))
             cls["required_classrooms"] = [r for r in allowed_rooms if r in room_names]
+
+        required_type = _cell_text(row.get("required_room_type"))
+        if required_type:
+            # Set by the excluded-rooms fallback below. Once it fires,
+            # `required_classrooms` is no longer the type-resolved list, so the
+            # capacity check that follows would be reporting a list the user
+            # was already told was not applied.
+            fell_back = False
+            # True only once the type has actually *decided*
+            # `required_classrooms`. Both later blocks speak about "the room
+            # type" and about the list the type produced; when the type could
+            # not be applied -- no room has it, or `allowed_rooms` and the type
+            # do not intersect -- `required_classrooms` is still the
+            # `allowed_rooms` list, and a sentence naming the type over that
+            # list names the wrong column, the wrong rooms and the wrong
+            # remedy. `fell_back` already guarded the capacity check against
+            # one of these two paths; this covers the other one, and the
+            # excluded-rooms rescue as well.
+            type_applied = False
+            matching = [r for r in rooms_by_type.get(fold_text(required_type), [])
+                        if r in room_names]
+            if not matching:
+                report.add_warning(
+                    tr("labels.classes"), row_num,
+                    tr("warnings.unknown_room_type").format(
+                        type=required_type,
+                        field=_column_label("classes", "required_room_type"),
+                        # A workbook can type no room at all, and then the list
+                        # is empty; an em dash keeps the sentence from ending on
+                        # a bare colon in all 22 locales without a 23rd key.
+                        known=", ".join(known_types) or "—"))
+            elif not cls["required_classrooms"]:
+                cls["required_classrooms"] = matching
+                type_applied = True
+            else:
+                narrowed = [r for r in cls["required_classrooms"] if r in matching]
+                if narrowed:
+                    cls["required_classrooms"] = narrowed
+                    type_applied = True
+                else:
+                    report.add_warning(
+                        tr("labels.classes"), row_num,
+                        tr("warnings.room_type_excludes_allowed_rooms").format(
+                            type=required_type,
+                            type_field=_column_label("classes", "required_room_type"),
+                            rooms_field=_column_label("classes", "allowed_rooms")))
+
+            # ST-FUNC-009, second contradiction. The block above enforces "the
+            # type may only narrow" against `allowed_rooms`; `excluded_rooms`
+            # is written independently below and can empty the candidate set
+            # just as completely. `get_physical_room_candidates` intersects
+            # required with the live rooms and THEN subtracts excluded, so a
+            # row whose type matches only rooms the same row excludes ends up
+            # with nowhere to go.
+            #
+            # Measured: required_room_type='Laboratuvar' with
+            # excluded_rooms='Lab 1, Lab 2' gave candidates [] where 82f558e --
+            # which discarded the column entirely -- gave ['Oda 1']. So Phase 8
+            # turned a schedulable class into a permanently unplaceable one,
+            # and the import report was empty. Falling back to the pre-type
+            # list restores exactly the old behaviour and says why.
+            #
+            # Gated on `type_applied`, and that gate is provably message-only:
+            # when the type was not applied `required_classrooms` is already
+            # the `allowed_rooms` list (or empty, and then the guard below is
+            # false), so the fallback assigned it the value it already held and
+            # only the sentence reached the user. Measured before the gate, on
+            # required_room_type='Derslik' + allowed_rooms='Lab 1' +
+            # excluded_rooms='Lab 1': the row was told "every room of type
+            # Derslik is also in Excluded Rooms" when the one Derslik room,
+            # Oda 1, was not excluded at all, and told the type "was not
+            # applied -- otherwise this class could never be placed", when the
+            # preceding line had already said the type was not applied and the
+            # class was still unplaceable afterwards. Both clauses false.
+            if type_applied and cls["required_classrooms"] and excluded_rooms:
+                survivors = [r for r in cls["required_classrooms"]
+                             if r not in excluded_rooms]
+                if not survivors:
+                    fallback = ([r for r in allowed_rooms if r in room_names]
+                                if allowed_rooms else [])
+                    # Both sentences below end "...so the room type was not
+                    # applied -- otherwise this class could never be placed
+                    # anywhere". That promise is only true if the fallback
+                    # actually leaves somewhere to go. When every fallback room
+                    # is ALSO excluded the fallback is a no-op and the class is
+                    # unplaceable either way, so the sentence claims a rescue
+                    # that did not happen. Measured on
+                    # `type=Laboratuvar, allowed_rooms='Lab 1',
+                    # excluded_rooms='Lab 1'`: the row's only line said the
+                    # type had been dropped so the class could still be placed,
+                    # while `get_physical_room_candidates` was `[]`.
+                    #
+                    # Staying silent leaves that row unwarned, which is a real
+                    # gap -- but it is the same gap the importer already has for
+                    # any class made unplaceable by `allowed_rooms` alone, it is
+                    # recorded in HANDOFF-PHASE9 §C, and a sentence that is
+                    # false is worse than one that is missing.
+                    # An EMPTY fallback is not "nowhere" — it is "any room", so
+                    # it rescues the class whenever any room at all survives the
+                    # exclusion. Reading it as nowhere silences the no-allowed_rooms
+                    # case, which is the one the rescue was written for.
+                    effective = fallback or sorted(room_names)
+                    rescued = any(r not in excluded_rooms for r in effective)
+                    cls["required_classrooms"] = fallback
+                    # Which sentence is *true* here depends on whether
+                    # `allowed_rooms` did any of the narrowing. With no
+                    # `allowed_rooms`, the resolved list IS `matching`, so
+                    # every room of the type really is excluded. With
+                    # `allowed_rooms`, the empty set is the intersection of
+                    # three columns and rooms of the type can be sitting
+                    # unexcluded outside `allowed_rooms` -- measured, type
+                    # 'Laboratuvar' + allowed 'Oda 1, Lab 1' + excluded 'Lab 1'
+                    # claimed every lab was excluded while Lab 2 was neither.
+                    all_of_type_excluded = all(r in excluded_rooms
+                                               for r in matching)
+                    if all_of_type_excluded:
+                        message = tr("warnings.room_type_all_excluded").format(
+                            type=required_type,
+                            type_field=_column_label("classes", "required_room_type"),
+                            rooms_field=_column_label("classes", "excluded_rooms"))
+                    else:
+                        message = tr("warnings.room_type_allowed_all_excluded").format(
+                            type=required_type,
+                            type_field=_column_label("classes", "required_room_type"),
+                            allowed_field=_column_label("classes", "allowed_rooms"),
+                            excluded_field=_column_label("classes", "excluded_rooms"))
+                    if rescued:
+                        report.add_warning(tr("labels.classes"), row_num, message)
+                    fell_back = True
+
+            # ST-FUNC-009, third contradiction: the resolved list versus the
+            # head count in the very same row. `get_physical_room_candidates`
+            # filters by `required_classrooms` FIRST and by `room_fits_class`
+            # second, so a type that resolves only to rooms too small for
+            # `participants` collapses the candidate set to [] just as
+            # completely as the two cases above.
+            #
+            # The app's own shipped template was such a row: C001 asked for the
+            # lab type with 25 students while the only lab seats 20, and
+            # `generate_excel_template -> load_scheduler_data_from_excel` gave
+            # `is_valid=True`, `warnings: []`, `required ['Laboratuvar A']`,
+            # `candidates []`. The template is repaired at its source
+            # (template.py C001 now says 18), and this catches the user's own
+            # workbook saying the same thing.
+            #
+            # Deliberately a WARNING that changes nothing, not a relaxation:
+            # widening back to "any room" is the exact ST-FUNC-009 inversion
+            # `test_a_room_type_no_room_has_is_reported_and_never_widens_the_class`
+            # exists to catch, and the user may genuinely intend to buy chairs.
+            #
+            # Deliberately NOT left to the solver, even though the solver's own
+            # reason is accurate and localized -- measured on the template, the
+            # unplaced list said "İzin verilen hiçbir dersliğin yeterli
+            # kapasitesi yok". That sentence only arrives after the user has
+            # built a full Setup (days and times) and run a solve, and it
+            # arrives as one line among every other class that failed for
+            # ordinary reasons. This contradiction is between two cells of one
+            # row, both of which the importer is holding at this moment, and
+            # File ▸ Import Excel is where the app promises to "report any
+            # problems before adding the classes".
+            #
+            # Scoped to the type-resolved list on purpose. A class whose
+            # `allowed_rooms` are all too small reaches the same dead end and
+            # is equally silent, but that path behaves exactly as it did at
+            # 82f558e and is not this change's to fix.
+            #
+            # `class_uses_physical_room` is the same predicate `room_fits_class`
+            # and `get_physical_room_candidates` short-circuit on, and this
+            # check is the importer's copy of their arithmetic, so it has to
+            # short-circuit in the same place. An online or lecturer-office
+            # class gets `[None]` from `get_room_candidates` -- the virtual
+            # sentinel, ST-ARCH-004's correct answer -- and places normally;
+            # `normalize_class_data` then discards `required_classrooms`
+            # entirely. Measured before this clause: an online class with
+            # required_room_type='Laboratuvar' and 25 students was told it
+            # "cannot be placed until the room is enlarged, the head count
+            # lowered, or the type changed", about a room list the same
+            # function was about to throw away.
+            #
+            # The gate is `required_classrooms == matching`, i.e. "the type IS
+            # what determines this list", NOT `type_applied`, i.e. "the type
+            # touched this list". Those differ whenever `allowed_rooms` is a
+            # SUBSET of the type's rooms: the intersection narrows to the
+            # allowed list, the flag goes True, and the sentence then quantifies
+            # over the type while the seats it counted came from Allowed Rooms.
+            # Measured with a fourth room Lab 3 / Laboratuvar / 50 and a row of
+            # `required_room_type=Laboratuvar, allowed_rooms=Lab 1,
+            # student_count=25`: "No room of type Laboratuvar seats 25 - the
+            # largest is Lab 1 with 20", every clause of which is false of the
+            # user's own Rooms sheet, and all three remedies it offers are the
+            # wrong cell to edit.
+            #
+            # A class constrained into rooms that are too small by `allowed_rooms`
+            # ALONE is a real and separate gap; it is pre-existing, it is not
+            # this sentence's subject, and it is recorded in HANDOFF-PHASE9 §C.
+            type_decides_the_list = cls["required_classrooms"] == matching
+            if (type_decides_the_list and cls["required_classrooms"]
+                    and not fell_back and class_uses_physical_room(cls)):
+                capacities = dataset.state.get("classroom_capacities", {})
+                # Capacity 0 means unlimited, matching `room_fits_class`; a
+                # class of 0 participants fits anywhere, so it never warns.
+                seats = {r: capacities.get(r, 0) for r in cls["required_classrooms"]}
+                if student_count > 0 and all(
+                        0 < cap < student_count for cap in seats.values()):
+                    biggest = max(seats, key=lambda r: seats[r])
+                    report.add_warning(
+                        tr("labels.classes"), row_num,
+                        tr("warnings.room_type_too_small").format(
+                            type=required_type,
+                            type_field=_column_label("classes", "required_room_type"),
+                            participants=student_count,
+                            count_field=_column_label("classes", "student_count"),
+                            room=biggest,
+                            capacity=seats[biggest]))
+
         if excluded_rooms:
             cls["excluded_classrooms"] = excluded_rooms
 

@@ -1042,3 +1042,74 @@ def test_download_release_tells_a_missing_sidecar_apart_from_an_unreachable_one(
         "the failure must say the sidecar was unreachable rather than absent; "
         "got %r" % message
     )
+
+
+# ── ST-SEC-001: what a workflow rewrite quietly stopped checking ────────────
+
+# The `$required` array from `.github/workflows/build-release.yml`, read at
+# `git show 980887c^:.github/workflows/build-release.yml` lines 101-108 — the
+# commit that deleted that workflow and replaced it with release.yml. Phase 7's
+# replacement carried five of these six forward and dropped
+# `$dist\Dersis.exe`, which is the file installer.iss points every shortcut at.
+#
+# Hard-coded rather than read from git on purpose: the point is to pin what the
+# old lane guaranteed, so the guarantee survives the commit ageing out of
+# anyone's memory. This list may never shrink.
+DELETED_LANE_REQUIRED = (
+    r"$dist\python\pythonw.exe",
+    r"$dist\scheduler_gui.py",
+    r"$dist\VERSION",
+    r"$dist\scheduler_app",
+    r"$dist\Dersis.exe",
+    r"build\version.iss",
+)
+
+
+def test_the_release_lane_verifies_everything_the_old_one_did():
+    """ST-SEC-001 — a rewrite that silently verified less than what it replaced.
+
+    Nobody removed a check on purpose. build-release.yml was deleted, release.yml
+    was written to replace it, and one line of a six-line array did not make the
+    journey — so the lane that publishes to users stopped checking that the
+    launcher exists, and no test noticed because no test compared the two.
+
+    A failure here means the release build can now ship an artefact that the
+    previous pipeline would have rejected. This is a superset assertion rather
+    than an equality: adding checks is progress, losing one is the bug.
+    """
+    from _support.pwsh_parse import powershell_string_array
+
+    verify = None
+    for job in (_workflows()["release.yml"].get("jobs") or {}).values():
+        for step in job.get("steps") or []:
+            if isinstance(step, dict) and step.get("name") == "Verify build output":
+                verify = str(step.get("run") or "")
+    assert verify is not None, (
+        "release.yml has no 'Verify build output' step at all. The workflow that "
+        "it replaced had one, and everything below is about not losing ground "
+        "that was already taken."
+    )
+
+    # The live members of the `$checks` array, not a substring search over the
+    # step body. Those are not the same test: a PowerShell `#` leaves the path
+    # in the body and removes it from the array, so the substring form this
+    # replaced was a pin against deletion only. Measured — commenting out
+    # `"$dist\Dersis.exe"` kept it green; deleting the line went red.
+    # Compared unexpanded, because DELETED_LANE_REQUIRED holds the `$dist`
+    # forms the old workflow's own array used.
+    checks = powershell_string_array(verify, "checks")
+    assert checks, (
+        "release.yml's 'Verify build output' step no longer has a readable "
+        "`$checks = @( ... )` array. Whatever replaced it has to be parsed "
+        "here too — this test is worth nothing if it cannot see the list."
+    )
+
+    lost = [item for item in DELETED_LANE_REQUIRED if item not in checks]
+    assert not lost, (
+        "release.yml's 'Verify build output' array no longer contains %s (its "
+        "live members are %s). The "
+        "build-release.yml it replaced (980887c^, lines 101-108) checked every "
+        "one of %s. Losing a check during a rewrite is invisible in review — "
+        "the diff shows a new file, not a missing line — so it is pinned here."
+        % (lost, checks, list(DELETED_LANE_REQUIRED))
+    )

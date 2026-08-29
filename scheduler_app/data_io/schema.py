@@ -1,5 +1,6 @@
 """Localized workbook schema helpers for Excel import/export templates."""
 
+from scheduler_app.i18n.text_fold import fold_text
 from scheduler_app.translations import TRANSLATIONS, tr
 
 
@@ -114,12 +115,12 @@ def get_workbook_sheet_description_texts(sheet_id):
 def get_workbook_sheet_reverse_header_map(sheet_id):
     reverse = {}
     for field, label_key, _ in WORKBOOK_SHEETS[sheet_id]["columns"]:
-        reverse[_normalize_label(field).casefold()] = field
-        reverse[_normalize_label(tr(label_key) or field).casefold()] = field
+        reverse[fold_text(_normalize_label(field))] = field
+        reverse[fold_text(_normalize_label(tr(label_key) or field))] = field
         for lang_dict in TRANSLATIONS.values():
             label = _normalize_label(lang_dict.get(label_key, field))
             if label:
-                reverse[label.casefold()] = field
+                reverse[fold_text(label)] = field
     return reverse
 
 
@@ -148,14 +149,14 @@ def is_lecturer_name_header(label):
     Every catalogue is consulted, not just the active one, so a roster exported
     before a language change still imports afterwards.
     """
-    candidate = _normalize_label(label).casefold()
+    candidate = fold_text(_normalize_label(label))
     if not candidate:
         return False
     for key in LECTURER_NAME_HEADER_KEYS:
-        if candidate == _normalize_label(tr(key)).casefold():
+        if candidate == fold_text(_normalize_label(tr(key))):
             return True
         for lang_dict in TRANSLATIONS.values():
-            if candidate == _normalize_label(lang_dict.get(key, "")).casefold():
+            if candidate == fold_text(_normalize_label(lang_dict.get(key, ""))):
                 return True
     return False
 
@@ -188,7 +189,7 @@ def get_workbook_sheet_alias_candidates():
     candidates = {}
     for sheet_id in WORKBOOK_SHEETS:
         for name in get_workbook_sheet_titles(sheet_id):
-            bucket = candidates.setdefault(name.casefold(), [])
+            bucket = candidates.setdefault(fold_text(name), [])
             if sheet_id not in bucket:
                 bucket.append(sheet_id)
     return candidates
@@ -212,7 +213,7 @@ def resolve_workbook_sheet_ids(sheet_names):
     resolved = {}
     ambiguous = []
     for actual_name in sheet_names:
-        sheet_ids = candidates.get(_normalize_label(actual_name).casefold())
+        sheet_ids = candidates.get(fold_text(_normalize_label(actual_name)))
         if not sheet_ids:
             continue
         if len(sheet_ids) == 1:
@@ -230,8 +231,8 @@ def resolve_workbook_sheet_ids(sheet_names):
         # own language breaks the tie; with a complete workbook this branch
         # never decides anything, which the round-trip tests pin.
         for sheet_id in free:
-            if _normalize_label(actual_name).casefold() == \
-                    get_workbook_sheet_title(sheet_id).casefold():
+            if fold_text(_normalize_label(actual_name)) == \
+                    fold_text(get_workbook_sheet_title(sheet_id)):
                 resolved[sheet_id] = actual_name
                 break
         else:
@@ -243,6 +244,6 @@ def canonicalize_workbook_columns(sheet_id, columns):
     reverse = get_workbook_sheet_reverse_header_map(sheet_id)
     renamed = {}
     for column in columns:
-        key = _normalize_label(column).casefold()
+        key = fold_text(_normalize_label(column))
         renamed[column] = reverse.get(key, column)
     return renamed

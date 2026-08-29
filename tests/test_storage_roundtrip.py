@@ -31,6 +31,7 @@ import hashlib
 import json
 import math
 import os
+import struct
 
 import pytest
 
@@ -464,50 +465,119 @@ def test_malformed_key_bin_fails_loudly_instead_of_minting_a_new_key(dersis_home
 
 # ── 5. ST-FUNC-007 — legacy plain-JSON saves ─────────────────────────────────
 #
-# _is_fernet_token() returns True for any blob whose first 80 bytes decode as
-# ASCII, so a plain-JSON file made of ASCII is routed to the Fernet branch and
-# dies there, while the *same* file with a Turkish letter near the front takes
-# the plain-JSON branch and loads. The two tests below pin both halves.
+# FIXED Phase 8. ``_is_fernet_token()`` used to return True for any blob whose
+# first 80 bytes decode as ASCII, so a plain-JSON file made of ASCII was routed
+# to the Fernet branch and died there, while the *same* file with a Turkish
+# letter near the front took the plain-JSON branch and loaded. The predicate now
+# asks the positive question — ``token.startswith(b"gAAAAA")``, which is what
+# urlsafe-base64 of Fernet's fixed 0x80 version byte plus a pre-2106 timestamp
+# always produces.
+#
+# The four tests below BRACKET that discriminator, and that is the point: a
+# constant-True ``_is_fernet_token`` fails the three negative ones, a
+# constant-False one fails the positive one. The old heuristic was one-sided and
+# nothing caught it.
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-FUNC-007 — _is_fernet_token() treats any ASCII blob as a Fernet "
-           "token, so ASCII plain-JSON legacy saves are misrouted and fail; "
-           "unscheduled in 14-implementation-roadmap.md")
 def test_legacy_plain_ascii_json_save_loads(dersis_home):
     """ST-FUNC-007: a legacy unencrypted JSON save written in ASCII must load.
 
-    A failure (today) means a user upgrading from an old DERSİS build cannot
-    open their own pre-encryption save file — it is rejected as undecryptable.
+    A failure means a user upgrading from an old DERSİS build cannot open their
+    own pre-encryption save file — it is rejected as undecryptable.
     """
     path = _save_path(dersis_home, "legacy_ascii.json")
     payload = {"days": ["monday"], "slots": ["09:00"], "note": "plain ascii"}
+    blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     with open(path, "wb") as f:
-        f.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        f.write(blob)
 
     assert storage.load_encrypted(path) == payload
+    # The same claim its Turkish twin below has always made. It is what catches
+    # a "fix" that routes ASCII JSON through the Fernet branch's auto-upgrade
+    # (which calls save_encrypted and rewrites the file) instead of through the
+    # plain-JSON branch, which never touches the bytes.
+    assert open(path, "rb").read() == blob, (
+        "loading a legacy plain-JSON file rewrote it in place")
 
 
 def test_legacy_plain_json_with_turkish_text_loads(dersis_home):
-    """ST-FUNC-007 (inverse half): non-ASCII plain JSON loads fine today.
+    """ST-FUNC-007 (the half that always worked): non-ASCII plain JSON loads.
 
     Kept as a guard so the ST-FUNC-007 fix does not "solve" the asymmetry by
-    breaking the half that currently works. A failure means legacy Turkish saves
+    breaking the half that already worked. A failure means legacy Turkish saves
     stopped opening.
     """
     path = _save_path(dersis_home, "legacy_turkish.json")
-    # The Turkish letters must land inside the first 80 bytes — that is the
-    # window _is_fernet_token() inspects.
     payload = {"ders": "Türkçe Öğretmenliği ışİĞŞ", "note": "legacy"}
     blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    # Kept as documentation of *why this half worked before the fix*, not as a
+    # statement about how the file is routed now: the first-80-bytes ASCII
+    # window decided everything until Phase 8 and decides nothing since. The
+    # same precedent as ST-DATA-013's rewritten reason strings in this module —
+    # a stale reason is rewritten, not deleted, because deleting it is how the
+    # next reader loses the story. It is also this pair's anti-vacuity check:
+    # the payload has to keep carrying non-ASCII for the pair to be a pair.
     with pytest.raises(UnicodeDecodeError):
-        blob[:80].decode("ascii")  # documents *why* this half works
+        blob[:80].decode("ascii")
     with open(path, "wb") as f:
         f.write(blob)
 
     assert storage.load_encrypted(path) == payload
     assert open(path, "rb").read() == blob, (
         "loading a legacy plain-JSON file rewrote it in place")
+
+
+def test_a_legacy_ascii_json_array_loads_too(dersis_home):
+    """ST-FUNC-007: a legacy feedback log is an ASCII JSON *array*, not a dict.
+
+    A second production path, not just File > Open: ``load_encrypted_lines``
+    falls back to ``load_encrypted`` for any file without the ``EGL1`` magic, so
+    before the fix an old array-shaped feedback log was misrouted to the Fernet
+    branch exactly like a save was. A failure means an upgrading user's whole
+    learned history reads back empty.
+    """
+    path = _save_path(dersis_home, "legacy_log.json")
+    payload = [{"event": "manual_move", "n": 1},
+               {"event": "correction", "n": 2}]
+    blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    with open(path, "wb") as f:
+        f.write(blob)
+
+    assert storage.load_encrypted(path) == payload
+    assert storage.load_encrypted_lines_report(path) == (payload, 0), (
+        "a readable legacy array log reported a loss, or came back empty")
+
+
+def test_a_real_fernet_token_is_still_routed_to_the_fernet_branch(dersis_home):
+    """ST-FUNC-007: the fix narrows the heuristic; it must not remove it.
+
+    A failure means the fix degenerated into "delete the legacy Fernet branch",
+    and a user whose pre-DERSİS build wrote Fernet-encrypted files can no longer
+    open them at all.
+    """
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key()
+    keys = os.path.join(str(dersis_home), storage.KEYS_DIR)
+    os.makedirs(keys, exist_ok=True)
+    with open(os.path.join(keys, "scheduler.key"), "wb") as f:
+        f.write(key)
+
+    payload = {"ders": "Türkçe", "n": 1}
+    token = Fernet(key).encrypt(
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+    assert token.startswith(b"gAAAAA"), (
+        "anti-vacuity: the cryptography package stopped producing the token "
+        "shape the predicate keys on, so this test would pass for the wrong "
+        "reason (got %r)" % (token[:8],))
+
+    path = _save_path(dersis_home, "legacy_fernet.egu")
+    with open(path, "wb") as f:
+        f.write(token)
+
+    assert storage.load_encrypted(path) == payload
+    assert open(path, "rb").read()[:4] == storage._MAGIC, (
+        "the Fernet branch's auto-upgrade did not fire: the file was read but "
+        "not re-saved in the current format")
 
 
 # ── 6. ST-DATA-013 — JSON type fidelity ──────────────────────────────────────
@@ -709,9 +779,10 @@ def test_the_json_hazard_walker_can_actually_see_a_hazard():
 def test_load_encrypted_lines_returns_empty_for_a_missing_file(dersis_home):
     """Guard: "no log yet" must stay a silent, empty result.
 
-    This is the companion to the ST-DATA-002 pin below: the fix has to make a
-    *corrupt* log loud without making a *missing* one loud. A failure means a
-    first run — where no feedback log exists — starts throwing at the user.
+    This is the companion to the ST-DATA-002 guards below: the fix had to make
+    a *corrupt* log loud without making a *missing* one loud. A failure means a
+    first run — where no feedback log exists — starts reporting damage that is
+    not there, and the user is told their history is broken on day one.
     """
     path = os.path.join(str(dersis_home), storage.LOGS_DIR, "never_written.egu")
     assert not os.path.exists(path)
@@ -719,27 +790,354 @@ def test_load_encrypted_lines_returns_empty_for_a_missing_file(dersis_home):
     assert not os.path.exists(path), "reading a missing log created one"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-DATA-002 — load_encrypted_lines catches every exception and "
-           "returns [], so a corrupt log is indistinguishable from an empty "
-           "one; unscheduled by ID in 14-implementation-roadmap.md, listed as "
-           "Related on the Phase 1 ST-DATA-001 row")
-def test_load_encrypted_lines_does_not_swallow_corruption(dersis_home):
-    """ST-DATA-002: a damaged log must raise, not masquerade as an empty log.
+def _damaged_log(dersis_home, entries, damage):
+    """Write an EGL1 log, apply *damage* to a bytearray of it, return the path.
 
-    A failure (today) means DERSİS reports "no feedback history" when the
-    history is actually there but unreadable — and the user never learns that
-    anything went wrong.
+    Guards its own fixture: the file must actually come back as ``EGL1``, or
+    every assertion downstream is about some other format.
     """
     path = os.path.join(str(dersis_home), storage.LOGS_DIR, "feedback.egu")
-    storage.save_encrypted_lines([{"a": 1}, {"b": 2}], path)
-    blob = open(path, "rb").read()
+    storage.save_encrypted_lines(entries, path)
+    blob = bytearray(open(path, "rb").read())
+    assert bytes(blob[:4]) == storage._LOG_MAGIC, (
+        "the fixture did not produce an EGL1 log (%r); the record-framing "
+        "assertions below would be vacuous" % (bytes(blob[:4]),))
+    damage(blob)
     with open(path, "wb") as f:
-        f.write(_corrupt(blob, "truncated"))
+        f.write(bytes(blob))
+    return path
 
-    with pytest.raises(EguFileError):
-        storage.load_encrypted_lines(path)
+
+def _frames(blob):
+    """``(length_prefix_offset, rec_len)`` for every frame in a healthy log."""
+    off = struct.calcsize(storage._LOG_HEADER_FMT)
+    out = []
+    while off + 4 <= len(blob):
+        (rec_len,) = struct.unpack_from(storage._LOG_RECLEN_FMT, blob, off)
+        out.append((off, rec_len))
+        off += 4 + rec_len
+    return out
+
+
+# The three tests below REPLACE a strict pin, `test_load_encrypted_lines_does_
+# not_swallow_corruption`, which asserted `pytest.raises(EguFileError)`. Three
+# measured reasons, none of them a weakening:
+#
+#   (i)   The pin did not test what its reason string said. It built its damage
+#         with `_corrupt(blob, "truncated")` — the one shape the reader already
+#         handled — and that log read back as [{'a': 1}], never []. The pin
+#         failed on "DID NOT RAISE", not on "indistinguishable from an empty
+#         one".
+#   (ii)  With a correct fix in place it STAYED QUIETLY XFAILED. A strict pin
+#         that cannot signal its own fix is the ST-FUNC-005 failure mode this
+#         module's header warns about, so "land the fix and flip the pin" was
+#         never an available workflow here.
+#   (iii) `raises` is the wrong contract, falsified by measurement:
+#         `append_encrypted_entry` calls this reader on its conversion branch
+#         and needs a *value*. With a raising variant substituted the append
+#         raised, `FeedbackLogger._write_entry` swallowed it, and `backups/`
+#         stayed EMPTY — the quarantine that
+#         `test_appending_to_an_unreadable_legacy_log_quarantines_its_bytes`
+#         exists to guard never ran.
+#
+# Where the pin asserted ONE bit ("something was wrong"), these assert three
+# facts: WHICH records survived, HOW MANY were lost, and that the two public
+# readers agree about the same bytes.
+
+def test_a_damaged_record_costs_only_itself(dersis_home):
+    """ST-DATA-002: damage inside one record must not cost the others.
+
+    A failure means one flipped bit erases the user's whole feedback history
+    from the learner's point of view — measured before the fix, 0 of 3 records
+    recovered from a log where 2 were intact and independently framed.
+    """
+    # 6-byte header, then a 4-byte length prefix, then the record's own EGU1
+    # container — whose byte 43 is inside the ciphertext, not the length prefix
+    # and not the checksum (same offset _corrupt uses on a standalone save).
+    path = _damaged_log(
+        dersis_home, [{"a": 1}, {"b": 2}, {"c": 3}],
+        lambda b: b.__setitem__(6 + 4 + 43, b[6 + 4 + 43] ^ 0x01))
+
+    entries, lost = storage.load_encrypted_lines_report(path)
+    assert entries == [{"b": 2}, {"c": 3}], (
+        "the intact records around the damage did not survive")
+    assert lost == 1, f"expected exactly one lost record, reported {lost}"
+    assert storage.load_encrypted_lines(path) == entries, (
+        "the two readers disagree about the same file")
+
+
+def test_a_log_nothing_can_read_is_distinguishable_from_an_empty_one(dersis_home):
+    """ST-DATA-002 proper: [] and "all of it was unreadable" must differ.
+
+    A failure means DERSİS reports "no feedback history" when the history is
+    there but unreadable, and the user is never told — which is the finding.
+    A reader that recovers records but stays quiet about the loss passes every
+    other test in this section and fails this one.
+    """
+    def _wreck_every_record(blob):
+        for (prefix_off, _rec_len) in _frames(bytes(blob)):
+            blob[prefix_off + 4 + 43] ^= 0x01
+
+    path = _damaged_log(dersis_home, [{"a": 1}, {"b": 2}, {"c": 3}],
+                        _wreck_every_record)
+
+    entries, lost = storage.load_encrypted_lines_report(path)
+    assert entries == [], "a fully damaged log yielded records"
+    assert lost == 3, (
+        "a log whose three records are all unreadable reported lost=%r, so "
+        "nothing distinguishes it from a log that is genuinely empty" % (lost,))
+
+    # The companion guard, in the same test so the two can never drift: a log
+    # that is genuinely empty must stay silent.
+    missing = os.path.join(str(dersis_home), storage.LOGS_DIR, "absent.egu")
+    assert storage.load_encrypted_lines_report(missing) == ([], 0)
+
+
+def test_a_torn_tail_is_reported_as_a_loss_not_as_a_clean_end(dersis_home):
+    """ST-DATA-002: the shape the old pin actually built, asserted correctly.
+
+    A half-written final record is the ordinary outcome of a power cut mid-
+    append. A failure means either the records before it are thrown away, or —
+    the subtler one — the truncated tail is reported as a clean end of file, so
+    the user is never told a record went missing.
+    """
+    path = _damaged_log(dersis_home, [{"a": 1}, {"b": 2}, {"c": 3}],
+                        lambda b: b.__delitem__(slice(-10, None)))
+
+    entries, lost = storage.load_encrypted_lines_report(path)
+    assert entries == [{"a": 1}, {"b": 2}], (
+        "the complete records before the torn tail were not kept")
+    assert lost == 1, (
+        "a torn tail was reported as a clean end of file (lost=%r). `lost` is "
+        "a floor, not a count — the framing that would have counted the "
+        "swallowed records is exactly what is missing — but it must not be 0"
+        % (lost,))
+
+
+def test_a_damaged_length_prefix_cannot_fabricate_a_record(dersis_home):
+    """ST-DATA-002: a reader that skips a bad record must not invent one.
+
+    A failure means the fix that recovers records also hands the learner
+    garbage it decoded out of the middle of another record — DERSİS would then
+    learn from data the user never produced. Resyncing is only safe because
+    every candidate window has to carry ``EGU1`` magic, a matching SHA-256 and
+    a valid AES-GCM tag, and arbitrary bytes carry none of the three.
+
+    This also proves the resync loop terminates: a length prefix that failed to
+    advance ``off`` would hang the run instead of failing it.
+
+    The assertion is deliberately "nothing outside the written set, and the
+    damaged record specifically gone", NOT a fixed entry list. It used to pin
+    ``entries == []``, which was the *pre-resync* reader's behaviour — that
+    reader followed the shrunk length, desynchronised, and lost records 1 and 2
+    as collateral. Recovering two records the user really wrote is the point of
+    the resync; pinning the collateral damage would have made this test forbid
+    the fix. What must never happen is an entry that was never written.
+    """
+    healthy_frames = []
+    written = [{"a": 1}, {"b": 2}, {"c": 3}]
+
+    def _shrink_first_prefix(blob):
+        healthy_frames.extend(_frames(bytes(blob)))
+        struct.pack_into(storage._LOG_RECLEN_FMT, blob, healthy_frames[0][0], 40)
+
+    path = _damaged_log(dersis_home, written, _shrink_first_prefix)
+    assert healthy_frames[0][1] != 40, "the fixture did not change anything"
+
+    entries, lost = storage.load_encrypted_lines_report(path)
+    invented = [e for e in entries if e not in written]
+    assert invented == [], (
+        "the reader resynced onto garbage and FABRICATED %r — no window of "
+        "arbitrary bytes should ever survive magic + checksum + GCM tag"
+        % (invented,))
+    assert {"a": 1} not in entries, (
+        "record 0's own frame was destroyed; decoding it anyway would mean the "
+        "container checks are not gating what the resync hands back")
+    assert len(entries) <= len(written) - 1, (
+        "more records came back than survived the damage: %r" % (entries,))
+    assert lost >= 1, (
+        "a destroyed length prefix was reported as a clean read (lost=%r)"
+        % (lost,))
+
+
+def _six_record_log(dersis_home):
+    """A real 6-record EGL1 log plus its healthy bytes and frame table."""
+    path = os.path.join(str(dersis_home), storage.LOGS_DIR, "feedback.egu")
+    for i in range(6):
+        storage.append_encrypted_entry({"i": i}, path)
+    healthy = open(path, "rb").read()
+    frames = _frames(healthy)
+    assert len(frames) == 6, "the fixture did not produce six frames"
+    return path, healthy, frames
+
+
+def test_a_flipped_length_prefix_does_not_freeze_the_entry_count(dersis_home):
+    """ST-DATA-002: one bad bit in a LENGTH PREFIX must not stop the count.
+
+    ``PreferenceLearner.learn()`` gates on ``_learned_through >= entry_count()``
+    and returns *before any read*, so a count that cannot grow is a permanent,
+    silent learning outage: every later correction the user makes is written to
+    disk and never read back, and ``last_read_lost`` keeps its constructor 0 so
+    ``_report_damaged_feedback_log`` says nothing.
+
+    Measured on this fixture before the fix, flipping ONE bit in record 2's
+    prefix (117 -> 119): ``log_entry_count`` fell 6 -> 3 and stayed at 3 after
+    three further real appends grew the file from 732 to 1101 bytes. Every
+    ``EGU1`` record start was still in the file the whole time.
+
+    The prefix is the one field a prefix-walking reader cannot check, which is
+    why the walk anchors on the container magic instead.
+    """
+    path, healthy, frames = _six_record_log(dersis_home)
+    assert storage.log_entry_count(path) == 6
+
+    off, rec_len = frames[2]
+    damaged = bytearray(healthy)
+    struct.pack_into(storage._LOG_RECLEN_FMT, damaged, off, rec_len ^ 0x2)
+    with open(path, "wb") as handle:
+        handle.write(bytes(damaged))
+    assert bytes(damaged).count(storage._MAGIC) == 6, (
+        "the fixture destroyed a record start; this test is about the PREFIX")
+
+    frozen_at = storage.log_entry_count(path)
+    assert frozen_at >= 5, (
+        "one flipped prefix bit dropped the count from 6 to %r: every record "
+        "after it is unreachable to the walk, so the learner's gate can never "
+        "open again" % (frozen_at,))
+
+    for i in range(3):
+        storage.append_encrypted_entry({"later": i}, path)
+    assert storage.log_entry_count(path) == frozen_at + 3, (
+        "the count did not grow by the three records that were really "
+        "appended (%r -> %r): learning is frozen for good"
+        % (frozen_at, storage.log_entry_count(path)))
+
+    report = storage.load_encrypted_lines_report(path)
+    assert report.lost >= 1, (
+        "a destroyed frame was read as a clean log (lost=%r)" % (report.lost,))
+    assert {"later": 0} in report.entries, (
+        "records appended after the damage are still not readable")
+
+
+def test_the_two_log_walks_agree_on_frame_count_after_prefix_damage(dersis_home):
+    """The learner's cursor is a frame index one walk makes and another spends.
+
+    ``log_entry_count`` cannot decrypt, so it counts frames; the learner passes
+    that number back as ``skip`` to ``load_encrypted_lines_since_report``. If
+    the two disagree about what a frame is on a damaged file, the cursor lands
+    in the wrong place and the learner re-learns or skips entries — the drift
+    ``storage.py`` warns about in as many words.
+
+    Measured before the fix on a 6-record log with one bit flipped in record
+    2's prefix: ``log_entry_count`` said 3 while the since-walk saw 4 frames.
+    """
+    path, healthy, frames = _six_record_log(dersis_home)
+
+    for idx in range(6):
+        off, rec_len = frames[idx]
+        damaged = bytearray(healthy)
+        struct.pack_into(storage._LOG_RECLEN_FMT, damaged, off, rec_len ^ 0x2)
+        with open(path, "wb") as handle:
+            handle.write(bytes(damaged))
+
+        total = storage.log_entry_count(path)
+        whole = storage.load_encrypted_lines_report(path).entries
+        assert storage.load_encrypted_lines_since_report(path, total).entries == [], (
+            "the since-walk still had records left at the cursor "
+            "log_entry_count reported (%r) with record %r's prefix damaged: "
+            "the learner would never read them" % (total, idx))
+        for skip in range(total + 1):
+            tail = storage.load_encrypted_lines_since_report(path, skip).entries
+            assert tail == whole[len(whole) - len(tail):], (
+                "since(%r) is not a suffix of the whole read with record %r's "
+                "prefix damaged: whole=%r tail=%r"
+                % (skip, idx, whole, tail))
+
+
+def test_a_tail_torn_just_past_a_record_boundary_is_not_a_clean_end(dersis_home):
+    """ST-DATA-002: records gone, ``lost`` reporting 0.
+
+    ``app.py``'s ``_report_damaged_feedback_log`` opens with ``if not lost:
+    return``, so ``lost == 0`` is the difference between the user being told
+    their history was damaged and being told nothing at all. The frame loop
+    ended on ``off + 4 <= len(blob)`` and had no loss accounting on that exit,
+    so a truncation landing in the 4-byte window after any record boundary
+    swallowed every later record and reported a clean read.
+
+    Measured over every truncation length of this 6-record log before the fix:
+    24 lengths lost records while reporting ``lost == 0``, 0 false alarms.
+    After: 6 — exactly the cuts that land ON a record boundary, which no reader
+    of this format can tell from a shorter log — and still 0 false alarms.
+    """
+    path, healthy, frames = _six_record_log(dersis_home)
+    boundary = frames[3][0]  # first byte of record 3's length prefix
+
+    for extra in (1, 2, 3):
+        with open(path, "wb") as handle:
+            handle.write(healthy[:boundary + extra])
+        entries, lost = storage.load_encrypted_lines_report(path)
+        assert len(entries) == 3, (
+            "the complete records before the tear were not kept (%r)" % (entries,))
+        assert lost >= 1, (
+            "%d byte(s) past a record boundary: three records are gone and the "
+            "read reported a clean end (lost=%r), so the user is told nothing"
+            % (extra, lost))
+
+    # The property that must NOT regress: a healthy log, and a log cut exactly
+    # at a boundary, are clean reads. Over-reporting would warn every user on
+    # every launch and make the signal worthless.
+    with open(path, "wb") as handle:
+        handle.write(healthy)
+    assert storage.load_encrypted_lines_report(path).lost == 0, (
+        "a healthy log reported a loss")
+    silent, false_alarms = [], []
+    for cut in range(struct.calcsize(storage._LOG_HEADER_FMT), len(healthy)):
+        with open(path, "wb") as handle:
+            handle.write(healthy[:cut])
+        entries, lost = storage.load_encrypted_lines_report(path)
+        if len(entries) < 6 and lost == 0:
+            silent.append(cut)
+        if len(entries) == 6 and lost != 0:
+            false_alarms.append(cut)
+    assert false_alarms == [], (
+        "truncations that lost nothing reported a loss: %r" % (false_alarms,))
+    assert silent == [f[0] for f in frames], (
+        "the only truncations allowed to read as a clean end are the ones that "
+        "land exactly on a record boundary; got %r" % (silent,))
+
+
+def test_both_readers_agree_about_damage_after_the_cursor(dersis_home):
+    """ST-DATA-002: ``load_encrypted_lines_since`` had the identical swallow.
+
+    Measured before the fix on one 3-record log: damage in record 0 gave
+    ``since(path, 1) == [{'b': 2}, {'c': 3}]`` (record 0 is skipped, so it was
+    never decrypted and never noticed) while ``load_encrypted_lines`` returned
+    ``[]``. A failure means ``PreferenceLearner.learn()`` — which calls this
+    whenever its cursor is non-zero, i.e. on every launch after the first —
+    silently loses a history the other reader can read.
+    """
+    prefixes = []
+
+    def _wreck_last_record(blob):
+        prefixes.extend(_frames(bytes(blob)))
+        last = prefixes[-1][0]
+        blob[last + 4 + 43] ^= 0x01
+
+    path = _damaged_log(dersis_home, [{"a": 1}, {"b": 2}, {"c": 3}],
+                        _wreck_last_record)
+    assert len(prefixes) == 3, "the fixture did not produce three frames"
+
+    since_entries, since_lost = storage.load_encrypted_lines_since_report(path, 1)
+    assert since_entries == [{"b": 2}], (
+        "the tail read past the cursor did not stop at the damaged record")
+    assert since_lost == 1, (
+        "damage after the cursor was not reported (lost=%r)" % (since_lost,))
+
+    whole_entries, _whole_lost = storage.load_encrypted_lines_report(path)
+    assert since_entries == whole_entries[1:], (
+        "the two public readers disagree about the same bytes: whole=%r "
+        "since(1)=%r" % (whole_entries, since_entries))
+    assert storage.load_encrypted_lines_since(path, 1) == since_entries
 
 
 def test_append_does_not_overwrite_a_corrupt_log(dersis_home):
@@ -765,9 +1163,10 @@ def test_append_does_not_overwrite_a_corrupt_log(dersis_home):
     the one copy of the user's feedback history that a future recovery path
     could still read.
 
-    The *other* half of ST-DATA-002 is still open and still pinned, one test
-    up: the damaged log reads back as ``[]`` rather than raising, so nothing
-    tells the user their history stopped being readable.
+    The *read* half of ST-DATA-002 was fixed in Phase 8 and is guarded by the
+    five tests above: a damaged log now returns the records that still decrypt
+    and reports how many it could not, instead of returning ``[]`` and letting
+    "unreadable" masquerade as "empty".
     """
     path = os.path.join(str(dersis_home), storage.LOGS_DIR, "feedback.egu")
     storage.save_encrypted_lines([{"a": 1}, {"b": 2}, {"c": 3}], path)
@@ -780,9 +1179,17 @@ def test_append_does_not_overwrite_a_corrupt_log(dersis_home):
     damaged = _corrupt(blob, "flipped_checksum_byte")
     with open(path, "wb") as f:
         f.write(damaged)
-    assert storage.load_encrypted_lines(path) == [], (
-        "the damaged log became readable again — the premise of this test "
-        "(an append onto a log nothing can parse) no longer holds")
+    # The premise, expressed as "there is still damage". It used to read
+    # `load_encrypted_lines(path) == []`, which was only ever a proxy for that
+    # — and a proxy that stopped holding the moment the reader learned to keep
+    # the records around the damage (measured: [{'a': 1}, {'b': 2}]).
+    entries, lost = storage.load_encrypted_lines_report(path)
+    assert lost, (
+        "the damaged log became fully readable again — the premise of this "
+        "test (an append onto a log carrying damage) no longer holds")
+    assert entries == [{"a": 1}, {"b": 2}], (
+        "flipped_checksum_byte damages the LAST record; the two records before "
+        "it must still come back, got %r" % (entries,))
 
     storage.append_encrypted_entry({"d": 4}, path)
 
@@ -885,3 +1292,121 @@ def test_failed_save_leaves_the_previous_file_intact(dersis_home, monkeypatch):
     assert open(path, "rb").read() == original, "a failed rename clobbered the good file"
     assert not os.path.exists(path + ".tmp"), "the staging .tmp file was left behind"
     assert storage.load_encrypted(path) == {"ders": "iyi kopya", "n": 1}
+
+
+# ── the resync must not go silent where the reader it replaced spoke ────────
+
+def _padded_log(dersis_home, pad, name):
+    """A real EGL1 log whose records are wide enough to inflate a prefix into.
+
+    Distinct from ``_six_record_log`` above, which builds the minimal-payload
+    fixture the earlier tests measure against; the length-prefix case needs a
+    record big enough that an inflated length still lands inside the file.
+    """
+    path = os.path.join(str(dersis_home), storage.LOGS_DIR, name)
+    for i in range(6):
+        storage.append_encrypted_entry({"n": i, "pad": "x" * pad}, path)
+    return path
+
+
+def test_damage_to_a_records_own_magic_is_reported_not_swallowed(dersis_home):
+    """ST-DATA-002 — the resync must not hide a record it steps over.
+
+    Found by the adversarial pass, against Phase 8's own ST-DATA-002 fix. When
+    a record's container magic is the damaged byte, the frame before it still
+    parses, so the walk read "the length that follows does not land on a record
+    start" as *this* record's length being wrong, resynced onto the record
+    after next, and counted nothing. Measured on a 6-record log: flipping one
+    bit in the magic of records 1-4 returned 5 records with ``lost == 0`` —
+    while the reader this replaced reported ``lost == 1``. The fix made the
+    common case recoverable and the uncommon case SILENT, which is the finding
+    ST-DATA-002 is about, reintroduced by its own remedy.
+
+    A failure means DERSİS drops a slice of the user's feedback history and
+    tells them nothing, so preference learning quietly trains on less than it
+    reports.
+    """
+    path, healthy_bytes, frames = _six_record_log(dersis_home)
+    blob = bytearray(healthy_bytes)
+    healthy = storage.load_encrypted_lines_report(path)
+    assert len(healthy.entries) == 6 and healthy.lost == 0
+
+    for idx, (prefix_off, _rec_len) in enumerate(frames):
+        damaged = bytearray(blob)
+        damaged[prefix_off + 4] ^= 0x01   # one bit of this record's EGU1 magic
+        with open(path, "wb") as f:
+            f.write(bytes(damaged))
+
+        report = storage.load_encrypted_lines_report(path)
+        assert len(report.entries) == 5, (
+            "record %d: expected the other five back, got %d"
+            % (idx, len(report.entries)))
+        assert report.lost >= 1, (
+            "record %d's magic was destroyed and the reader reported lost=%d; "
+            "a lost record the user is not told about is ST-DATA-002"
+            % (idx, report.lost))
+
+
+def test_an_inflated_length_prefix_does_not_shrink_the_entry_count(dersis_home):
+    """ST-DATA-002 — the cheap count and the real walk must not disagree.
+
+    ``log_entry_count`` is the unit ``PreferenceLearner``'s cursor is expressed
+    in, so if it and ``load_encrypted_lines_since`` disagree about one file the
+    learner reads from the wrong place. Its seek loop returned its own count on
+    any short read at the end, and an inflated length prefix produces exactly
+    that: measured on a 6-record log, one flipped bit took record 0's length
+    from 201 to 1225 — still past ``_MIN_CONTAINER``, still inside the file —
+    so the seek landed 1 byte from EOF and the count came back 1 while the
+    shared walk recovered all 6.
+
+    A failure means the learner's cursor and the log's real contents drift, and
+    it either re-reads history forever or skips records it could have learned
+    from.
+    """
+    path = _padded_log(dersis_home, 98, "inflated.egu")
+    blob = bytearray(open(path, "rb").read())
+    prefix, original = _frames(bytes(blob))[0]
+    first_payload = prefix + 4
+
+    inflated = len(blob) - first_payload - 1    # fits, but swallows the rest
+    assert inflated > original >= storage._MIN_CONTAINER
+    struct.pack_into(storage._LOG_RECLEN_FMT, blob, prefix, inflated)
+    with open(path, "wb") as f:
+        f.write(bytes(blob))
+
+    walk = sum(1 for frame in storage._walk_log_frames(bytes(blob))
+               if frame is not None)
+    assert storage.log_entry_count(path) == walk, (
+        "log_entry_count says %d and the shared walk says %d for the same file"
+        % (storage.log_entry_count(path), walk))
+    assert storage.load_encrypted_lines_since(
+        path, storage.log_entry_count(path)) == [], (
+        "records remain at the cursor the count reported")
+
+
+def test_a_damaged_version_byte_is_not_counted_as_readable_history(dersis_home):
+    """ST-DATA-002 — the count must refuse what the reader refuses.
+
+    ``log_entry_count`` validated only the 4-byte EGL1 magic, while
+    ``_read_log_records_report`` also checks the version and raises on an
+    unsupported one. So a flipped bit in the VERSION byte made the count report
+    six records in a file from which zero records can be read. Measured over
+    all 48 single-bit flips of the 6-byte header: the 32 magic flips already
+    agreed (0 and 0), the 16 version flips all disagreed (6 against 0).
+
+    A failure means DERSİS reports history it cannot read, and the learner
+    advances a cursor over records that were never delivered to it.
+    """
+    path, healthy_bytes, _unused_frames = _six_record_log(dersis_home)
+    blob = bytearray(healthy_bytes)
+    assert storage.log_entry_count(path) == 6
+
+    blob[struct.calcsize(storage._LOG_HEADER_FMT) - 1] ^= 0x01   # version byte
+    with open(path, "wb") as f:
+        f.write(bytes(blob))
+
+    readable = storage.load_encrypted_lines_report(path)
+    assert readable.entries == []
+    assert storage.log_entry_count(path) == len(readable.entries), (
+        "count reports %d records in a log the reader cannot open at all"
+        % storage.log_entry_count(path))

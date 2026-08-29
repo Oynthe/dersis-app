@@ -960,8 +960,33 @@ def _register_unicode_fonts() -> "tuple[str, str]":
 # a single character of ru (22), ar (18), fa (17), hi (17), zh (9), ja (8),
 # ko (8), pl (2) or az (1) -- 9 of the 22, all offered by the first-run
 # language gate. reportlab ships only Vera and DarkGarden, so there is no
-# bundled face to swap in; bundling DejaVu would cover ru/pl/az and nothing
-# else.
+# bundled face to swap in.
+#
+# THAT 9-OF-22 IS A FACT ABOUT VERA, NOT ABOUT THE SHIPPED APP. Say which one
+# you mean; earlier notes did not, and "9 of 22 locales cannot print their
+# weekday names" was carried forward as a product claim. Driving
+# _resolve_pdf_fonts per locale on a stock Windows install (measured
+# 2026-08-29, weekday names plus the 10 UI keys _pdf_document_text collects)
+# recovers 6 of the 9 from host faces with an EMPTY unprintable set:
+#
+#     az, pl, ru -> arial.ttf      ja -> msgothic.ttc
+#     zh         -> msyh.ttc       ko -> malgun.ttf
+#
+# The live figure is 3 of 22 -- ar, fa and hi -- and the cause for those three
+# is shaping, not glyph coverage (see _needs_text_shaping below).
+#
+# The residual, stated honestly: those 6 depend on a face the HOST happens to
+# have. A stripped Windows image, a bare Linux container or a locked-down
+# fonts directory drops them back to the note page. That is why the tests in
+# tests/test_pdf_locale_coverage.py assert the property ("we never silently
+# drop a character we could have drawn") and never the host outcome -- "az
+# resolves to arial" is true here and false on the CI runner.
+#
+# Bundling DejaVu is NOT the answer, and the reason is structural rather than
+# a coverage table: it would cover ru/pl/az, which _resolve_pdf_fonts already
+# recovers from arial on this host, and it cannot touch ar/fa/hi at all,
+# because the shaped-script short-circuit below means no substitute face --
+# bundled or host -- is ever tried for them. See the note at _resolve_pdf_fonts.
 #
 # Two things follow, and this section does both:
 #
@@ -975,13 +1000,36 @@ def _register_unicode_fonts() -> "tuple[str, str]":
 # The one thing not done here is quietly drawing a script the layout engine
 # cannot lay out -- see _needs_text_shaping.
 
-# Scripts reportlab cannot lay out correctly even with a covering font.
+# Scripts reportlab cannot lay out correctly AS THIS PROJECT INSTALLS IT.
 # Measured, not assumed: registering arial.ttf and drawing "العربية" emits
 # `(\001\002\003\004\005\006\007) Tj` -- the seven codepoints in LOGICAL order,
-# each as its isolated form. reportlab has no bidi and no shaping engine, so
-# for these scripts a covering font buys confidently wrong output (a word
-# spelled backwards in disconnected letters) in place of an honest box. The
-# note is the truthful answer there.
+# each as its isolated form. For these scripts a covering font buys
+# confidently wrong output (a word spelled backwards in disconnected letters)
+# in place of an honest box. The note is the truthful answer there.
+#
+# READ THE NEXT PARAGRAPH BEFORE RE-DERIVING ANYTHING FROM THAT PROBE. An
+# earlier version of this comment concluded "reportlab has no bidi and no
+# shaping engine". That is false, and the probe above cannot tell the
+# difference. reportlab 5.0.1 declares BOTH as optional extras --
+# reportlab-5.0.1.dist-info/METADATA:29-32, `Provides-Extra: bidi` -> rlbidi
+# and `Provides-Extra: shaping` -> uharfbuzz -- and the code paths are live,
+# not vestigial: pdfgen/textobject.py:21-23 binds rlbidi.log2vis,
+# pdfbase/ttfonts.py:1344-1360 builds a real HarfBuzz face from the embedded
+# TTF, fonts/hb-test.ttf ships as the fixture, and ParagraphStyle carries a
+# `shaping` attribute (lib/styles.py:133) that platypus/paragraph.py:2102
+# consumes. Neither extra is installed here, and TTFont.shapable is
+# `bool(self._shapable and uharfbuzz)`, so with them absent reportlab quietly
+# behaves exactly like a library that cannot shape.
+#
+# So the accurate statement is: THE CAPABILITY EXISTS AND IS GATED ON AN
+# OPTIONAL DEPENDENCY THIS PROJECT DOES NOT INSTALL. The decision to leave
+# ar/fa/hi on the note page may still be the right one -- on cost, and on the
+# fact that requirements-lock.txt pins reportlab 4.4.10 into the shipped
+# installer, which is not the version measured above -- but it is not
+# "reportlab cannot". Anyone taking this up must verify the extras against
+# 4.4.10 first, and must assert the emitted TEXT LAYER (visual order, joined
+# forms, and a Ctrl-F round-trip), because ST-FUNC-004's failure mode was
+# precisely a page that looked plausible over a falsified text layer.
 _SHAPED_SCRIPT_RANGES = (
     (0x0590, 0x05FF),  # Hebrew (bidi)
     (0x0600, 0x06FF),  # Arabic
@@ -1124,7 +1172,18 @@ def _register_covering_font(text: str) -> "tuple[str, str] | None":
 
 
 def _resolve_pdf_fonts(text: str) -> "tuple[str, str, set[str]]":
-    """Return ``(regular, bold, unprintable)`` for a document containing *text*."""
+    """Return ``(regular, bold, unprintable)`` for a document containing *text*.
+
+    The shaping guard below is a SHORT-CIRCUIT, and it is the reason adding a
+    font never helps Arabic, Persian or Hindi. If any missing character belongs
+    to a script the layout engine cannot lay out, the covering-font search is
+    skipped entirely -- so no substitute face, bundled or host, is ever tried
+    for those documents. Bundling DejaVu, or adding an entry to
+    _PDF_SYSTEM_FONT_CANDIDATES, changes nothing for ar/fa/hi BY CONSTRUCTION,
+    independently of what the added face covers. Deleting this guard is not a
+    font change; it is a decision to emit logical-order isolated forms, which
+    is the confidently-wrong output the note page exists to avoid.
+    """
     regular, bold = _register_unicode_fonts()
     missing = (_chars_without_glyphs(regular, text)
                | _chars_without_glyphs(bold, text))
@@ -1347,6 +1406,13 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     # locales; for the other 9 the page was a row of empty boxes and nothing
     # said so. _resolve_pdf_fonts upgrades to a host face that covers the
     # document where one exists, and reports what is left.
+    #
+    # What that leaves in practice, measured on a stock Windows install: 6 of
+    # those 9 (az/pl/ru/ja/zh/ko) come back with a covering host face and an
+    # empty `unprintable_chars`, so 3 locales reach the note page, not 9 --
+    # ar, fa and hi, blocked by shaping rather than by coverage. On a host
+    # without those faces the number rises again, which is the point of
+    # reporting `unprintable_chars` instead of assuming either figure.
     FONT_REGULAR, FONT_BOLD, unprintable_chars = _resolve_pdf_fonts(
         _pdf_document_text(schedule))
     cell_style = ParagraphStyle(

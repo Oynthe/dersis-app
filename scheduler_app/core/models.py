@@ -3,6 +3,7 @@
 import uuid
 from typing import Optional, TypedDict
 
+from scheduler_app.i18n.text_fold import fold_text
 from scheduler_app.translations import TRANSLATIONS, tr
 
 
@@ -42,19 +43,39 @@ def get_location_label(location_type):
 
 
 def parse_location_type_label(value):
-    """Parse a raw or translated location-type label into a stable key."""
+    """Parse a raw or translated location-type label into a stable key.
+
+    Folded with ``fold_text``, not ``str.casefold``. Phase 8 routed four
+    comparison sites through the shared fold and left this one behind, which
+    made the importer inconsistent *within a single row*: two lines apart,
+    ``required_room_type`` matched a shouted Turkish cell and this did not.
+    Measured before the fix -- ``'ÇEVRİMİÇİ'`` -> ``face_to_face``,
+    ``'OFİS (ÖĞR. ELEM.)'`` -> ``face_to_face``, while ``'Çevrimiçi'`` and
+    ``'ONLINE'`` both resolved correctly.
+
+    That miss is silent and expensive: the fallback below is
+    ``LOCATION_FACE_TO_FACE``, which is indistinguishable from a blank cell, so
+    an online lesson imported from a workbook whose cells are upper-cased --
+    what a Turkish-locale Excel ``=UPPER()`` writes -- is marked as needing a
+    physical room, and ``needs_physical_room`` then reserves a classroom for
+    every remote lecture.
+
+    The soft fallback itself is deliberately left alone: whether an
+    unrecognised location label should be an import error is a product
+    decision, not a folding one, and it is recorded in HANDOFF-PHASE9.md.
+    """
     text = str(value or "").strip()
     if not text:
         return LOCATION_FACE_TO_FACE
-    lowered = text.casefold()
-    if lowered in {lt.casefold(): lt for lt in LOCATION_TYPES}:
-        return {lt.casefold(): lt for lt in LOCATION_TYPES}[lowered]
+    lowered = fold_text(text)
+    if lowered in {fold_text(lt): lt for lt in LOCATION_TYPES}:
+        return {fold_text(lt): lt for lt in LOCATION_TYPES}[lowered]
 
     aliases = {}
     for lt, label_key in LOCATION_LABEL_KEYS.items():
-        aliases[LOCATION_LABELS[lt].casefold()] = lt
+        aliases[fold_text(LOCATION_LABELS[lt])] = lt
         for lang_dict in TRANSLATIONS.values():
-            aliases[str(lang_dict.get(label_key, "")).strip().casefold()] = lt
+            aliases[fold_text(str(lang_dict.get(label_key, "")).strip())] = lt
     return aliases.get(lowered, LOCATION_FACE_TO_FACE)
 
 

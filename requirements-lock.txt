@@ -1,6 +1,44 @@
 # DERSİS — Pinned Dependencies (lock file)
 # Generated from a clean virtual environment on 2026-04-03.
-# Use this for reproducible CI/CD and build installations.
+#
+# WHAT THIS FILE PINS, AND WHAT IT DOES NOT
+#
+# This is the Python environment that goes inside the SHIPPED INSTALLER. It is
+# read by exactly three consumers, all of them build lanes:
+#
+#   .github/workflows/build-installer.yml:111   pip install -r requirements-lock.txt
+#   build_nuitka.bat:46                         pip install -r requirements-lock.txt
+#   build_embed.bat:133                         pip install ... -r requirements-lock.txt
+#
+# The TEST lanes do not read it. ci.yml:43 installs the unpinned
+# requirements.txt, ci.yml:151/:221 requirements-dev.txt, and release.yml:67
+# both — so the suite resolves whatever the floors in requirements.txt allow
+# today. A green CI run therefore says nothing about these pins, and changing
+# them changes what users install without any test moving.
+#
+# IT IS DELIBERATELY NOT THE AUDIT VENV. `.venv-audit` is a development
+# environment: it carries 16 packages this file does not describe (pytest,
+# mypy, coverage, radon, PyYAML, tzdata, ...), and it tracks the floors rather
+# than the pins. Measured 2026-08-29 against `.venv-audit`, 13 of these 26 pins
+# have drifted — absl-py 2.4.0->2.5.0, cffi 2.0.0->2.1.1, charset-normalizer
+# 3.4.7->3.5.1, cryptography 46.0.6->50.0.1, deepdiff 9.0.0->9.1.0, numpy
+# 2.4.4->2.5.2, packaging 26.0->26.3, pandas 3.0.2->3.0.5, pillow
+# 12.2.0->12.3.0, PyQt6-Qt6 6.11.0->6.11.2, PyQt6-sip 13.11.1->13.12.0,
+# reportlab 4.4.10->5.0.1, typing-extensions 4.15.0->4.16.0 — and 3 pins
+# (certifi, idna, urllib3) name packages the audit venv does not install at
+# all, a transitive tail requirements.txt no longer produces.
+#
+# THAT DRIFT IS RECORDED, NOT REPAIRED. Regenerating these pins changes the
+# bytes in the installer, and no test in this repository — and no lane short of
+# an actual `iscc` build on a Windows runner — can tell you whether the result
+# still works. Do it as its own change, with a build behind it. In particular
+# reportlab 5.0.1 is a MAJOR bump from the pinned 4.4.10 and is the version the
+# PDF-export measurements in data_io/exporter.py were taken against; the
+# shipped installer runs 4.4.10.
+#
+# What IS enforced automatically: every pin here must satisfy the corresponding
+# floor in requirements.txt. See
+# tests/test_packaging_manifest.py::test_every_locked_pin_satisfies_the_requirements_floor.
 #
 # Regenerate:
 #   python -m venv .venv-lock

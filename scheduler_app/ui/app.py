@@ -900,6 +900,14 @@ class SchedulerApp(QMainWindow):
         self._dragging_classes = []
         self._drag_backup = None
         self._drag_success = False
+        # ST-ARCH-012. True between _start_drag_gfx's pre-emptive _push_undo
+        # and whoever consumes it. _execute_drop has to know whether the
+        # entry on top of the stack is THIS drag's: a drag that starts in the
+        # unplaced sidebar (_start_drag_unplaced) pushes nothing, and popping
+        # there destroyed an unrelated action's only snapshot. Measured: the
+        # previous 'unplace' entry was replaced by the drag's, depth unchanged
+        # at 1, and that unplace became permanently un-undoable.
+        self._drag_undo_pushed = False
 
         # Undo / Redo stacks (snapshot-based)
         self._undo_stack = []   # list of (label, classes_snapshot)
@@ -1973,6 +1981,10 @@ class SchedulerApp(QMainWindow):
 
     def _flush_startup_settings_report(self):
         """Surface a settings problem detected before the window existed."""
+        # FIRST, and deliberately above the `if not pending: return` early exit
+        # below — a damaged feedback log is its own report and must not be
+        # skipped just because the settings container was fine.
+        self._report_damaged_feedback_log()
         from scheduler_app.ui import first_run as _first_run
         quarantined = getattr(_first_run, "LAST_QUARANTINE", None)
         if quarantined:
@@ -2049,6 +2061,35 @@ class SchedulerApp(QMainWindow):
         except Exception:
             pass
         self._deferred_warning(tr("status.settings_problem_title"), message)
+
+    def _report_damaged_feedback_log(self):
+        """ST-DATA-002: tell the user their feedback history stopped being readable.
+
+        Routed through ``_report_settings_problem`` rather than a second
+        channel: it is already rate-limited per *kind* per session, already
+        mirrors into the toast and the warning panel, and is already the place
+        a storage problem found before the widgets existed comes out. The
+        learner runs from ``__init__`` long before ``_build_main()``.
+
+        Called from ``_flush_startup_settings_report``, NOT from the learn()
+        call site in ``__init__``: ``_pending_settings_report`` is a single slot
+        and ``learn()`` runs before ``_auto_load()``, so a message stashed there
+        would be silently overwritten by a settings message.
+
+        Nothing is quarantined here, deliberately. ``quarantine_corrupt`` moves
+        the whole file, and on an EGL1 log the records around the damage are
+        still readable — ST-DATA-014's principle is that nothing is deleted,
+        and here nothing needs to be moved either.
+
+        The message carries no count: ``LogRead.lost`` is a floor, not an exact
+        number of records (a torn tail is one loss however many it swallowed).
+        """
+        lost = getattr(self._preference_learner, "last_read_lost", 0)
+        if not lost:
+            return
+        self._report_settings_problem(
+            "feedback_log", tr("errors.feedback_log_damaged").format(
+                path=self._feedback_logger.log_file))
 
     def _read_settings_container(self):
         """Read the settings container, distinguishing the three outcomes.
@@ -4435,6 +4476,7 @@ class SchedulerApp(QMainWindow):
         # Push undo BEFORE the pre-emptive mark_unplaced so the snapshot
         # captures the original placed state.  Popped later if drag fails.
         self._push_undo(tr("actions.unplace").format(name=cls["name"]))
+        self._drag_undo_pushed = True
         mark_unplaced(cls)
 
         self._dragging_cls = cls
@@ -4488,10 +4530,32 @@ class SchedulerApp(QMainWindow):
         if not self._drag_success:
             for k, v in self._drag_backup.items():
                 cls[k] = v
-            # Drag was cancelled — discard the pre-emptive undo snapshot
-            if self._undo_stack:
+            # Drag was cancelled — discard the pre-emptive undo snapshot.
+            #
+            # The flag is belt-and-braces HERE and the old comment overstated
+            # it. It claimed the guard stops us popping an entry
+            # `_execute_drop` has already consumed; measured 2026-08-29, the
+            # enclosing `if not self._drag_success` already excludes that —
+            # `_execute_drop` sets `_drag_success = True` on the only path that
+            # consumes the entry, so control never reaches this line in the
+            # state the old text described. Within `_start_drag_gfx`,
+            # `_drag_undo_pushed` is assigned True above and never cleared
+            # before this read, so `if self._drag_undo_pushed and
+            # self._undo_stack` cannot differ from a bare `if self._undo_stack`
+            # on any path the user can reach.
+            #
+            # It stays because it states the entry's OWNERSHIP rather than its
+            # existence: the flag is this drag's claim on the top of the stack,
+            # and it is what keeps the guard correct if the outer
+            # `if not self._drag_success` is ever refactored or if a second
+            # starter learns to reach this code. `_start_drag_unplaced` pushes
+            # nothing, and a bare `if` there popped an unrelated action —
+            # depth unchanged, which is why it went unnoticed. One cheap
+            # attribute read; no test can tell it from being absent.
+            if self._drag_undo_pushed and self._undo_stack:
                 self._undo_stack.pop()
 
+        self._drag_undo_pushed = False
         self._dragging_cls = None
         self._dragging_classes = []
         self._drag_backup = None
@@ -4518,6 +4582,10 @@ class SchedulerApp(QMainWindow):
             "placed_time": None,
             "placed_classroom": None,
         }
+        # A sidebar drag pushes NO pre-emptive snapshot: nothing has been
+        # unplaced, so there is nothing to restore if it is cancelled.
+        # _execute_drop therefore has to PUSH a new entry, not pop one.
+        self._drag_undo_pushed = False
         self._dragging_cls = drag_classes[0]
         self._dragging_classes = drag_classes
         self._drag_success = False
@@ -4673,12 +4741,45 @@ class SchedulerApp(QMainWindow):
         self._workflow.log_manual_move(
             cls, old_day, old_slot, old_room, day, slot, room)
 
-        # Replace the pre-emptive undo snapshot (pushed by _start_drag_gfx
-        # with an "unplace" label) with a proper "move" snapshot.  The
-        # snapshot data is identical — only the label differs.
-        if self._undo_stack:
-            self._undo_stack.pop()
-        self._push_undo(tr("actions.move").format(name=cls["name"]))
+        # ST-ARCH-012. RE-LABEL the pre-emptive snapshot; do not push a fresh
+        # one. _start_drag_gfx took its snapshot BEFORE its own
+        # mark_unplaced, so it is the only record of where the lesson was --
+        # by the time control gets here mark_unplaced has already run, and a
+        # fresh _push_undo deep-copies the lesson as UNPLACED. That is why one
+        # Ctrl+Z after a drag unplaced the lesson instead of putting it back.
+        # The old comment here claimed "the snapshot data is identical";
+        # measured, the popped entry held (True, 'monday', '09:00', 'R001')
+        # and the replacement held (False, None, None, None).
+        #
+        # The FLAG decides, not `if self._undo_stack`. A drag that started in
+        # the unplaced sidebar pushed nothing, and the bare `if` popped
+        # whatever unrelated action was on top and destroyed it -- depth
+        # unchanged, which is why it went unnoticed.
+        #
+        # pop + append keeps the depth, so nothing is evicted at _max_undo;
+        # the redo clear that _push_undo would have done is made explicit.
+        #
+        # That clear is INERT on every path production reaches, and stays
+        # anyway. Measured 2026-08-29 by instrumenting `_redo_stack.clear`
+        # through a real drag: plant a genuine redo entry (an action, then
+        # Ctrl+Z) — depth 1 — arm a grid drag, and depth is already 0 by the
+        # time control gets here, because `_start_drag_gfx`'s pre-emptive
+        # `_push_undo` cleared it one statement before raising
+        # `_drag_undo_pushed`. No arrangement of the shipped code can leave a
+        # pending redo entry at this line, so no test can tell it from being
+        # absent — one that hand-poked `_redo_stack` in between would pin a
+        # state production cannot produce. It is kept because it makes this
+        # branch's postcondition match `_push_undo`'s in the `else` below
+        # rather than depending on an invariant held in another method; it is
+        # one call on an empty list.
+        move_label = tr("actions.move").format(name=cls["name"])
+        if self._drag_undo_pushed and self._undo_stack:
+            _stale_label, snapshot = self._undo_stack.pop()
+            self._undo_stack.append((move_label, snapshot))
+            self._redo_stack.clear()
+        else:
+            self._push_undo(move_label)
+        self._drag_undo_pushed = False
         mark_placed(cls, day, slot, room)
         self._drag_success = True
         self._show_toast(

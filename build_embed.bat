@@ -237,9 +237,26 @@ echo start "" "python\pythonw.exe" "scheduler_gui.py"
 :: .exe launcher — compile a tiny C# wrapper. Build it as a GUI-subsystem app
 :: (WindowsApplication) so it does not flash a console window before handing
 :: off to pythonw.exe.
+::
+:: This is NOT an optional nicety and the failure path is NOT ".vbs instead".
+:: installer.iss:151/:153/:160 point the Start Menu shortcut, the Desktop
+:: shortcut and the post-install "Launch program" at {app}\Dersis.exe with no
+:: fallback; Dersis.vbs and Dersis.bat ship beside it and nothing references
+:: them. So a failed Add-Type produces an installer whose every entry point is
+:: a file that is not there.
+::
+:: The `2>$null` that used to sit on the Add-Type call discarded the C#
+:: compiler's stderr, and the else-branch printed "[WARN] exe failed, using
+:: .vbs" and carried on. Both are gone: the compiler's real error now reaches
+:: the build log, and the step exits non-zero.
 echo   Creating Dersis.exe...
 powershell -NoProfile -Command ^
-  "$src = 'using System; using System.Diagnostics; using System.IO; using System.Reflection; class P { static void Main() { string d = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location); Process.Start(new ProcessStartInfo { FileName = Path.Combine(d, \"python\", \"pythonw.exe\"), Arguments = \"\\\"\" + Path.Combine(d, \"scheduler_gui.py\") + \"\\\"\", WorkingDirectory = d, UseShellExecute = false, CreateNoWindow = true }); } }'; Add-Type -TypeDefinition $src -OutputAssembly '%DIST_DIR%\Dersis.exe' -OutputType WindowsApplication 2>$null; if (Test-Path '%DIST_DIR%\Dersis.exe') { Write-Host '  [OK] Dersis.exe' } else { Write-Host '  [WARN] exe failed, using .vbs' }"
+  "$src = 'using System; using System.Diagnostics; using System.IO; using System.Reflection; class P { static void Main() { string d = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location); Process.Start(new ProcessStartInfo { FileName = Path.Combine(d, \"python\", \"pythonw.exe\"), Arguments = \"\\\"\" + Path.Combine(d, \"scheduler_gui.py\") + \"\\\"\", WorkingDirectory = d, UseShellExecute = false, CreateNoWindow = true }); } }'; Add-Type -TypeDefinition $src -OutputAssembly '%DIST_DIR%\Dersis.exe' -OutputType WindowsApplication; if (Test-Path '%DIST_DIR%\Dersis.exe') { Write-Host '  [OK] Dersis.exe' } else { Write-Error 'Add-Type produced no Dersis.exe'; exit 1 }"
+if errorlevel 1 (
+    echo   [FAIL] Dersis.exe launcher could not be compiled.
+    echo          Every installer shortcut points at it; refusing to continue.
+    exit /b 1
+)
 
 :: Copy icon into dist for shortcuts
 copy /y scheduler_app\assets\app_icon.ico "%DIST_DIR%\scheduler_app\assets\" >nul 2>nul
@@ -287,6 +304,16 @@ if exist "%DIST_DIR%\VERSION" (
     set /a ERRORS+=1
 )
 
+:: The launcher every installer shortcut points at. It is compiled above rather
+:: than copied, so it is the one item in this list that can go missing without
+:: anything upstream having failed to find a file.
+if exist "%DIST_DIR%\Dersis.exe" (
+    echo   [OK] Dersis.exe
+) else (
+    echo   [MISSING] Dersis.exe
+    set /a ERRORS+=1
+)
+
 if exist "%DIST_DIR%\scheduler_app\ui\app.pyc" (
     echo   [OK] scheduler_app compiled to .pyc
 ) else if exist "%DIST_DIR%\scheduler_app\ui\app.py" (
@@ -314,9 +341,22 @@ for /r "%DIST_DIR%" %%f in (*) do set /a TOTAL+=1
 echo   Total files: %TOTAL%
 
 echo.
+:: ERRORS was counted above and then only warned about: this script printed its
+:: warning and exited 0, so a CI step calling it saw success. build_nuitka.bat
+:: has exited 1 here since Phase 7 (666b160) -- before that it had no ERRORS
+:: branch at all, so "always" was wrong. This script HAS branched on ERRORS
+:: since the first release (d7953a4:271); it only ever echoed a warning and
+:: fell through to exit 0, which is the half this change fixes. Phase 7's
+:: comment in build_nuitka.bat ("build_embed.bat already branches on it; now
+:: both do") was accurate about the branch and said nothing about the exit
+:: code; do not read it as a claim that both lanes already failed.
 if %ERRORS% GTR 0 (
-    echo WARNING: %ERRORS% critical file^(s^) missing!
+    echo ============================================
+    echo  BUILD INCOMPLETE: %ERRORS% critical file^(s^) missing.
+    echo  Do not run iscc installer.iss on this output.
+    echo ============================================
     pause
+    exit /b 1
 ) else (
     echo ============================================
     echo  BUILD SUCCESSFUL!

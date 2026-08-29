@@ -95,7 +95,18 @@ def _sheet_examples():
                 "teacher_id": "T001",
                 "branch_id": "B001",
                 "duration": 2,
-                "student_count": 25,
+                # 18, not 25, and the two numbers below it are why: this row
+                # asks for `lab_room_type`, and the only lab in the Rooms sheet
+                # above is room 2 with 20 seats. While `required_room_type` was
+                # discarded at import (before ST-FUNC-009) a 25-student lab
+                # class was harmless -- it imported with no room constraint at
+                # all and the 30-seat lecture room was a legal candidate. Now
+                # that the column is honoured, 25 resolves to a room that
+                # cannot seat them, `get_physical_room_candidates` returns []
+                # and the app's own example workbook ships a course that can
+                # never be placed. The head count and the capacities are
+                # hard-coded integers, so this was identical in all 22 locales.
+                "student_count": 18,
                 "required_room_type": lab_room_type,
                 "allowed_rooms": "",
                 "excluded_rooms": "",
