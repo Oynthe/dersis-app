@@ -45,8 +45,8 @@ suite.
 ## STATE OF THE REPO
 
 * Branch: `fix/phase-8-remaining`, cut from `main` (`82f558e`, the Phase 7 merge).
-* **Fast lane: 1140 selected · 1138 passed · 2 xfailed · 0 failed · exit 0.**
-  (954 / 946 / 8 at the start of Phase 8: **+186 tests, 6 of 8 pins closed**.)
+* **Fast lane: 1144 selected · 1142 passed · 2 xfailed · 0 failed · exit 0.**
+  (954 / 946 / 8 at the start of Phase 8: **+190 tests, 6 of 8 pins closed**.)
 * Slow engine lane: 52 · 51 passed · 1 XPASS (`ST-SCHED-013`, `strict=False` by
   design — it xfails on a loaded box and XPASSes on an idle one; both are fine).
 * `mypy` clean over 42 source files.

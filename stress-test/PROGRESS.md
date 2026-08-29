@@ -26,8 +26,8 @@ what has changed since. Per-finding state also lives in the
 > defects) first, section C (ten unverified incidentals) last, and for C the
 > first question is "is this real?" rather than "how do we fix it?".
 
-**Suite: 1140 tests — 1138 pass, 2 known-defect pins, 0 failures.** Both lanes
-exit 0. (954 / 946 / 8 at the start of the phase: **+186 tests, and 6 of the 8
+**Suite: 1144 tests — 1142 pass, 2 known-defect pins, 0 failures.** Both lanes
+exit 0. (954 / 946 / 8 at the start of the phase: **+190 tests, and 6 of the 8
 pins closed by fixing the defect**.) `mypy` clean over 42 source files. **All
 four layering ratchets are still `0`, and the translation ratchet was never
 raised** — every one of the six new user-facing strings ships in all 22 locales.
