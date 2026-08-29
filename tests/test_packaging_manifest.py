@@ -569,6 +569,153 @@ def test_every_installer_shortcut_target_is_a_verified_build_output():
         )
 
 
+def _disable_dersis_exe_line(body, style):
+    """release.yml's verify body with the ``Dersis.exe`` member commented out.
+
+    Three positions, because PowerShell's two comment syntaxes reach the member
+    in three ways and the first version of the parser understood exactly one of
+    them. The line is located rather than hard-coded so that re-indenting the
+    step does not quietly turn this into a test of nothing.
+    """
+    lines = body.split("\n")
+    hits = [i for i, ln in enumerate(lines)
+            if "Dersis.exe" in ln and ln.strip().startswith('"')]
+    assert len(hits) == 1, (
+        "expected exactly one quoted `Dersis.exe` array member in the verify "
+        "step body, found %d. Re-point this helper before trusting it." % len(hits)
+    )
+    index = hits[0]
+    line = lines[index]
+    indent = line[:len(line) - len(line.lstrip())]
+    if style == "block_inline":                       # S1
+        lines[index] = "%s<# %s #>" % (indent, line.strip())
+    elif style == "block_multiline":                  # S2
+        lines[index:index + 1] = [indent + "<#", line, indent + "#>"]
+    elif style == "line_trailing":                    # R10
+        lines[index - 1] = "%s  # %s" % (lines[index - 1], line.strip())
+        del lines[index]
+    elif style == "line_leading":                     # R1, the one already caught
+        lines[index] = "%s# %s" % (indent, line.strip())
+    else:                                             # pragma: no cover
+        raise AssertionError("unknown style %r" % style)
+    return "\n".join(lines)
+
+
+def test_a_disabled_check_reads_as_an_absent_check():
+    """ST-SEC-007 — the parser's own premise, in all three comment positions.
+
+    Every assertion about ``$checks`` in this suite and in
+    ``test_release_pipeline.py`` rests on ``powershell_string_array`` returning
+    what the *shell* would iterate. If it returns a commented-out path as live,
+    those assertions pin the text of a check rather than the check, and a
+    release engineer can switch off the ``Dersis.exe`` verification in a way no
+    reviewer would flag.
+
+    The first version of this parser dropped a line only when its first
+    non-space character was ``#``. Measured on bd12e58, the other three
+    positions each removed the member from the array with both modules at exit
+    0 and 36 passes: ``<# ... #>`` inline (S1), ``<# ... #>`` across lines (S2),
+    and a trailing ``#`` on the preceding member (R10). Verified against the
+    real PowerShell interpreter, not inferred — all three leave a two-member
+    array.
+    """
+    from _support.pwsh_parse import powershell_string_array
+
+    body = _verify_build_output_run()
+    live = powershell_string_array(body, "checks")
+    assert live and r"$dist\Dersis.exe" in live, (
+        "the unmutated step body does not list `$dist\\Dersis.exe` as a live "
+        "member, so the mutations below would prove nothing. Live members: %s"
+        % (live,)
+    )
+
+    for style in ("line_leading", "line_trailing", "block_inline",
+                  "block_multiline"):
+        disabled = _disable_dersis_exe_line(body, style)
+        assert disabled != body, "%s mutation did not change the body" % style
+        members = powershell_string_array(disabled, "checks")
+        assert members is not None, (
+            "%s: the parser lost the `$checks` array entirely. Commenting one "
+            "member out must remove that member, not blind the parser to the "
+            "whole list." % style
+        )
+        assert r"$dist\Dersis.exe" not in members, (
+            "%s: `$dist\\Dersis.exe` is commented out and PowerShell would "
+            "iterate a five-member array, but the parser still reports it as "
+            "live: %s. Every `$checks` assertion in this suite is a pin "
+            "against deletion only for as long as that is true — which is the "
+            "exact hole this parser was written to close, one comment "
+            "spelling to the left." % (style, members)
+        )
+        assert len(members) == len(live) - 1, (
+            "%s: expected exactly one member to disappear, got %s from %s"
+            % (style, members, live)
+        )
+
+
+def test_the_verify_step_actually_enforces_the_list_it_declares():
+    """ST-SEC-007 — a list of required files that nothing requires.
+
+    ``test_every_installer_shortcut_target_is_a_verified_build_output`` and
+    ``test_the_release_lane_verifies_everything_the_old_one_did`` both assert
+    that a path is *listed*. Neither asserts that listing it does anything, so
+    the array can keep every member and stop being a check. Measured on
+    bd12e58, each of these left both modules at exit 0 with 36 passes:
+
+      R4  delete the whole ``foreach`` — the step becomes an assignment and a
+          ``Write-Host`` and exits 0 on a build with no ``Dersis.exe``.
+      R5  keep the loop, change its ``exit 1`` to ``exit 0``.
+      R9  keep ``$checks`` intact, iterate ``@("$dist\\VERSION")`` instead.
+      S3  insert a second ``$checks = @("$dist\\VERSION")`` above the loop —
+          the parser reads the first assignment, the shell obeys the last.
+
+    Any of them reproduces ST-SEC-007 in full: an installer whose Start Menu
+    entry, Desktop icon and post-install "Launch program" all point at a file
+    the build never produced, with the packaging and release lanes green. That
+    is the same "a rewrite that silently verified less than what it replaced"
+    failure these tests exist for, which is why the enforcement is pinned and
+    not just the membership. The build_embed.bat side of the chain has been
+    pinned structurally since it was written; this is the asymmetry closed.
+    """
+    from _support.pwsh_parse import powershell_assignment_count, powershell_foreach
+
+    body = _verify_build_output_run()
+
+    count = powershell_assignment_count(body, "checks")
+    assert count == 1, (
+        "release.yml's 'Verify build output' step assigns `$checks` %d times. "
+        "Every membership assertion in this suite reads the first assignment "
+        "and the shell obeys the last, so a second one turns all of them into "
+        "assertions about a list nothing iterates. If the step legitimately "
+        "needs to build the list in stages, use `+=` — appending is adding "
+        "checks, and this counts only plain `=`." % count
+    )
+
+    loop = powershell_foreach(body, "checks")
+    assert loop is not None, (
+        "release.yml's 'Verify build output' step has no `foreach ($x in "
+        "$checks) { ... }`. Either nothing acts on the array at all, or the "
+        "loop iterates something other than the bare `$checks` variable — a "
+        "loop over a fresh literal leaves the array fully pinned by the "
+        "membership tests and connected to nothing. Step body was:\n%s" % body
+    )
+    variable, loop_body = loop
+
+    assert re.search(r"Test-Path\s+\$" + re.escape(variable) + r"\b", loop_body), (
+        "release.yml's 'Verify build output' loop never calls `Test-Path` on "
+        "its own loop variable `$%s`, so whatever it does with `$checks` is "
+        "not checking that those files exist. Loop body was:\n%s"
+        % (variable, loop_body)
+    )
+    assert re.search(r"(?m)^\s*exit\s+1\s*$", loop_body), (
+        "release.yml's 'Verify build output' loop finds a missing file and "
+        "then does not `exit 1`. A step that reports and continues is a step "
+        "the release proceeds past: Inno Setup compiles an installer out of "
+        "the incomplete bundle and the failure surfaces on the user's machine "
+        "as a shortcut that does nothing. Loop body was:\n%s" % loop_body
+    )
+
+
 def test_every_build_script_exits_nonzero_on_a_missing_critical_file():
     """ST-SEC-007 — a build that counts its own errors and then returns success.
 
