@@ -717,3 +717,101 @@ def test_the_real_start_drag_gfx_wires_up_the_undo_entry(win, monkeypatch):
     assert _placement(back) == (True, "monday", "09:00", "R001"), (
         "one undo after a REAL drag did not put the lesson back where the "
         "drag found it: %r" % (_placement(back),))
+
+
+def test_a_cancelled_grid_drag_leaves_the_undo_stack_as_it_found_it(
+        win, monkeypatch):
+    """ST-ARCH-012, the other half — the cancel path of the real starter.
+
+    The test above drops inside ``exec`` and so only ever exercises the
+    COMMIT half of the fix. The cancel half — ``_start_drag_gfx``'s
+    ``if self._drag_undo_pushed and self._undo_stack: self._undo_stack.pop()``
+    and the ``_drag_undo_pushed = False`` after it — was pinned by nothing:
+    measured 2026-08-29 at bd12e58, replacing that ``if``/``pop`` pair with
+    ``pass``, or deleting the flag reset, left ``tests/test_drag_and_drop.py``,
+    ``tests/test_full_state_undo.py`` and
+    ``tests/test_unplaced_panel_identity.py`` green — 24 passed, exit 0 — for
+    either mutation.
+
+    Here the substituted ``QDrag.exec`` returns WITHOUT dropping, which is
+    what Qt does when the user presses Esc or releases over a non-target.
+    Production must then undo its own pre-emptive bookkeeping: put the
+    placement back from ``_drag_backup``, and discard the ``unplace``
+    snapshot it pushed before ``mark_unplaced``.
+
+    The discriminator is the pre-drag edit to ``lecturers``. The phantom
+    snapshot, if it survives, was taken AFTER that edit, so restoring it is
+    a no-op the user cannot see — the lesson's placement looks right either
+    way. Only the earlier action's snapshot carries the old lecturer list,
+    so ``undo`` reaching it is what proves the phantom is gone.
+
+    A failure means every cancelled or refused drag leaves a phantom entry
+    on the stack and the user's next Ctrl+Z undoes a gesture they abandoned
+    instead of the action they actually took.
+
+    Deliberately NOT asserted here, because production gets them wrong today
+    and this test must not certify them: a cancelled drag clears the redo
+    stack (``_push_undo`` does it before the pop can put the entry back), and
+    at the 50-entry ``_max_undo`` cap the pre-emptive push evicts the oldest
+    entry, which the pop does not restore. Both are recorded for a later
+    session. This test pins only what the fix promises: the placement comes
+    back and the pre-emptive entry is discarded.
+    """
+    cls = _seed(win)
+
+    # An earlier, unrelated action — the one the user's next Ctrl+Z must
+    # reach. Its snapshot is the only one holding the old lecturer list.
+    win._push_undo("rename-lecturer")
+    win.state_data["lecturers"] = ["Ada L."]
+
+    labels_before = [entry[0] for entry in win._undo_stack]
+    assert labels_before == ["rename-lecturer"]
+
+    monkeypatch.setattr("scheduler_app.ui.app.QDrag", _FakeDrag)
+
+    captured = {}
+
+    def _cancel_during_exec(self, action):
+        # Mid-gesture, before the user gives up: production has already
+        # pushed its snapshot and taken the lesson off the grid. If these
+        # two do not hold, the drag never really ran and the assertions
+        # after it would pass vacuously.
+        captured["labels_during_drag"] = [e[0] for e in win._undo_stack]
+        captured["placement_during_drag"] = _placement(cls)
+        return action  # the user pressed Esc: no drop
+
+    monkeypatch.setattr(_FakeDrag, "exec", _cancel_during_exec)
+
+    win._start_drag_gfx(cls, _StubItem())
+
+    assert captured.get("labels_during_drag") == [
+        "rename-lecturer", tr("actions.unplace").format(name="Fizik")], (
+        "the gesture never got as far as the pre-emptive snapshot, so the "
+        "cancel path below was not exercised; stack was %r"
+        % (captured.get("labels_during_drag"),))
+    assert captured.get("placement_during_drag") == (
+        False, None, None, None), (
+        "the lesson was not taken off the grid before the drag went live, "
+        "so there is nothing for the cancel path to restore: %r"
+        % (captured.get("placement_during_drag"),))
+
+    live = win.state_data["classes"][0]
+    assert _placement(live) == (True, "monday", "09:00", "R001"), (
+        "a cancelled drag did not put the lesson back where it was: %r"
+        % (_placement(live),))
+
+    assert [entry[0] for entry in win._undo_stack] == labels_before, (
+        "a cancelled drag left its pre-emptive snapshot on the undo stack; "
+        "labels are %r, they were %r"
+        % ([entry[0] for entry in win._undo_stack], labels_before))
+
+    assert win._drag_undo_pushed is False, (
+        "the flag outlived the cancelled gesture, so it no longer states "
+        "whose entry is on top of the stack")
+
+    win.undo()
+
+    assert win.state_data["lecturers"] == ["Ada Lovelace"], (
+        "one Ctrl+Z after a cancelled drag did not reach the action the "
+        "user actually took; lecturers are %r"
+        % (win.state_data["lecturers"],))
