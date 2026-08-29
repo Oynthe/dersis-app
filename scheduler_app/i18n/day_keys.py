@@ -1,5 +1,6 @@
 """Weekday key helpers for UI translations and state normalization."""
 
+from scheduler_app.i18n.text_fold import fold_text
 from scheduler_app.translations import TRANSLATIONS, tr
 
 DAY_KEYS = [
@@ -37,21 +38,31 @@ def format_day_time(day_value, slot=None):
 
 
 def normalize_day_value(value):
-    """Convert a stored/imported day value into a stable day key."""
+    """Convert a stored/imported day value into a stable day key.
+
+    Folded with `fold_text`, not `str.casefold`: casefold does not know the
+    Turkish dotted/dotless I, so PAZARTESİ, SALI and CUMARTESİ -- and the
+    Azerbaijani ÇƏRŞƏNBƏ AXŞAMI and CÜMƏ AXŞAMI, which break under plain ASCII
+    .upper() -- all resolved to None and were then dropped by
+    `normalize_state_day_keys` with no warning, on the autosave path that then
+    writes the shrunken week back to disk. The seven keys are ASCII and fold to
+    themselves, which `test_the_seven_day_keys_are_fold_stable` pins, so the
+    fast path below stays correct.
+    """
     text = str(value or "").strip()
     if not text:
         return None
-    key = text.casefold()
+    key = fold_text(text)
     if key in DAY_KEYS:
         return key
 
     for day_key in DAY_KEYS:
-        if key == day_label(day_key).casefold():
+        if key == fold_text(day_label(day_key)):
             return day_key
 
     for lang_dict in TRANSLATIONS.values():
         for day_key in DAY_KEYS:
-            if key == str(lang_dict.get(f"weekdays.{day_key}", "")).strip().casefold():
+            if key == fold_text(str(lang_dict.get(f"weekdays.{day_key}", "")).strip()):
                 return day_key
     return None
 

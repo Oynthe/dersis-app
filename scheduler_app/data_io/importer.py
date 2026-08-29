@@ -16,6 +16,7 @@ from scheduler_app.models import (
     new_class, new_state, new_lecturer_availability,
     normalize_class_data, normalize_state_classes, parse_location_type_label,
 )
+from scheduler_app.i18n.text_fold import fold_text
 from scheduler_app.translations import tr
 from scheduler_app.data_io.schema import (
     canonicalize_workbook_columns,
@@ -207,9 +208,11 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
     # (T001's excluded day vanished), the name appeared twice in the lecturer
     # list, and both teachers' classes came back carrying the same string, so
     # the core reads them as one person and refuses to schedule them in
-    # parallel. Names are folded with `casefold()`, the same rule
-    # `SchedulingWorkflow.register_lecturer` uses (ST-UI-020), so the importer
-    # and the class form agree on what counts as a second teacher.
+    # parallel. Names are folded with `scheduler_app.i18n.text_fold.fold_text`,
+    # the same rule `SchedulingWorkflow.register_lecturer` uses (ST-UI-020), so
+    # the importer and the class form agree on what counts as a second teacher.
+    # Both sides must move together or they disagree; that is why the fold
+    # lives in a leaf module both layers can import rather than in either one.
     first_spelling: dict[str, str] = {}
     duplicate_names: dict[str, list[str]] = {}
     for idx, row in df.iterrows():
@@ -220,7 +223,7 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
             report.add_error(tr("labels.teachers"), row_num, tr("errors.teacher_id_required"))
             continue
 
-        folded = name.casefold()
+        folded = fold_text(name)
         if folded in first_spelling:
             duplicate_names.setdefault(folded, [first_spelling[folded]]).append(name)
         else:
