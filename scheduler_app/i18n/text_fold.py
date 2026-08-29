@@ -65,9 +65,21 @@ def fold_text(value):
     # ORDER: measured over the whole codespace on 2026-08-29, not asserted --
     # it is NOT load-bearing, and the comment that used to stand here said the
     # opposite of what is true. All six permutations of these three replaces
-    # agree on every one of the 83 488 strings the shipped catalogues contain,
-    # in every casing including a Turkish-keyboard upper(); exhaustively over
-    # 0..0x30000 the only probes that tell any two orders apart are U+0131
+    # agree on every key and every value of every shipped catalogue, in both
+    # casings including a Turkish-keyboard upper(). The corpus is the whole of
+    # TRANSLATIONS at whatever size it currently is -- stated that way on
+    # purpose, because the size is the one part of this that rots: it is four
+    # times the (locale, key) pair count, so it moves every time an English key
+    # is added across the 22 locales. Re-derive it, do not trust a number here.
+    # Snapshot, in the manner Dersis-mac.spec dates its own count: 83 664 on
+    # 2026-08-29 at bd12e58, from 20 916 pairs, zero disagreements. This line
+    # read "83 488" until that re-measurement -- exact when written at 1098671
+    # and stale two commits later, when 898da14 added two keys to all 22
+    # locales and moved it by 176, inside the very phase convened to make stale
+    # measurements true.
+    #
+    # Exhaustively over 0..0x30000 the only probes that tell any two orders
+    # apart are U+0131
     # followed by one or two U+0307 COMBINING DOT ABOVE, which no caller
     # produces. In particular the old claim that collapsing 'i' + U+0307 first
     # is what stops "the stray combining mark surviving into the comparison"
