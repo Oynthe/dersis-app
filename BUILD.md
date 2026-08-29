@@ -31,6 +31,19 @@ The **Nuitka** method compiles Python to native C code. Produces a smaller outpu
 
 ### Local Developer Setup
 
+Run `setup.bat` once, then `run.bat` to start the app:
+
+```bat
+setup.bat    :: creates .venv and installs requirements.txt, then verifies
+run.bat      :: launches DERSİS using that environment
+```
+
+Both scripts `cd` to their own directory, so they work when double-clicked from
+Explorer as well as from a terminal, and neither needs the environment
+activated.
+
+The manual equivalent, if you prefer it:
+
 ```bat
 :: Create a virtual environment (recommended)
 python -m venv .venv
@@ -38,7 +51,18 @@ python -m venv .venv
 
 :: Install runtime dependencies
 pip install -r requirements.txt
+
+:: Run
+python scheduler_gui.py
 ```
+
+> **The activation step is load-bearing.** `python scheduler_gui.py` runs
+> whichever `python` is first on `PATH`. If that is the system interpreter
+> rather than the environment you installed into, the app fails with
+> `ModuleNotFoundError: No module named 'PyQt6'` and reports it through its
+> startup-error dialog — which names the missing module, not the actual cause.
+> `run.bat` exists so that failure cannot happen: it locates `.venv` (or
+> `.venv-audit`) itself instead of trusting `PATH`.
 
 ### Refreshing the Lock File
 
@@ -55,7 +79,7 @@ The lock file should be regenerated on Windows for full accuracy.
 
 ### GitHub Actions
 
-- **CI workflow** (`ci.yml`): Installs from `requirements.txt` (Linux runner). There are no test files; CI runs version, build-file, and import-smoke checks only.
+- **CI workflow** (`ci.yml`): Installs from `requirements.txt` (Linux runner) and runs the regression suite under `tests/` — 1271 selected in the fast lane plus a separate slow engine lane — alongside version, build-file and import-smoke checks. (This line previously said the repository had no test files. It had none when it was written; it has had a suite since Phase 0.)
 - **Build workflow** (`build-installer.yml`):
   - Embed method: `build_embed.bat` handles its own dependency installation
   - Nuitka method: Installs from `requirements-lock.txt` for pinned reproducibility

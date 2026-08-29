@@ -211,6 +211,11 @@ henüz sağlanmamaktadır.
 Bu bölüm, DERSİS'i kendisi çalıştırmak veya derlemek isteyen, komut satırına aşina kişiler
 içindir. **Python 3.10 veya üzeri** gereklidir.
 
+**Windows'ta kısa yolu iki betiktir** — bir kez `setup.bat` çalıştırın, sonra
+uygulamayı başlatmak için her seferinde `run.bat`. İkisi de çift tıklamayla
+çalışır ve ortamın etkinleştirilmiş olmasını gerektirmez. Aşağıdaki adımlar bu
+betiklerin yaptığı işlerdir; Linux/macOS yolu da budur.
+
 ### 1. Kodu alın ve bağımlılıkları kurun
 
 ```bash

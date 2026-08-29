@@ -209,6 +209,11 @@ provided.
 This section is for people comfortable with a command line who want to run or build DERSİS
 themselves. You need **Python 3.10 or newer**.
 
+**On Windows the short version is two scripts** — run `setup.bat` once, then
+`run.bat` whenever you want to start the app. Both work when double-clicked and
+neither needs an activated environment. The steps below are what they do, and
+are also the Linux/macOS route.
+
 ### 1. Get the code and install dependencies
 
 ```bash
