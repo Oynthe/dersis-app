@@ -4,20 +4,21 @@ nothing reconciles it when Setup renames the room.
 The defect
 ----------
 ``data_io/importer.py`` (the ``required_room_type`` / ``allowed_rooms`` block
-around line 481) resolves a room *type* down to literal room **names** and
+in ``_process_classes``) resolves a room *type* down to literal room **names** and
 stores them in ``cls["required_classrooms"]``. Its own comment argues the point:
 ``required_classrooms`` is "the one room constraint the solver, the conflict
 graph, the negotiator and the class dialog all already read".
 
 What no one taught that field is that a room name is not a stable key. The only
-repair that runs after a Setup change (``ui/app.py:3707``
-``_reconcile_after_setup`` -> ``SchedulingWorkflow.reconcile_placements``,
-``core/workflow.py:970``) and after an import (``ui/app.py:5258``) reads exactly
+repair that runs after a Setup change
+(``ui/app.py::_reconcile_after_setup`` -> ``SchedulingWorkflow.reconcile_placements``
+in ``core/workflow.py``) and after an import
+(``ui/app.py::_import_from_excel``) reads exactly
 four axis sets — days, slots, classrooms, lecturers — and then only ever looks
 at ``placed_*`` and ``pinned_*``. It never reads ``required_classrooms`` or
 ``excluded_classrooms``.
 
-``SetupDialog._ok`` (``ui/dialogs.py:1966``) assigns ``self.state["classrooms"]
+``SetupDialog._ok`` (``ui/dialogs.py``) assigns ``self.state["classrooms"]
 = rooms`` straight from the table, so *renaming* a room is indistinguishable
 from *deleting one and adding another*. Renaming "Lab 1" to "Lab A" therefore
 leaves every class that required "Lab 1" pointing at a room that does not exist:
@@ -50,7 +51,7 @@ fixer prefers.
 How the rename is driven
 ------------------------
 ``SetupDialog`` is not opened. It writes the new room list into state with a
-plain assignment (``ui/dialogs.py:1966``), and a rename reaches state as
+plain assignment (``ui/dialogs.py::SetupDialog._ok``), and a rename reaches state as
 nothing more than a different string in ``state["classrooms"]``, so
 ``_rename_room`` below reproduces it exactly. Everything *after* that point —
 the repair, the candidate computation and the dialog — is the real production
@@ -194,7 +195,10 @@ def test_reconcile_leaves_no_dangling_excluded_classroom():
 
 
 def test_the_app_level_reconcile_reports_it(make_app):
-    """The same claim at the call site Setup actually uses (ui/app.py:3707)."""
+    """The same claim at the call site Setup actually uses.
+
+    ``ui/app.py::edit_setup`` -> ``ui/app.py::_reconcile_after_setup``.
+    """
     state, cls = _required_lab_then_renamed()
     win = make_app()
     win.state_data = state
@@ -227,7 +231,8 @@ def test_class_is_still_placeable_after_its_required_room_is_renamed():
     assert physical, (
         "get_physical_room_candidates returned %r for %r after Setup renamed "
         "%r to %r and the reconcile ran. Every room in the school was filtered "
-        "out by `r in cls['required_classrooms']` (core/models.py:557-558) "
+        "out by `r in cls['required_classrooms']` "
+        "(core/models.py::get_physical_room_candidates) "
         "because that list still names the old room. A class with no room "
         "candidates can never be placed — not by drag, not by the greedy pass, "
         "not by the solver — and it is unplaceable for a reason no screen in "
@@ -309,7 +314,7 @@ def test_reopening_edit_class_and_pressing_ok_keeps_the_room_constraints(
     assert set(after) == set(before), (
         "Opening Edit Class on %r and pressing OK without touching anything "
         "changed its required classrooms from %r to %r. _ok rebuilds the field "
-        "from the checkbox registry (ui/dialogs.py:2695), and the registry was "
+        "from the checkbox registry (AddClassDialog._ok), and the registry was "
         "built from the live room list, so a constraint naming the renamed %r "
         "is not merely hidden — it is destroyed by the act of looking at the "
         "class. That is silent, undoable-only-by-luck data loss on a field the "
@@ -327,8 +332,9 @@ def test_the_state_field_is_excluded_classrooms_not_excluded_rooms():
 
     The handoff for this defect used both ``excluded_classrooms`` and
     ``excluded_rooms``. Only the first exists in state: ``excluded_rooms`` is
-    the *spreadsheet column* (``data_io/schema.py:51``), which
-    ``importer.py:699`` copies into ``cls["excluded_classrooms"]``. A repair
+    the *spreadsheet column* (``data_io/schema.py``), which
+    ``importer.py::_process_classes`` copies into
+    ``cls["excluded_classrooms"]``. A repair
     written against ``excluded_rooms`` would read a key that is never present
     and silently do nothing, which is why this is asserted behaviourally rather
     than by looking the key up.
@@ -453,7 +459,8 @@ def test_opening_a_file_does_not_unplace_the_users_lessons(
         "opening a saved schedule unplaced %d of its 2 lessons. The undo "
         "stack is cleared one statement later and the result is marked as "
         "the clean baseline, so this is silent, unrecoverable data loss on "
-        "File > Open — the exact thing core/models.py:690-694 forbids. "
+        "File > Open — the exact thing core/models.py::find_off_grid_placements "
+        "forbids in its own docstring. "
         "Placements now: %r"
         % (2 - len(placed),
            [(c["name"], c.get("placed"), c.get("placed_day"),
@@ -682,7 +689,8 @@ def test_reconcile_records_which_lesson_lost_its_room_requirement_entirely():
         "outright. It must report exactly the classes whose "
         "required_classrooms went from non-empty to EMPTY, together with the "
         "room names it deleted — an empty list means 'any room' everywhere in "
-        "core (core/models.py:557), so that class can now be auto-scheduled "
+        "core (core/models.py::get_physical_room_candidates), so that class "
+        "can now be auto-scheduled "
         "into a lecture hall, and the room name is the only thing that lets a "
         "user put the requirement back. %r was merely narrowed and is still "
         "constrained to %r, so it is not this event.\n"
@@ -758,7 +766,7 @@ def test_the_lost_requirement_message_does_not_grow_with_the_school(
     """Bounded output, unbounded truth.
 
     Deleting a room a whole department requires is one gesture, and the toast
-    is 350 px wide with a 3 s life (ui/widgets.py:48). ST-UI-B6 is the same
+    is 350 px wide with a 3 s life (``ui/widgets.py::Toast``). ST-UI-B6 is the same
     shape one layer over: an unbounded report measured 24 110 px tall for 500
     rows. The COUNT must stay true; the list of names is what gets cut.
     """

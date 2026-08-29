@@ -11,14 +11,13 @@ had **no test at all**. Two measurements, both reproduced in Phase 7:
    so.
 
 2. ``tests/test_validator_unification.py``'s ``_drop_verdict`` helper says it
-   "mirrors ui/app.py::_execute_drop (:3910-3984) phase for phase". The line
-   reference is hundreds of lines stale and the replica is missing two of
-   production's inputs, so it answers differently from the code it claims to
-   mirror:
+   "mirrors ``ui/app.py::_execute_drop`` phase for phase". The replica is
+   missing two of production's inputs, so it answers differently from the code
+   it claims to mirror:
 
    * it calls ``validate_drop`` with **no ``drag_backup``**, so the
-     ``protection == "same_day"`` branch (``core/workflow.py``:696-699) can
-     never fire from it. A protected lesson dropped on another day: production
+     ``protection == "same_day"`` branch (``core/workflow.py::validate_drop``)
+     can never fire from it. A protected lesson dropped on another day: production
      ``valid=False``, replica ``valid=True``;
    * it calls ``find_drop_classroom`` with **no ``preferred_rooms``**, while
      production derives them in ``_get_preferred_rooms`` (``ui/app.py``)
@@ -38,9 +37,16 @@ carried seven of its own. Re-measured 2026-08-29 at ca781f1, every
 +47 and +117 lines — and the worst of them had been *refreshed* one phase
 earlier, which is the point: re-numbering restores exactly the failure it is
 meant to fix. They are gone; the symbols are stable and greppable, so name
-those. (The two references to other files — ``core/workflow.py``:696-699 for
-the ``same_day`` branch and ``ui/renderer.py``:2052 for ``dragLeaveEvent`` —
-were re-measured too and are both exact, so they stand as written.)
+those.
+
+That first pass kept two line references into other files — the ``same_day``
+branch in ``core/workflow.py`` and ``dragLeaveEvent`` in ``ui/renderer.py`` —
+on the grounds that both were re-measured and exact. Both are gone now as
+well, and the reason is the paragraph above: "exact today" is the state every
+one of the seven was in when it was written. Measured across the whole suite
+on 2026-08-29, of the fifty ``file``-plus-line citations whose prose also named
+a function, **forty-one pointed outside it**. The rule is now enforced by
+``tests/test_source_citations.py`` rather than left to each author.
 
 Every test below drives the real ``SchedulerApp`` through the ``make_app``
 fixture, with no refactor of any kind. Nothing here asserts a pixel: the
@@ -466,7 +472,7 @@ def test_a_refused_drop_leaves_the_undo_stack_alone(win):
 
     (This docstring used to credit `dragLeaveEvent`/`_cancel_drag` with the
     restore. There is no `_cancel_drag` anywhere in `scheduler_app`, and
-    `dragLeaveEvent` — `ui/renderer.py`:2052 — only clears the drop highlight.
+    `ui/renderer.py::dragLeaveEvent` only clears the drop highlight.
     The assertions were right; the explanation was not.)
     """
     cls = _seed(win)

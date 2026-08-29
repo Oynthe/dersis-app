@@ -2,8 +2,8 @@
 
 ``tests/test_export_smoke.py`` covers ``export_schedule(state, "csv", ...)``.
 Measured in Phase 7, that function has **no production caller**: the File menu
-is wired at ``ui/app.py:1000`` to ``SchedulerApp.export_csv``
-(``ui/app.py:2685``), a second writer with its own ``csv.writer``. So the
+is wired in ``ui/app.py::_build_menu`` to ``SchedulerApp.export_csv``, a
+second writer with its own ``csv.writer``. So the
 suite was proving CSV correctness -- encoding included -- in a function no user
 can reach, which is ST-ARCH-003 repeating one format later.
 
@@ -92,7 +92,7 @@ def _turkish_state(with_groupless=False):
 
     place("D001", LESSON, "monday", "09:00", [{"year": YEAR, "branch": "A"}])
     if with_groupless:
-        # new_class() initializes targets to [] (core/models.py:578) and
+        # new_class() initializes targets to [] (core/models.py::new_class) and
         # neither class-editor path requires one, so this is the default state
         # of every lesson placed before its groups were ticked.
         place("D900", GROUPLESS_LESSON, "tuesday", "10:00", [])

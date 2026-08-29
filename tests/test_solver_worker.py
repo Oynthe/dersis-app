@@ -2,7 +2,7 @@
 
 Why this module exists
 ----------------------
-``SchedulerApp._do_reschedule`` (``ui/app.py:2805-2831``) calls
+``SchedulerApp._do_reschedule`` (``ui/app.py``) calls
 ``self._workflow.reschedule(...)`` **inline on the GUI thread** and hands it a
 progress callback that does ``self.statusBar().showMessage(...)`` followed by
 ``QApplication.processEvents(...)``. That callback is the freeze: the only
@@ -220,7 +220,8 @@ adapter's iteration denominator drifts from      exactly 1 fails, the new
 A second, unrelated defect surfaced while checking isolation and is written up
 on ``_defuse_foreign_dangling_modals``: ``pytest tests/test_settings_recovery.py
 tests/test_solver_worker.py`` aborts the interpreter 6/6 once the fix lands,
-because ``ui/app.py:1884`` leaves an un-owned ``QTimer.singleShot`` pointing at
+because ``ui/app.py``'s deferred settings-problem warning box leaves an
+un-owned ``QTimer.singleShot`` pointing at
 a destroyed window and this module is the first thing in the suite that pumps
 the Qt loop hard enough to fire it. Contained here, 10/10 clean; the one-line
 production fix is in the plan. The natural whole-suite order never hit it,
@@ -469,7 +470,7 @@ def _defuse_foreign_dangling_modals(qapp):
     VERIFIER, measured and reproducible 6/6: running
     ``tests/test_settings_recovery.py`` and this module in one invocation
     aborts the interpreter outright — Windows 0xc0000374, heap corruption, no
-    pytest summary at all — inside ``ui/app.py:1884``::
+    pytest summary at all — inside ``ui/app.py``'s settings-problem warning::
 
         QTimer.singleShot(0, lambda: QMessageBox.warning(
             self, tr("status.settings_problem_title"), message))
@@ -487,7 +488,7 @@ def _defuse_foreign_dangling_modals(qapp):
     and this module never shows a message box of its own, so the call is
     stubbed for the module's lifetime and restored afterwards.
 
-    This is containment, not a fix. ``ui/app.py:1884`` should read
+    This is containment, not a fix. That ``ui/app.py`` call should read
     ``QTimer.singleShot(0, self, lambda: ...)`` so Qt drops the timer with the
     window; that is a required item in the implementation plan, and when it
     lands this fixture can go.

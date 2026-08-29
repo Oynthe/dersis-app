@@ -9,10 +9,10 @@ each append rewrites the entire encrypted log, so the cost of using the app
 grows with the history of using the app, and ``PreferenceLearner.learn()``
 re-reads and re-trains on the whole file on every call.
 
-The hot path is doubled: ``core/workflow.py:623`` logs a ``manual_move`` and
-``core/workflow.py:628`` immediately calls ``learn()``. One drag-drop pays a
-whole-log rewrite *and* a whole-log read-and-retrain. ``ui/app.py:850`` pays the
-read-and-retrain again on every launch.
+The hot path is doubled: ``core/workflow.py::log_manual_move`` logs a
+``manual_move`` and then immediately calls ``learn()``. One drag-drop pays a
+whole-log rewrite *and* a whole-log read-and-retrain. ``ui/app.py::__init__``
+pays the read-and-retrain again on every launch.
 
 Why every assertion here is a count or a ratio, never a duration
 ---------------------------------------------------------------
@@ -229,7 +229,7 @@ def _seed_log(n_entries):
     """Write an *n_entries* feedback log in one shot, in the shipped format.
 
     ``storage.save_encrypted(list, path)`` is byte-for-byte what
-    ``save_encrypted_lines`` does today (``storage.py:419-421``), so this is the
+    ``save_encrypted_lines`` does today (``storage.py``), so this is the
     on-disk file a real user already has. Seeding this way rather than by
     appending keeps the ``learn()`` tests measuring ``learn()`` — the cost of
     *building* a log is ST-PERF-005's other half and is measured separately.
@@ -422,7 +422,7 @@ def test_a_log_written_by_todays_code_still_loads_and_appends(dersis_home):
     worse, the first post-upgrade append overwrites it.
 
     The "old" file is built with ``storage.save_encrypted`` — which is exactly
-    what ``save_encrypted_lines`` does today (``storage.py:419-421``) and is the
+    what ``save_encrypted_lines`` does today (``storage.py``) and is the
     generic single-object container writer used for settings, saves and learned
     weights. Building it that way rather than through ``save_encrypted_lines``
     means this test keeps testing *back-compat* even if the fix repoints the
@@ -455,8 +455,9 @@ def test_a_legacy_uva_feedback_log_still_loads_and_appends(dersis_home):
     """ST-PERF-005: the pre-rename ``.uva`` log is still a live on-disk case.
 
     ``storage.feedback_log_path()`` falls back to ``logs/feedback_log.uva`` when
-    no ``.egu`` exists (``storage.py:131-133`` via ``_with_legacy_fallback`` at
-    ``104-113``), so a user who has not logged feedback since the rename still
+    no ``.egu`` exists (``storage.py::feedback_log_path`` via
+    ``storage.py::_with_legacy_fallback``), so a user who has not logged
+    feedback since the rename still
     has their history in a ``.uva``. A failure means that history is dropped —
     or destroyed by the first append — on upgrade.
     """
@@ -484,7 +485,7 @@ def test_learn_does_not_reprocess_entries_it_has_already_learned_from(
     """ST-PERF-005: ``learn()`` must consume new feedback, not the whole log.
 
     A failure means every learning pass costs the full history — and, because
-    ``workflow.py:628`` fires a pass after *every* drag-drop, a user who moves
+    ``workflow.py::log_manual_move`` fires a pass after *every* drag-drop, a user who moves
     ten classes re-processes the first move ten times. Measured today: 40
     entries -> 40 signals, then 40 signals *again* with no new feedback, then 45
     after five more entries.
@@ -538,7 +539,7 @@ def test_repeat_learn_does_not_move_weights_it_already_applied(dersis_home):
     implementation passes the cost assertions and fails this one.)
 
     The final clause is the restart case, and it is the one that decides whether
-    the fix's high-water mark has to be **persisted**. ``ui/app.py:848-850``
+    the fix's high-water mark has to be **persisted**. ``ui/app.py::__init__``
     constructs a ``PreferenceLearner`` and calls ``learn()`` on every launch, so
     a cursor that lives only in memory still re-applies the entire history once
     per app start — the weights drift a little every time the user opens DERSİS.
@@ -748,7 +749,7 @@ def test_storage_append_does_not_destroy_a_corrupt_log(dersis_home):
     A failure means one bad sector plus one drag-drop permanently erases
     everything DERSİS has learned about the user. Every non-destructive outcome
     is accepted: refuse the append and leave the file alone, quarantine it the
-    way ``storage.quarantine_corrupt`` (``storage.py:473-489``) already does for
+    way ``storage.quarantine_corrupt`` (``storage.py``) already does for
     saves and settings, or append past the damage. What is not accepted is the
     bytes ceasing to exist — ST-DATA-014 settled that principle: nothing is ever
     deleted.
@@ -768,7 +769,7 @@ def test_logger_append_does_not_destroy_a_corrupt_log(dersis_home):
 
     A failure means the destruction happens on an ordinary drag-drop and the
     user is never told, because ``FeedbackLogger._write_entry``
-    (``feedback_logger.py:61-68``) swallows every exception on the way out.
+    (``feedback_logger.py``) swallows every exception on the way out.
 
     Deliberately a separate test with its own ``dersis_home`` rather than a
     second half of the one above: if both ran in one sandbox and the storage

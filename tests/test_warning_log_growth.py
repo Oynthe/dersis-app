@@ -1,8 +1,7 @@
 """The warning log must describe the timetable that exists **now**, exactly once.
 
-ST-PERF-003 (High) · ``app.py:3117-3154`` (``_refresh_warnings``),
-``app.py:3156-3214`` (``_run_auto_negotiation``), ``widgets.py:213-239``
-(``WarningLogPanel.log``)
+ST-PERF-003 (High) · ``app.py::_refresh_warnings``,
+``app.py::_run_auto_negotiation``, ``widgets.py::WarningLogPanel.log``
     ``_refresh_warnings`` **appends** to a list that is never reset, and
     ``WarningLogPanel.log`` re-renders the whole list into fresh HTML on every
     single append. Refresh *k* therefore stores *k* copies of the same warnings
@@ -12,7 +11,7 @@ ST-PERF-003 (High) · ``app.py:3117-3154`` (``_refresh_warnings``),
     growing ``warning_log._messages`` 138 → 1656 (+138 each), process RSS
     +480 MB, and per-refresh time 2081 ms → 4816 ms.
 
-ST-PERF-006 (Medium) · ``app.py:2993-3115`` (``_refresh_open_slots``)
+ST-PERF-006 (Medium) · ``app.py::_refresh_open_slots``
     The open-slots panel tears down and rebuilds its entire widget tree, and
     re-runs the full occupancy/validity analysis, on **every** refresh — even
     when nothing about the state has changed.
@@ -363,7 +362,7 @@ def seeded(window):
 
     Why *excluded* days and not ``allowed_days=["saturday"]``, which reads more
     naturally: ``refresh_grid`` -> ``_auto_save`` -> ``normalize_state_day_keys``
-    strips off-grid values out of ``allowed_days`` (``day_keys.py:78``), so a
+    strips off-grid values out of ``allowed_days`` (``day_keys.py``), so a
     Saturday-only class silently becomes an unrestricted one on the first
     repaint and the diagnostics change between refresh 1 and refresh 2. That
     would make every "same state, same warnings" assertion below measure the
@@ -639,16 +638,16 @@ def test_settings_failure_is_reported_once_and_survives_the_rebuild(
     tells a user their work is not being saved.
 
     The count-of-2 case is not hypothetical and it is the trap in the obvious
-    implementation. ``_report_settings_problem`` (app.py:1869) already calls
+    implementation. ``_report_settings_problem`` (app.py) already calls
     ``warning_log.add(message)`` — a method ``WarningLogPanel`` does not have,
     so today it raises inside ``except Exception: pass`` and the message reaches
-    the panel only via the ``_show_toast`` mirror at app.py:3980. The moment the
+    the panel only via the ``_show_toast`` mirror. The moment the
     fix gives the panel a real ``add()`` as its sticky channel, *both* paths
     fire and the user reads the same alarming sentence twice. Measured: that
     variant scores 2 here.
 
-    The remedy is to delete the ``log.add(...)`` blocks at app.py:1838-1842 and
-    app.py:1869-1873 and let the toast mirror be the one channel — **not** to
+    The remedy is to delete both ``log.add(...)`` blocks in ``ui/app.py``
+    and let the toast mirror be the one channel — **not** to
     give ``_show_toast`` a ``log=False`` switch. ``tests/test_settings_recovery.py``
     (Phase 1, ST-DATA-005) replaces ``_show_toast`` with a spy of signature
     ``(self, message, kind="info")`` and spies on ``WarningLogPanel.log``, not on

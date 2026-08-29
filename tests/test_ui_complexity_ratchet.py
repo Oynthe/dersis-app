@@ -108,7 +108,8 @@ measured happening rather than reasoned about:
   * `_repair_report_message` (+5) exists because a count-only toast could not
     tell "this class's room requirement was NARROWED" from "this class's room
     requirement is GONE". An empty `required_classrooms` means "any room"
-    everywhere in core (core/models.py:557), and after one Setup rename
+    everywhere in core (core/models.py::get_physical_room_candidates), and
+    after one Setup rename
     `place_batch` put a physics-lab lesson in "Hall A", the lecture hall, under
     a message that said only "2 class(es) were repaired".
   * `_place_classes_batch` (+1) is the undo gate. Without it, Ctrl+P with

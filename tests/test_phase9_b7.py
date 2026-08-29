@@ -9,7 +9,7 @@ anything::
 
 That ``return`` happens before ``get_entries_since_report`` is ever called, so
 ``last_read_lost`` keeps its constructor 0, and
-``SchedulerApp._report_damaged_feedback_log`` (ui/app.py:2087) short-circuits on
+``SchedulerApp._report_damaged_feedback_log`` (ui/app.py) short-circuits on
 ``if not lost: return``.  A user who has recorded fewer than five corrections
 therefore loses that history in complete silence: nothing is learned from it,
 and nothing is said about it.

@@ -30,7 +30,7 @@ user has been getting -- see PROGRESS.md.
 
 **Which one does a user reach?** Measured in Phase 7: only the second.
 ``export_schedule(..., "csv", ...)`` is called nowhere in production -- the
-menu at ``ui/app.py:1000`` is wired to ``ui/app.py::export_csv``. So every CSV
+menu built in ``ui/app.py::_build_menu`` is wired to ``ui/app.py::export_csv``. So every CSV
 assertion in *this* module is a library guard, not a user-facing pin, and
 ST-FUNC-006's real pins moved to ``tests/test_export_csv_live.py``, which
 drives the writer a user actually gets.
@@ -516,7 +516,7 @@ def test_csv_and_xlsx_keep_a_class_with_no_target_groups(tmp_path, fmt, request)
 
     A failure means a lesson the user placed before assigning it to a class
     group crashes the export or disappears from it. (The CSV writer's
-    otherwise-untested ``else`` branch, exporter.py:390.)
+    otherwise-untested ``else`` branch in ``exporter.py``.)
     """
     if fmt == "xlsx":
         openpyxl_mod = request.getfixturevalue("openpyxl_mod")

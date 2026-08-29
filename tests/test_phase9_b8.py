@@ -3,7 +3,7 @@
 The defect
 ----------
 ``PreferenceLearner.learn()`` opens with a size fast-path
-(``scheduler_app/learning/preference_learner.py:87-89``)::
+(``scheduler_app/learning/preference_learner.py``)::
 
     size = self.feedback_logger.log_size()
     if size and size == self._learned_size:
@@ -14,7 +14,7 @@ the log — which it has after the first pass, and which is the steady state of
 every installation older than five feedback entries — the only thing it ever
 looks at again is a number that in-place rot cannot move. Every later
 ``learn()`` returns at that line: ``last_read_lost`` keeps its constructor 0,
-``SchedulerApp._report_damaged_feedback_log`` (``ui/app.py:2087-2092``) returns
+``SchedulerApp._report_damaged_feedback_log`` (``ui/app.py``) returns
 at its ``if not lost``, and the user is never told that their feedback history
 stopped being readable.
 
@@ -45,7 +45,7 @@ What the fix must not do
 ------------------------
 Not a full re-read on every call: the size gate is ST-PERF-005's removal of an
 O(n) cost paid after every drag-drop. The module's own ST-DATA-002 comment
-(``preference_learner.py:130-136``) already names the shape of the answer — a
+(``preference_learner.py::_span_fingerprint``) already names the shape of the answer — a
 fingerprint of the skipped BYTES, "cheap, since it needs no AES-GCM decrypt" —
 and explicitly rules out a fingerprint over their LENGTH, which is exactly what
 the size gate is.
@@ -203,7 +203,8 @@ def test_an_in_place_bit_flip_on_a_caught_up_log_is_noticed(dersis_home):
     # ── The behaviour under test. ────────────────────────────────────────────
     # Instrumented only to make the failure message name the right line: a
     # learn() that never reaches entry_count() returned at the size fast-path
-    # (preference_learner.py:87-89), above every other gate in the method.
+    # (the size fast-path at the top of PreferenceLearner.learn), above every
+    # other gate in the method.
     reached_count_gate = []
     real_entry_count = learner.feedback_logger.entry_count
     learner.feedback_logger.entry_count = (
@@ -220,7 +221,7 @@ def test_an_in_place_bit_flip_on_a_caught_up_log_is_noticed(dersis_home):
         "storage.load_encrypted_lines_report says lost=%r over %r readable "
         "records, and entry_count() is %r, well past MIN_ENTRIES_TO_LEARN=%r. "
         "learn() %s reach the MIN_ENTRIES gate, so it returned at the size "
-        "fast-path (preference_learner.py:87-89). "
+        "fast-path at the top of PreferenceLearner.learn. "
         "SchedulerApp._report_damaged_feedback_log therefore returns at its "
         "`if not lost` and the user is told nothing, forever."
         % (learner.last_read_lost, size_after, report.lost,

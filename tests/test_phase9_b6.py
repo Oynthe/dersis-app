@@ -5,9 +5,9 @@ The defect
 ``required_room_type`` (Classes sheet) and ``room_type`` (Rooms sheet) are both
 optional. A school that fills the class column and names a type none of its
 rooms carries gets **one warning per class row** from
-``data_io/importer.py:504-514``, and ``DataValidationReport.summary()``
-(``importer.py:78-88``) concatenates every one of them into a single string.
-``SchedulerApp._import_from_excel`` (``ui/app.py:5271-5273``) then hands that
+``data_io/importer.py::_process_classes``, and ``DataValidationReport.summary()``
+concatenates every one of them into a single string.
+``SchedulerApp._import_from_excel`` (``ui/app.py``) then hands that
 whole string to ``QMessageBox.information`` — no scroll area, no cap, no
 "and 480 more".
 
@@ -55,7 +55,7 @@ that only trims the list must be trimmed hard, or be given somewhere to scroll.
 
 The sibling column
 ------------------
-``allowed_rooms`` (``importer.py:477-481``) warns per row in the same way and
+``allowed_rooms`` (``importer.py::_process_classes``) warns per row in the same way and
 explodes at exactly the same rate — 500 rows, 500 warnings, one dialog. Its
 lines are shorter, so it wraps less and the dialog is "only" ~8100 px tall on
 the same machine. ``test_the_allowed_rooms_sibling_explodes_the_same_way``
@@ -433,7 +433,8 @@ def test_the_allowed_rooms_sibling_explodes_the_same_way(
     """The ``allowed_rooms`` column warns per row too, and must be bounded too.
 
     The per-row form of the room-type warning was chosen for parity with this
-    sibling (``errors.unknown_rooms``, same function, ``importer.py:477-481``),
+    sibling (``errors.unknown_rooms``, same function,
+    ``importer.py::_process_classes``),
     and the parity is real: 500 rows produce 500 warnings on either column.
     Measured on the same machine, the sibling's dialog is ~8100 px tall against
     the room type's ~24100 (its lines are shorter, so it wraps less) — smaller

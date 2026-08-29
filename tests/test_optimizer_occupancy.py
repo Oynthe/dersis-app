@@ -9,7 +9,7 @@ lane, which the spine's ST-SCHED-001 pins (all ``slow``) do not.
 What is actually broken
 -----------------------
 **ST-SCHED-001.** ``ScheduleOptimizer._greedy_construct``
-(``scheduler_app/core/schedule_optimizer.py:636-757``) records its answer as a
+(``scheduler_app/core/schedule_optimizer.py``) records its answer as a
 *snapshot*: ``solve()`` copies ``solution`` into ``best_solution`` at a leaf and
 then keeps searching. There are two exits.
 
@@ -41,17 +41,18 @@ map that was emptied behind its back. That attribution is what
 the thing the spine's oracle-level pins cannot tell you.
 
 **ST-SCHED-010.** ``ConstraintValidator``'s occupancy cells
-(``scheduler_app/core/constraint_validator.py:36-38``) are ref-count-free
+(``scheduler_app/core/constraint_validator.py``) are ref-count-free
 ``set``s, so two classes contributing the same claim to one cell collapse into
-one entry — and ``remove_placement`` (``:283-298``) uses ``discard``, so
+one entry — and ``ConstraintValidator.remove_placement`` uses ``discard``, so
 removing *either* of them erases the claim of the other. Two classes pinned to
 the same room/day/hour is an ordinary state (the user types it in; the spine's
 ``test_colliding_pins_are_not_silently_committed`` covers it, and
 ``workflow.apply_reschedule`` deliberately registers an infeasible pin anyway —
-``workflow.py:533-536``). Confirmed against HEAD:
+``workflow.py::apply_reschedule``). Confirmed against HEAD:
 ``check_placement_explained(PinA, monday, 09:00, R001)`` returns ``(True, [])``
 while PinB sits in exactly that room, because the temporary self-removal at
-``constraint_validator.py:170-177`` took PinB's claim down with it.
+``constraint_validator.py::check_placement_explained`` took PinB's claim down
+with it.
 
 Traps this module defends against
 ---------------------------------
@@ -76,7 +77,7 @@ holds the other end: the same validator must still say Yes to a free cell.
 
 **Trap 4 — the obvious ST-SCHED-010 fix breaks locked classes.** Turning the
 cells into ``{entity: refcount}`` and nothing else makes
-``schedule_optimizer.py:387-397`` a leak: ``exclude_ids`` there covers only
+``schedule_optimizer.py::optimize`` a leak: ``exclude_ids`` there covers only
 ``all_flexible``, so a ``locked``/``protected`` class is claimed once by
 ``build_occupancy`` (it is ``placed``) and a second time by the explicit
 ``validator.add_placement`` loop. With sets that collapsed harmlessly; with
@@ -513,7 +514,7 @@ def test_lns_never_introduces_a_conflict_the_greedy_did_not_have():
     for i, run in enumerate(runs):
         # Anti-vacuity: LNS must actually have had a schedule to work on. It
         # returns immediately when fewer than 3 placements exist
-        # (schedule_optimizer.py:770-772), and "LNS broke nothing" would then be
+        # (schedule_optimizer.py::_lns_improve), and "LNS broke nothing" would then be
         # true because LNS did nothing.
         assert run["lns_hard"] is not None, (
             f"run {i}: _lns_improve was never called, so this proves nothing "
@@ -566,13 +567,13 @@ def test_removing_one_pin_leaves_the_other_pins_room_occupied():
     A user pins two classes to monday/09:00/R001 — an ordinary thing to do, and
     a state the app explicitly supports: ``apply_reschedule`` registers an
     infeasible pin in the occupancy map rather than clearing it
-    (``workflow.py:533-536``), and the spine's
+    (``workflow.py::apply_reschedule``), and the spine's
     ``test_colliding_pins_are_not_silently_committed`` covers the same shape.
 
     Lift *one* of them out of the maps — which ordinary production code does all
     the time, e.g. ``check_placement_explained`` temporarily removes a class's
     own placement so it cannot conflict with itself
-    (``constraint_validator.py:170-177``) — and R001 reads as free, although the
+    (``constraint_validator.py``) — and R001 reads as free, although the
     second pin is still sitting in it. A failure means DERSİS will cheerfully
     drop a third lesson into a room that already has two.
     """
@@ -601,7 +602,8 @@ def test_explained_check_reports_the_room_a_second_pin_still_occupies():
     """Pins ST-SCHED-010 (Medium) through the API the UI actually asks.
 
     ``check_placement_explained`` is what produces the "why can't this go here?"
-    reasons a user reads (``schedule_impact_analyzer.py:200``). Asked about PinA
+    reasons a user reads (``schedule_impact_analyzer.py::_check_hard_violations``).
+    Asked about PinA
     at PinA's own pin, it removes PinA's claims to avoid a self-conflict — and
     with set-valued cells that removal takes PinB's identical room claim with it,
     so the answer comes back ``(True, [])``: *no conflicts*. Measured on
@@ -714,7 +716,7 @@ def test_optimizer_validator_holds_one_claim_per_locked_class():
 
     ``ScheduleOptimizer.optimize`` builds its per-run validator with
     ``exclude_ids`` covering only ``all_flexible``
-    (``schedule_optimizer.py:387-397``), so a ``locked`` class — which is
+    (``schedule_optimizer.py::optimize``), so a ``locked`` class — which is
     ``placed``, and therefore already counted by ``build_occupancy`` — is then
     claimed a *second* time by the explicit ``validator.add_placement`` loop.
     Set-valued cells swallowed that. Ref-counted cells do not: the cell would
@@ -771,7 +773,7 @@ def test_optimizer_validator_holds_one_claim_per_locked_class():
         assert after is True, (
             f"run {i}: one remove_placement did NOT free the locked class's "
             "cell, so the optimizer's validator is holding more than one claim "
-            "for a single placement. See schedule_optimizer.py:387-397 — the "
+            "for a single placement. See ScheduleOptimizer.optimize — the "
             "locked class is registered by build_occupancy AND by the explicit "
             "add_placement loop, and with ref-counted cells that double claim "
             "can never be released.")

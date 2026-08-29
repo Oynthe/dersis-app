@@ -78,8 +78,9 @@ dropping off-grid-day placements, and the CSV must not start dropping off-grid
 which holds the CSV to the same bar this module holds the PDF to.
 
 The crash also *moves* in two places rather than disappearing. Guarding
-``slots_fit`` exposes ``workflow.py:476``; guarding ``get_consecutive_slots``
-exposes ``logic.py:228``. Both are covered here
+``slots_fit`` exposes ``workflow.py::validate_drop``; guarding
+``get_consecutive_slots`` exposes ``logic.py::_detect_occupancy_conflicts``.
+Both are covered here
 (``test_validate_drop_...`` and ``test_axis_removal_does_not_crash_conflict_detection``).
 """
 import base64
@@ -537,7 +538,7 @@ def test_validate_drop_reports_an_out_of_grid_slot_instead_of_crashing():
 
     A failure means dropping a lesson onto a cell whose hour is no longer on the
     grid raises out of the Qt drop handler. Note this path holds a *second* bare
-    ``state['slots'].index(slot)`` (``workflow.py:476``) that only becomes
+    ``state['slots'].index(slot)`` (``workflow.py::validate_drop``) that only becomes
     reachable once ``slots_fit`` stops raising — fixing ``slot_index`` alone
     moves the crash rather than removing it.
     """
@@ -712,7 +713,7 @@ def test_axis_removal_does_not_crash_conflict_detection(make_state, kind):
     user can no longer drag *any* lesson anywhere: choosing a drop target walks
     every placed class, reaches the stranded one and raises.
 
-    This path holds a SECOND bare ``.index()`` — ``logic.py:228``
+    This path holds a SECOND bare ``.index()`` — ``logic.py::_detect_occupancy_conflicts``
     (``ex_start_idx = slot_index(state, ex_start)``) — that only becomes
     reachable once ``occupied_slots_of`` stops raising, so guarding
     ``get_consecutive_slots`` alone MOVES this crash rather than removing it.
