@@ -3424,10 +3424,49 @@ class SchedulerApp(QMainWindow):
         # state does not list -- and the next Setup OK unplaces it.
         cls["lecturer"] = SchedulingWorkflow.register_lecturer(
             self.state_data, cls.get("lecturer")) or ""
+        # B1/B2, THIRD site (`bulk_add_classes` below is the fourth). This was
+        # `self._push_undo(...)` right here, above a call that can end in
+        # `SchedulingWorkflow.rollback_schedule` — the user adds a class, the
+        # results dialog opens, they press Cancel, and the rollback puts the
+        # placements back but cannot put back the redo stack `_push_undo`
+        # cleared nor the `_undo_stack[0]` it evicted at the 50-entry cap.
+        # `_push_undo`'s own docstring forbids this shape: snapshot AND commit
+        # in one statement is only for a change that is already certain.
+        #
+        # THE GATE IS THE STATE, NOT `_schedule_new_classes`'s BOOLEAN. That
+        # boolean is wrong at two of its five exits, measured:
+        #
+        #   1 single_success          state CHANGED    returns True   undo YES
+        #   2 single_failed + pinned   state UNCHANGED  returns False  undo NO
+        #   3 single_failed + unpinned state UNCHANGED  returns TRUE   undo NO
+        #   4 accepted                state CHANGED    returns True   undo YES
+        #   5 rejected (rollback)     state UNCHANGED  returns False  undo NO
+        #
+        # Exits 2, 3 and 5 all reach here. At exit 3 the workflow has ALREADY
+        # removed the class, so the `True` is a lie and today it also fires
+        # `_note_structural_change` for a state that did not change; at exit 5
+        # it is the reported defect. One comparison is right at all five, so
+        # `_schedule_new_classes`'s contract needs no change at all — which is
+        # the half of the prescribed fix that turned out to be unnecessary.
+        #
+        # Not a count and not `result.rescheduled`, for the reasons
+        # `_place_classes_batch` records at length: `placed_count` counts only
+        # the candidates while Phase 2 of `optimized_batch_schedule` re-solves
+        # every already-placed unpinned lesson, and `rescheduled` is returned
+        # True unconditionally (re-verified at core/facade.py and
+        # core/workflow.py for this phase).
+        #
+        # The whole state rather than `snapshot_placements`, because this
+        # gesture can add and remove CLASSES, which a placement map cannot see.
         snap_before = capture_snapshot(self.state_data)
-        self._push_undo(tr("actions.add").format(name=cls["name"]))
+        before_add = copy.deepcopy(self.state_data)
         split_classes = split_non_joint(cls)
-        if self._schedule_new_classes(split_classes):
+        self._schedule_new_classes(split_classes)
+        if self.state_data != before_add:
+            _commit_undo_entry(self._undo_stack, self._redo_stack,
+                               self._max_undo,
+                               tr("actions.add").format(name=cls["name"]),
+                               before_add)
             desc = tr("impact.trigger.classes_added").format(n=len(split_classes))
             self._note_structural_change(snap_before, description=desc)
         self.refresh_grid()
@@ -3456,9 +3495,17 @@ class SchedulerApp(QMainWindow):
         for rc in raw_classes:
             new_classes.extend(split_non_joint(rc))
 
+        # B1/B2, fourth site. Same shape, same gate, same five exits — see the
+        # accounting in `add_class` above. Bulk Add reaches exit 5 (the user
+        # presses Cancel in the results dialog) most often of the four sites,
+        # because it is the one that always opens that dialog.
         snap_before = capture_snapshot(self.state_data)
-        self._push_undo(tr("actions.bulk_schedule"))
-        if self._schedule_new_classes(new_classes):
+        before_add = copy.deepcopy(self.state_data)
+        self._schedule_new_classes(new_classes)
+        if self.state_data != before_add:
+            _commit_undo_entry(self._undo_stack, self._redo_stack,
+                               self._max_undo, tr("actions.bulk_schedule"),
+                               before_add)
             desc = tr("impact.trigger.classes_added").format(n=len(new_classes))
             self._note_structural_change(snap_before, description=desc)
         self.refresh_grid()
@@ -5028,8 +5075,29 @@ class SchedulerApp(QMainWindow):
         """Handle drops that are not over a specific timetable cell."""
         drag_group = list(getattr(self, "_dragging_classes", []) or [])
         if len(drag_group) > 1 and all(not c.get("placed") for c in drag_group):
+            # `= True` unconditionally, until this phase, whatever the batch
+            # did. It showed no false toast — but only because
+            # `_start_drag_unplaced` toasts solely for `len(drag_classes) == 1`
+            # while this method runs solely for `len(drag_group) > 1`. Those
+            # two conditions are disjoint by accident, two methods apart, and
+            # nothing stated it. `_drag_success` is not only a toast flag:
+            # `_start_drag_gfx` reads it to decide whether the gesture was a
+            # no-op, which is the mechanism Phase 9 rebuilt for B1/B2, so
+            # "true for a batch that placed nothing" is that family's untruth
+            # in a place no test could see.
+            #
+            # DELETING the line would be wrong the other way — a successful
+            # batch drop would stop setting the flag and the gesture would
+            # read as abandoned. The comparison is the same one
+            # `_place_classes_batch` makes internally for its undo gate.
+            #
+            # Placements, not the whole state as in `add_class`: a drop cannot
+            # add or remove classes, only move them. The two gates are
+            # deliberately different predicates.
+            before_drop = snapshot_placements(self.state_data)
             self._place_classes_batch(drag_group)
-            self._drag_success = True
+            self._drag_success = (
+                snapshot_placements(self.state_data) != before_drop)
 
     def _execute_drop(self, day, slot):
         """Finalize the drop: validate fully and either commit or reject."""
@@ -5361,7 +5429,25 @@ class SchedulerApp(QMainWindow):
         lines = []
         tab_idx = self.notebook.currentIndex()
 
-        if tab_idx == 3:
+        # ST-FUNC-008. `>=`, not `== 3`: the else-branch below indexes a
+        # THREE-element list with `tab_idx`, and the Dashboard is tab 4. With
+        # `== 3` that is an IndexError raised inside a QShortcut slot, and
+        # `scheduler_gui.py` installs an exception hook, so the user is shown
+        # the crash-report dialog — DERSIS announcing that it has crashed —
+        # gets a crash-log entry, and gets nothing on the clipboard. Measured
+        # through the real Ctrl+C shortcut: tabs 0-3 copy, tab 4 raises.
+        #
+        # "Everything" is the right answer for the Dashboard and not a guess:
+        # `_export_to_excel` and `_export_to_pdf` both carry
+        # {0: classroom, 1: group, 2: lecturer, 3: everything, 4: everything},
+        # driving the real Excel export from tab 3 and tab 4 produces
+        # identical workbooks, and `DashboardWidget.refresh` is handed the
+        # whole state — there is no subset for a filter function to select.
+        #
+        # `>= 3` rather than `in (3, 4)` so a sixth tab added later gets the
+        # everything matrix instead of re-entering the crash. That is the same
+        # fallback the export dict already takes (`.get(tab_idx, "everything")`).
+        if tab_idx >= 3:
             days = s["days"]
             slots = s["slots"]
             for yr in sorted(s["years"].keys()):
