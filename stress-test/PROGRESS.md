@@ -170,10 +170,30 @@ report.
 
 ### Known gaps left behind
 
-Recorded with their measurements in [`HANDOFF-PHASE10.md`](HANDOFF-PHASE10.md).
-The largest is that `open_file` and `_auto_load` both still carry B4's exposure,
-and the honest fix there is the one `models.py` prescribes — warn, list, or offer
-— not a silent repair. That needs a decision, not a patch.
+A four-angle read-only audit after the merge enumerated everything still open,
+and the user set the split: **Phase 10 is the seventeen application-facing
+defects**, Phase 11 is the release and packaging cluster, and pushing `main`
+stays parked. All of it, with per-item verification state, is in
+[`HANDOFF-PHASE10.md`](HANDOFF-PHASE10.md).
+
+Two results from that audit belong here rather than only there.
+
+**The register is down to 0 Critical · 1 High · 2 Medium · 10 Low open**, from a
+headline of 6 · 27 · 43 · 17 — and every one of the five claims behind
+[`15-final-assessment.md`](15-final-assessment.md)'s "Internal alpha" verdict was
+re-checked against the code and found false, so that verdict has been overtaken.
+The single remaining High is **ST-FUNC-008**, which has sat as a bare `OBSERVED`
+*Medium* for nine phases, is pinned by no test, and turns Ctrl+C on the Dashboard
+tab into a crash-report dialog telling the user their timetabling program has
+crashed. It was in no phase's plan; the audit found it by re-reading the register
+against the code rather than trusting its state column.
+
+**Both four-digit complexity ceilings are now saturated** — `ui/app.py` at
+920/920 and `ui/dialogs.py` at 885/885 — so the next `if`, `and`, `except` or
+comprehension `for` added to either file turns the fast lane red. Phase 9's own
+raise (915 → 920) is recorded in the constant's docstring, but nothing recorded
+that *both* were full, and at least ten of Phase 10's seventeen items live in
+those two files.
 
 ---
 

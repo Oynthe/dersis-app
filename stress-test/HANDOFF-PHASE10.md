@@ -1,7 +1,7 @@
 # Handoff — Phase 10
 
-Phase 9 is complete on `fix/phase-9-convergence` (3 commits, cut from `main` at
-`f049964`). This file is what the next session works from.
+Phase 9 is complete and **merged into local `main`** (`a561a71`). This file is
+what the next session works from, in the order the user set.
 
 Read [`PROGRESS.md`](PROGRESS.md#phase-9--complete) first. Its "What the briefs
 got wrong" section records four prescribed fixes that were wrong, and that is
@@ -9,53 +9,95 @@ more useful than the list of what worked.
 
 ---
 
-## The one thing to take from Phase 9
+## The scope, and why it is this scope
 
-**Four times a prescribed fix was wrong, and every time it was found by building
-it and watching it fail — never by argument.** Twice the wrong fix would have
-introduced a *second* defect; once it would have shipped green while permitting
-the exact defect it was written for; once it would have created an ST-SEC blind
-spot in a file where two previous phases had already found one.
+After Phase 9 merged, a four-angle read-only audit enumerated everything still
+open. The user then set the split explicitly:
 
-So: the loop is not a formality.
+> "1'den 17'e kadar olan sorunların hepsini çözelim phase 10'da aynı mantıkla.
+> ayrıca B, C, D, E, F, G, H'de düzeltilmeli ama phase 11'de, A şimdilik dursun."
+
+* **Phase 10 = items 1–17.** Every open defect a *user* can reach. That is the
+  whole of the application-facing backlog: 1 High, 4 Medium, 12 Low.
+* **Phase 11 = items B–H.** Release, packaging and CI. Real, and none of it
+  touches a running user — it hits whoever ships next.
+* **Item A is parked on the user's instruction.** `origin/main` stays 108
+  commits behind. Do not push. Do not tag. See "Do not do this" below.
+
+**"Aynı mantıkla" is the operative phrase**, and it means the loop, per item,
+with no exceptions:
 
 > reproduce the original failure → implement the fix → re-run the *same* probe
 > and show it is gone → regression-check the neighbours → mark resolved
 
-And its two hard edges, both of which paid this phase:
+Nothing is marked resolved on inspection, on an intended change, or on a
+plausible explanation. **If you cannot reproduce it, mark it
+`NOT_REPRODUCIBLE` and change nothing.** Phase 9 did that four times out of ten
+in section C and one of those four "fixes" would have been a regression.
 
-* **If you cannot reproduce it, change nothing.** Four of Section C's ten items
-  did not survive measurement, and acting on one of them (C10) would have been a
-  regression. `NOT_REPRODUCIBLE` is a result.
-* **Adversarial testing runs only after you believe the fixes are done**, and its
-  job is to validate them. Phase 9 ran it that way and it found two regressions
-  the phase's own fixes had introduced, plus a policy violation the main agent
-  added by hand.
+---
+
+## ⚠ READ THIS BEFORE YOUR FIRST COMMIT — both god-object ceilings are full
+
+This is the single most important operational fact for Phase 10, it is new, and
+**nothing recorded it before this file**. Measured with the ratchet module's own
+counter at `a561a71`:
+
+| ceiling | actual | headroom |
+|---|---|---|
+| `MAX_APP_PY_TOTAL_MCCABE` | **920 / 920** | **0** |
+| `MAX_DIALOGS_PY_TOTAL_MCCABE` | **885 / 885** | **0** |
+| `MAX_SCHEDULERAPP_METHODS` | 153 / 154 | 1 |
+| `MAX_SCHEDULERAPP_TOTAL_MCCABE` | 817 / 830 | 13 |
+
+**Adding one `if`, `and`, `except`, ternary or comprehension `for` to
+`ui/app.py` or `ui/dialogs.py` turns the fast lane red on the very next commit.**
+At least ten of your seventeen items live in one of those two files.
+
+So plan for it up front rather than discovering it item by item:
+
+* **Prefer module scope and new modules.** Phase 9 did this four times —
+  `_commit_undo_entry`, `_confirm_lecturer_reassignment`,
+  `ui/validation_report.py`, and `_repair_report_message` + `_conflict_label` —
+  which is why the method count came *down* to 153 while behaviour was added.
+  Moving a function out of the class does not lower the FILE's McCabe; moving it
+  to a different file does.
+* **Several of these items are natural extractions**, not additions. Items 10,
+  12 and 13 are widget behaviour that has no business in a 5 800-line window
+  class; item 16 is a one-token fix in four files that *reduces* nothing but
+  costs nothing either.
+* **When you do raise a ceiling, the ratchet's contract demands a sentence in
+  the commit message saying why**, and Phase 9's raise (915 → 920) set the bar:
+  a per-function accounting of what moved and what it bought, in the constant's
+  docstring. Do not raise both ceilings in one commit and do not raise either
+  without the accounting.
+* `BANKED_HEADROOM` is 20 and it cuts **both** ways: a ceiling sitting more than
+  20 above reality must be *lowered* in the same commit that earned it.
+  `MAX_SCHEDULERAPP_TOTAL_MCCABE` is 13 below its ceiling right now — Phases 8–9
+  took that out without banking it. Lowering it to 817 is free and is the kind
+  of thing that should be done while someone is looking.
 
 ---
 
 ## STATE OF THE REPO
 
-* Branch `fix/phase-9-convergence`, 3 commits ahead of `main`.
+* `main` at `a561a71` (the Phase 9 merge). **Nothing is pushed**; `origin/main`
+  is at `b6c453b`, the Phase 6 merge, 108 commits behind. That is item A and it
+  is parked deliberately.
 * **Fast lane: 1271 selected · 1269 passed · 2 xfailed · 0 failed · exit 0.**
-  (1144 / 1142 / 2 at the start of Phase 9: **+127 tests**.)
-* Slow engine lane: 52, exit 0. `ST-SCHED-013` is `strict=False` by design — it
-  xfails on a loaded box and XPASSes on an idle one, and both are fine.
+* Slow engine lane: 52 · 51 passed · 1 XPASS · exit 0. `ST-SCHED-013` is
+  `strict=False` by design — it xfails on a loaded box and XPASSes on an idle
+  one. Both are fine.
 * `mypy` clean over 42 source files.
-* **Translation backlog 2548 against a 2548 ceiling — the ratchet never moved
-  in Phase 9**, because every new string shipped in all 22 locales. All four
-  layering ratchets still `0`.
-* `MAX_SCHEDULERAPP_METHODS` 154 with the class at **153**.
-  `MAX_APP_PY_TOTAL_MCCABE` was raised 915 → 920; the per-function accounting is
-  in the constant's docstring.
-* The two remaining `xfail` pins are still the **ST-DATA-013** pair. They are
-  documentation, not defects. Leave them.
-
-### ⚠ `main` still has never been pushed
-
-`origin/main` is at `b6c453b`, the **Phase 6** merge. Local `main` is 102 commits
-ahead and carries Phases 7 and 8; Phase 9 adds 3 more on its own branch. A `v*`
-tag pushed today would still run the *old* workflow tree.
+* **Translation backlog 2548 against a 2548 ceiling.** Zero headroom. All four
+  layering ratchets still `0` (asserted with `==`, so they are floor *and*
+  ceiling).
+* The two remaining `xfail` pins are the **ST-DATA-013** pair. Re-verified in the
+  audit: still true, still unreachable by a user, and guarded by a live test in
+  the same file (`test_no_persisted_payload_needs_the_two_pins_above`) that goes
+  red the day a real save path acquires the hazard. **Leave them.**
+* **Zero `TODO` / `FIXME` / `XXX` / `HACK` markers under `scheduler_app/`.**
+  Swept case-insensitively. That item is closed, not merely quiet.
 
 ---
 
@@ -68,70 +110,104 @@ tag pushed today would still run the *old* workflow tree.
   and `print()` raises on a Turkish letter or a `→`.
 * `QT_QPA_PLATFORM=offscreen` for Qt tests; **never for a geometry measurement**.
   Offscreen has no Segoe UI, its fallback is fixed-pitch, and it wraps about
-  twice as often: the same 500-warning dialog measures **24 110 px** on the real
-  Windows platform and **56 100 px** offscreen. Neither is "the" number.
+  twice as often — the same dialog measured **24 110 px** real and **56 100 px**
+  offscreen. **Items 4, 11, 12 and 15 are all geometry or colour**, so this
+  matters more in Phase 10 than it did in Phase 9.
+* **Do not measure a widget with `sizeHint()`.** It reported 973×8106 for a
+  dialog the user receives at 24 110 px, because QMessageBox re-wraps and grows
+  inside its show handler. Use `setAttribute(WA_DontShowOnScreen)` then `show()`
+  — real fonts, full layout, no window on screen. `tests/test_phase9_b6.py` is
+  the worked example.
 * Any standalone probe needs `if __name__ == "__main__":` — the optimizer uses
   multiprocessing and will otherwise fork-bomb Windows.
 * Use the `make_app` fixture for anything that builds a `SchedulerApp`.
 
-### Corrected: the line-ending rule
+### The line-ending rule, corrected
 
 `HANDOFF-PHASE9.md` said "every tracked file is CRLF". **Measured, that is not
-true.** The working tree is **124 CRLF files and 11 bare-LF** (`git ls-files
---eol` shows the index is uniformly `i/lf`; six of the eleven predate Phase 9).
+true**: the working tree is **124 CRLF files and 11 bare-LF** (`git ls-files
+--eol` shows the index uniformly `i/lf`). The practical rule is unchanged and
+matters more than its reason: **use the Write/Edit tools for every source
+change.** A `\n`-based `str.replace` on a CRLF file is a **silent no-op** — it
+cost Phase 8 two no-op patches and Phase 9 one, a `'@classmethod\n'` replace
+that left the decorator at module scope and produced 27 failures with
+`TypeError: 'classmethod' object is not callable`.
 
-The *practical* rule survives unchanged and is more important than the reason
-for it: **use the Write/Edit tools for every source change.** A `\n`-based
-`str.replace` on a CRLF file is a **silent no-op**. That cost Phase 8 two no-op
-patches, and it cost Phase 9 one — a `'@classmethod\n'` replace that left the
-decorator in place at module scope and produced 27 failures with
-`TypeError: 'classmethod' object is not callable`. You cannot tell which kind of
-file you have by looking, so do not hand-roll the edit.
+### Four traps that have cost real time in more than one phase
 
-### Four traps that cost real time
-
-1. **`pytest`'s final summary line is swallowed in this environment.** The words
-   "passed"/"failed" never appear in captured output. **Gate on the exit code**
-   and count outcomes from the progress characters (`.`, `F`, `x`, `X`, `E`, `s`)
-   on the lines ending `[ NN%]`.
-2. **Never background a test run and poll for it.** Foreground, with an explicit
+1. **`pytest`'s final summary line is swallowed here.** "passed"/"failed" never
+   appear; output ends at the "slowest durations" block. **Gate on the exit
+   code** and count from the progress characters on lines matching
+   `^([.FxXEs]+)\s+\[\s*\d+%\]`. **Counting bare `.FxXEs` characters anywhere in
+   the output is wrong** — it picks them out of prose and gives a nonsense total.
+2. **Never background a test run and poll for it.** Foreground, explicit
    `timeout`. Three Phase 8 agents hung permanently in `until grep -q "passed"`
    loops and had to be killed.
-3. **The full fast lane now takes ~11 minutes and EXCEEDS the 600 s tool cap.**
-   Run it in the background, or run single modules (5–20 s), which is almost
-   always what you want.
+3. **The full fast lane takes ~11 min and exceeds the 600 s tool cap.** Run it
+   with `run_in_background`, or run single modules (5–20 s).
 4. **Worktrees are provisioned from a stale base.** Every worktree agent in
-   Phase 9 — as in Phases 6, 7 and 8 — found its worktree cut from the *Phase 6*
-   merge. Make `git log --oneline -3` and `git merge <the phase branch>` the
-   first action of any worktree agent, and have it verify
-   `scheduler_app.__file__` resolves **inside its own worktree** before trusting
-   a single measurement.
+   Phases 6–9 found its worktree cut from the *Phase 6* merge. Make
+   `git log --oneline -3` and `git merge main` the first action of any worktree
+   agent, and verify `scheduler_app.__file__` resolves **inside its own
+   worktree** before trusting a measurement.
 
-### The rule Phase 8 passed on, which held for a whole phase
+### Translations: ship all 22, do not raise the ratchet
 
-**Translate into all 22 locales instead of raising the translation ratchet.**
-Phase 9 added six user-facing strings across B and C and moved
-`MAX_MISSING_LOCALE_KEY_PAIRS` **zero** times. It costs one scripted insert.
+Phase 9 added six user-facing strings and moved `MAX_MISSING_LOCALE_KEY_PAIRS`
+**zero** times. Backlog is 2548 against 2548 — one English-only key is a red
+lane. A working inserter lives in the session scratchpad; the shape is
+`{"key": {"en": ..., "tr": ..., ...}}` for **en tr de fr es zh ru ar fa it pt_BR
+pt_PT nl sv da pl az hi id af ja ko**, inserted in sorted position, CRLF-safe,
+idempotent. Write real translations, not English copies.
 
-And the measurement rule that goes with it: **count the backlog the way the test
-counts it**, i.e. with `import scheduler_app.i18n.tier_translations` first.
-Without that import you get ~1700 and a false sense of headroom; the real figure
-is 2548 against 2548. Three phases in a row fell into this; Phase 9 did not,
-because it measured before writing anything.
+**Measure the backlog the way the test does** — `import
+scheduler_app.i18n.tier_translations` FIRST. Without it you get ~1700 and a false
+sense of headroom. Three phases in a row fell into this; Phase 9 did not.
 
 ---
 
-## OPEN WORK, in the order it deserves
+## PHASE 10 — the seventeen items
 
-### 1. B4's exposure on the load paths — needs a DECISION, not a patch
+**Verification state is marked on every item and it is not decoration.** Phase 9
+proved that a handoff item written against an old tree is often wrong: four of
+ten Section C items evaporated on measurement. Nine of the seventeen below come
+from register entries that have sat as a bare `OBSERVED` for nine phases and have
+**never been reproduced by anyone**. Reproduce first. `NOT_REPRODUCIBLE` is a
+result and the user has already accepted it as one.
 
-`open_file` and `_auto_load` both load a state that can carry dangling room
-names, and **neither reconciles**. A file saved by any build before Phase 9 still
-has them, and `AddClassDialog` rebuilds both room fields from the live room list
-— so opening such a class and pressing OK **deletes** the constraint.
+Key: **⬤ reproduced live** · **◐ code shape confirmed, not driven end to end** ·
+**○ located in code from a register entry, never reproduced**
 
-Phase 9 tried the obvious fix and it was wrong. `core/models.py`
-(`normalize_class_data`'s neighbourhood) states the policy in writing:
+### The one High
+
+**1. ⬤ Ctrl+C on the Dashboard tab makes DERSİS announce that it has crashed.**
+`ui/app.py::_copy_to_clipboard`. The line is
+`filter_fn = [self._filter_classroom, self._filter_group, self._filter_lecturer][tab_idx]`
+— a three-element list indexed by the tab number. Tab 3 has its own branch above;
+the Dashboard is tab 4, so the index is out of range. With the shipped
+`scheduler_gui.py` exception hook installed, the user gets the **crash-report
+dialog** saying the program has crashed, an entry in the crash log, and nothing
+on the clipboard. Ctrl+C works correctly on the other four tabs.
+
+Reproduced live twice by the audit — once by calling the method, once by a real
+`QTest` key press through the actual Qt shortcut. **Registered as ST-FUNC-008,
+Medium, bare `OBSERVED`, for nine phases, pinned by no test.** The audit re-rated
+it High because "raises IndexError" understates what a user is shown. This is the
+most user-facing thing left in the application and it is one line.
+
+### The Mediums
+
+**2. ⬤ A file saved by an older build opens with dangling room rules, and the
+app then deletes them without saying so.** `ui/app.py::open_file` and
+`::_auto_load` — neither calls `reconcile_placements`. A dangling "must be in the
+physics lab" matches no room, so the lesson can never be placed again by drag,
+Place All Unplaced or the solver, and nothing says why. A dangling "never room
+12" silently stops applying — a *wrong* timetable rather than none. Then
+`ui/dialogs.py::AddClassDialog._ok` rebuilds both fields from the live room list,
+so opening the class and pressing OK **erases the rule**.
+
+**Phase 9 tried the obvious fix and it was wrong**, which is why this is still
+open. `core/models.py` states the policy in writing:
 
 > Deliberately NOT called from `normalize_state_classes` (and so not from the
 > .egu load path): unplacing orphans at load time would silently discard the
@@ -139,111 +215,216 @@ Phase 9 tried the obvious fix and it was wrong. `core/models.py`
 > — **warn, list, or offer to reconcile**.
 
 `_reconcile_after_setup()` was added to `open_file` and chose none of the three.
-Measured on a real `.egu` from an older build: **6 of 6 lessons unplaced, undo
-depth 0**, and `mark_current_state_as_baseline()` then recorded the wrecked state
-as having no unsaved changes — one save and the term's placements are gone from
-disk. It was reverted, with the policy quoted at the site.
+Measured on a real `.egu`: **6 of 6 lessons unplaced, undo depth 0**, and
+`mark_current_state_as_baseline()` then recorded the wrecked state as having no
+unsaved changes — one save and the term's placements are gone from disk. It was
+reverted with the policy quoted at the site.
 
-So the work is to build one of the three the policy names. `_auto_load` is the
-harder half: it runs from `__init__` before `_build_main()`, so there is no
-widget for a report, and `_pending_settings_report` is a single slot that is
-already contended (see `_flush_startup_settings_report`, which puts the damaged-
-log report first for exactly this reason).
+So **build one of the three the policy names.** `_auto_load` is the harder half:
+it runs from `__init__` before `_build_main()`, so there is no widget for a
+report, and `_pending_settings_report` is a single slot that is already contended
+(see `_flush_startup_settings_report`, which puts the damaged-log report first
+for exactly this reason).
 
-### 2. B1/B2 a third time, in `_bulk_schedule` — found, not reproduced
+**3. ○ A multi-lesson drag from the timetable moves only the lesson under the
+cursor.** `ui/app.py::_start_drag_gfx` — `_dragging_classes` gets the whole
+selection, but `_drag_backup` and `mark_unplaced` touch only the primary, so
+`_execute_drop`'s `all(not placed)` guard is False and the single-lesson branch
+runs. Registered as **ST-DATA-010** and pinned by a test in
+`tests/test_drag_and_drop.py`, so the current behaviour is *asserted*: changing
+it means changing that test, deliberately, with the reason in the commit message.
+Note this interacts with Phase 9's drag rework — read `_start_drag_gfx`'s held
+snapshot and the three commit points before touching it.
 
-`_bulk_schedule` (`ui/app.py`, the `actions.bulk_schedule` push) has the same
-pre-emptive shape `_place_classes_batch` just lost: `_push_undo` fires before
-`_schedule_new_classes`, and that callee can end in
-`self._workflow.rollback_schedule(...)` when the user presses Cancel in
-`BulkResultsDialog`. The rollback restores the placements. It does **not** restore
-the redo stack `_push_undo` cleared, nor the `_undo_stack[0]` it evicted at the
-50-entry cap.
+**4. ○ One long class name inflates that hour's row across the whole grid.**
+`ui/renderer.py::_needed_height_for_class` and its two consumers, which do
+`row_heights[b["row"]] = needed` unbounded. `grep elide` over `renderer.py`
+returns nothing. **ST-UI-012**, bare `OBSERVED`, in no phase's plan.
+**Geometry — do not measure it offscreen.**
 
-Not reproduced — it needs the BulkAdd + BulkResults dialog pair driven end to
-end — and not fixed, because the fix changes `_schedule_new_classes`'s contract:
-the rollback would have to become the thing that decides, the way the placement
-comparison now decides in `_place_classes_batch`. **Reproduce it first.**
+**5. ◐ Opening "Edit Classes" and closing it unchanged destroys your Redo
+history.** `ui/app.py::edit_classes` — an unconditional `_push_undo` above
+`dlg.exec()`. The snapshot is genuinely needed, because
+`EditClassesDialog._delete_selected` writes state directly; what is wrong is that
+it fires whether or not anything happens. **Recorded nowhere before this file.**
 
-Related, same area, cheap: `_execute_drop_anywhere` sets `_drag_success = True`
-unconditionally after `_place_classes_batch`, even when the batch placed nothing.
-It causes no false toast today *only* because `_start_drag_unplaced` shows its
-success toast solely for `len(drag_classes) == 1` while `_execute_drop_anywhere`
-only fires for `len > 1`. Two lines apart, in different methods, with nothing
-pinning the coincidence.
+**8. ○ The warnings sidebar re-runs a full negotiation pass on every repaint.**
+`ui/app.py::_refresh_warnings` has no fingerprint guard, unlike
+`_refresh_open_slots` right beside it, and `_run_auto_negotiation` does a
+`neg.negotiate_class(cls)` per unplaced class per refresh. **ST-PERF-006.**
+The fix shape already exists in the same file — copy the fingerprint guard.
+**Measure before and after; a performance claim without a number is not a fix.**
 
-### 3. `AddClassDialog` lies about its own caption
+### The undo family — 6 and 7, same root cause, do them together
 
-After B3's "No", the form is re-shown seeded through the only channel the dialog
-has, `edit_cls=`, and the title is derived from it — so a user **adding** a class
-who answers No gets all their data back under an **"Edit Class"** caption. Every
-field is correct; only the caption lies, and only on the add path's second
-showing. The fix is a keyword-only `title=None` on `AddClassDialog.__init__`; it
-was not done because `dialogs.py` was owned by another agent and because
-choosing the title caller-side costs a branch `ui/app.py` did not have room for
-at the time.
+**6. ◐ Bulk Add, then Cancel in the results dialog.** `ui/app.py::_bulk_schedule`
+— `_push_undo` fires above `_schedule_new_classes`, which can end in
+`SchedulingWorkflow.rollback_schedule`. The rollback restores the placements; it
+does **not** restore the redo stack `_push_undo` cleared, nor the
+`_undo_stack[0]` it evicted at the 50-entry cap.
 
-### 4. Parity gap, not a risk: the excluded-rooms dialog bound
+**7. ◐ Add Class, then Cancel.** `ui/app.py::add_class` — identical shape above
+`_schedule_new_classes(split_classes)`. **Recorded nowhere before this file.**
 
-`tests/test_phase9_b6.py` bounds the 500-row dialog for the room-type warning and
-its `allowed_rooms` sibling. Phase 9 added two more per-row keys
-(`warnings.unknown_excluded_rooms`, `warnings.allowed_rooms_too_small`) that can
-each fire 500 times, and no test pins them. **Checked: this is a pinning gap, not
-a risk** — `ui/validation_report.py` routes on `_fits_a_plain_box(detail)`, so
-the bound is structural and independent of which key produced the lines. Worth
-adding for parity.
+This is **B1/B2 for the third and fourth time**, and the cure is already in the
+tree twice: `edit_setup` holds its snapshot in a local and commits only on
+accept, and Phase 9's `_execute_drop` holds it in a field and commits at a commit
+point. `_push_undo`'s own docstring forbids exactly this shape. **The fix changes
+`_schedule_new_classes`'s contract** — the rollback has to become the thing that
+decides, the way the placement comparison now decides in `_place_classes_batch`.
 
-### 5. The probe files are named after a phase, not a behaviour
+Two warnings from Phase 9, both paid for:
 
-Twelve permanent regression tests are called `tests/test_phase9_*.py`.
-`test_phase9_b7.py` tells a future reader nothing; `test_feedback_log_health.py`
-would.
+* **Do not gate on a count.** The obvious gate — "commit the undo entry only if
+  something was placed" — is wrong: `placed_count` counts only the candidates,
+  while Phase 2 of `optimized_batch_schedule` re-solves every already-placed
+  unpinned lesson, so a batch can report `0 placed` while having *relocated*
+  lessons on the timetable. `result.rescheduled` is worse: it is returned `True`
+  unconditionally. Compare placements before and after.
+* **Neither of these is reproduced yet.** The audit read the code shape and
+  stopped there, because driving the BulkAdd + BulkResults dialog pair end to end
+  is reproduction work. Do that first.
 
-No *code* references the names (checked with grep across `tests/` and
-`scheduler_app/`), so a rename is mechanical. What does reference them is prose:
-this file, the Phase 9 section of `PROGRESS.md`, and the four Phase 9 commit
-messages — which is the whole argument for renaming them soon rather than
-eventually. Every phase that passes makes the phase-numbered name more useful as
-history and less useful as a description, and the mapping only lives in commits
-someone has to go looking for. If you rename, put the old → new mapping in the
-commit message so `git log -S` still finds the reasoning.
+**Related, and NOT in the user's 1–17.** `_execute_drop_anywhere` sets
+`_drag_success = True` unconditionally after `_place_classes_batch`, even when
+the batch placed nothing — so a multi-lesson drop can report success having done
+nothing. It is harmless *today* only because `_start_drag_unplaced` shows its
+toast solely for `len(drag_classes) == 1` while `_execute_drop_anywhere` only
+fires for `len > 1`: two lines apart, in different methods, with nothing pinning
+the coincidence. It is the same family and nearly free while you are in there.
+**Ask before folding it in** — the user scoped this phase at 1–17 explicitly.
+
+### The Lows
+
+**9. ○ The Hindi "unsupported file version" message drops its `{supported}`
+placeholder.** `i18n/translations.py`, `hi` catalogue, key
+`errors.unsupported_egu_version`; raised at `storage/storage.py`. A Hindi user
+opening a `.egu` from a different build is told the file's version but not which
+version their copy can read — every other language tells them both. It does not
+crash (`str.format` ignores the extra argument); the sentence just loses half its
+information. Pinned by `MAX_PLACEHOLDER_SUBSETS = 1` in
+`tests/test_translation_coverage.py`, currently at **zero headroom with this as
+its sole occupant** — so fixing it lets you lower that ratchet to 0 in the same
+commit, which is the banked-headroom rule working as designed.
+
+**10. ○ Open-slots rows advertise clickability and do nothing.**
+`ui/app.py::_refresh_open_slots` builds each row as a bare `QWidget` with
+`setCursor(PointingHandCursor)` and a `:hover` stylesheet, and **connects
+nothing**. **ST-UI-017**, recorded as "Partially fixed (Phase 6)". Decide what a
+click should do (jump to the slot? place the selected lesson there?) — that is a
+product question, and the cheap honest alternative is to remove the affordance.
+
+**11. ○ The crash and bug-report dialogs are dark-themed in a light-only app.**
+`ui/bug_report.py` — `background: #1e293b` at eight sites; the module docstring
+itself says "polished dark-themed dialog". **ST-UI-018.** Note this is the dialog
+item 1 makes users see, so doing 1 and 11 together is coherent.
+
+**12. ○ The warning log has no timestamps, a 120 px ceiling, and an unbounded
+history list.** `ui/widgets.py` — `setMaximumHeight(120)`, and `log()` appends to
+`self._sticky` with no bound. **ST-UI-019.** The unbounded list is the
+ST-PERF-003 growth shape; `tests/test_warning_log_growth.py` already exists, so
+read what it pins before changing the bound.
+
+**13. ○ The empty state offers no guidance and terminology drifts across
+screens.** No empty-state widget exists; `grep empty_state|getting_started` over
+`ui/` and `i18n/` returns nothing. **ST-UI-020**, "Empty-state CTAs untouched".
+Any new string ships in 22 locales.
+
+**14. ○ When Thorough mode's solver silently falls back, nothing tells the
+user.** `core/schedule_optimizer.py` sets `summary["cpsat_failure"]` at six
+sites; `grep` finds **no reader anywhere in `scheduler_app/ui/`**. The user asked
+for the thorough engine, got the fallback, and was not told. Note Phase 8 found a
+sibling claim false — "the UI cannot tell a cancelled solve from a failed one"
+turned out to be wrong because three distinct signals exist — so **check that
+this write-only flag really is unread before building on it.**
+
+**15. ○ Green and amber text in dialogs fails the contrast standard.**
+`ui/dialogs.py` (nine sites) and `ui/app.py` (one), plus a documented comparison
+comment in `core/constants.py`. `tests/test_cell_contrast.py` exists — read what
+ratio it enforces and where, because the grid may already be held to a standard
+the dialogs are not.
+
+**16. ○ A class with two identical targets draws both sub-blocks in the same
+place.** `c["targets"].index(t)` where `enumerate` is meant, in **four** places:
+`ui/renderer.py`, `data_io/exporter.py` (two sites) and `ui/app.py`. `.index()`
+returns the first match, so two identical targets both get index 0 and overlap.
+Cheap, but **fix all four or none** — a partial fix means the screen and the
+export disagree, which is worse than both being wrong the same way.
+
+**17. ○ The Add Class form calls itself "Edit Class" while the user is adding
+one.** After Phase 9's B3 fix, answering "No" to the name-collision prompt
+re-shows the form seeded through the only channel the dialog has, `edit_cls=`,
+and the title is derived from it. Every field is correct; only the caption lies,
+and only on the add path's second showing. The fix is a keyword-only
+`title=None` on `AddClassDialog.__init__`.
 
 ---
 
-## What Phase 9 deliberately did NOT do, and why
+## PHASE 11 — release, packaging and CI (do NOT start these now)
 
-Do not re-open these without new evidence; each was measured.
+The user deferred these explicitly. They are recorded here so Phase 11 does not
+have to re-derive them; **B and C are the dangerous pair** because they are
+silently wrong rather than obviously broken.
+
+| | Item | Where |
+|---|---|---|
+| **B** | 🔴 The documented "Manual alternative" release route runs the **old, broken June workflow** and looks identical in the UI. GitHub reads `workflow_dispatch` from the **default branch only**, and `origin/main` is still Phase 6. That file has no `test` job, and `macos-13` — retired by GitHub on 2025-12-08 — makes `needs: build-macos` permanently unsatisfiable, so `publish` never runs and no release is ever created. | `origin/main:.github/workflows/release.yml`; `docs/RELEASE_CHECKLIST.md:36` |
+| **C** | 🟠 `VERSION` is still `1.0.0`, one commit since "Initial public release". A release cut today produces `Dersis_Setup_v1.0.0.exe` with the same filename, About string and bug-report version as the June builds already downloaded 105+ times — after nine phases of change. | `VERSION`; `scheduler_app/_version.py` |
+| **D** | 🟠 The release lane's test gate is weaker than CI's and the stronger run does not block publishing: `release.yml`'s `test` job runs `pytest -m "not slow"` only — no `mypy`, none of the four slow engine modules. A tag with a provably broken engine still publishes. | `release.yml` job `test` vs `ci.yml` job `engine` |
+| **E** | 🟠 macOS artifacts are built from **unpinned** dependencies while Windows is pinned: `build_mac.sh` installs `requirements-build-mac.txt` → `requirements.txt` (floors only), so the `.dmg` ships whatever PyPI resolves that day. One version number, two dependency sets. | `build_mac.sh:83` |
+| **F** | 🟡 `BUILD.md` — linked from all five READMEs — is stale in four ways, including a release recipe that no longer matches the workflow. | `BUILD.md` |
+| **G** | 🟡 `docs/RELEASE_CHECKLIST.md` still tells the releaser the repository has no tests. | `:10`, `:36` |
+| **H** | 🟡 The installer never carries the Visual C++ runtime; the failure mode is a silent non-start on a clean machine. | `installer.iss:123-125`, `:157` |
+
+**Item A — pushing `main` — is parked on the user's instruction.** Do not push,
+do not tag, do not open a PR. `origin/main` stays at `b6c453b`, 108 commits
+behind. Note that **B cannot be fixed without A**, because the broken dispatch
+route lives on the remote's default branch — so Phase 11 has to start by asking
+the user to lift the park.
+
+---
+
+## Do not re-open these without new evidence — each was measured
 
 | Item | Why it stands |
 |---|---|
-| **C2** — "exact equality re-opens ST-FUNC-010" | The claim inverts the defect. Exact equality is the **guard**: tightening a drop-predicate can only ever drop FEWER rows. Measured by shouting and lower-casing every cell of row 2 of every sheet — nothing is lost; a row is *gained* and the workbook is refused loudly. |
-| **C4** — "the fallback must subtract `excluded_rooms`" | The outcome happens; the cause is wrong. Where a lab class reaches a lecture hall the fallback is already `[]`, so subtracting changes nothing — and the rescue sentence fires, so it is not silent. Where the fallback is non-empty the subtraction is a placement no-op. Building it turns an existing test red and re-opens the ST-FUNC-009 inversion. |
-| **C8** — "the batch early-return leaks `_drag_undo_pushed`" | Dead for grid drags: `_start_drag_gfx` filters to PLACED classes and unplaces only the primary, so with `len>1` at least one member is still placed. Measured over 11 cases. Live only for sidebar drags, which hold no snapshot. |
-| **C10** — "the regex needs a `$` anchor" | **The proposed fix IS the defect.** Proven by mutation: move `exit /b 1` into `build_embed.bat`'s else branch and the current pattern catches it RED, while the anchored version runs past `) else (`, finds the wrong `exit /b 1`, and goes GREEN. The sibling that *does* use `^\)$` is correct because that block ends in a bare `)`. |
-| **C7** — `InfeasibilityAnalyzer(state, None, None)` | The crash is real; `ConstraintNegotiator` is the only construction site in the package and it cannot pass `None`. No menu action, import or solve reaches it, so the PyQt6 slot-death multiplier never engages. Closed with one docstring sentence instead of a guard for a caller that does not exist. |
-| **Release rehearsal** (`v1.0.1` on a scratch fork) | **The user declined it.** The script is in `HANDOFF-PHASE8.md` §6 if it is ever wanted. |
-| **PDF shaping for ar/fa/hi** | `_resolve_pdf_fonts` **short-circuits on shaped scripts**, so no substitute face is ever tried. Needs a real shaping engine. reportlab 5.0.1 ships `rlbidi`/`uharfbuzz` extras — but `requirements-lock.txt` pins **4.4.10** for the shipped build, so verify against that version. |
-| **ST-ARCH-005** (`ui/app.py` god object) | Six candidate seams were built in Phase 7; **all six leave the MI at exactly 0.00**, because the complexity term alone (−205) exceeds the formula's 171 constant. Extraction is not the cure — the ratchets are. |
-| **`requirements-lock.txt` pins** | 13 of 26 have drifted and 3 name packages the audit venv does not install. **The test CI does not read this file** — only the build paths do — so regenerating it changes what *ships* and cannot be verified without running the build. |
-| **The two ST-DATA-013 pins** | Library-level properties with no production producer. Documentation. |
+| **The two ST-DATA-013 pins** | Library-level JSON properties (int dict keys stringified; NaN/Infinity written as non-standard tokens) with no production producer. Re-verified after Phases 8–9: every settings write uses string keys and string/boolean values, and a live test in the same file goes red the day that stops being true. |
+| **ST-SCHED-013's non-strict xfail** | Making it strict turns every fast correct run into a failure; deleting it turns every slow correct run into one. Measured: 96.4 s / 103.6 s idle vs 120.07 s loaded, same machine, same hour; CI is 1.87× faster. The runner-independent half of the property is asserted unconditionally by two other tests. |
+| **The 2548 translation backlog** | A translator's job, not a defect. Machine translation was rejected on a measured failure mode: a translation that drops a placeholder makes the room name vanish from the sentence with **no error at all** — see item 9 for the one instance that already exists. |
+| **No coverage ratchet** | A coverage floor that skips when the data file is absent is not a ratchet, it is a test that always passes. Needs `coverage` in `requirements-dev.txt` and a CI change; `requirements-dev.txt` still has no such entry, so this is a stated non-decision, not an oversight. |
+| **ST-ARCH-005 extraction** | Six candidate seams were built in Phase 7; **all six** left radon's Maintainability Index at exactly 0.00, because the complexity term alone (−205) exceeds the formula's 171 constant. The ratchets exist instead of the refactor. |
+| **PDF shaping for ar/fa/hi** | `_resolve_pdf_fonts` **short-circuits on shaped scripts**, so no substitute face — bundled or host — is ever tried. Needs a real shaping engine. reportlab 5.0.1 ships `rlbidi`/`uharfbuzz` extras, but `requirements-lock.txt` pins **4.4.10** for the shipped build, so verify against that version. |
+| **`requirements-lock.txt` pins** | The test CI does not read this file — only the build paths do — so regenerating it changes what *ships* and cannot be verified without running the build. A consistency test guards it instead. |
+| **The release rehearsal** | The user declined it in Phase 8. The script is in `HANDOFF-PHASE8.md` §6 if it is ever wanted. |
 
 ---
 
-## The rule Phase 9 would most like to pass on
+## Two rules Phase 9 would most like to pass on
 
-**A test that plants the state it is meant to observe is measuring nothing.**
+**1. A test that plants the state it is meant to observe is measuring nothing.**
 
 Phase 8 recorded this once: deleting `self._drag_undo_pushed = True` from
 production left the whole suite green, because the test helpers set the flag
-themselves. Phase 9 hit the identical pattern again, one layer over — two
-production lines could be deleted **together** with the suite green, and removing
-them let a sidebar drag plus one Ctrl+Z resurrect an abandoned gesture's
-placement under the wrong label. The test that set that state up **hand-assigned
-`_drag_undo_entry = None`** instead of letting `_start_drag_unplaced` clear it,
-so it could not notice production had stopped clearing it.
+themselves. Phase 9 hit the identical pattern again — two production lines
+deletable **together** with the suite green, whose removal let a sidebar drag
+plus one Ctrl+Z resurrect an abandoned gesture's placement under the wrong label.
+The test that set that state up **hand-assigned** `_drag_undo_entry = None`
+instead of letting `_start_drag_unplaced` clear it.
 
 The check is cheap and it is the only one that works: **mutate the production
-line, confirm the mutation actually landed with `git diff --stat`, and run the
-suite.** A green suite under a real mutation is a finding about your test, not a
-fact about the code. Phase 9 ran ten mutations on the drag path alone; seven were
-killed and three survived, and the three were the finding.
+line, confirm the mutation landed with `git diff --stat`, and run the suite.** A
+green suite under a real mutation is a finding about your test. Phase 9 ran ten
+mutations on the drag path alone; seven were killed, three survived, and the
+three were the finding.
+
+**2. Build the prescribed fix before believing it.**
+
+Four times in Phase 9 a prescribed fix was wrong, and **every one was found by
+building it and watching it fail** — never by argument. Twice it would have
+introduced a *second* defect; once it would have shipped green while permitting
+the exact defect it was written for; once ("add the `$` anchor") it would have
+created an ST-SEC blind spot in a file where two earlier phases had already found
+one. This handoff is written by the same fallible process. **Treat its fix
+sketches as evidence, not orders**, and when one of them turns out to be wrong,
+say so in the write-up — that record is the most valuable thing each phase has
+handed the next.
