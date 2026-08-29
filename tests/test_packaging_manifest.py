@@ -457,7 +457,15 @@ def test_every_installer_source_exists_or_is_explicitly_optional():
 # size gate is `-lt 1MB` against a ~113 MiB artefact, so it passes on a bundle
 # that is complete apart from the one file every shortcut names.
 #
-# The three tests below pin the three links of that chain independently.
+# The tests below pin the three links of that chain independently — and pin
+# them against *disabling*, not merely against deletion. The first draft of this
+# section did neither: it asked `"$dist\Dersis.exe" in run_body` and
+# `"exit /b 1" in build_embed_text`, so a PowerShell `#` in front of the array
+# member kept it green (measured: mutation R1, exit 0) and the two gates
+# build_embed.bat grew for this chain were pinned by nothing at all (measured:
+# mutations M3 and M4, both exit 0, both surviving all 105 tests in the
+# packaging and docs lane). The helpers in `tests/_support/pwsh_parse.py` exist
+# so that the array is read as an array.
 
 WORKFLOW_DIR = os.path.join(REPO, ".github", "workflows")
 
@@ -477,6 +485,37 @@ def _verify_build_output_run():
         "rename it here too — this test is the only thing standing between a "
         "failed launcher build and a published installer."
     )
+
+
+def _verified_dist_relative_paths():
+    """What the verify step's `foreach` *actually* iterates, `$dist`-relative.
+
+    Substring matching over the step body cannot tell a live array member from
+    a commented-out one, and cannot tell either from the path appearing inside
+    a ``Write-Host``. All three read as "checked". This returns the live
+    members only, with the body's own ``$dist`` assignment expanded and
+    stripped, so the caller can assert exact membership.
+    """
+    from _support.pwsh_parse import (
+        expand, powershell_scalar_assignments, powershell_string_array)
+
+    body = _verify_build_output_run()
+    members = powershell_string_array(body, "checks")
+    assert members is not None, (
+        "release.yml's 'Verify build output' step no longer contains a "
+        "`$checks = @( ... )` array. If the step was rewritten in another "
+        "shape, this parser has to be rewritten with it — a check nobody can "
+        "read is a check nobody is pinning."
+    )
+    assignments = powershell_scalar_assignments(body)
+    dist = assignments.get("dist")
+    assert dist, (
+        "the 'Verify build output' step no longer assigns `$dist = \"...\"`; "
+        "the paths below cannot be resolved against the build directory."
+    )
+    prefix = dist + "\\"
+    return {expand(m, assignments)[len(prefix):]
+            for m in members if expand(m, assignments).startswith(prefix)}
 
 
 def _app_rooted_targets():
@@ -508,20 +547,25 @@ def test_every_installer_shortcut_target_is_a_verified_build_output():
     this: it reads ``[Files] Source:`` and ``continue``s on anything under
     ``build\\``, and ``[Icons]``/``[Run]`` have no ``Source:`` at all.
     """
-    verify = _verify_build_output_run()
+    checked = _verified_dist_relative_paths()
     targets = _app_rooted_targets()
     assert targets, (
         "installer.iss's [Icons]/[Run] name no {app}-rooted file at all. Either "
         "the shortcut section was gutted or the parser above stopped matching."
     )
+    assert checked, (
+        "release.yml's 'Verify build output' checks nothing under $dist at all."
+    )
     for target in sorted(targets):
-        assert target in verify, (
+        assert target in checked, (
             "installer.iss points a user-facing entry at {app}\\%s, but "
             "release.yml's 'Verify build output' step never checks that the "
-            "build produced it. That is exactly how Dersis.exe went unverified: "
-            "the build can exit 0 without it, the installer's `-lt 1MB` size "
-            "gate cannot see it, and the failure surfaces as a shortcut that "
-            "does nothing on the user's machine." % target
+            "build produced it. It checks %s. That is exactly how Dersis.exe "
+            "went unverified: the build can exit 0 without it, the installer's "
+            "`-lt 1MB` size gate cannot see it, and the failure surfaces as a "
+            "shortcut that does nothing on the user's machine. Note that this "
+            "reads the live members of the `$checks` array, so commenting the "
+            "line out counts as removing it." % (target, sorted(checked))
         )
 
 
@@ -551,6 +595,39 @@ def test_every_build_script_exits_nonzero_on_a_missing_critical_file():
         )
 
 
+def _add_type_lines():
+    """The non-comment ``build_embed.bat`` lines that invoke ``Add-Type``.
+
+    ``::`` comment lines are excluded deliberately: the comment above the call
+    quotes the redirection it is explaining, and a scanner that cannot tell
+    code from the prose describing it fails on its own documentation.
+    """
+    text = _read("build_embed.bat")
+    lines = [ln for ln in text.splitlines()
+             if "Add-Type" in ln and not ln.lstrip().startswith("::")]
+    assert lines, "build_embed.bat no longer compiles a Dersis.exe launcher"
+    return lines
+
+
+# Matched as patterns rather than as one literal string. The first draft
+# asserted `"2>$null" not in line`, which is a blacklist of exactly one
+# spelling: `2> $null` with a space and `-ErrorAction SilentlyContinue` both
+# passed it (measured, mutations M5 and M6, exit 0) and both delete the same
+# thing — a probe against deliberately broken C# showed each one removing the
+# per-line compiler diagnostic and the `>>>` source echo, leaving only the
+# generic "Cannot add type. Compilation errors occurred."
+#
+# `| Out-Null` is deliberately NOT listed. It was proposed, and measurement
+# says it belongs to a different stream: piping Add-Type's output leaves the
+# diagnostics byte-for-byte intact, because they travel the error stream, not
+# the pipeline. Banning it would be a rule this test cannot justify.
+_SUPPRESSORS = (
+    (re.compile(r"2\s*>\s*\$null"), "a `2>$null` stderr redirection"),
+    (re.compile(r"-ErrorAction\s+(SilentlyContinue|Ignore)"),
+     "an `-ErrorAction SilentlyContinue`/`Ignore` preference"),
+)
+
+
 def test_the_launcher_compile_step_does_not_discard_its_error():
     """ST-SEC-007 — the one build failure whose cause was thrown away.
 
@@ -560,33 +637,138 @@ def test_the_launcher_compile_step_does_not_discard_its_error():
     ``$null`` there was no way to learn why from the build log — the only
     evidence was a ``[WARN]`` line in an otherwise green run.
     """
-    text = _read("build_embed.bat")
-    # `::` comment lines are excluded deliberately: the comment above the call
-    # quotes the redirection it is explaining, and a scanner that cannot tell
-    # code from the prose describing it fails on its own documentation.
-    add_type = [ln for ln in text.splitlines()
+    for pattern, spelling in _SUPPRESSORS:
+        for line in _add_type_lines():
+            assert not pattern.search(line), (
+                "build_embed.bat discards the C# compiler's diagnostics on the "
+                "Add-Type that produces Dersis.exe, via %s. Every installer "
+                "shortcut points at that file; when the compile fails, the "
+                "reason is the only thing that makes it fixable, and this is "
+                "what throws it away." % spelling
+            )
+
+
+def test_the_launcher_compile_failure_stops_the_build_immediately():
+    """ST-SEC-007 — the gate that turns a failed compile into a failed build.
+
+    ``build_embed.bat`` grew an ``if errorlevel 1 (... exit /b 1)`` block
+    directly after the ``Add-Type`` call. Nothing read it: deleting the whole
+    block left the packaging and release suites green (measured, mutation M3,
+    exit 0 across 105 tests), and a whole-file ``"exit /b 1" in text`` check
+    cannot help — the script contains ten of them.
+
+    Scoped by position rather than by line number: the gate must be the first
+    line of actual code after the compile, so that inserting a blank line or a
+    ``::`` comment between the two stays green while removing the gate does not.
+    """
+    lines = _read("build_embed.bat").splitlines()
+    compiles = [i for i, ln in enumerate(lines)
                 if "Add-Type" in ln and not ln.lstrip().startswith("::")]
-    assert add_type, "build_embed.bat no longer compiles a Dersis.exe launcher"
-    for line in add_type:
-        assert "2>$null" not in line, (
-            "build_embed.bat discards the C# compiler's stderr on the Add-Type "
-            "that produces Dersis.exe. Every installer shortcut points at that "
-            "file; when the compile fails, the reason is the only thing that "
-            "makes it fixable, and this redirection is what threw it away."
-        )
+    assert len(compiles) == 1, (
+        "expected exactly one Add-Type invocation in build_embed.bat, found %d "
+        "on lines %s — the positional gate below has no single call to attach "
+        "to." % (len(compiles), [i + 1 for i in compiles])
+    )
+
+    index = compiles[0] + 1
+    while index < len(lines) and (not lines[index].strip()
+                                 or lines[index].lstrip().startswith("::")):
+        index += 1
+    assert index < len(lines) and lines[index].strip() == "if errorlevel 1 (", (
+        "the first statement after build_embed.bat's Add-Type call is %r, not "
+        "`if errorlevel 1 (`. cmd does not stop on a failed command, so "
+        "without that gate a failed C# compile continues into `iscc "
+        "installer.iss` and produces an installer whose Start Menu entry, "
+        "Desktop icon and post-install \"Launch program\" all point at a file "
+        "that was never built."
+        % (lines[index].strip() if index < len(lines) else "<end of file>")
+    )
+    body = []
+    for line in lines[index + 1:]:
+        if line.rstrip() == ")":
+            break
+        body.append(line)
+    assert any(ln.strip() == "exit /b 1" for ln in body), (
+        "build_embed.bat checks `errorlevel` after compiling Dersis.exe and "
+        "then does not `exit /b 1`. The CI step that calls the script reads "
+        "the script's own exit code, so a gate that only prints is a gate that "
+        "does nothing. Block body was:\n  %s" % "\n  ".join(body)
+    )
+
+
+def test_the_launcher_is_one_of_the_files_the_build_counts_as_critical():
+    """ST-SEC-007 — the entry in build_embed.bat's own verify list.
+
+    ``test_every_build_script_exits_nonzero_on_a_missing_critical_file`` pins
+    that the ``if %ERRORS% GTR 0`` branch exits non-zero. It does not pin that
+    anything ever counts a missing ``Dersis.exe`` into ``ERRORS`` — so deleting
+    that entry both removed the check and neutered the branch for this file,
+    with the suite green (measured, mutation M4, exit 0).
+
+    Scoped to the region between ``set ERRORS=0`` and ``if %ERRORS% GTR 0``, so
+    a mention of the launcher in prose or in the success banner cannot satisfy
+    it.
+    """
+    text = _read("build_embed.bat")
+    start = text.index("set ERRORS=0")
+    end = text.index("if %ERRORS% GTR 0 (")
+    assert start < end, "build_embed.bat counts ERRORS after branching on them"
+    region = text[start:end]
+
+    subjects = set(re.findall(r'if exist "%DIST_DIR%\\([^"]+)"', region))
+    assert "Dersis.exe" in subjects, (
+        "build_embed.bat's verify list no longer checks for Dersis.exe. It "
+        "checks %s. Dersis.exe is the one item in that list compiled at build "
+        "time rather than copied, so it is the only one that can go missing "
+        "without anything upstream having failed to *find* a file."
+        % sorted(subjects)
+    )
+    match = re.search(
+        r'if exist "%DIST_DIR%\\Dersis\.exe"\s*\((.*?)^\)$',
+        region, re.S | re.M)
+    assert match and "set /a ERRORS+=1" in match.group(1), (
+        "build_embed.bat tests for Dersis.exe but its else-branch never does "
+        "`set /a ERRORS+=1`, so the end-of-build gate cannot see it missing."
+    )
 
 
 # ── ST-SEC-004: the lock file against the floors it claims to satisfy ───────
 
+def _normalise(name):
+    return name.strip().lower().replace("_", "-")
+
+
 def _parse_pins(name, sep):
-    """`{package_lower: version_spec}` for a requirements file."""
+    """`{package_lower: version_spec}` for a requirements file.
+
+    Only ever called with ``sep="=="`` on the lock file, where every line is an
+    exact pin by construction. requirements.txt is read by ``_requirements``
+    instead — see the anti-vacuity note in the test below for why a separator
+    split is the wrong tool for a file that may use any operator.
+    """
     out = {}
     for raw in _read(name).splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line or sep not in line:
             continue
         pkg, _, spec = line.partition(sep)
-        out[pkg.strip().lower().replace("_", "-")] = spec.strip()
+        out[_normalise(pkg)] = spec.strip()
+    return out
+
+
+def _requirements():
+    """Every requirement in requirements.txt, parsed, whatever the operator."""
+    from packaging.requirements import Requirement
+
+    out = []
+    for raw in _read("requirements.txt").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        try:
+            out.append(Requirement(line))
+        except Exception:
+            continue
     return out
 
 
@@ -603,24 +785,41 @@ def test_every_locked_pin_satisfies_the_requirements_floor():
     a development environment carrying 16 packages the lock does not describe,
     so that test would be red by construction and deleted within a week.
     """
-    from packaging.specifiers import SpecifierSet
     from packaging.version import Version
 
-    floors = _parse_pins("requirements.txt", ">=")
+    required = _requirements()
     locked = _parse_pins("requirements-lock.txt", "==")
 
-    assert floors, "requirements.txt declares no `>=` floors — did it change shape?"
-    missing = sorted(set(floors) - set(locked))
+    # Anti-vacuity, and the reason this test is written with a real parser.
+    # The first draft split each line on `>=` and `continue`d when it was not
+    # there, so a requirement written `ortools==9.7` — or `>`, or `~=` — left
+    # the floors dict entirely and stopped being checked, silently and one
+    # package at a time. The old `assert floors` guard fired only if ALL of
+    # them vanished. Measured: `ortools==9.7` in requirements.txt against
+    # `ortools==1.0.0` in the lock was green.
+    declared = [ln for ln in (raw.split("#", 1)[0].strip()
+                              for raw in _read("requirements.txt").splitlines())
+                if ln]
+    assert len(required) == len(declared), (
+        "requirements.txt has %d requirement lines but only %d of them parsed: "
+        "%s. A line this test cannot read is a dependency it stops checking, "
+        "which is exactly the failure this assertion exists to make loud."
+        % (len(declared), len(required),
+           sorted(set(declared) - {str(r) for r in required}))
+    )
+
+    names = {_normalise(req.name): req for req in required}
+    missing = sorted(set(names) - set(locked))
     assert not missing, (
         "requirements.txt requires %s, which requirements-lock.txt does not pin. "
         "The build lanes install ONLY the lock file, so an unpinned direct "
         "dependency is simply absent from the shipped app." % missing
     )
 
-    for pkg, floor in sorted(floors.items()):
-        assert Version(locked[pkg]) in SpecifierSet(">=" + floor), (
-            "requirements-lock.txt pins %s==%s, below requirements.txt's floor "
-            "of >=%s. The build lanes read the lock and the test lanes read the "
-            "floors, so this ships a version nothing in CI has ever imported."
-            % (pkg, locked[pkg], floor)
+    for pkg, req in sorted(names.items()):
+        assert Version(locked[pkg]) in req.specifier, (
+            "requirements-lock.txt pins %s==%s, which does not satisfy "
+            "requirements.txt's `%s`. The build lanes read the lock and the "
+            "test lanes read requirements.txt, so this ships a version nothing "
+            "in CI has ever imported." % (pkg, locked[pkg], req)
         )

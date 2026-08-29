@@ -1077,6 +1077,8 @@ def test_the_release_lane_verifies_everything_the_old_one_did():
     previous pipeline would have rejected. This is a superset assertion rather
     than an equality: adding checks is progress, losing one is the bug.
     """
+    from _support.pwsh_parse import powershell_string_array
+
     verify = None
     for job in (_workflows()["release.yml"].get("jobs") or {}).values():
         for step in job.get("steps") or []:
@@ -1088,11 +1090,26 @@ def test_the_release_lane_verifies_everything_the_old_one_did():
         "that was already taken."
     )
 
-    lost = [item for item in DELETED_LANE_REQUIRED if item not in verify]
+    # The live members of the `$checks` array, not a substring search over the
+    # step body. Those are not the same test: a PowerShell `#` leaves the path
+    # in the body and removes it from the array, so the substring form this
+    # replaced was a pin against deletion only. Measured — commenting out
+    # `"$dist\Dersis.exe"` kept it green; deleting the line went red.
+    # Compared unexpanded, because DELETED_LANE_REQUIRED holds the `$dist`
+    # forms the old workflow's own array used.
+    checks = powershell_string_array(verify, "checks")
+    assert checks, (
+        "release.yml's 'Verify build output' step no longer has a readable "
+        "`$checks = @( ... )` array. Whatever replaced it has to be parsed "
+        "here too — this test is worth nothing if it cannot see the list."
+    )
+
+    lost = [item for item in DELETED_LANE_REQUIRED if item not in checks]
     assert not lost, (
-        "release.yml's 'Verify build output' no longer checks %s. The "
+        "release.yml's 'Verify build output' array no longer contains %s (its "
+        "live members are %s). The "
         "build-release.yml it replaced (980887c^, lines 101-108) checked every "
         "one of %s. Losing a check during a rewrite is invisible in review — "
         "the diff shows a new file, not a missing line — so it is pinned here."
-        % (lost, list(DELETED_LANE_REQUIRED))
+        % (lost, checks, list(DELETED_LANE_REQUIRED))
     )
