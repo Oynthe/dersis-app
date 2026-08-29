@@ -558,9 +558,32 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
                 survivors = [r for r in cls["required_classrooms"]
                              if r not in excluded_rooms]
                 if not survivors:
-                    cls["required_classrooms"] = (
-                        [r for r in allowed_rooms if r in room_names]
-                        if allowed_rooms else [])
+                    fallback = ([r for r in allowed_rooms if r in room_names]
+                                if allowed_rooms else [])
+                    # Both sentences below end "...so the room type was not
+                    # applied -- otherwise this class could never be placed
+                    # anywhere". That promise is only true if the fallback
+                    # actually leaves somewhere to go. When every fallback room
+                    # is ALSO excluded the fallback is a no-op and the class is
+                    # unplaceable either way, so the sentence claims a rescue
+                    # that did not happen. Measured on
+                    # `type=Laboratuvar, allowed_rooms='Lab 1',
+                    # excluded_rooms='Lab 1'`: the row's only line said the
+                    # type had been dropped so the class could still be placed,
+                    # while `get_physical_room_candidates` was `[]`.
+                    #
+                    # Staying silent leaves that row unwarned, which is a real
+                    # gap -- but it is the same gap the importer already has for
+                    # any class made unplaceable by `allowed_rooms` alone, it is
+                    # recorded in HANDOFF-PHASE9 §C, and a sentence that is
+                    # false is worse than one that is missing.
+                    # An EMPTY fallback is not "nowhere" — it is "any room", so
+                    # it rescues the class whenever any room at all survives the
+                    # exclusion. Reading it as nowhere silences the no-allowed_rooms
+                    # case, which is the one the rescue was written for.
+                    effective = fallback or sorted(room_names)
+                    rescued = any(r not in excluded_rooms for r in effective)
+                    cls["required_classrooms"] = fallback
                     # Which sentence is *true* here depends on whether
                     # `allowed_rooms` did any of the narrowing. With no
                     # `allowed_rooms`, the resolved list IS `matching`, so
@@ -583,7 +606,8 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
                             type_field=_column_label("classes", "required_room_type"),
                             allowed_field=_column_label("classes", "allowed_rooms"),
                             excluded_field=_column_label("classes", "excluded_rooms"))
-                    report.add_warning(tr("labels.classes"), row_num, message)
+                    if rescued:
+                        report.add_warning(tr("labels.classes"), row_num, message)
                     fell_back = True
 
             # ST-FUNC-009, third contradiction: the resolved list versus the
@@ -633,12 +657,27 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
             # required_room_type='Laboratuvar' and 25 students was told it
             # "cannot be placed until the room is enlarged, the head count
             # lowered, or the type changed", about a room list the same
-            # function was about to throw away. `type_applied` replaces the
-            # `matching` test for the reason given above: with `allowed_rooms`
-            # present and disjoint from the type, `required_classrooms` is the
-            # allowed list, and this sentence would name the type over it.
-            if (type_applied and cls["required_classrooms"] and not fell_back
-                    and class_uses_physical_room(cls)):
+            # function was about to throw away.
+            #
+            # The gate is `required_classrooms == matching`, i.e. "the type IS
+            # what determines this list", NOT `type_applied`, i.e. "the type
+            # touched this list". Those differ whenever `allowed_rooms` is a
+            # SUBSET of the type's rooms: the intersection narrows to the
+            # allowed list, the flag goes True, and the sentence then quantifies
+            # over the type while the seats it counted came from Allowed Rooms.
+            # Measured with a fourth room Lab 3 / Laboratuvar / 50 and a row of
+            # `required_room_type=Laboratuvar, allowed_rooms=Lab 1,
+            # student_count=25`: "No room of type Laboratuvar seats 25 - the
+            # largest is Lab 1 with 20", every clause of which is false of the
+            # user's own Rooms sheet, and all three remedies it offers are the
+            # wrong cell to edit.
+            #
+            # A class constrained into rooms that are too small by `allowed_rooms`
+            # ALONE is a real and separate gap; it is pre-existing, it is not
+            # this sentence's subject, and it is recorded in HANDOFF-PHASE9 §C.
+            type_decides_the_list = cls["required_classrooms"] == matching
+            if (type_decides_the_list and cls["required_classrooms"]
+                    and not fell_back and class_uses_physical_room(cls)):
                 capacities = dataset.state.get("classroom_capacities", {})
                 # Capacity 0 means unlimited, matching `room_fits_class`; a
                 # class of 0 participants fits anywhere, so it never warns.

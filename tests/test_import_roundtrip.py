@@ -1591,3 +1591,124 @@ def test_a_virtual_class_is_not_warned_about_a_room_it_never_needed(
         build_workbook(tmp_path / "virtual_control.xlsx", classes=f2f))
     assert [m for m in messages(ds2.report) if row_prefix("classes", 2) in m], \
         "the control row stopped warning; this test would pass vacuously"
+
+
+# ── the warning must be true of the row it is attached to ───────────────────
+
+_ROOMS_WITH_A_BIG_LAB = [
+    {"room_id": "R001", "name": "Oda 1", "capacity": 30,
+     "room_type": ROOM_TYPE_LECTURE},
+    {"room_id": "R002", "name": "Lab 1", "capacity": 20,
+     "room_type": ROOM_TYPE_LAB},
+    {"room_id": "R003", "name": "Lab 2", "capacity": 20,
+     "room_type": ROOM_TYPE_LAB},
+    # The room that makes the head-count sentence false when the type is not
+    # what narrowed the list: big enough for the class, and of the named type.
+    {"room_id": "R004", "name": "Lab 3", "capacity": 50,
+     "room_type": ROOM_TYPE_LAB},
+]
+
+
+def test_the_head_count_warning_is_not_raised_over_a_list_the_type_did_not_choose(tmp_path):
+    """ST-FUNC-009 — a warning must be true of the row it is attached to.
+
+    Found by the adversarial pass against Phase 8's own message fix. The gate
+    was "the type touched this list", which is True whenever ``allowed_rooms``
+    is a SUBSET of the type's rooms — the intersection narrows to the allowed
+    list and the flag is set. The sentence then quantifies over the *type*
+    while the seats it counted came from *Allowed Rooms*.
+
+    Measured before this fix, with a fourth room Lab 3 (Laboratuvar, seats 50)
+    and a row of ``required_room_type=Laboratuvar, allowed_rooms=Lab 1,
+    student_count=25``: "No room of type Laboratuvar seats 25 - the largest is
+    Lab 1 with 20." Every clause is false of the user's own Rooms sheet, and
+    all three remedies it offers name the wrong cell: the fix is to add Lab 3
+    to Allowed Rooms.
+
+    A failure means the import report sends a school to enlarge a room or cut a
+    class size when the room it needs already exists.
+    """
+    rows = [klass("C001", required_room_type=ROOM_TYPE_LAB,
+                  allowed_rooms="Lab 1", student_count=25)]
+    path = build_workbook(tmp_path / "narrowed_by_allowed.xlsx", classes=rows,
+                          rooms=_ROOMS_WITH_A_BIG_LAB)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    cls = ds.state["classes"][0]
+    assert cls["required_classrooms"] == ["Lab 1"], (
+        "this fix is message-only; the resolved list must not move")
+    assert not any(ROOM_TYPE_LAB in m for m in messages(ds.report)), (
+        "the row was warned about the room type over a list Allowed Rooms "
+        "alone chose: %r" % (messages(ds.report),))
+
+
+def test_the_head_count_warning_still_fires_when_the_type_did_choose(tmp_path):
+    """ST-FUNC-009 guard — the silence above must not swallow the real case.
+
+    With no ``allowed_rooms`` the resolved list IS the type's rooms, so the
+    sentence quantifies over exactly what it counted and is true. A failure
+    means the fix for the false warning removed the true one with it.
+    """
+    rows = [klass("C001", required_room_type=ROOM_TYPE_LECTURE,
+                  student_count=40)]
+    path = build_workbook(tmp_path / "type_chose.xlsx", classes=rows,
+                          rooms=_ROOMS_WITH_A_BIG_LAB)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert any(ROOM_TYPE_LECTURE in m and row_prefix("classes", 2) in m
+               for m in messages(ds.report)), (
+        "a class that genuinely fits no room of its own type was not warned: "
+        "%r" % (messages(ds.report),))
+
+
+def test_a_rescue_that_rescued_nothing_is_not_announced_as_a_rescue(tmp_path):
+    """ST-FUNC-009 — do not promise a rescue that did not happen.
+
+    Both excluded-rooms sentences end "...so the room type was not applied —
+    otherwise this class could never be placed anywhere". That is only true if
+    dropping the type leaves somewhere to go. When every fallback room is also
+    excluded the fallback is a no-op and the class is unplaceable either way.
+
+    Measured before this fix on ``type=Laboratuvar, allowed_rooms='Lab 1',
+    excluded_rooms='Lab 1'``: the row's ONLY line said the type had been
+    dropped so the class could still be placed, while
+    ``get_physical_room_candidates`` was ``[]``.
+
+    A failure means the import report tells a school a class was rescued when
+    it is silently unschedulable. (The row is now unwarned, which is a real and
+    separate gap — the importer has the same blind spot for any class made
+    unplaceable by Allowed Rooms alone — but a false sentence is worse than a
+    missing one, and the gap is recorded in HANDOFF-PHASE9 §C.)
+    """
+    from scheduler_app.core.models import get_physical_room_candidates
+
+    rows = [klass("C001", required_room_type=ROOM_TYPE_LAB,
+                  allowed_rooms="Lab 1", excluded_rooms="Lab 1")]
+    path = build_workbook(tmp_path / "rescue_noop.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+    cls = ds.state["classes"][0]
+
+    assert get_physical_room_candidates(ds.state, cls) == [], (
+        "premise of this test no longer holds: the class became placeable")
+    assert not any("Excluded Rooms" in m or ROOM_TYPE_LAB in m
+                   for m in messages(ds.report)), (
+        "a rescue was announced for a class that is still unplaceable: %r"
+        % (messages(ds.report),))
+
+
+def test_a_rescue_that_did_happen_is_still_announced(tmp_path):
+    """ST-FUNC-009 guard — the silence above must not swallow a true rescue.
+
+    Here ``Oda 1`` survives the exclusion, so dropping the type really does
+    leave the class somewhere to go and the sentence is true. A failure means
+    the user stops being told why their room type was ignored.
+    """
+    rows = [klass("C001", required_room_type=ROOM_TYPE_LAB,
+                  allowed_rooms="Oda 1, Lab 1", excluded_rooms="Lab 1")]
+    path = build_workbook(tmp_path / "rescue_real.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert any(row_prefix("classes", 2) in m and ROOM_TYPE_LAB in m
+               for m in messages(ds.report)), (
+        "a genuine rescue was not reported: %r" % (messages(ds.report),))
