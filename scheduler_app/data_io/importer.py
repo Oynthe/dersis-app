@@ -13,7 +13,7 @@ except ImportError:
     HAS_PANDAS = False
 
 from scheduler_app.models import (
-    new_class, new_state, new_lecturer_availability,
+    class_uses_physical_room, new_class, new_state, new_lecturer_availability,
     normalize_class_data, normalize_state_classes, parse_location_type_label,
 )
 from scheduler_app.i18n.text_fold import fold_text
@@ -488,6 +488,17 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
             # capacity check that follows would be reporting a list the user
             # was already told was not applied.
             fell_back = False
+            # True only once the type has actually *decided*
+            # `required_classrooms`. Both later blocks speak about "the room
+            # type" and about the list the type produced; when the type could
+            # not be applied -- no room has it, or `allowed_rooms` and the type
+            # do not intersect -- `required_classrooms` is still the
+            # `allowed_rooms` list, and a sentence naming the type over that
+            # list names the wrong column, the wrong rooms and the wrong
+            # remedy. `fell_back` already guarded the capacity check against
+            # one of these two paths; this covers the other one, and the
+            # excluded-rooms rescue as well.
+            type_applied = False
             matching = [r for r in rooms_by_type.get(fold_text(required_type), [])
                         if r in room_names]
             if not matching:
@@ -502,10 +513,12 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
                         known=", ".join(known_types) or "—"))
             elif not cls["required_classrooms"]:
                 cls["required_classrooms"] = matching
+                type_applied = True
             else:
                 narrowed = [r for r in cls["required_classrooms"] if r in matching]
                 if narrowed:
                     cls["required_classrooms"] = narrowed
+                    type_applied = True
                 else:
                     report.add_warning(
                         tr("labels.classes"), row_num,
@@ -528,19 +541,49 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
             # turned a schedulable class into a permanently unplaceable one,
             # and the import report was empty. Falling back to the pre-type
             # list restores exactly the old behaviour and says why.
-            if required_type and cls["required_classrooms"] and excluded_rooms:
+            #
+            # Gated on `type_applied`, and that gate is provably message-only:
+            # when the type was not applied `required_classrooms` is already
+            # the `allowed_rooms` list (or empty, and then the guard below is
+            # false), so the fallback assigned it the value it already held and
+            # only the sentence reached the user. Measured before the gate, on
+            # required_room_type='Derslik' + allowed_rooms='Lab 1' +
+            # excluded_rooms='Lab 1': the row was told "every room of type
+            # Derslik is also in Excluded Rooms" when the one Derslik room,
+            # Oda 1, was not excluded at all, and told the type "was not
+            # applied -- otherwise this class could never be placed", when the
+            # preceding line had already said the type was not applied and the
+            # class was still unplaceable afterwards. Both clauses false.
+            if type_applied and cls["required_classrooms"] and excluded_rooms:
                 survivors = [r for r in cls["required_classrooms"]
                              if r not in excluded_rooms]
                 if not survivors:
                     cls["required_classrooms"] = (
                         [r for r in allowed_rooms if r in room_names]
                         if allowed_rooms else [])
-                    report.add_warning(
-                        tr("labels.classes"), row_num,
-                        tr("warnings.room_type_all_excluded").format(
+                    # Which sentence is *true* here depends on whether
+                    # `allowed_rooms` did any of the narrowing. With no
+                    # `allowed_rooms`, the resolved list IS `matching`, so
+                    # every room of the type really is excluded. With
+                    # `allowed_rooms`, the empty set is the intersection of
+                    # three columns and rooms of the type can be sitting
+                    # unexcluded outside `allowed_rooms` -- measured, type
+                    # 'Laboratuvar' + allowed 'Oda 1, Lab 1' + excluded 'Lab 1'
+                    # claimed every lab was excluded while Lab 2 was neither.
+                    all_of_type_excluded = all(r in excluded_rooms
+                                               for r in matching)
+                    if all_of_type_excluded:
+                        message = tr("warnings.room_type_all_excluded").format(
                             type=required_type,
                             type_field=_column_label("classes", "required_room_type"),
-                            rooms_field=_column_label("classes", "excluded_rooms")))
+                            rooms_field=_column_label("classes", "excluded_rooms"))
+                    else:
+                        message = tr("warnings.room_type_allowed_all_excluded").format(
+                            type=required_type,
+                            type_field=_column_label("classes", "required_room_type"),
+                            allowed_field=_column_label("classes", "allowed_rooms"),
+                            excluded_field=_column_label("classes", "excluded_rooms"))
+                    report.add_warning(tr("labels.classes"), row_num, message)
                     fell_back = True
 
             # ST-FUNC-009, third contradiction: the resolved list versus the
@@ -578,7 +621,24 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
             # `allowed_rooms` are all too small reaches the same dead end and
             # is equally silent, but that path behaves exactly as it did at
             # 82f558e and is not this change's to fix.
-            if matching and cls["required_classrooms"] and not fell_back:
+            #
+            # `class_uses_physical_room` is the same predicate `room_fits_class`
+            # and `get_physical_room_candidates` short-circuit on, and this
+            # check is the importer's copy of their arithmetic, so it has to
+            # short-circuit in the same place. An online or lecturer-office
+            # class gets `[None]` from `get_room_candidates` -- the virtual
+            # sentinel, ST-ARCH-004's correct answer -- and places normally;
+            # `normalize_class_data` then discards `required_classrooms`
+            # entirely. Measured before this clause: an online class with
+            # required_room_type='Laboratuvar' and 25 students was told it
+            # "cannot be placed until the room is enlarged, the head count
+            # lowered, or the type changed", about a room list the same
+            # function was about to throw away. `type_applied` replaces the
+            # `matching` test for the reason given above: with `allowed_rooms`
+            # present and disjoint from the type, `required_classrooms` is the
+            # allowed list, and this sentence would name the type over it.
+            if (type_applied and cls["required_classrooms"] and not fell_back
+                    and class_uses_physical_room(cls)):
                 capacities = dataset.state.get("classroom_capacities", {})
                 # Capacity 0 means unlimited, matching `room_fits_class`; a
                 # class of 0 participants fits anywhere, so it never warns.

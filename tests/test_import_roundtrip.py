@@ -1371,7 +1371,18 @@ def test_a_room_type_whose_every_room_is_excluded_does_not_strand_the_class(tmp_
     assert get_physical_room_candidates(ds.state, cls) == ["Oda 1"], (
         "the class has no room left to be placed in")
 
-    assert any(ROOM_TYPE_LAB in m and row_prefix("classes", 2) in m
+    # The exact sentence, not just "a line mentioning the type". This row is
+    # the one where "every room of type Laboratuvar is also in Excluded Rooms"
+    # is *true* — no ``allowed_rooms`` narrowed anything, so the resolved list
+    # is the whole type. The three-column wording exists for the case where it
+    # is not true, and the two must not drift into each other.
+    exact = tr("warnings.room_type_all_excluded").format(
+        type=ROOM_TYPE_LAB,
+        type_field=schema.get_workbook_sheet_header_map("classes")[
+            "required_room_type"],
+        rooms_field=schema.get_workbook_sheet_header_map("classes")[
+            "excluded_rooms"])
+    assert any(exact in m and row_prefix("classes", 2) in m
                for m in messages(ds.report)), (
         "the user was not told the room type was dropped: %r"
         % (messages(ds.report),))
@@ -1396,3 +1407,187 @@ def test_a_room_type_still_narrows_when_only_some_rooms_are_excluded(tmp_path):
 
     from scheduler_app.core.models import get_physical_room_candidates
     assert get_physical_room_candidates(ds.state, cls) == ["Lab 2"]
+
+
+# ── the room-type report must describe the row it is looking at ─────────────
+# Three sentences were added to the import report by the ST-FUNC-009 work, and
+# all three named ``required_room_type`` over whatever ``required_classrooms``
+# happened to hold. That list is only the type-resolved one when the type
+# actually decided it: when no room has the type, or when ``allowed_rooms`` and
+# the type do not intersect, the list is still ``allowed_rooms`` and every
+# clause about "the room type" is then about the wrong column. The behaviour
+# was right in each case; only the sentence was wrong, so these tests assert
+# the message AND pin the resolved list, which must not move.
+
+def _classes_header(field):
+    """The Classes column header as the user's own workbook spells it."""
+    return schema.get_workbook_sheet_header_map("classes")[field]
+
+
+def test_a_type_that_could_not_be_applied_is_not_described_over_allowed_rooms(
+        tmp_path):
+    """The capacity sentence must not speak for a type that was not applied.
+
+    ``required_room_type='Derslik'`` with ``allowed_rooms='Lab 1'``: the two
+    columns do not intersect, so the row keeps ``['Lab 1']`` and the report
+    already says the type was not applied. Measured before the fix, a second
+    line then said "No room of type Derslik seats 25 — the largest is Lab 1
+    with 20. The room type was kept", of which every clause is false: Oda 1 is
+    the Derslik room and seats 30, Lab 1 is not a Derslik room at all, the type
+    was not kept, and "change the type" is offered as the remedy for a type
+    that is not the problem. The cell the user must edit is Allowed Rooms.
+    """
+    rows = [klass("C001", student_count=25,
+                  required_room_type=ROOM_TYPE_LECTURE,
+                  allowed_rooms="Lab 1")]
+    path = build_workbook(tmp_path / "type_not_applied.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    cls = ds.state["classes"][0]
+    # Behaviour is unchanged: the named room still wins, as it did before.
+    assert cls["required_classrooms"] == ["Lab 1"]
+
+    capacity_line = tr("warnings.room_type_too_small").format(
+        type=ROOM_TYPE_LECTURE,
+        type_field=_classes_header("required_room_type"),
+        participants=25,
+        count_field=_classes_header("student_count"),
+        room="Lab 1",
+        capacity=20)
+    assert not [m for m in messages(ds.report) if capacity_line in m], (
+        "the head-count warning described the type over a list the type did "
+        "not produce:\n  %s" % "\n  ".join(messages(ds.report)))
+    # The one true line — "the type matched none of Allowed Rooms" — stays.
+    assert [m for m in messages(ds.report) if row_prefix("classes", 2) in m], \
+        "the row now reports nothing at all"
+
+
+def test_an_unapplied_type_does_not_claim_its_rooms_were_all_excluded(tmp_path):
+    """The rescue must not announce a fallback it did not perform.
+
+    ``required_room_type='Derslik'``, ``allowed_rooms='Lab 1'``,
+    ``excluded_rooms='Lab 1'``. The type never narrowed anything, so the
+    "fallback" recomputed the list it already held — a pure no-op. Measured
+    before the fix it still warned "Every room of type Derslik is also listed
+    in Excluded Rooms, so the room type was not applied — otherwise this class
+    could never be placed anywhere", while Oda 1, the only Derslik room, was
+    not excluded, the preceding line had already said the type was not applied,
+    and the class was still placeable nowhere afterwards. Both clauses false,
+    and both checkable by the user against their own sheet.
+    """
+    rows = [klass("C001", student_count=25,
+                  required_room_type=ROOM_TYPE_LECTURE,
+                  allowed_rooms="Lab 1", excluded_rooms="Lab 1")]
+    path = build_workbook(tmp_path / "noop_rescue.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    cls = ds.state["classes"][0]
+    # The no-op stays a no-op: same list the pre-fix tree produced.
+    assert cls["required_classrooms"] == ["Lab 1"]
+    assert cls["excluded_classrooms"] == ["Lab 1"]
+
+    rescued = tr("warnings.room_type_all_excluded").format(
+        type=ROOM_TYPE_LECTURE,
+        type_field=_classes_header("required_room_type"),
+        rooms_field=_classes_header("excluded_rooms"))
+    three_columns = tr("warnings.room_type_allowed_all_excluded").format(
+        type=ROOM_TYPE_LECTURE,
+        type_field=_classes_header("required_room_type"),
+        allowed_field=_classes_header("allowed_rooms"),
+        excluded_field=_classes_header("excluded_rooms"))
+    reported = messages(ds.report)
+    assert not [m for m in reported if rescued in m], (
+        "the report claimed every %s room was excluded; Oda 1 is not:\n  %s"
+        % (ROOM_TYPE_LECTURE, "\n  ".join(reported)))
+    # Neither wording belongs here. Both end "the room type was not applied —
+    # otherwise this class could never be placed anywhere", which promises a
+    # rescue; nothing was rescued (the list is what it already was) and the
+    # class is still placeable nowhere, which the row's other line already
+    # said. A rescue sentence for a rescue that did not happen reads as the
+    # app contradicting itself.
+    assert not [m for m in reported if three_columns in m], (
+        "a rescue was announced for a fallback that changed nothing:\n  %s"
+        % "\n  ".join(reported))
+    assert get_physical_room_candidates(ds.state, cls) == [], (
+        "fixture drift: this row is supposed to be the one nothing rescued")
+
+
+def test_the_all_excluded_sentence_names_allowed_rooms_when_it_did_the_narrowing(
+        tmp_path):
+    """The rescue's premise has to match the row it fired on.
+
+    ``required_room_type='Laboratuvar'``, ``allowed_rooms='Oda 1, Lab 1'``,
+    ``excluded_rooms='Lab 1'``. Here the type genuinely narrowed — to
+    ``['Lab 1']`` — and that single survivor is excluded, so the fallback is
+    correct and stays. But Lab 2 is a Laboratuvar and is not excluded, so
+    "every room of type Laboratuvar is also in Excluded Rooms" is false; the
+    empty set is the intersection of *three* columns. The sentence must name
+    all three, and the other sentence stays reserved for the case where it is
+    true (the test above this block).
+    """
+    rows = [klass("C001", required_room_type=ROOM_TYPE_LAB,
+                  allowed_rooms="Oda 1, Lab 1", excluded_rooms="Lab 1")]
+    path = build_workbook(tmp_path / "three_columns.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    cls = ds.state["classes"][0]
+    # Behaviour unchanged — the fallback still restores the allowed list.
+    assert cls["required_classrooms"] == ["Oda 1", "Lab 1"]
+
+    false_line = tr("warnings.room_type_all_excluded").format(
+        type=ROOM_TYPE_LAB,
+        type_field=_classes_header("required_room_type"),
+        rooms_field=_classes_header("excluded_rooms"))
+    true_line = tr("warnings.room_type_allowed_all_excluded").format(
+        type=ROOM_TYPE_LAB,
+        type_field=_classes_header("required_room_type"),
+        allowed_field=_classes_header("allowed_rooms"),
+        excluded_field=_classes_header("excluded_rooms"))
+    reported = messages(ds.report)
+    assert not [m for m in reported if false_line in m], (
+        "Lab 2 is a %s and is not excluded, so this sentence is false:\n  %s"
+        % (ROOM_TYPE_LAB, "\n  ".join(reported)))
+    assert [m for m in reported if true_line in m], (
+        "the three-column sentence was not reported:\n  %s"
+        % "\n  ".join(reported))
+
+
+@pytest.mark.parametrize("location_type", [LOCATION_ONLINE,
+                                           LOCATION_LECTURER_OFFICE])
+def test_a_virtual_class_is_not_warned_about_a_room_it_never_needed(
+        tmp_path, location_type):
+    """ST-ARCH-004 — no physical room is the right answer, not a problem.
+
+    A school that fills Required Room Type on every row, its online lectures
+    included, was told once per remote class that the class "cannot be placed
+    until the room is enlarged, the head count lowered, or the type changed".
+    Nothing is wrong: ``get_room_candidates`` returns ``[None]``, the virtual
+    sentinel, the class schedules normally, and ``normalize_class_data``
+    discards ``required_classrooms`` — the importer was warning about a list it
+    was about to throw away. ``class_uses_physical_room`` is the predicate
+    ``room_fits_class`` and ``get_physical_room_candidates`` short-circuit on,
+    and the importer's copy of their arithmetic has to short-circuit with them.
+    """
+    rows = [klass("C001", student_count=25, required_room_type=ROOM_TYPE_LAB,
+                  location_type=get_location_label(location_type))]
+    path = build_workbook(tmp_path / f"virtual_{location_type}.xlsx",
+                          classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    cls = ds.state["classes"][0]
+    assert cls["location_type"] == location_type, "fixture drift: not virtual"
+    assert not [m for m in messages(ds.report) if row_prefix("classes", 2) in m], (
+        "a class needing no room was warned about one:\n  %s"
+        % "\n  ".join(messages(ds.report)))
+
+    # The control: the identical row face-to-face still warns, so the silence
+    # above is about the location type and not about the check going missing.
+    f2f = [klass("C001", student_count=25, required_room_type=ROOM_TYPE_LAB)]
+    ds2 = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "virtual_control.xlsx", classes=f2f))
+    assert [m for m in messages(ds2.report) if row_prefix("classes", 2) in m], \
+        "the control row stopped warning; this test would pass vacuously"
