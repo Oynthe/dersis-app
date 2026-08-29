@@ -61,6 +61,8 @@ The Edit Class dialog IS driven for real (a real ``AddClassDialog`` with
 ``edit_cls=``, constructed offscreen); the tests read its real checkbox
 registries and call its real ``_ok``.
 """
+import re
+
 import pytest
 
 pytest.importorskip("PyQt6.QtWidgets", reason="PyQt6 not installed")
@@ -351,3 +353,511 @@ def test_the_state_field_is_excluded_classrooms_not_excluded_rooms():
     assert HALL in get_physical_room_candidates(state, cls), (
         "'excluded_rooms' now excludes rooms in state — the two field names "
         "have converged and this defect's fix must target both")
+
+
+# ── Where this repair may NOT run: the .egu load path ───────────────────────
+#
+# `core/models.py`'s `find_off_grid_placements` states the policy in writing:
+# it is "Deliberately NOT called from ``normalize_state_classes`` (and so not
+# from the .egu load path): unplacing orphans at load time would silently
+# discard the user's own placements with no way to see or undo it, which is
+# the same class of bug in a new place. Callers decide what to do — warn,
+# list, or offer to reconcile."
+#
+# B4 put `_reconcile_after_setup()` into `open_file` and chose none of the
+# three: it repaired unconditionally, then cleared the undo stack, then
+# recorded the result as the clean baseline. Measured on the file this test
+# builds: 2 of 2 lessons unplaced, one count-only toast, undo depth 0, Ctrl+Z
+# a no-op. One save afterwards and the placements are gone from disk. The call
+# was reverted; this test is what stops it coming back.
+#
+# It does NOT forbid `open_file` from telling the user anything — a warn, a
+# list or an offer-to-reconcile is exactly what the policy asks for, and all
+# three keep this green. It forbids the silent destruction.
+
+
+def _stranded_egu(tmp_path):
+    """A saved .egu that a repair sweep would want to "fix".
+
+    Both lessons name a teacher who is not in the file's own ``lecturers``
+    list — the "file from an older build" case B4 exists to rescue — and both
+    require a room the file's own ``classrooms`` list does not contain. Every
+    branch of ``reconcile_placements`` therefore has something to do: unplace
+    on ``not lecturer_ok``, and empty ``required_classrooms``.
+    """
+    from scheduler_app import storage
+    from scheduler_app.core.models import new_state, new_class, mark_placed
+
+    state = new_state()
+    state["days"] = ["monday"]
+    state["slots"] = ["09:00", "10:00"]
+    state["classrooms"] = [LAB_OLD, HALL]
+    state["classroom_capacities"] = {LAB_OLD: 0, HALL: 0}
+    state["lecturers"] = []
+    state["years"] = {"Year-1": ["A"]}
+    state["classes"] = []
+    for i in range(2):
+        cls = new_class()
+        cls["class_code"] = "PHY10%d" % i
+        cls["name"] = "Fizik %d" % i
+        cls["lecturer"] = LECTURER
+        cls["targets"] = [dict(TARGET)]
+        cls["duration"] = 1
+        cls["participants"] = 0
+        cls["required_classrooms"] = ["GHOST_LAB"]
+        state["classes"].append(cls)
+        mark_placed(cls, "monday", state["slots"][i], LAB_OLD)
+
+    path = str(tmp_path / "stranded.egu")
+    storage.save_encrypted(state, path)
+    return path
+
+
+@pytest.mark.ui
+def test_opening_a_file_does_not_unplace_the_users_lessons(
+        make_app, monkeypatch, tmp_path):
+    """The .egu load path may not repair by destroying.
+
+    `open_file` runs `_undo_stack.clear()` and `mark_current_state_as_baseline()`
+    immediately after the load, so anything it changes is unrecoverable AND
+    recorded as "no unsaved changes". That is the one place in the app where
+    an automatic repair has no way back, which is why the policy singles it
+    out.
+    """
+    from PyQt6.QtWidgets import QFileDialog, QMessageBox
+
+    path = _stranded_egu(tmp_path)
+    win = make_app()
+
+    for name in ("question", "information", "warning", "critical"):
+        monkeypatch.setattr(
+            QMessageBox, name,
+            staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (path, "")))
+
+    win.open_file()
+
+    classes = win.state_data["classes"]
+    # Anti-vacuity: the file really was loaded, so the assertions below are
+    # about the opened schedule and not about an empty default state.
+    assert len(classes) == 2, (
+        "the file did not load: state has %d classes, the .egu had 2"
+        % len(classes))
+    assert win.current_file == path, (
+        "open_file did not adopt the file: current_file is %r"
+        % (win.current_file,))
+
+    placed = [c for c in classes if c.get("placed")]
+    assert len(placed) == 2, (
+        "opening a saved schedule unplaced %d of its 2 lessons. The undo "
+        "stack is cleared one statement later and the result is marked as "
+        "the clean baseline, so this is silent, unrecoverable data loss on "
+        "File > Open — the exact thing core/models.py:690-694 forbids. "
+        "Placements now: %r"
+        % (2 - len(placed),
+           [(c["name"], c.get("placed"), c.get("placed_day"),
+             c.get("placed_time"), c.get("placed_classroom"))
+            for c in classes]))
+
+    still_required = [c.get("required_classrooms") for c in classes]
+    assert still_required == [["GHOST_LAB"], ["GHOST_LAB"]], (
+        "opening a saved schedule deleted a room constraint the user wrote: "
+        "%r. `[]` means 'any room' everywhere in core, so the lesson that "
+        "must be in one particular lab is now free to be auto-scheduled into "
+        "a lecture hall — with no undo entry and no record of the room name "
+        "that was dropped." % (still_required,))
+
+
+# ── The fourth call site: Setup opened from a lesson's context menu ─────────
+#
+# `_edit_lecturer_from_class` (reached from the unplaced-list context menu,
+# Edit > Edit Lecturer) opens the FULL `SetupDialog` — every tab editable,
+# only `focus_lecturer=` differs from `edit_setup` — and then runs the same
+# `_reconcile_after_setup()`. `edit_setup` holds a `copy.deepcopy` across the
+# dialog and commits it when the dialog is accepted; this site recorded
+# nothing at all, so the same room rename was undoable through one entry point
+# and permanent through the other. Measured before the fix:
+#
+#     edit_setup                -> required [], undo 0->1, undo() restores ['Lab 1']
+#     _edit_lecturer_from_class -> required [], undo 0->0, undo() a no-op
+#
+# and renaming the room BACK does not restore the constraint, because the name
+# is what the sweep deleted.
+
+
+class _FakeSetupDialog:
+    """A `SetupDialog` that renames a room and is accepted.
+
+    The real dialog reaches state exactly this way: `SetupDialog._ok` assigns
+    `self.state["classrooms"] = rooms` from its table, so a rename arrives as
+    nothing but a different string in the list (`_rename_room` above). What
+    matters to these tests is the surface `app.py` uses — construct, `exec()`,
+    read `.result` — and that the state has changed by the time `.result` is
+    read.
+    """
+
+    def __init__(self, parent, state, **kwargs):
+        self._state = state
+        self.result = False
+
+    def exec(self):
+        _rename_room(self._state, LAB_OLD, LAB_NEW)
+        self.result = True
+        return 1
+
+
+def _app_on(make_app, state):
+    win = make_app()
+    win.state_data = state
+    win._workflow.state = state
+    return win
+
+
+@pytest.mark.ui
+def test_editing_a_lecturer_from_a_class_is_one_undoable_action(
+        make_app, monkeypatch):
+    """The context-menu route into Setup must be as undoable as the menu one."""
+    state, cls = _make_state()
+    cls["required_classrooms"] = [LAB_OLD]
+    win = _app_on(make_app, state)
+    monkeypatch.setattr("scheduler_app.ui.app.SetupDialog", _FakeSetupDialog)
+
+    assert win._undo_stack == [], "the fixture started with undo history"
+
+    win._edit_lecturer_from_class(win.state_data["classes"][0])
+
+    # Anti-vacuity: the destructive repair really did run, so there is
+    # something for undo to be responsible for.
+    assert win.state_data["classrooms"] == [LAB_NEW, HALL], (
+        "the stand-in dialog did not rename the room: %r"
+        % (win.state_data["classrooms"],))
+    assert win.state_data["classes"][0]["required_classrooms"] == [], (
+        "the reconcile did not drop the dangling room name, so this test is "
+        "not measuring the destruction it claims to: %r"
+        % (win.state_data["classes"][0]["required_classrooms"],))
+
+    assert len(win._undo_stack) == 1, (
+        "Setup opened from a lesson's context menu recorded %d undo entries. "
+        "It opens the same full SetupDialog as File > Setup and runs the same "
+        "repair, which deletes the room NAME — so with no undo entry the "
+        "user's 'this lesson must be in the physics lab' is gone for good, "
+        "and putting the room name back does not bring it back."
+        % len(win._undo_stack))
+
+    win.undo()
+    live = win.state_data["classes"][0]
+    assert live["required_classrooms"] == [LAB_OLD], (
+        "one Ctrl+Z after Setup-from-a-class did not restore the room "
+        "constraint: %r" % (live["required_classrooms"],))
+    assert win.state_data["classrooms"] == [LAB_OLD, HALL], (
+        "the undo restored the constraint without restoring the room list it "
+        "refers to — a half-transaction undo, which is the ST-ARCH-012 "
+        "failure: %r" % (win.state_data["classrooms"],))
+
+
+@pytest.mark.ui
+def test_a_cancelled_lecturer_edit_records_nothing(make_app, monkeypatch):
+    """The other half of the gate, and the half Phase 4 got wrong on Setup.
+
+    A snapshot recorded before the dialog and popped on cancel cannot put back
+    the redo stack it cleared, nor the entry it evicted at the 50-entry cap.
+    The entry must be COMMITTED only once the dialog is accepted — which is
+    what `edit_setup` does and what this asserts for its sibling.
+    """
+    state, cls = _make_state()
+    cls["required_classrooms"] = [LAB_OLD]
+
+    class _Cancelled(_FakeSetupDialog):
+        def exec(self):
+            self.result = False
+            return 0
+
+    win = _app_on(make_app, state)
+    monkeypatch.setattr("scheduler_app.ui.app.SetupDialog", _Cancelled)
+    win._push_undo("earlier")
+    win.undo()
+    assert len(win._redo_stack) == 1, "the fixture armed no redo entry"
+
+    win._edit_lecturer_from_class(win.state_data["classes"][0])
+
+    assert win._undo_stack == [], (
+        "a CANCELLED Setup-from-a-class left an undo entry behind: %r"
+        % ([e[0] for e in win._undo_stack],))
+    assert len(win._redo_stack) == 1, (
+        "a CANCELLED Setup-from-a-class destroyed the pending redo entry: "
+        "depth is %d, it was 1" % len(win._redo_stack))
+    assert win.state_data["classes"][0]["required_classrooms"] == [LAB_OLD], (
+        "a cancelled dialog changed the state: %r"
+        % (win.state_data["classes"][0]["required_classrooms"],))
+
+
+# ── Emptying a requirement is not the same event as narrowing one ──────────
+#
+# The sweep above argues, in its own comment, that dropping a dangling room
+# name is safe "ONLY because the class then lands in `affected`". `affected`
+# was a COUNT to both call sites — not the class, not the field, not the room
+# — so the two outcomes it covered were reported with one identical sentence.
+# Measured on ONE Setup OK renaming "Lab 1" -> "Lab A" over two classes:
+#
+#   required ['Lab 1','Lab 2'] -> ['Lab 2']  candidates ['Lab 2']   (harmless)
+#   required ['Lab 1']         -> []         candidates ALL rooms   ("any room")
+#   the single message for both: "2 class(es) were repaired ..."
+#
+# and then, through the app's own placer, `place_batch` put the physics-lab
+# lesson in "Hall A" — the lecture hall. That is the ST-FUNC-009 inversion
+# arriving through the repair written to prevent it, and the user could not
+# have stopped it: the message named neither the lesson nor the room, and the
+# room name is what the sweep deleted, so it cannot be recovered by putting
+# the room back.
+#
+# These tests pin the distinction, not the wording: they read the room and
+# lesson names, which are the user's own data and identical in all 22 locales.
+
+LAB_2 = "Lab 2"
+OTHER = "Kimya Lab"
+
+
+def _add_class(state, code, name, required):
+    from scheduler_app.core.models import new_class
+
+    cls = new_class()
+    cls["class_code"] = code
+    cls["name"] = name
+    cls["lecturer"] = LECTURER
+    cls["targets"] = [dict(TARGET)]
+    cls["duration"] = 1
+    cls["participants"] = 0
+    cls["required_classrooms"] = list(required)
+    state["classes"].append(cls)
+    return cls
+
+
+def _narrowed_and_emptied():
+    """One Setup rename, two classes: one keeps a requirement, one loses it.
+
+    The pair is the whole point. A fix that reported *every* repaired class in
+    detail would pass a test built on the emptied class alone while making an
+    ordinary rename a wall of text.
+    """
+    state, narrowed = _make_state()
+    state["classrooms"] = [LAB_OLD, LAB_2, HALL]
+    state["classroom_capacities"] = {LAB_OLD: 0, LAB_2: 0, HALL: 0}
+    narrowed["name"] = OTHER
+    narrowed["required_classrooms"] = [LAB_OLD, LAB_2]
+    emptied = _add_class(state, "PHY102", "Fizik Lab", [LAB_OLD])
+    _rename_room(state, LAB_OLD, LAB_NEW)
+    return state, narrowed, emptied
+
+
+def _toasts_of(win, monkeypatch):
+    """Capture what `_show_toast` was given, message text only."""
+    said = []
+    monkeypatch.setattr(type(win), "_show_toast",
+                        lambda self, message, kind="info": said.append(message))
+    return said
+
+
+def test_reconcile_records_which_lesson_lost_its_room_requirement_entirely():
+    state, narrowed, emptied = _narrowed_and_emptied()
+
+    report = _reconcile(state)
+
+    # Anti-vacuity: both classes really were repaired, so a report that
+    # singles one out is choosing, not merely reflecting an empty sweep.
+    assert len(report) == 2, (
+        "the fixture did not repair both classes: %r"
+        % ([c["name"] for c in report],))
+    assert narrowed["required_classrooms"] == [LAB_2], (
+        "the narrowed class is not narrowed: %r"
+        % (narrowed["required_classrooms"],))
+    assert emptied["required_classrooms"] == [], (
+        "the emptied class is not emptied: %r"
+        % (emptied["required_classrooms"],))
+
+    lost = [(c["name"], list(rooms))
+            for c, rooms in report.lost_room_requirements]
+    assert lost == [("Fizik Lab", [LAB_OLD])], (
+        "reconcile_placements reported %r as having lost its room requirement "
+        "outright. It must report exactly the classes whose "
+        "required_classrooms went from non-empty to EMPTY, together with the "
+        "room names it deleted — an empty list means 'any room' everywhere in "
+        "core (core/models.py:557), so that class can now be auto-scheduled "
+        "into a lecture hall, and the room name is the only thing that lets a "
+        "user put the requirement back. %r was merely narrowed and is still "
+        "constrained to %r, so it is not this event.\n"
+        "  lost_room_requirements = %r"
+        % (lost, narrowed["name"], narrowed["required_classrooms"], lost))
+
+
+def test_the_message_names_the_lesson_and_the_room_it_may_no_longer_require(
+        make_app, monkeypatch):
+    state, narrowed, emptied = _narrowed_and_emptied()
+    win = _app_on(make_app, state)
+    said = _toasts_of(win, monkeypatch)
+
+    win._reconcile_after_setup()
+
+    assert said, "the repair told the user nothing at all"
+    text = "\n".join(said)
+    assert emptied["name"] in text and LAB_OLD in text, (
+        "after Setup renamed %r to %r, %r lost its ONLY room requirement and "
+        "can now be scheduled in any room — including a lecture hall, measured "
+        "through place_batch. The user was told %r, which names neither the "
+        "lesson nor the room, so there is nothing to act on: the room name is "
+        "gone from the state and putting the room back does not restore the "
+        "requirement.\n"
+        "  said = %r"
+        % (LAB_OLD, LAB_NEW, emptied["name"], text, said))
+    assert narrowed["name"] not in text, (
+        "%r was merely narrowed to %r — still constrained, still a legal "
+        "schedule — and naming it here makes an ordinary Setup rename read "
+        "like the dangerous case. Only the emptied requirement is news.\n"
+        "  said = %r"
+        % (narrowed["name"], narrowed["required_classrooms"], said))
+    assert re.search(r"(?<!\d)2(?!\d)", text), (
+        "the total repaired count (2) is no longer stated: %r" % (said,))
+
+
+def test_a_narrowed_room_requirement_alone_stays_a_one_line_repair(
+        make_app, monkeypatch):
+    """The quiet case must stay quiet.
+
+    A school that renames one room used by one lesson that has other rooms to
+    fall back on has lost nothing it can act on, and
+    `tests/test_setup_reconcile.py::test_setup_without_removals_changes_and_warns_nothing`
+    holds the neighbouring "changed nothing" case. This holds the line one step
+    in: repaired, still constrained, one sentence.
+    """
+    state, narrowed = _make_state()
+    state["classrooms"] = [LAB_OLD, LAB_2, HALL]
+    state["classroom_capacities"] = {LAB_OLD: 0, LAB_2: 0, HALL: 0}
+    narrowed["required_classrooms"] = [LAB_OLD, LAB_2]
+    _rename_room(state, LAB_OLD, LAB_NEW)
+    win = _app_on(make_app, state)
+    said = _toasts_of(win, monkeypatch)
+
+    win._reconcile_after_setup()
+
+    assert narrowed["required_classrooms"] == [LAB_2], (
+        "the fixture did not narrow anything: %r"
+        % (narrowed["required_classrooms"],))
+    assert len(said) == 1 and "\n" not in said[0], (
+        "a narrowing repair now emits %d message(s) / %d line(s). The class is "
+        "still constrained to %r and the schedule it produces is still legal, "
+        "so this is the ordinary case and it may not grow: %r"
+        % (len(said), sum(m.count("\n") + 1 for m in said),
+           narrowed["required_classrooms"], said))
+    assert LAB_OLD not in said[0], (
+        "the narrowing repair names the dropped room %r as if the requirement "
+        "were gone: %r" % (LAB_OLD, said[0]))
+
+
+def test_the_lost_requirement_message_does_not_grow_with_the_school(
+        make_app, monkeypatch):
+    """Bounded output, unbounded truth.
+
+    Deleting a room a whole department requires is one gesture, and the toast
+    is 350 px wide with a 3 s life (ui/widgets.py:48). ST-UI-B6 is the same
+    shape one layer over: an unbounded report measured 24 110 px tall for 500
+    rows. The COUNT must stay true; the list of names is what gets cut.
+    """
+    state, _first = _make_state()
+    state["classes"] = []
+    for i in range(40):
+        _add_class(state, "PHY%03d" % i, "Ders %d" % i, [LAB_OLD])
+    _rename_room(state, LAB_OLD, LAB_NEW)
+    win = _app_on(make_app, state)
+    said = _toasts_of(win, monkeypatch)
+
+    win._reconcile_after_setup()
+
+    text = "\n".join(said)
+    named = text.count("(%s)" % LAB_OLD)
+    assert named <= 3, (
+        "the message named %d of the 40 lessons that lost their room "
+        "requirement. One deleted room can be required by an entire "
+        "department; the sentence has to carry the true total and a readable "
+        "sample, not every name.\n  message = %r" % (named, text))
+    assert named >= 1, (
+        "the message named no lesson at all, so 40 lessons became placeable "
+        "in any room with nothing to act on: %r" % (text,))
+    assert re.search(r"(?<!\d)40(?!\d)", text), (
+        "the true total (40) is missing from a truncated message — the "
+        "truncation may cost names, never the size of the problem: %r"
+        % (text,))
+
+
+# ── The import path says the same thing ────────────────────────────────────
+#
+# `_import_from_excel` replaces `state["classrooms"]` wholesale, so it strands
+# a PRE-EXISTING class's `required_classrooms` exactly as a Setup rename does,
+# and it is the one call site whose repair the user never asked for. It reads
+# the same report through the same sentence builder; this is what says so.
+
+
+class _FakeReport:
+    is_valid = True
+    warnings = []
+
+    def summary(self):
+        return ""
+
+
+def _dataset_replacing_rooms(rooms):
+    from scheduler_app.data_io.importer import SchedulerDataset
+
+    ds = SchedulerDataset()
+    ds.state["classrooms"] = list(rooms)
+    ds.state["classroom_capacities"] = {r: 0 for r in rooms}
+    ds.state["lecturers"] = []
+    ds.state["years"] = {}
+    ds.state["classes"] = []
+    ds.report = _FakeReport()
+    return ds
+
+
+@pytest.mark.ui
+def test_an_import_that_strands_a_requirement_names_it_too(
+        make_app, monkeypatch, tmp_path):
+    from PyQt6.QtWidgets import QFileDialog
+
+    from scheduler_app.plans import TIER_INSTITUTIONAL
+    from scheduler_app.ui.tier_enforcement import TierEnforcement
+    import scheduler_app.data_io.importer as importer_mod
+    import scheduler_app.ui.app as app_mod
+
+    state, cls = _make_state()
+    cls["required_classrooms"] = [LAB_OLD]
+    win = _app_on(make_app, state)
+
+    enforcer = TierEnforcement.instance()
+    monkeypatch.setattr(enforcer, "_tier_slug", TIER_INSTITUTIONAL)
+    monkeypatch.setattr(enforcer, "_tier_confirmed", True)
+    monkeypatch.setattr(QFileDialog, "getOpenFileName",
+                        staticmethod(lambda *a, **k: (str(tmp_path / "x.xlsx"), "")))
+    monkeypatch.setattr(app_mod, "show_validation_report",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(
+        importer_mod, "load_scheduler_data_from_excel",
+        lambda path: _dataset_replacing_rooms([LAB_NEW, HALL]))
+    said = _toasts_of(win, monkeypatch)
+
+    win._import_from_excel()
+
+    # Anti-vacuity: the import really did land and really did strand the class.
+    assert win.state_data["classrooms"] == [LAB_NEW, HALL], (
+        "the stand-in workbook did not replace the room list: %r"
+        % (win.state_data["classrooms"],))
+    assert cls["required_classrooms"] == [], (
+        "the import did not strand the requirement, so this test is not "
+        "measuring what it claims: %r" % (cls["required_classrooms"],))
+
+    text = "\n".join(said)
+    assert cls["name"] in text and LAB_OLD in text, (
+        "an import replaced the room list and %r silently lost its only room "
+        "requirement — it can now be auto-scheduled into any room in the "
+        "school. The import path reports through the same builder as Setup "
+        "and must name the lesson and the room here too; the user did not "
+        "even change a setup, so a bare count is doubly unactionable.\n"
+        "  said = %r" % (cls["name"], said))

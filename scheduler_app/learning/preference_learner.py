@@ -50,6 +50,11 @@ class PreferenceLearner:
     # growth back.
     _FINGERPRINT_WINDOW = 8192
 
+    # Bytes per read of the WHOLE-span digest in _hash_prefix. Nothing subtle:
+    # big enough that the Python loop disappears next to the I/O, small enough
+    # that a 30 MB log is never held in memory twice.
+    _DIGEST_CHUNK = 1 << 20
+
     def __init__(self, data_dir=None):
         if data_dir is None:
             data_dir = storage.sub_dir(storage.LEARNING_DIR)
@@ -79,6 +84,23 @@ class PreferenceLearner:
         # Persisting it would make a corruption that arrived while DERSİS was
         # closed survive unlooked-at forever, which is the B8 defect again.
         self._checked_span = None
+        # ── The clean-span anchor (ST-PERF-005 / R1) ─────────────────────────
+        # ``_verified_size`` bytes of the log were, at some moment, decrypted
+        # end to end and every record read; ``_verified_digest`` is a SHA-256
+        # over ALL of those bytes, and the anchor exists ONLY when that read
+        # found nothing lost. Both are persisted next to the weights, unlike
+        # _checked_span above, and the difference is coverage: _checked_span
+        # samples three windows and would hide a flip in the gap forever if it
+        # were persisted, whereas this digest covers every byte, so no change
+        # anywhere can slip past it. See _check_log_health for what it buys.
+        #
+        # ``_verified_hash`` is the live hashlib object behind that digest --
+        # in-memory only, because a hashlib object cannot be serialised. It is
+        # what lets _extend_verified carry the anchor over an append by hashing
+        # ONLY the appended bytes instead of the whole history.
+        self._verified_size = 0
+        self._verified_digest = None
+        self._verified_hash = None
 
         self._load_weights()
 
@@ -142,6 +164,114 @@ class PreferenceLearner:
         digest = self._span_fingerprint(size)
         self._checked_span = None if digest is None else (size, digest)
 
+    def _hash_prefix(self, span):
+        """SHA-256 over the log's first *span* bytes — ALL of them.
+
+        Returns the live hash OBJECT rather than a digest string, so the caller
+        can keep it and later extend it with only the bytes appended since; see
+        _extend_verified. None when the bytes cannot be read, or when the file
+        turns out to be shorter than *span*, both of which the caller has to
+        treat as "assume it changed".
+
+        This is the O(n) read _span_fingerprint refuses to do, and it is here
+        for the one caller that can afford it: once per launch, in place of an
+        O(n) read that costs 21x more. Measured 2026-08-29 on .venv-audit, a
+        20 000-record / 11.7 MB log: 4.1 ms to read the bytes plus 5.5 ms to
+        hash them, against 203.0 ms for the AES-GCM + json read it replaces.
+        It must NEVER be put on the per-manual-move path -- that is what
+        _FINGERPRINT_WINDOW exists to prevent, and the numbers there rule it
+        out at 8x the bytes for an 8x log.
+        """
+        digest = hashlib.sha256()
+        remaining = span
+        try:
+            with open(self.feedback_logger.log_file, "rb") as handle:
+                while remaining > 0:
+                    chunk = handle.read(min(self._DIGEST_CHUNK, remaining))
+                    if not chunk:
+                        return None  # shorter than span: not the same bytes
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+        except OSError:
+            return None
+        return digest
+
+    def _forget_verified(self):
+        """Drop the clean-span anchor, so the next launch reads the log in full.
+
+        Called on every verdict that is not "clean", and on every failure to
+        maintain the anchor. Forgetting is always the safe direction: it costs
+        one O(n) integrity read, and the alternative -- keeping an anchor that
+        no longer describes a span known to be readable -- is silence.
+        """
+        self._verified_size = 0
+        self._verified_digest = None
+        self._verified_hash = None
+
+    def _remember_verified(self, size):
+        """Anchor: the log's first *size* bytes decrypted CLEAN, end to end.
+
+        Only ever called with a size whose every record was just decrypted and
+        found readable — so the hash below is over bytes that have been through
+        AES-GCM, not merely over bytes that exist.
+        """
+        if size <= 0:
+            self._forget_verified()
+            return
+        digest = self._hash_prefix(size)
+        if digest is None:
+            self._forget_verified()
+            return
+        self._verified_hash = digest
+        self._verified_size = size
+        self._verified_digest = digest.hexdigest()
+
+    def _extend_verified(self, size):
+        """Carry the anchor forward over bytes a decrypt read just vouched for.
+
+        Hashes ONLY the range ``[_verified_size, size)`` — the records the
+        incremental read in learn() has just decrypted — so an append costs a
+        hash of the appended bytes and not of the history. That is the whole
+        reason the anchor keeps a live hashlib object around.
+
+        The subtle half, and the reason this must extend the OBJECT rather than
+        re-hash the file: the prefix's bytes are not re-read here. The digest
+        that ends up persisted therefore describes the log *as this session
+        believed it to be* — the prefix as it was when it was last hashed for
+        real, plus the tail as it is now. If a bit flipped in the prefix during
+        the session, in a gap between _span_fingerprint's three windows where
+        nothing in-session can see it, the persisted digest and the bytes on
+        disk have diverged, so the next launch's comparison FAILS and takes the
+        full integrity read. Re-hashing the whole file here instead would
+        launder that damage into the anchor and make the documented in-session
+        residue permanent, which is the B8 defect back again.
+        """
+        if size == self._verified_size:
+            return
+        if self._verified_hash is None or size < self._verified_size:
+            # No anchor to extend, or the log shrank — a truncation is not an
+            # append and must not be treated as one.
+            self._forget_verified()
+            return
+        digest = self._verified_hash.copy()
+        remaining = size - self._verified_size
+        try:
+            with open(self.feedback_logger.log_file, "rb") as handle:
+                handle.seek(self._verified_size)
+                while remaining > 0:
+                    chunk = handle.read(min(self._DIGEST_CHUNK, remaining))
+                    if not chunk:
+                        self._forget_verified()
+                        return
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+        except OSError:
+            self._forget_verified()
+            return
+        self._verified_hash = digest
+        self._verified_size = size
+        self._verified_digest = digest.hexdigest()
+
     def _check_log_health(self, size):
         """Set ``last_read_lost`` from the LOG, not from the learning gates.
 
@@ -201,6 +331,71 @@ class PreferenceLearner:
             cost ST-PERF-005 removed was 27.8 ms per manual move on the same
             log; this is not that cost back, and it is what buys the report.
 
+        R1: that once-per-launch cost is LINEAR AND UNBOUNDED, and nothing in
+        the product caps the feedback log — it grows by one record per manual
+        move, per single auto-placement, per rejection, per batch and per
+        reschedule, and is never rotated or pruned. Re-measured 2026-08-29 on
+        .venv-audit, min of 5, fresh learner per rep over a caught-up log:
+
+            n=2 000    1.2 MB    17.6 ms
+            n=5 000    3.1 MB    44.5 ms
+            n=10 000   6.2 MB    94.1 ms
+            n=20 000  11.7 MB   199.8 ms
+            n=50 000  30.8 MB   538.2 ms
+
+        — 10 microseconds per record, forever. In context: a whole
+        ``SchedulerApp.__init__`` costs 90 ms with no feedback log at all, so at
+        20 000 records this ONE read is more than the entire rest of the launch
+        (cProfile: 357 ms of a 481 ms __init__, and no other O(n) in __init__ at
+        all). 20 000 records is not exotic — it is one user action a minute for
+        a few hundred hours of timetabling.
+
+        So the read is now skipped when, and only when, the log is byte-for-byte
+        a span that a previous full read already decrypted end to end and found
+        CLEAN. That is the ``_verified_*`` anchor: a SHA-256 over every byte of
+        that span, persisted next to the weights, checked here by re-hashing.
+        The whole file, not a sample — so no change anywhere can pass it — and
+        the anchor exists only for a clean verdict, so a DAMAGED log pays the
+        full read on every launch until it is repaired, which is the right way
+        round. Reading the bytes and hashing them costs 9.6 ms at 20 000 records
+        against the 199.8 ms above: 21x, and still O(n), because detecting an
+        arbitrary flipped bit in an n-byte file cannot be cheaper than reading
+        n bytes. What it removes is the AES-GCM and the json.loads (147 ms of
+        that 203 ms), not the read.
+
+        Four reasons this cannot become a way of missing damage:
+
+          * the hash is taken over ``size`` — the WHOLE file as it is now — and
+            compared against a digest of ``_verified_size`` bytes, so a log that
+            grew by one byte cannot match however the size test is written.
+            ``size == self._verified_size`` in front of it is a cheap filter,
+            not the guard; the guard is the argument to _hash_prefix. Verified
+            by mutation: relaxing the comparison to ``<=`` alone changes nothing
+            (10/10 green, an equivalent mutant), while ALSO hashing only
+            ``_verified_size`` bytes is caught. That matters because accepting a
+            verified PREFIX would make the "half-written record" residue above
+            permanent instead of bounded: those bytes yield no new frame, so
+            learn() returns at its cursor gate and never looks at them either,
+            and the next launch's full read is the only thing that ever does;
+          * the anchor is cleared the moment any read reports a loss, so the
+            report is never suppressed by a stale "it was fine last time". The
+            shape that makes that line load-bearing is not the obvious one:
+            a damaged log the learner is caught up on never reaches _save_weights
+            at all, so a bad anchor could not persist. It is a damaged log with
+            UNLEARNED records — closed after an auto-placement or a batch
+            schedule, neither of which calls learn(), or after a crash. Then the
+            tail read that follows is healthy, reports lost 0, and carries the
+            anchor forward. Measured with this guard removed: launch 1 reports
+            the damage, launch 2 reports 0;
+          * a wrong or missing key does not survive it. The anchor lives inside
+            ``learned_weights.egu``, encrypted with the SAME master key as the
+            log, so a key that can no longer read the log cannot read the anchor
+            either: _load_weights fails, the anchor is absent, and the launch
+            takes the full read that reports every record lost;
+          * the digest is extended, never recomputed, on an append — see
+            _extend_verified for why that is what preserves the in-session
+            residue rather than laundering it.
+
         Returns the LogRead when it read, None when it did not.
         """
         checked = self._checked_span
@@ -214,12 +409,26 @@ class PreferenceLearner:
                     # comparing only the stale prefix.
                     self._anchor_span(size)
                 return None
+        # The once-per-launch path, and the only place the persisted anchor is
+        # consulted. `_checked_span` is None here exactly when no integrity read
+        # has happened in THIS process, which is what makes this the launch.
+        if self._verified_digest is not None and 0 < self._verified_size == size:
+            whole = self._hash_prefix(size)
+            if whole is not None and whole.hexdigest() == self._verified_digest:
+                self.last_read_lost = 0
+                self._verified_hash = whole
+                self._anchor_span(size)
+                return None
         report = storage.load_encrypted_lines_report(self.feedback_logger.log_file)
         # Assigned on every read, including a clean one, so a REPAIRED log stops
         # reporting. That is why the fingerprint gate above must not be allowed
         # to swallow a shrink: `size >= prev_size` is what sends a truncation
         # here rather than treating it as an append.
         self.last_read_lost = report.lost
+        if report.lost:
+            self._forget_verified()
+        else:
+            self._remember_verified(size)
         self._anchor_span(size)
         return report
 
@@ -334,6 +543,9 @@ class PreferenceLearner:
                 # user and leave the weights alone.
                 self._learned_through = total
                 self._learned_size = self.feedback_logger.log_size()
+                # Damage seen: the clean-span anchor is void, so the next launch
+                # reads the log in full and reports it again. R1.
+                self._forget_verified()
                 self._save_weights()
             return 0
 
@@ -355,6 +567,18 @@ class PreferenceLearner:
 
         self._learned_through = total
         self._learned_size = self.feedback_logger.log_size()
+        # R1. Every record from 0 to `size` has now been through a decrypt read
+        # — the prefix by whichever earlier read anchored it, the tail by the
+        # get_entries_since_report above — so the anchor may move up to `size`.
+        # `size`, from the top of this method, and NOT the freshly stat-ed
+        # _learned_size: those are equal for the single writer this app is, and
+        # anchoring at the smaller of the two is the direction that costs a
+        # launch read rather than the direction that vouches for bytes nothing
+        # decrypted.
+        if lost:
+            self._forget_verified()
+        else:
+            self._extend_verified(size)
         if signals_processed > 0:
             self.train_count += 1
         # Saved even when nothing was learned, so an entry carrying no signal is
@@ -538,6 +762,11 @@ class PreferenceLearner:
             "train_count": self.train_count,
             "learned_through": self._learned_through,
             "learned_size": self._learned_size,
+            # R1: the clean-span anchor. Absent-or-None means "no span is known
+            # readable", which is the safe reading and what every file written
+            # before this change decodes to.
+            "verified_size": self._verified_size,
+            "verified_digest": self._verified_digest,
         }
         try:
             storage.save_encrypted(data, self.weights_path)
@@ -559,6 +788,14 @@ class PreferenceLearner:
             # migration.
             self._learned_through = data.get("learned_through", 0)
             self._learned_size = data.get("learned_size", 0)
+            # R1. Note what this file being unreadable implies: it is encrypted
+            # with the same master key as the feedback log, so a key that cannot
+            # decrypt the log cannot decrypt this either. The `except` below
+            # therefore leaves the anchor at its constructor 0/None, the launch
+            # takes the full integrity read, and a log gone unreadable because
+            # its key went missing is reported rather than skipped.
+            self._verified_size = data.get("verified_size", 0)
+            self._verified_digest = data.get("verified_digest")
         except Exception:
             pass
 

@@ -260,6 +260,14 @@ def test_the_fold_is_idempotent_and_blank_safe():
 _SHARED_FOLD_SITES = [
     ("scheduler_app/i18n/day_keys.py", None),
     ("scheduler_app/core/workflow.py", "register_lecturer"),
+    # Phase 9 moved the fold one function away: `register_lecturer` now
+    # delegates to `_resolve_roster_spelling`, which holds the comparison. The
+    # `register_lecturer` entry above stayed green through that move while
+    # guarding nothing, because it checks the named node for a rogue
+    # `.casefold()`/`.lower()` and the node no longer contains any comparison
+    # at all. Both are listed: the new one is where a second rule would now
+    # appear, and the old one still catches somebody re-inlining it.
+    ("scheduler_app/core/workflow.py", "_resolve_roster_spelling"),
     ("scheduler_app/data_io/importer.py", "_process_teachers"),
     ("scheduler_app/data_io/schema.py", None),
 ]

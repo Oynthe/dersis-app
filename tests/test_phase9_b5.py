@@ -14,6 +14,15 @@ into a lecture hall.
 The workbook builder here is a deliberate copy of the one in
 ``tests/test_import_roundtrip.py`` rather than an import of it: this module has
 to stand on its own while other agents edit that file in parallel.
+
+The second half of the file guards the *remediation* of that fix. Merging the
+room constraints introduced a regression of its own — the new
+``excluded_classrooms`` union emptied the candidate set of joint groups that
+imported placeable before it, silently — and left the merge's own stated
+invariant ("the same two rows swapped must produce the same session") false of
+``location_type``. Everything below the marker exists because the first four
+tests above were not enough: the whole exclusion union and the whole warning
+apparatus could be deleted with the suite still green.
 """
 
 import pytest
@@ -23,9 +32,13 @@ pytest.importorskip("openpyxl", reason="workbook fixtures need openpyxl")
 
 import openpyxl  # noqa: E402
 
-from scheduler_app.core.models import get_physical_room_candidates  # noqa: E402
+from scheduler_app.core.models import (  # noqa: E402
+    LOCATION_FACE_TO_FACE, LOCATION_ONLINE, get_location_label,
+    get_physical_room_candidates,
+)
 from scheduler_app.data_io import schema  # noqa: E402
 from scheduler_app.data_io.importer import load_scheduler_data_from_excel  # noqa: E402
+from scheduler_app.translations import tr  # noqa: E402
 
 pytestmark = pytest.mark.excel
 
@@ -54,6 +67,11 @@ DEFAULT_ROOMS = [
 DEFAULT_BRANCHES = [
     {"branch_id": "B001", "name": "Grup A"},
     {"branch_id": "B002", "name": "Grup B"},
+    # A third branch so a joint group can have THREE rows. The exclusion union
+    # is the only merge rule whose failure needs three of them: no single row
+    # can rule out every room in the building, but three rows ruling out one
+    # room each can, and that is the shape no two-row test reaches.
+    {"branch_id": "B003", "name": "Grup C"},
 ]
 
 
@@ -121,22 +139,52 @@ def joint_rows(*, lab_row_index, joint="J1", course="Ortak Fizik",
     return rows
 
 
-def merged_joint_class(dataset):
-    """The single surviving class of a two-row joint group.
+def merged_joint_class(dataset, branches=("Grup A", "Grup B")):
+    """The single surviving class of a joint group.
 
     Asserts the merge itself happened first, so a failure below is never a
     failure of the fixture.
     """
     classes = dataset.state["classes"]
     assert len(classes) == 1, (
-        "fixture drift: the two rows of joint group J1 did not merge into one "
+        "fixture drift: the rows of joint group J1 did not merge into one "
         f"session; state holds {[c['name'] for c in classes]}")
     merged = classes[0]
     assert merged["joint_session"] is True
-    branches = {t["branch"] for t in merged.get("targets", [])}
-    assert branches == {"Grup A", "Grup B"}, (
-        f"fixture drift: the merged session lost a branch target; got {branches}")
+    got = {t["branch"] for t in merged.get("targets", [])}
+    assert got == set(branches), (
+        f"fixture drift: the merged session lost a branch target; got {got}")
     return merged
+
+
+def joint_warning(dataset, key, **fields):
+    """The report line the importer rendered from *key*, or ``None``.
+
+    Builds the expected sentence through ``tr`` and the schema's own header map
+    rather than matching English text, so the assertion pins the message the
+    user actually reads in whatever locale the suite runs under — and fails if
+    the placeholders the importer fills stop matching the ones the catalogue
+    declares. Unused keyword arguments are ignored by ``str.format``, so one
+    call site serves every joint-group key.
+    """
+    headers = schema.get_workbook_sheet_header_map("classes")
+    text = tr(key).format(
+        group_field=headers["joint_class_group"],
+        type_field=headers["required_room_type"],
+        rooms_field=headers["allowed_rooms"],
+        excluded_field=headers["excluded_rooms"],
+        location_field=headers["location_type"],
+        **fields)
+    for line in dataset.report.warnings:
+        if line.endswith(text):
+            return line
+    return None
+
+
+def joint_klass(class_id, branch_id, **overrides):
+    """A row of joint group ``J1``."""
+    return klass(class_id, branch_id=branch_id, course_name="Ortak Fizik",
+                 joint_class_group="J1", **overrides)
 
 
 def test_a_joint_group_keeps_a_room_type_declared_by_its_second_row(tmp_path):
@@ -230,3 +278,281 @@ def test_a_joint_merge_never_widens_a_group_whose_rows_declare_room_types(
     assert len(get_physical_room_candidates(ds.state, merged)) < 3, (
         "the merged session is allowed into every room in the building despite "
         "both of its rows naming a room type")
+
+
+# ── Remediation of the fix above ────────────────────────────────────────────
+#
+# Everything from here down was written after an adversarial pass measured the
+# fix. Four of its seven mutants survived: the entire `excluded_classrooms`
+# union could be deleted, its write-back removed, the dropped-room bookkeeping
+# deleted and the whole warning suppressed, with the suite still green. The
+# three tests above are all about `required_classrooms`, so none of them could
+# fire. Each test below names the mutant it kills.
+
+
+def test_a_joint_group_unions_the_exclusions_of_its_rows(tmp_path):
+    """The exclusion half of the merge, pinned. Kills mutants M3 and M5.
+
+    Row 1 asks for the lab type (``['Lab 1', 'Lab 2']``); row 2 excludes
+    ``Lab 1``. A joint session is ONE session in ONE room, so a room any member
+    row rules out is ruled out for the session — the merge takes the UNION of
+    the exclusions, the opposite rule to the intersection it takes for the
+    required lists, because an exclusion is a prohibition rather than a
+    preference.
+
+    The commit that introduced the union quoted this exact before/after
+    measurement (``excluded_classrooms=[]`` with candidates
+    ``['Oda 1', 'Lab 1', 'Lab 2']``, now ``['Lab 1']`` and ``['Oda 1', 'Lab 2']``
+    — here narrowed further by row 1's lab type) and never turned it into an
+    assertion, so both the union and its write-back to the primary could be
+    deleted with the suite green.
+    """
+    rows = [joint_klass("C001", "B001", required_room_type=ROOM_TYPE_LAB),
+            joint_klass("C002", "B002", excluded_rooms="Lab 1")]
+    ds = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "joint_union.xlsx", classes=rows))
+
+    assert ds.report.is_valid, ds.report.summary()
+    merged = merged_joint_class(ds)
+
+    assert merged["excluded_classrooms"] == ["Lab 1"], (
+        "the joint session lost the room its second row excluded: "
+        f"excluded_classrooms={merged['excluded_classrooms']!r}")
+    assert get_physical_room_candidates(ds.state, merged) == ["Lab 2"], (
+        "the merged session can still be scheduled into a room one of its own "
+        "rows ruled out; candidates are "
+        f"{get_physical_room_candidates(ds.state, merged)}")
+    # A union that leaves somewhere to go is not a conflict and must stay
+    # silent — the warning below has to mean something when it does appear.
+    assert ds.report.warnings == [], (
+        f"an unremarkable joint group was warned about: {ds.report.warnings}")
+
+
+def test_a_joint_merge_never_leaves_a_group_with_nowhere_to_meet(tmp_path):
+    """REGRESSION — the exclusion union made placeable groups unplaceable.
+
+    Row 1 requires the lecture type, which resolves to ``['Oda 1']``; row 2
+    excludes ``Oda 1``. ``get_physical_room_candidates`` intersects
+    ``required_classrooms`` with the live rooms and THEN subtracts
+    ``excluded_classrooms``, so the union wrote a pair of lists with no room
+    between them. Measured against the pre-merge importer
+    (``git show f049964:scheduler_app/data_io/importer.py``):
+
+        before  req=['Oda 1']  exc=[]         candidates=['Oda 1']
+        after   req=['Oda 1']  exc=['Oda 1']  candidates=[]  warnings=0
+
+    A joint session the school had been timetabling for years became impossible
+    to place, and the import report was empty — the solver's unplaced list was
+    the first the user heard of it. ``_process_classes`` already rescues and
+    reports the identical contradiction when both cells sit on ONE row.
+    """
+    rows = [joint_klass("C001", "B001", required_room_type=ROOM_TYPE_LECTURE),
+            joint_klass("C002", "B002", excluded_rooms="Oda 1")]
+    ds = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "joint_nowhere.xlsx", classes=rows))
+
+    assert ds.report.is_valid, ds.report.summary()
+    merged = merged_joint_class(ds)
+
+    assert get_physical_room_candidates(ds.state, merged) == ["Oda 1"], (
+        "the joint session has nowhere left to meet: required_classrooms="
+        f"{merged['required_classrooms']!r} and excluded_classrooms="
+        f"{merged['excluded_classrooms']!r} leave "
+        f"{get_physical_room_candidates(ds.state, merged)}")
+    assert joint_warning(ds, "warnings.joint_group_room_unplaceable",
+                         group="J1", dropped="Oda 1", kept="Oda 1"), (
+        "the merge dropped a row's room restriction to keep the session "
+        "placeable and did not say so; the report holds "
+        f"{ds.report.warnings}")
+
+
+def test_three_rows_excluding_a_room_each_do_not_exclude_the_whole_building(
+        tmp_path):
+    """REGRESSION — the union shape no single row can produce.
+
+    Three rows of one group, each excluding a different one of the three rooms.
+    Every row is individually harmless; the union is every room in the
+    building. Measured before the merge existed: candidates
+    ``['Lab 1', 'Lab 2']``. After it: ``[]``, with an empty report.
+
+    The third row's exclusion is the one that empties the group, so it is the
+    one dropped — the same "earlier row wins, and the user is told" rule the
+    merge already applies to two disjoint room types. ``Lab 2`` is therefore
+    the only room left, and the two exclusions that fit are both honoured.
+    """
+    rows = [joint_klass("C001", "B001", excluded_rooms="Oda 1"),
+            joint_klass("C002", "B002", excluded_rooms="Lab 1"),
+            joint_klass("C003", "B003", excluded_rooms="Lab 2")]
+    ds = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "joint_three_excl.xlsx", classes=rows))
+
+    assert ds.report.is_valid, ds.report.summary()
+    merged = merged_joint_class(ds, branches=("Grup A", "Grup B", "Grup C"))
+
+    assert get_physical_room_candidates(ds.state, merged) == ["Lab 2"], (
+        "three rows excluding one room each between them excluded the whole "
+        f"building; excluded_classrooms={merged['excluded_classrooms']!r} "
+        f"leaves {get_physical_room_candidates(ds.state, merged)}")
+    assert merged["excluded_classrooms"] == ["Oda 1", "Lab 1"], (
+        "the two exclusions that DO fit were not applied: "
+        f"{merged['excluded_classrooms']!r}")
+    assert joint_warning(ds, "warnings.joint_group_room_unplaceable",
+                         group="J1", dropped="Lab 2", kept="Lab 2"), (
+        f"the dropped exclusion was not reported; report: {ds.report.warnings}")
+
+
+def test_a_room_type_that_every_other_row_excludes_is_reported_either_order(
+        tmp_path):
+    """REGRESSION — and it is not an artefact of which row comes first.
+
+    The lab type on one row against an exclusion of every lab on the other,
+    written both ways round. Both orderings emptied the candidate set silently;
+    both must now leave the session somewhere to go and say what they dropped.
+    The two answers differ — the rule is "the earlier row wins" — but neither
+    is silent and neither is empty, which is the property that matters.
+    """
+    lab_first = [joint_klass("C001", "B001", required_room_type=ROOM_TYPE_LAB),
+                 joint_klass("C002", "B002", excluded_rooms="Lab 1, Lab 2")]
+    excl_first = [joint_klass("C001", "B001", excluded_rooms="Lab 1, Lab 2"),
+                  joint_klass("C002", "B002", required_room_type=ROOM_TYPE_LAB)]
+
+    ds = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "joint_lab_then_excl.xlsx", classes=lab_first))
+    merged = merged_joint_class(ds)
+    assert get_physical_room_candidates(ds.state, merged) == ["Lab 1", "Lab 2"], (
+        "the lab row came first and the session still has nowhere to meet: "
+        f"{get_physical_room_candidates(ds.state, merged)}")
+    assert joint_warning(ds, "warnings.joint_group_room_unplaceable",
+                         group="J1", dropped="Lab 1, Lab 2",
+                         kept="Lab 1, Lab 2"), ds.report.warnings
+
+    ds = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "joint_excl_then_lab.xlsx", classes=excl_first))
+    merged = merged_joint_class(ds)
+    assert get_physical_room_candidates(ds.state, merged) == ["Oda 1"], (
+        "the exclusion row came first and the session still has nowhere to "
+        f"meet: {get_physical_room_candidates(ds.state, merged)}")
+    assert joint_warning(ds, "warnings.joint_group_room_unplaceable",
+                         group="J1", dropped="Lab 1, Lab 2",
+                         kept="Oda 1"), ds.report.warnings
+
+
+def test_a_joint_group_says_which_room_type_it_had_to_ignore(tmp_path):
+    """The disjoint-type warning, pinned. Kills mutants M4 and M6.
+
+    ``Derslik`` resolves to ``['Oda 1']`` and ``Laboratuvar`` to
+    ``['Lab 1', 'Lab 2']``. The merge cannot honour both, keeps the earlier
+    row's list and must name what it ignored: this is the one place the fix
+    tells the user it made a choice on their behalf, and both the choice and
+    the sentence could be removed with the suite green.
+
+    The sentence is rebuilt from the catalogue rather than quoted, so it also
+    fails if the key stops shipping the placeholders the importer fills.
+    """
+    rows = joint_rows(lab_row_index=0, first_type=ROOM_TYPE_LECTURE,
+                      second_type=ROOM_TYPE_LAB)
+    ds = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "joint_two_types_warned.xlsx", classes=rows))
+
+    assert ds.report.is_valid, ds.report.summary()
+    merged_joint_class(ds)
+    assert joint_warning(ds, "warnings.joint_group_room_conflict", group="J1",
+                         kept="Oda 1", dropped="Lab 1, Lab 2"), (
+        "the merge silently picked one of two disagreeing room types; the "
+        f"report holds {ds.report.warnings}")
+
+
+def test_a_joint_group_whose_rows_disagree_on_where_it_meets_says_so(tmp_path):
+    """``location_type`` is not merged, and the silence was the defect.
+
+    The fix above documented "the same two rows swapped must produce the same
+    session". True of ``required_classrooms``; false of ``location_type``,
+    which is still whatever ``classes[0]`` says.
+    ``normalize_class_location_fields`` blanks the room lists of any
+    non-physical class, and ``normalize_state_classes`` runs again after the
+    merge, so an online row typed FIRST wipes the merged room list outright:
+
+        online, then face-to-face + Laboratuvar -> online, required=[], report empty
+        the same two rows swapped              -> face_to_face, ['Lab 1', 'Lab 2']
+
+    A joint physics lab whose online row happens to be typed first imported as
+    an online session with no room requirement at all. Merging the column was
+    rejected — there is no defensible winner between "online" and
+    "face-to-face" for one session, and picking one would flip whole sessions
+    in existing workbooks on the strength of a stray cell — so both orderings
+    now report the disagreement instead, which is what the merge already does
+    for two disjoint room types.
+    """
+    online = get_location_label(LOCATION_ONLINE)
+    in_person = get_location_label(LOCATION_FACE_TO_FACE)
+
+    rows = [joint_klass("C001", "B001", location_type=online),
+            joint_klass("C002", "B002", required_room_type=ROOM_TYPE_LAB)]
+    ds = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "joint_online_first.xlsx", classes=rows))
+    assert ds.report.is_valid, ds.report.summary()
+    merged_joint_class(ds)
+    assert joint_warning(ds, "warnings.joint_group_location_conflict",
+                         group="J1", kept=online, dropped=in_person), (
+        "an online first row swallowed a face-to-face row's lab requirement "
+        f"without a word; the report holds {ds.report.warnings}")
+
+    rows = [joint_klass("C001", "B001", required_room_type=ROOM_TYPE_LAB),
+            joint_klass("C002", "B002", location_type=online)]
+    ds = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "joint_online_second.xlsx", classes=rows))
+    merged = merged_joint_class(ds)
+    assert sorted(merged["required_classrooms"]) == ["Lab 1", "Lab 2"], (
+        "the swapped ordering lost the lab constraint too: "
+        f"{merged['required_classrooms']!r}")
+    assert joint_warning(ds, "warnings.joint_group_location_conflict",
+                         group="J1", kept=in_person, dropped=online), (
+        "the same disagreement went unreported with the rows the other way "
+        f"round; the report holds {ds.report.warnings}")
+
+
+def test_a_joint_group_that_agrees_on_where_it_meets_is_not_warned(tmp_path):
+    """Control for the test above — an all-online group must stay silent.
+
+    Both rows say online, so there is no disagreement to report. Without this,
+    the previous test is satisfied by a warning that fires on every joint group
+    with a ``Location Type`` cell in it.
+    """
+    online = get_location_label(LOCATION_ONLINE)
+    rows = [joint_klass("C001", "B001", location_type=online),
+            joint_klass("C002", "B002", location_type=online)]
+    ds = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "joint_all_online.xlsx", classes=rows))
+
+    assert ds.report.is_valid, ds.report.summary()
+    merged = merged_joint_class(ds)
+    assert merged["location_type"] == LOCATION_ONLINE
+    assert ds.report.warnings == [], (
+        f"a joint group whose rows agree was warned about: {ds.report.warnings}")
+
+
+def test_a_room_named_twice_is_not_read_back_to_the_user_twice(tmp_path):
+    """``allowed_rooms='Oda 1, Oda 1'`` reached state, and then the report.
+
+    ``_parse_comma_list`` kept repeats verbatim, which was invisible until the
+    merge started rendering ``required_classrooms`` into a sentence: the import
+    report read "...the joint session keeps Oda 1, Oda 1 and ignores...". Every
+    reader of these lists is a membership test, so de-duplicating changes no
+    candidate set — it only stops the repeat reaching state and the user.
+    """
+    rows = [joint_klass("C001", "B001", allowed_rooms="Oda 1, Oda 1"),
+            joint_klass("C002", "B002", required_room_type=ROOM_TYPE_LAB)]
+    ds = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "joint_dupe_rooms.xlsx", classes=rows))
+
+    assert ds.report.is_valid, ds.report.summary()
+    merged = merged_joint_class(ds)
+
+    assert merged["required_classrooms"] == ["Oda 1"], (
+        "a room named twice in one cell reached the merged session twice: "
+        f"{merged['required_classrooms']!r}")
+    assert get_physical_room_candidates(ds.state, merged) == ["Oda 1"]
+    assert joint_warning(ds, "warnings.joint_group_room_conflict", group="J1",
+                         kept="Oda 1", dropped="Lab 1, Lab 2"), (
+        "the room-conflict sentence still repeats the room name: "
+        f"{ds.report.warnings}")

@@ -105,11 +105,21 @@ class _FakeDrag:
     def setMimeData(self, mime):
         pass
 
-    def setPixmap(self, pixmap):
-        pass
-
     def setHotSpot(self, point):
         pass
+
+    def setPixmap(self, pixmap):
+        self._pixmap = pixmap
+
+    def pixmap(self):
+        """``_start_drag_unplaced`` reads back what it just set.
+
+        A multi-lesson sidebar drag does
+        ``drag.setHotSpot(QPoint(drag.pixmap().width() // 2, 12))``, so a
+        stand-in that only swallowed ``setPixmap`` would raise there and the
+        batch tests below would never reach the drop.
+        """
+        return self._pixmap
 
     def exec(self, action):
         hook = type(self).on_exec
@@ -402,3 +412,214 @@ def test_a_committed_drag_still_clears_redo_and_is_one_relabelled_entry(
     assert _placement(_live(win)) == (True, "monday", "09:00", "R001"), (
         "one undo after a committed drag did not put the lesson back where "
         "the drag found it: %r" % (_placement(_live(win)),))
+
+
+# ── B1 + B2 in the sibling gesture: _place_classes_batch ────────────────────
+#
+# `_place_classes_batch` had the same shape `_start_drag_gfx` had -- a
+# `_push_undo` before the outcome was known -- and the Phase 9 commit message
+# looked at it and analysed the wrong branch. It reasoned about the
+# `0 placed / 0 unresolved` early return and called that unreachable from the
+# UI. The reachable no-op is `0 placed / N unresolved`: it sails PAST that
+# early return, raises an error toast, and returns with the speculative entry
+# still on the stack. Two shipped gestures reach it -- Ctrl+P /
+# "place all unplaced" (`place_class`), and a multi-selection dragged out of
+# the sidebar and dropped off-cell (`_execute_drop_anywhere`).
+
+
+def _seed_an_unplaceable_batch(win):
+    """A world where every candidate in the batch is impossible to place.
+
+    One PINNED lesson owns the grid's only cell for the only lecturer, and the
+    two candidates require a classroom the setup does not contain, so
+    ``get_physical_room_candidates`` yields nothing for either of them at any
+    cell. ``place_batch`` therefore comes back `0 placed / 2 unresolved` --
+    the branch that is reachable from the UI and that the early return does
+    not catch.
+    """
+    s = win.state_data
+    s["days"] = ["monday"]
+    s["slots"] = ["09:00"]
+    s["classrooms"] = ["R001", "R002"]
+    s["classroom_capacities"] = {"R001": 40, "R002": 40}
+    s["lecturers"] = ["Ada Lovelace"]
+    s["classes"] = []
+
+    blocker = new_class()
+    blocker.update(name="Blok", lecturer="Ada Lovelace", duration=1,
+                   student_count=10)
+    blocker["pinned"] = True
+    blocker["pinned_day"] = "monday"
+    blocker["pinned_time"] = "09:00"
+    blocker["pinned_classroom"] = "R001"
+    s["classes"].append(blocker)
+    mark_placed(blocker, "monday", "09:00", "R001")
+
+    for i in range(2):
+        cls = new_class()
+        cls.update(name="Buyuk%d" % i, lecturer="Ada Lovelace", duration=1,
+                   student_count=10)
+        cls["required_classrooms"] = ["GHOST_ROOM"]
+        s["classes"].append(cls)
+
+
+def _seed_a_placeable_batch(win):
+    """The same world with room to breathe: both candidates CAN be placed."""
+    s = win.state_data
+    s["days"] = ["monday", "tuesday"]
+    s["slots"] = ["09:00", "10:00"]
+    s["classrooms"] = ["R001", "R002"]
+    s["classroom_capacities"] = {"R001": 40, "R002": 40}
+    s["lecturers"] = ["Ada Lovelace"]
+    s["classes"] = []
+
+    for i in range(2):
+        cls = new_class()
+        cls.update(name="Serbest%d" % i, lecturer="Ada Lovelace", duration=1,
+                   student_count=10)
+        s["classes"].append(cls)
+
+
+def _placements(win):
+    """Every lesson's name and placement, order-independent."""
+    return sorted(
+        (c["name"], c.get("placed"), c.get("placed_day"),
+         c.get("placed_time"), c.get("placed_classroom"))
+        for c in win.state_data["classes"])
+
+
+def test_a_batch_that_places_nothing_leaves_the_redo_stack_intact(win):
+    """B1, in the Ctrl+P gesture.
+
+    The teacher presses "place all unplaced" with lessons that cannot fit.
+    They are told nothing was placed -- and Ctrl+Y is dead, because the
+    snapshot taken on the way in already ran ``_redo_stack.clear()``.
+    """
+    _seed_an_unplaceable_batch(win)
+    _arm_a_pending_redo(win)
+    before = _placements(win)
+
+    win.place_class()
+
+    # Anti-vacuity: this has to be the no-op the finding is about. If the
+    # batch actually placed something, everything below is measuring a
+    # different gesture.
+    assert _placements(win) == before, (
+        "the seed is wrong: the batch changed the timetable, so this is not "
+        "the 'placed nothing' case:\n  after : %r\n  before: %r"
+        % (_placements(win), before))
+
+    assert win._undo_stack == [], (
+        "a batch placement that placed NOTHING left an undo entry behind: %r"
+        % ([e[0] for e in win._undo_stack],))
+    assert len(win._redo_stack) == 1, (
+        "a batch placement that placed NOTHING destroyed the pending redo "
+        "entry: depth is %d, it was 1. The gesture changed nothing on the "
+        "timetable, so Ctrl+Y must survive it." % len(win._redo_stack))
+
+    win.redo()
+    assert win.state_data["lecturers"] == ["Ada L."], (
+        "redo after a no-op batch did not re-apply the undone action; "
+        "lecturers are %r" % (win.state_data["lecturers"],))
+
+
+def test_a_batch_that_places_nothing_keeps_the_whole_history_at_the_cap(win):
+    """B2, in the Ctrl+P gesture.
+
+    At the 50-entry cap the speculative append evicts ``_undo_stack[0]``, and
+    nothing here even attempts the ``pop()`` the drag path used to attempt --
+    so the user's oldest undoable action is discarded for a gesture that moved
+    nothing.
+    """
+    _seed_an_unplaceable_batch(win)
+    labels_before = _fill_undo_to_the_cap(win)
+    before = _placements(win)
+
+    win.place_class()
+
+    assert _placements(win) == before, (
+        "the seed is wrong: the batch changed the timetable")
+
+    labels_after = [entry[0] for entry in win._undo_stack]
+    assert len(labels_after) == win._max_undo, (
+        "a no-op batch changed the undo depth at the cap: %d entries, there "
+        "were %d" % (len(labels_after), win._max_undo))
+    assert labels_after[0] == labels_before[0], (
+        "a no-op batch evicted the OLDEST undo entry at the cap: the stack "
+        "now starts at %r, it started at %r -- that action is unrecoverable"
+        % (labels_after[0], labels_before[0]))
+    assert labels_after == labels_before, (
+        "a no-op batch rewrote the undo history at the cap:\n  after : %r\n"
+        "  before: %r" % (labels_after, labels_before))
+
+
+def test_a_multi_drag_that_places_nothing_leaves_the_redo_stack_intact(
+        win, monkeypatch):
+    """B1, reached by a DRAG rather than by the menu.
+
+    Multi-select in the unplaced sidebar, drag onto the timetable, release
+    anywhere that is not a cell: ``_start_drag_unplaced`` ->
+    ``_execute_drop_anywhere`` -> ``_place_classes_batch``. Driven through the
+    real starter, so a fix that only guarded the menu path fails here.
+    """
+    _seed_an_unplaceable_batch(win)
+    _arm_a_pending_redo(win)
+    stuck = [c for c in win.state_data["classes"]
+             if c["name"].startswith("Buyuk")]
+    assert len(stuck) == 2, "the seed lost its candidates: %r" % (stuck,)
+    before = _placements(win)
+
+    monkeypatch.setattr("scheduler_app.ui.app.QDrag", _FakeDrag)
+    monkeypatch.setattr(_FakeDrag, "on_exec",
+                        lambda: win._execute_drop_anywhere())
+    # The widget argument reaches nothing but `QDrag(widget)` for a
+    # multi-lesson drag -- the single-lesson branch is the only one that calls
+    # `widget.currentItem()` -- so the stand-in QDrag swallows it.
+    win._start_drag_unplaced(stuck, None)
+
+    assert _placements(win) == before, (
+        "the seed is wrong: the multi-drag changed the timetable")
+    assert win._undo_stack == [], (
+        "a multi-drag that placed NOTHING left an undo entry behind: %r"
+        % ([e[0] for e in win._undo_stack],))
+    assert len(win._redo_stack) == 1, (
+        "a multi-drag onto the grid that placed NOTHING destroyed the pending "
+        "redo entry: depth is %d, it was 1" % len(win._redo_stack))
+
+
+def test_a_batch_that_places_something_is_one_undo_that_puts_it_back(win):
+    """The control for the three above. GREEN TODAY, must stay green.
+
+    A batch that really does place lessons is a real edit: exactly one undo
+    entry, labelled "bulk schedule", redo invalidated, and one Ctrl+Z takes
+    the timetable back to before the batch ran. The cheap way to fix the
+    no-op case -- never record anything -- breaks this.
+    """
+    _seed_a_placeable_batch(win)
+    before = _placements(win)
+    win._push_undo("earlier")
+    win.undo()
+    assert len(win._redo_stack) == 1, "the fixture armed no redo entry"
+    undo_depth_before = len(win._undo_stack)
+
+    win.place_class()
+
+    placed_now = [c for c in win.state_data["classes"] if c["placed"]]
+    assert len(placed_now) == 2, (
+        "the seed is wrong: the batch placed %d of 2 lessons, so this is not "
+        "the 'placed something' case" % len(placed_now))
+
+    assert win._redo_stack == [], (
+        "a batch that PLACED lessons left %d redo entries alive; a real edit "
+        "must invalidate redo" % len(win._redo_stack))
+    assert len(win._undo_stack) == undo_depth_before + 1, (
+        "a whole batch must be exactly one Ctrl+Z: depth went %d -> %d"
+        % (undo_depth_before, len(win._undo_stack)))
+    assert win._undo_stack[-1][0] == tr("actions.bulk_schedule"), (
+        "the batch's undo entry is labelled %r, not the bulk-schedule label"
+        % (win._undo_stack[-1][0],))
+
+    win.undo()
+    assert _placements(win) == before, (
+        "one undo after a batch placement did not put the timetable back:\n"
+        "  after : %r\n  before: %r" % (_placements(win), before))

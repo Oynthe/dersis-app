@@ -1030,3 +1030,200 @@ def test_a_drag_onto_the_unplaced_sidebar_is_one_undo_entry(win, monkeypatch):
         True, "monday", "09:00", "R001"), (
         "one Ctrl+Z after unplacing by drag did not put the lesson back where "
         "it was: %r" % (_placement(win.state_data["classes"][0]),))
+
+
+# ── the guard nothing measured: a sidebar drag must not inherit a snapshot ──
+#
+# Two production lines are the ENTIRE guard stopping a sidebar drag from
+# committing a grid drag's abandoned snapshot:
+#
+#   * `_start_drag_unplaced`'s  `self._drag_undo_entry = None`
+#   * `_execute_drop`'s         `if self._drag_undo_pushed and ...`
+#
+# Measured 2026-08-29 at a1e1d13: each could be deleted, and both could be
+# deleted TOGETHER, with `tests/test_drag_and_drop.py`,
+# `tests/test_phase9_b1b2.py`, `tests/test_full_state_undo.py` and
+# `tests/test_state_transactions.py` green — 48 passed, exit 0. With both gone
+# a sidebar drag that places "Bos" followed by one Ctrl+Z RESURRECTS the
+# abandoned grid gesture's placement, under the "Bos move" label. The guard
+# works; nothing was watching it.
+#
+# Why nothing fired: `_arm_drag_from_sidebar` above hand-assigns
+# `win._drag_undo_entry = None` instead of letting `_start_drag_unplaced`
+# clear it, so it cannot see production stop clearing it — verbatim the
+# Phase 8 pattern where a helper set the flag itself and the production line
+# became deletable under a green suite. The two tests below close it from both
+# ends: the first drives the REAL starter, the second pins the ownership flag
+# `_execute_drop` reads.
+
+
+class _StubList:
+    """The unplaced sidebar, as much of it as ``_start_drag_unplaced`` uses.
+
+    A single-lesson drag reads ``widget.currentItem()`` to build its drag
+    label; returning None skips that block. Nothing else on the widget is
+    touched — the multi-lesson branch does not consult the widget at all.
+    """
+
+    def currentItem(self):
+        return None
+
+
+def _by_name(win, name):
+    """The lesson as it exists NOW.
+
+    ``_restore_state`` replaces ``state_data``'s contents wholesale, so a
+    reference held across an ``undo()`` is a stale dict that no longer
+    participates in the app's state.
+    """
+    return next(c for c in win.state_data["classes"] if c["name"] == name)
+
+
+def _abandon_a_grid_drag_leaving_its_snapshot_held(win, monkeypatch, cls):
+    """Leave a real, production-built ``_drag_undo_entry`` behind.
+
+    The tail of ``_start_drag_gfx`` clears the held snapshot on every normal
+    exit — commit, sidebar-commit and cancel alike — so the only way out that
+    leaves it set is an exception escaping ``drag.exec()``. Raising there is
+    not a claim that Qt raises (no reachable raiser is known); it is the
+    cheapest way to get PRODUCTION'S OWN snapshot into the leaked state
+    instead of hand-building a tuple that merely resembles one.
+
+    Returns the leaked ``(label, snapshot)``. On return the lesson is
+    unplaced — ``mark_unplaced`` ran one statement after the snapshot was
+    taken — so the snapshot and the live state disagree, which is what makes
+    "which one got committed?" answerable.
+    """
+    monkeypatch.setattr("scheduler_app.ui.app.QDrag", _FakeDrag)
+
+    def _the_gesture_dies(self, action):
+        raise RuntimeError("drag.exec() did not return")
+
+    monkeypatch.setattr(_FakeDrag, "exec", _the_gesture_dies)
+    with pytest.raises(RuntimeError):
+        win._start_drag_gfx(cls, _StubItem())
+
+    held = win._drag_undo_entry
+    assert held is not None, (
+        "the abandoned gesture left no held snapshot, so nothing below is "
+        "testing a stale one")
+    assert win._drag_undo_pushed is True, (
+        "the abandoned gesture left the ownership flag down")
+    assert _placement(_by_name(win, "Fizik")) == (False, None, None, None), (
+        "the abandoned gesture did not leave the lesson unplaced, so the "
+        "stale snapshot is indistinguishable from the live state: %r"
+        % (_placement(_by_name(win, "Fizik")),))
+    assert _placement(held[1]["classes"][0]) == (
+        True, "monday", "09:00", "R001"), (
+        "the leaked snapshot does not hold the PRE-gesture placement, so "
+        "committing it would be invisible: %r"
+        % (_placement(held[1]["classes"][0]),))
+    return held
+
+
+def test_a_sidebar_drag_does_not_commit_an_abandoned_grid_drags_snapshot(
+        win, monkeypatch):
+    """The real ``_start_drag_unplaced`` must disown a leaked snapshot.
+
+    A failure means one Ctrl+Z after dragging a lesson out of the sidebar puts
+    a DIFFERENT lesson back onto the timetable — one the user had picked up
+    and abandoned — under the label of the move they just made.
+    """
+    cls = _seed(win)
+    bos = _add_class(win, "Bos")
+    _abandon_a_grid_drag_leaving_its_snapshot_held(win, monkeypatch, cls)
+
+    seen = {}
+
+    def _drop_during_exec(self, action):
+        # The moment `_execute_drop` decides whose snapshot it is holding.
+        # No other test in this module observes it after a REAL
+        # `_start_drag_unplaced`; the helper above plants the answer.
+        seen["entry"] = win._drag_undo_entry
+        seen["pushed"] = win._drag_undo_pushed
+        win._execute_drop("tuesday", "10:00")
+        return action
+
+    monkeypatch.setattr(_FakeDrag, "exec", _drop_during_exec)
+
+    win._start_drag_unplaced([bos], _StubList())
+
+    assert seen.get("entry") is None, (
+        "production `_start_drag_unplaced` did not disown the previous "
+        "gesture's held snapshot: `_drag_undo_entry` was still %r when the "
+        "drop ran. A sidebar drag unplaces nothing, so it has no pre-gesture "
+        "snapshot to restore and must not inherit one."
+        % (seen.get("entry") and seen["entry"][0],))
+    assert seen.get("pushed") is False, (
+        "production `_start_drag_unplaced` left the ownership flag up: %r"
+        % (seen.get("pushed"),))
+
+    moved = _by_name(win, "Bos")
+    assert _placement(moved)[:3] == (True, "tuesday", "10:00"), (
+        "the sidebar drag did not commit through the real starter: %r"
+        % (_placement(moved),))
+    assert len(win._undo_stack) == 1, (
+        "the sidebar drag left %d undo entries instead of one"
+        % len(win._undo_stack))
+    assert win._undo_stack[-1][0] == tr("actions.move").format(name="Bos"), (
+        "the entry is labelled %r, not the Bos move"
+        % (win._undo_stack[-1][0],))
+
+    win.undo()
+
+    assert _placement(_by_name(win, "Bos")) == (False, None, None, None), (
+        "one Ctrl+Z after the sidebar drag did not take Bos back off the "
+        "grid: %r" % (_placement(_by_name(win, "Bos")),))
+    assert _placement(_by_name(win, "Fizik")) == (False, None, None, None), (
+        "one Ctrl+Z after a sidebar drag RESURRECTED an abandoned grid "
+        "gesture's placement: Fizik is %r, and the user was told the entry "
+        "was 'Bos move'. The sidebar drag committed a snapshot taken by a "
+        "gesture that never happened."
+        % (_placement(_by_name(win, "Fizik")),))
+
+
+def test_execute_drop_will_not_consume_a_snapshot_it_does_not_own(
+        win, monkeypatch):
+    """The second half of the guard: the FLAG, not the mere presence of a tuple.
+
+    This state — a held snapshot with the ownership flag down — is not
+    reachable through today's two starters, because `_start_drag_unplaced`
+    clears both and the test above pins that it does. The conjunct is defence
+    in depth on a path whose failure mode is a silently resurrected
+    placement, and it is pinned separately for the reason the section header
+    records: with the flag test and the clear BOTH deleted, the whole suite
+    stayed green. One test that needs both lines cannot say which one broke;
+    two tests can.
+
+    Everything but the last assignment is production: the stale entry is the
+    one `_start_drag_gfx` built, and `_arm_drag_from_sidebar` reproduces
+    `_start_drag_unplaced`'s field assignments.
+    """
+    cls = _seed(win)
+    bos = _add_class(win, "Bos")
+    stale = _abandon_a_grid_drag_leaving_its_snapshot_held(win, monkeypatch, cls)
+
+    _arm_drag_from_sidebar(win, bos)
+    assert win._drag_undo_entry is None and win._drag_undo_pushed is False, (
+        "`_arm_drag_from_sidebar` no longer mirrors `_start_drag_unplaced`")
+    # The leak the conjunct exists to survive: a snapshot is present, and this
+    # gesture is not its owner.
+    win._drag_undo_entry = stale
+
+    win._execute_drop("tuesday", "10:00")
+
+    assert not win.refusals, "the drop was refused: %r" % (win.refusals,)
+    assert len(win._undo_stack) == 1, (
+        "the drop left %d undo entries instead of one" % len(win._undo_stack))
+
+    win.undo()
+
+    assert _placement(_by_name(win, "Fizik")) == (False, None, None, None), (
+        "`_execute_drop` committed a snapshot this gesture does not own: one "
+        "Ctrl+Z put Fizik back at %r. `_drag_undo_pushed` was False — the "
+        "sidebar drag holds nothing — so the entry on `_drag_undo_entry` "
+        "belongs to an abandoned gesture and must be ignored, not relabelled "
+        "and committed." % (_placement(_by_name(win, "Fizik")),))
+    assert _placement(_by_name(win, "Bos")) == (False, None, None, None), (
+        "one Ctrl+Z did not take Bos back off the grid: %r"
+        % (_placement(_by_name(win, "Bos")),))

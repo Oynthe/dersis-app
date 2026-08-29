@@ -258,3 +258,382 @@ def test_the_class_form_does_not_silently_hand_the_lesson_to_another_teacher(
         "surfaces sharing one fold apply opposite policies to one collision."
         % (TYPED, assigned, state["lecturers"], notes.texts, EXISTING,
            EXISTING))
+
+
+# ===========================================================================
+# The prompt's own preconditions — everything the guard promises to be quiet
+# about. Added after an adversarial round found the first three of these
+# false. Before Phase 9's remediation the whole new API surface
+# (find_lecturer_collision, register_lecturer's collision half,
+# _same_name_other_case) was reachable only through the one end-to-end probe
+# above, which drives `add_class` with a one-name roster; four mutations of
+# the decision line survived it.
+# ===========================================================================
+
+# "İlgin" written in NFD — LATIN CAPITAL LETTER I followed by COMBINING DOT
+# ABOVE. It renders identically to TYPED on screen and is what a macOS
+# clipboard hands over (this repo ships Dersis-mac.spec), so it reaches the
+# lecturer combo through ordinary use, not through a fuzzer.
+TYPED_NFD = "İlgin"
+
+# Two spellings of one plain-ASCII name. `_turkish_fold_case` maps every
+# capital I to a dotless ı, so "Yilmaz" and "YILMAZ" land on "yilmaz" and
+# "yılmaz" — different strings, measured. That is correct Turkish casing and
+# the wrong answer to the question the guard asks, which is only "is this
+# difference worth interrupting a human over?".
+ASCII_LISTED = "Ayse Yilmaz"
+ASCII_SHOUTED = "AYSE YILMAZ"
+
+
+def _roster(*names):
+    return {"lecturers": list(names)}
+
+
+@pytest.mark.parametrize("roster,typed,why", [
+    ((EXISTING,), EXISTING, "the exact spelling, and the only entry"),
+    ((EXISTING, TYPED), TYPED, "the exact spelling, second on the roster"),
+    ((TYPED, EXISTING), EXISTING, "the exact spelling, second on the roster"),
+    (("Sıla", "Sila"), "Sila", "the other real pair, exact, second"),
+    ((TYPED,), "İLGİN", "a listed teacher re-typed in Turkish capitals"),
+    ((ASCII_LISTED,), ASCII_SHOUTED, "a listed teacher shouted in ASCII"),
+    ((TYPED,), TYPED_NFD, "the same name pasted from an NFD source"),
+    ((TYPED_NFD,), TYPED, "an NFD name on the roster, typed as NFC"),
+    ((EXISTING,), "", "blank"),
+    ((EXISTING,), None, "unset"),
+    ((EXISTING,), "Bülent Çınar", "nothing on the roster folds onto it"),
+])
+def test_the_form_keeps_quiet_when_it_has_nothing_to_say(roster, typed, why):
+    """B3 — every case ``find_lecturer_collision`` documents as silent.
+
+    A prompt that fires on the harmless cases is a prompt users learn to click
+    through before it ever reaches the harmful one, so each row here is load
+    bearing for the ONE row that matters
+    (``test_a_genuine_collision_is_still_reported``). Three of them were
+    measured false on the shipped fix:
+
+    * the exact spelling second on the roster — the loop returned at the FIRST
+      fold match and never saw it, so ``('Ilgın', 'İlgin')`` / ``'İlgin'``
+      reported ``'Ilgın'`` where the docstring promised None. Reachable
+      through ordinary use: ``SetupDialog._ok`` writes ``state["lecturers"]``
+      from its table with no fold check and no dedup, so a school with both
+      teachers has both;
+    * the ASCII shout — ``'Ayse Yilmaz'`` / ``'AYSE YILMAZ'`` reported
+      ``'Ayse Yilmaz'``, which is the exact case the second identity rule was
+      added to keep quiet;
+    * NFD — ``'İlgin'`` / ``'İlgin'`` reported ``'İlgin'``, a modal
+      quoting two strings that look the same on screen.
+
+    Liveness, not just noise: a prompt here has nothing patching QMessageBox
+    in front of it under the offscreen platform, so a run that reaches one
+    HANGS rather than fails. Measured — a mutation that made the exact match
+    prompt blocked ``tests/test_ui_affordances.py`` past a 150 s timeout.
+    """
+    from scheduler_app.core.workflow import SchedulingWorkflow
+
+    got = SchedulingWorkflow.find_lecturer_collision(_roster(*roster), typed)
+    assert got is None, (
+        "the class form raised the collision prompt on a case it documents as "
+        "silent (%s): roster=%r typed=%r reported=%r" % (why, roster, typed, got))
+
+
+@pytest.mark.parametrize("roster,typed,expected", [
+    ((EXISTING,), TYPED, EXISTING),
+    ((TYPED,), EXISTING, TYPED),
+    (("Sıla",), "Sila", "Sıla"),
+    ((EXISTING, "Bülent Çınar"), TYPED, EXISTING),
+])
+def test_a_genuine_collision_is_still_reported(roster, typed, expected):
+    """The other half: silence must not have been bought by saying nothing.
+
+    Without this every row above is satisfiable by ``return None``, which is
+    exactly the mutation that killed the end-to-end probe and nothing else.
+    """
+    from scheduler_app.core.workflow import SchedulingWorkflow
+
+    got = SchedulingWorkflow.find_lecturer_collision(_roster(*roster), typed)
+    assert got == expected, (
+        "roster=%r typed=%r: expected the prompt to name %r, got %r"
+        % (roster, typed, expected, got))
+
+
+@pytest.mark.parametrize("roster,typed", [
+    ((EXISTING, TYPED), TYPED),
+    ((TYPED, EXISTING), EXISTING),
+    (("Sıla", "Sila"), "Sila"),
+    ((EXISTING,), TYPED),
+    ((EXISTING,), EXISTING),
+    ((TYPED,), "İLGİN"),
+    ((ASCII_LISTED,), ASCII_SHOUTED),
+    ((TYPED,), TYPED_NFD),
+    ((), "Bülent Çınar"),
+    ((EXISTING, TYPED), "İLGİN"),
+])
+def test_silence_means_the_lesson_goes_to_the_teacher_who_was_typed(roster, typed):
+    """The invariant that makes the two functions one decision, not two.
+
+    ``find_lecturer_collision`` only ever answers a question about what
+    ``register_lecturer`` is *about to do*, and the caller runs them back to
+    back on the same state. Two separate loops over the same roster is how the
+    shipped fix drifted: silencing the exact-match case without touching
+    ``register_lecturer`` would have turned a wrong-but-loud outcome into a
+    wrong-and-silent one — measured on the shipped tree, roster
+    ``['Ilgın', 'İlgin']`` and typed ``'İlgin'`` gave ``collision='Ilgın'``
+    *and* ``register_lecturer -> 'Ilgın'``, so the teacher who is on the
+    roster, with their own availability record, could not be given a class at
+    all.
+
+    So: whatever the prompt names must be the name that is actually assigned,
+    and saying nothing must mean the assignment is the same human the user
+    typed — not merely that nobody was told.
+    """
+    from scheduler_app.core.workflow import (
+        SchedulingWorkflow, _same_name_other_case)
+
+    collision = SchedulingWorkflow.find_lecturer_collision(_roster(*roster), typed)
+    state = _roster(*roster)
+    assigned = SchedulingWorkflow.register_lecturer(state, typed)
+
+    if collision is not None:
+        assert collision == assigned, (
+            "the prompt names %r but the lesson is written to %r, so the "
+            "question the user answered was about a different teacher "
+            "(roster=%r typed=%r)" % (collision, assigned, roster, typed))
+        return
+
+    assert assigned == typed or _same_name_other_case(assigned, typed), (
+        "nothing was said, and the lesson still went to a different spelling: "
+        "roster=%r typed=%r assigned=%r. Silence is only honest when the "
+        "assignment is the same teacher, in the same name, differing at most "
+        "in case." % (roster, typed, assigned))
+
+
+# ===========================================================================
+# "No" must give the form back — the regression Phase 9's own fix introduced
+# ===========================================================================
+
+def _install_class_form(monkeypatch, script):
+    """Replace the modal ``AddClassDialog`` with a scripted stand-in.
+
+    Returns the ``seeds`` list: one entry per showing, holding the ``edit_cls``
+    the form was constructed with. That list *is* the finding — a second entry
+    carrying the user's data is the form coming back, and no second entry at
+    all is the form being thrown away.
+
+    Runs out loudly rather than quietly: a re-open loop with no exit would
+    otherwise spin forever under the offscreen platform, and a hung job says
+    much less than a failed one.
+    """
+    from scheduler_app.ui import app as app_module
+
+    seeds = []
+    pending = list(script)
+
+    class _Form:
+        DialogCode = app_module.AddClassDialog.DialogCode
+
+        def __init__(self, parent, state, edit_cls=None):
+            seeds.append(edit_cls)
+            assert pending, (
+                "the class form has been shown %d times and the script holds "
+                "%d results — nothing is ending the re-open loop"
+                % (len(seeds), len(script)))
+            self.result = pending.pop(0)
+
+        def exec(self):
+            return self.DialogCode.Accepted
+
+    monkeypatch.setattr(app_module, "AddClassDialog", _Form)
+    return seeds
+
+
+def _install_answers(monkeypatch, answers):
+    """Script ``QMessageBox.question``; return the list of bodies it was given.
+
+    An empty script means "nothing may ask anything", and asserts rather than
+    defaulting, so a prompt that should not have fired names itself instead of
+    silently taking Yes.
+    """
+    from PyQt6.QtWidgets import QMessageBox
+
+    asked = []
+    pending = list(answers)
+
+    def _question(parent, title, text, *args, **kwargs):
+        asked.append(text)
+        assert pending, (
+            "a modal question fired that this test did not script (%d so far, "
+            "%d scripted); last body: %r" % (len(asked), len(answers), text))
+        return (QMessageBox.StandardButton.Yes if pending.pop(0)
+                else QMessageBox.StandardButton.No)
+
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(_question))
+    return asked
+
+
+def _quiet(window, monkeypatch):
+    """Silence every channel that is not under test in this section.
+
+    ``_show_toast`` arms a 3 s QTimer that would outlive the test
+    (tests/test_refresh_cost.py), and ``_run_impact_analysis`` raises a
+    ``QMessageBox.question`` of its own — scripting that one alongside the
+    collision prompt would make the prompt count measure two things.
+    """
+    from PyQt6.QtWidgets import QDialog
+
+    from scheduler_app.ui.app import SchedulerApp
+    from scheduler_app.ui.tier_enforcement import UpgradeDialog
+
+    monkeypatch.setattr(SchedulerApp, "_show_toast", lambda *a, **kw: None)
+    monkeypatch.setattr(SchedulerApp, "_run_impact_analysis",
+                        lambda *a, **kw: None)
+    monkeypatch.setattr(UpgradeDialog, "exec",
+                        lambda self: QDialog.DialogCode.Rejected.value)
+
+
+def _window_with(make_app, roster, classes=()):
+    window = make_app()
+    state = window.state_data
+    state["days"] = ["monday"]
+    state["slots"] = ["09:00"]
+    state["classrooms"] = ["R001"]
+    state["classroom_capacities"] = {"R001": 30}
+    state["lecturers"] = list(roster)
+    state["lecturer_availability"] = {}
+    state["years"] = {"Y1": ["A"]}
+    state["classes"] = list(classes)
+    return window, state
+
+
+def _typed_class(**over):
+    cls = new_class()
+    cls.update(name="Fizik", lecturer=EXISTING, duration=1, participants=10,
+               targets=[{"year": "Y1", "branch": "A"}])
+    cls.update(over)
+    return cls
+
+
+@pytest.mark.ui
+def test_declining_the_collision_prompt_gives_the_form_back(
+        qapp, dersis_home, make_app, monkeypatch):
+    """B3 regression — answering the question honestly destroyed the entry.
+
+    The shipped message ends "Choose No to go back and give the new teacher a
+    name that differs by more than that" (all 22 locales). Nothing went back:
+    all three call sites were a bare ``return`` executed AFTER
+    ``AddClassDialog`` had already closed. Measured on the shipped tree —
+    ``add_class`` + No gave ``classes == []``, ``toasts == []`` and undo depth
+    0, so the class name, targets, duration, participant count and room
+    constraints the user had just typed were gone with nothing to undo.
+
+    Before B3 no path did this, because there was no prompt: the measured case
+    (Yes) improved and its unmeasured neighbour degraded silently.
+
+    Pinned on what the user can see, not on the mechanism: the form is shown
+    again, seeded with everything they entered.
+    """
+    _assert_the_pair_still_collides()
+
+    window, state = _window_with(make_app, [EXISTING])
+    _quiet(window, monkeypatch)
+
+    typed = _typed_class(lecturer=TYPED, participants=27)
+    # A name that shares no fold with the roster, so the second showing is
+    # accepted without a second prompt.
+    corrected = _typed_class(lecturer="Bülent Çınar", participants=27)
+    seeds = _install_class_form(monkeypatch, [typed, corrected])
+    asked = _install_answers(monkeypatch, [False])
+
+    window.add_class()
+
+    assert len(asked) == 1, "the collision prompt did not fire: %r" % (asked,)
+    assert len(seeds) == 2, (
+        "the form was shown %d time(s). Answering No discarded everything the "
+        "user typed instead of giving the form back, which is what the "
+        "message in all 22 locales promises. classes=%r"
+        % (len(seeds), [c["name"] for c in state["classes"]]))
+
+    back = seeds[1]
+    assert back is not None, "the form came back empty"
+    assert (back.get("name"), back.get("participants"), back.get("lecturer")) \
+        == ("Fizik", 27, TYPED), (
+        "the form came back without the user's entry: name=%r participants=%r "
+        "lecturer=%r" % (back.get("name"), back.get("participants"),
+                         back.get("lecturer")))
+
+    assert [c["name"] for c in state["classes"]] == ["Fizik"], (
+        "the corrected class was not added: %r"
+        % ([c["name"] for c in state["classes"]],))
+    assert state["classes"][0]["lecturer"] == "Bülent Çınar"
+
+
+@pytest.mark.ui
+def test_declining_on_the_edit_path_does_not_discard_the_edit(
+        qapp, dersis_home, make_app, monkeypatch):
+    """The same regression on ``_edit_class``, where there is more to lose.
+
+    Measured on the shipped tree: with the user's edit changing the name from
+    'Fizik' to 'Fizik II' and the participant count from 10 to 27, answering
+    No left the class at 'Fizik'/10 with ``toasts == []`` and undo depth 0 —
+    an edit silently rolled back with no way to see or recover it.
+    """
+    _assert_the_pair_still_collides()
+
+    cls = _typed_class()
+    window, state = _window_with(make_app, [EXISTING], [cls])
+    _quiet(window, monkeypatch)
+
+    edited = _typed_class(name="Fizik II", participants=27, lecturer=TYPED)
+    kept = _typed_class(name="Fizik II", participants=27, lecturer=EXISTING)
+    seeds = _install_class_form(monkeypatch, [edited, kept])
+    asked = _install_answers(monkeypatch, [False])
+
+    window._edit_class(cls)
+
+    assert len(asked) == 1, "the collision prompt did not fire: %r" % (asked,)
+    assert len(seeds) == 2, (
+        "the edit form was shown %d time(s); No threw the edit away rather "
+        "than giving it back" % len(seeds))
+    assert (seeds[1].get("name"), seeds[1].get("participants")) \
+        == ("Fizik II", 27), (
+        "the edit form came back without the user's changes: %r"
+        % ((seeds[1].get("name"), seeds[1].get("participants")),))
+    assert (cls["name"], cls["participants"]) == ("Fizik II", 27), (
+        "the user's edit was lost: %r" % ((cls["name"], cls["participants"]),))
+
+
+@pytest.mark.ui
+def test_an_edit_that_never_touched_the_lecturer_asks_nothing(
+        qapp, dersis_home, make_app, monkeypatch):
+    """B3 regression — a modal about a field the user did not open the form for.
+
+    Measured on the shipped tree: roster ``['Ilgın', 'İlgin']``, a class
+    already on 'İlgin', the user changes ONLY the participant count 10 -> 11 —
+    and the collision prompt fires. Yes then rewrote the lecturer to 'Ilgın',
+    and (see above) No discarded the edit entirely.
+
+    Two independent things now stop it and both are pinned here: 'İlgin' is on
+    the roster exactly, so there is nothing to report; and an edit that leaves
+    the lecturer string as it found it does not get to raise a question about
+    the lecturer at all. Same shape as B4's "the dialog erases its own
+    evidence", on a different field.
+    """
+    _assert_the_pair_still_collides()
+
+    cls = _typed_class(lecturer=TYPED)
+    window, state = _window_with(make_app, [EXISTING, TYPED], [cls])
+    _quiet(window, monkeypatch)
+
+    seeds = _install_class_form(
+        monkeypatch, [_typed_class(lecturer=TYPED, participants=11)])
+    asked = _install_answers(monkeypatch, [])
+
+    window._edit_class(cls)
+
+    assert asked == [], (
+        "changing the participant count raised a modal about the lecturer: %r"
+        % (asked,))
+    assert len(seeds) == 1, "the form was re-opened for no reason"
+    assert cls["lecturer"] == TYPED, (
+        "an edit that never touched the lecturer field rewrote it from %r to "
+        "%r" % (TYPED, cls["lecturer"]))
+    assert cls["participants"] == 11, "the edit did not apply"

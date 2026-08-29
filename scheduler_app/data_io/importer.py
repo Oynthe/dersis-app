@@ -13,8 +13,9 @@ except ImportError:
     HAS_PANDAS = False
 
 from scheduler_app.models import (
-    class_uses_physical_room, new_class, new_state, new_lecturer_availability,
-    normalize_class_data, normalize_state_classes, parse_location_type_label,
+    class_uses_physical_room, get_location_label, location_type_of, new_class,
+    new_state, new_lecturer_availability, normalize_class_data,
+    normalize_state_classes, parse_location_type_label,
 )
 from scheduler_app.i18n.text_fold import fold_text
 from scheduler_app.translations import tr
@@ -152,10 +153,56 @@ def _column_label(sheet_id: str, field: str) -> str:
 
 
 def _parse_comma_list(value) -> list:
-    """Parse a comma-separated string into a list of stripped strings."""
+    """Parse a comma-separated string into a de-duplicated list of stripped strings.
+
+    First occurrence wins, so the user's own order is preserved. Repeats were
+    kept verbatim until 2026-08-29: `allowed_rooms='Oda 1, Oda 1'` reached
+    `required_classrooms=['Oda 1', 'Oda 1']` and, once `_resolve_joint_groups`
+    started rendering that list into a sentence, the import report read
+    "...the joint session keeps Oda 1, Oda 1 and ignores...". No consumer ever
+    wanted the repeat. This helper has exactly six call sites -- the class
+    row's `allowed_rooms` and `excluded_rooms`, and the lecturer's four
+    availability lists -- and every reader of all six filters some other
+    sequence by membership rather than iterating the parsed list:
+    `get_physical_room_candidates` walks `state["classrooms"]` testing
+    `r in required` / `r not in excluded` (core/models.py:552-562), and
+    `apply_lecturer_availability_filters` walks the day and time grids testing
+    against `set(avail[...])` (core/models.py:529-548). So removing duplicates
+    cannot change any candidate set or its order; it only stops them reaching
+    state and the report. (`filter_class_days` DOES iterate its allow-list and
+    would repeat a day, but a class's `allowed_days` has no workbook column and
+    never comes from here.)
+    """
     if _is_blank(value):
         return []
-    return [x.strip() for x in str(value).split(",") if x.strip()]
+    items: list = []
+    for x in str(value).split(","):
+        x = x.strip()
+        if x and x not in items:
+            items.append(x)
+    return items
+
+
+def _rooms_left(room_names: list, required: list, excluded: list) -> list:
+    """The live rooms a class carrying these two lists could still be placed in.
+
+    A deliberate mirror of `get_physical_room_candidates`
+    (core/models.py:552-562) minus its capacity filter: `required` intersects,
+    `excluded` subtracts, and an EMPTY `required` means "any room" rather than
+    "no room" -- which is the whole reason a caller cannot just ask
+    `if required and not excluded`.
+
+    Capacity is left out on purpose. `_process_classes` already reports a row
+    whose room type resolves only to rooms too small for its head count
+    (`warnings.room_type_too_small`), so folding capacity in here would make
+    `_resolve_joint_groups` re-report that row's problem as a group problem and
+    name the wrong remedy. It also keeps this answer stable under the
+    participants bug noted in the Phase 9 review -- a joint group's
+    `participants` is still `classes[0]`'s head count, not the sum -- so the
+    number this check would divide by is one we already know is wrong.
+    """
+    rooms = [r for r in room_names if r in required] if required else list(room_names)
+    return [r for r in rooms if r not in excluded]
 
 
 def _room_names_by_type(dataset) -> dict[str, list[str]]:
@@ -859,25 +906,68 @@ def _resolve_joint_groups(dataset: SchedulerDataset):
         # `get_physical_room_candidates` reads as "any room" — candidates came
         # back `['Oda 1', 'Lab 1', 'Lab 2']`, i.e. the lecture hall was a legal
         # placement for a lab. Row order carries no meaning in a spreadsheet
-        # and nothing tells a user the typed row must come first, so the same
-        # two rows swapped must produce the same session.
+        # and nothing tells a user the typed row must come first, so a room
+        # type on any row has to reach the merged session.
+        #
+        # That is the invariant this block actually establishes, and it is
+        # narrower than the one written here until 2026-08-29 ("the same two
+        # rows swapped must produce the same session"). Swapping the rows does
+        # NOT in general produce the same session and this loop never made it
+        # so: `location_type` is still whatever `classes[0]` says, and two rows
+        # declaring disjoint room types resolve by "the earlier row wins".
+        # Both of those are announced below rather than merged — see the two
+        # warnings at the end — because a joint session is one session and two
+        # rows that disagree about it are a data error only the user can
+        # settle. What is order-independent is that no constraint is silently
+        # dropped and that the merge never widens the session.
+        room_names = list(dataset.state.get("classrooms", []))
+        # `normalize_class_location_fields` blanks `required_classrooms` and
+        # `excluded_classrooms` for every non-physical class — per row on the
+        # way in, and again over the whole state right after this function
+        # returns — so for an online or lecturer-office primary every list the
+        # room merge could compute is wiped before anything reads it. Skipping
+        # it is therefore a measured no-op on state (b1: `required=[]` either
+        # way), and it is a guard rather than a tidy-up because the
+        # unplaceability check below would otherwise fire on a session that
+        # needs no room at all and is perfectly placeable.
+        merge_rooms = class_uses_physical_room(primary)
         required = list(primary.get("required_classrooms") or [])
         excluded = list(primary.get("excluded_classrooms") or [])
         dropped_rooms: list = []
+        unplaceable_rooms: list = []
+        other_locations: list = []
+        primary_location = location_type_of(primary)
         for other in classes[1:]:
             for t in other.get("targets", []):
                 key = (t["year"], t["branch"])
                 if key not in seen_targets:
                     primary["targets"].append(t)
                     seen_targets.add(key)
+            # A row that disagrees about *where* the session happens. Blank
+            # reads as face-to-face, which is what `_process_classes` already
+            # did with the cell, so this compares the values the importer
+            # actually holds rather than guessing at intent.
+            other_location = location_type_of(other)
+            if (other_location != primary_location
+                    and other_location not in other_locations):
+                other_locations.append(other_location)
+            if not merge_rooms:
+                if other in dataset.state["classes"]:
+                    dataset.state["classes"].remove(other)
+                continue
+            # This row's contribution is computed first and applied only if the
+            # group survives it (see the check below), so nothing here writes
+            # `required`/`excluded` directly.
+            new_required = required
+            new_dropped: list = []
             other_required = other.get("required_classrooms") or []
             if other_required:
                 if not required:
-                    required = list(other_required)
+                    new_required = list(other_required)
                 else:
                     narrowed = [r for r in required if r in other_required]
                     if narrowed:
-                        required = narrowed
+                        new_required = narrowed
                     else:
                         # Disjoint lists. NEVER write the empty intersection:
                         # `[]` means "any room", so intersecting `Derslik`
@@ -900,8 +990,8 @@ def _resolve_joint_groups(dataset: SchedulerDataset):
                         # sheet would silently flip which of two unrelated rows
                         # decides this group. Row order is visible in the file
                         # and stable under edits elsewhere in it.
-                        dropped_rooms.extend(r for r in other_required
-                                             if r not in dropped_rooms)
+                        new_dropped = [r for r in other_required
+                                       if r not in dropped_rooms]
             # `excluded_classrooms` has the same hole — checked, not assumed:
             # measured with `excluded_rooms='Lab 1'` on row 2 of a joint pair,
             # the merged session came out `excluded_classrooms=[]` with
@@ -909,18 +999,101 @@ def _resolve_joint_groups(dataset: SchedulerDataset):
             # and `['Oda 1', 'Lab 2']`. The rule here is the opposite one,
             # because an exclusion is a prohibition: the UNION is the only
             # merge that can neither widen the session nor depend on row order,
-            # and unlike the intersection above it can never contradict itself,
-            # so there is nothing to report. (A union that leaves the session
-            # nowhere to go is the pre-existing gap of HANDOFF-PHASE9 §C, the
-            # same one a single row's `allowed_rooms` already has.)
-            for room in other.get("excluded_classrooms") or []:
-                if room not in excluded:
-                    excluded.append(room)
+            # and unlike the intersection above it can never contradict itself.
+            other_excluded = other.get("excluded_classrooms") or []
+            new_excluded = list(excluded)
+            for room in other_excluded:
+                if room not in new_excluded:
+                    new_excluded.append(room)
+            # The union CAN, however, leave the session nowhere to go, and the
+            # first version of this merge shipped that silently. Measured
+            # against the pre-merge importer (`git show f049964:` ...), on a
+            # two-row group whose first row said `required_room_type=Derslik`
+            # and whose second said `excluded_rooms='Oda 1'`:
+            #   before  req=['Oda 1']  exc=[]         candidates=['Oda 1']
+            #   after   req=['Oda 1']  exc=['Oda 1']  candidates=[]  warnings=0
+            # Three more shapes did the same (a type against an exclusion of
+            # every room of that type, in both row orders; and three rows each
+            # excluding one different room, which no single row could do). A
+            # group the school had been timetabling for years became impossible
+            # to place, and File > Import Excel reported zero errors and zero
+            # warnings — the merge was widening nothing and quietly emptying
+            # everything.
+            #
+            # The comment that stood here called that "the pre-existing gap of
+            # HANDOFF-PHASE9 §C, the same one a single row's `allowed_rooms`
+            # already has". Both halves were false: the union arrived with the
+            # merge in a1e1d13 and these workbooks imported placeable before
+            # it, and the single-row twin is NOT unhandled —
+            # `_process_classes` rescues and reports the identical
+            # contradiction ~300 lines above (`required_room_type=Laboratuvar`
+            # + `excluded_rooms='Lab 1, Lab 2'` on ONE row falls back to
+            # `required_classrooms=[]`, candidates `['Oda 1']`, and says so).
+            # So the group-level merge now does what its own file already did.
+            #
+            # The rule: a row's room restriction is applied only if the group
+            # still has somewhere to meet afterwards; otherwise the whole of
+            # that row's contribution is skipped and the user is told. Gated on
+            # the group being placeable BEFORE this row — when the primary's
+            # own two columns already left it nowhere, the merge is not what
+            # emptied it, and inventing a rescue there would claim credit for
+            # fixing a row-level problem this loop cannot see. Coarse on
+            # purpose: a row carrying both a narrowing type and a fatal
+            # exclusion loses both rather than being unpicked column by column,
+            # so the rule stays one sentence the report can state.
+            if (_rooms_left(room_names, required, excluded)
+                    and not _rooms_left(room_names, new_required, new_excluded)):
+                unplaceable_rooms.extend(
+                    r for r in list(other_required) + list(other_excluded)
+                    if r not in unplaceable_rooms)
+            else:
+                required = new_required
+                excluded = new_excluded
+                dropped_rooms.extend(new_dropped)
             # Remove the duplicate class from state
             if other in dataset.state["classes"]:
                 dataset.state["classes"].remove(other)
         primary["required_classrooms"] = required
         primary["excluded_classrooms"] = excluded
+        if unplaceable_rooms:
+            # `kept` is resolved HERE, after the loop, not where the rejection
+            # happened: a later row can still narrow the group legitimately,
+            # and a sentence naming rooms the session no longer has would be
+            # false of the thing it is attached to (935c84b). It can never
+            # render empty — a rejection only happens when the group was
+            # placeable before that row, the rejected row changes nothing, and
+            # every accepted row is accepted precisely because it left
+            # something.
+            dataset.report.add_warning(
+                tr("labels.classes"), None,
+                tr("warnings.joint_group_room_unplaceable").format(
+                    group_field=_column_label("classes", "joint_class_group"),
+                    group=group_name,
+                    dropped=", ".join(unplaceable_rooms),
+                    kept=", ".join(_rooms_left(room_names, required, excluded)),
+                    type_field=_column_label("classes", "required_room_type"),
+                    rooms_field=_column_label("classes", "allowed_rooms"),
+                    excluded_field=_column_label("classes", "excluded_rooms")))
+        if other_locations:
+            # `location_type` is NOT merged, and deliberately so: there is no
+            # defensible winner between "online" and "face-to-face" for one
+            # session, and picking either would flip whole sessions in existing
+            # workbooks on the strength of a single stray cell. What was wrong
+            # was the silence. Measured: row 1 online + row 2 face-to-face with
+            # `required_room_type=Laboratuvar` imported as an online session
+            # with `required_classrooms=[]` and an empty report — the school's
+            # lab requirement simply gone. The two orderings still produce
+            # different sessions, but both now say so, which is the same
+            # resolution the disjoint-room-type case above already uses.
+            dataset.report.add_warning(
+                tr("labels.classes"), None,
+                tr("warnings.joint_group_location_conflict").format(
+                    group_field=_column_label("classes", "joint_class_group"),
+                    group=group_name,
+                    location_field=_column_label("classes", "location_type"),
+                    kept=get_location_label(primary_location),
+                    dropped=", ".join(get_location_label(lt)
+                                      for lt in other_locations)))
         if dropped_rooms:
             # Reported against the GROUP, not against a row (`row=None`). The
             # row that declared the losing constraint has just been deleted

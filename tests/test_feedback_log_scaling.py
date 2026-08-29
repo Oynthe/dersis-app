@@ -622,6 +622,72 @@ def test_repeat_learn_cost_does_not_grow_with_log_size(dersis_home):
         f"({_ratio(large_read, small_read):.2f}x for an 8x log)")
 
 
+def test_launch_cost_does_not_grow_with_log_size(dersis_home):
+    """R1: the LAUNCH pass must not decrypt the history either.
+
+    The test above deliberately primes with one ``learn()`` and measures the
+    SECOND, idle one — so nothing in this repository measured a first-of-process
+    pass at all, and that is the one ``SchedulerApp.__init__`` pays,
+    synchronously, before the window exists. ``_check_log_health`` sits above
+    every gate and, with ``_checked_span`` None on construction, read and
+    decrypted the whole log on it.
+
+    Measured 2026-08-29 on .venv-audit, min of 5, fresh learner per rep over a
+    caught-up log: 17.6 ms at 2 000 records, 44.5 ms at 5 000, 94.1 ms at
+    10 000, 199.8 ms at 20 000 (11.7 MB), 538.2 ms at 50 000 — linear, ~10 us
+    per record, and the log is append-only with no rotation, cap or pruning
+    anywhere in ``learning/`` or ``storage/``. A whole ``SchedulerApp.__init__``
+    costs 90 ms with no feedback log at all, so at 20 000 records this one read
+    was more than the entire rest of the launch. With the clean-span anchor:
+    10.7 ms at 20 000, 26.0 ms at 50 000.
+
+    Counted in AES-GCM decrypts, not milliseconds, for the reason at the top of
+    this module: a duration threshold on this box is noise, and the decrypt IS
+    the cost. The one or two decrypts a correct implementation still does are
+    ``learned_weights.egu``, not the log.
+    """
+    def _launch_decrypts(n_entries):
+        """Seed *n_entries*, catch the learner up, then count a fresh launch."""
+        weights = storage.learned_weights_path()
+        if os.path.exists(weights):
+            os.remove(weights)
+        # save_encrypted_lines, not _seed_log: this test is about the EGL1
+        # append-only log the app actually writes, whose records are decrypted
+        # one at a time. _seed_log writes the LEGACY single-array container.
+        storage.save_encrypted_lines([_raw_entry(i) for i in range(n_entries)],
+                                     storage.feedback_log_path())
+        assert PreferenceLearner().learn() == n_entries
+
+        calls = []
+        real = storage._parse_container
+
+        def counted(blob):
+            calls.append(len(blob))
+            return real(blob)
+
+        storage._parse_container = counted
+        try:
+            relaunched = PreferenceLearner()
+            relaunched.learn()
+        finally:
+            storage._parse_container = real
+        assert relaunched.last_read_lost == 0, (
+            "a healthy %r-entry log reported a loss at launch (%r)"
+            % (n_entries, relaunched.last_read_lost))
+        return len(calls)
+
+    small = _launch_decrypts(100)
+    large = _launch_decrypts(800)
+
+    assert large <= max(small, 1) * 2.0, (
+        f"the first learning pass of a process decrypted {small} records on a "
+        f"100-entry log and {large} on an 800-entry one "
+        f"({_ratio(large, small):.2f}x for an 8x log). That pass runs inside "
+        f"SchedulerApp.__init__ on every launch, so the wait before the window "
+        f"appears is a function of how long the user has owned DERSİS: 199.8 ms "
+        f"at 20 000 records, and nothing caps the log")
+
+
 # ── 5. A damaged log must not be destroyed by the next append ───────────────
 
 def _all_files_under(root):
