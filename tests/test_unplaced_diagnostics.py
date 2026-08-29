@@ -5,7 +5,8 @@ Findings guarded here
 * **ST-SCHED-001 (the "surface dropped classes" half).** ``apply_reschedule``
   re-validates every placement the optimizer proposed and throws away the ones
   that no longer fit. It reports them — as a bare list of *names* — and
-  ``ui/app.py:3019`` (``self._workflow.apply_reschedule(result)``) discards the
+  ``ui/app.py::_on_solve_finished`` (``self._workflow.apply_reschedule(result)``)
+  discards the
   return value entirely. From the user's chair a lesson the solver placed simply
   vanishes. Section 1 pins the *core-layer* contract the UI has to consume: no
   drop without a report, and no report without a reason.
@@ -34,9 +35,9 @@ The API this file assumes for ST-SCHED-014 (read before implementing)
 ---------------------------------------------------------------------
 Nothing global exists yet, so the shape below is a *proposal* pinned as a strict
 xfail. It extends the ``summary`` dict ``ScheduleOptimizer.optimize()`` already
-returns — the ``summary = {`` literal at schedule_optimizer.py:589-615 as of this
-writing, though that file is under active Phase 3 edit, so match on the literal
-rather than on the line number — instead of inventing a new return channel::
+returns — the ``summary = {`` literal inside ``schedule_optimizer.py::optimize``;
+match on the literal, never on a line number — instead of inventing a new
+return channel::
 
     summary["infeasibility"] is None          # not provably oversubscribed
     summary["infeasibility"] == {
@@ -181,7 +182,8 @@ def oversubscribed_grid():
     The negotiation report is read BEFORE ``apply_reschedule``, which is the
     order ``ui/app.py`` uses: ``BulkResultsDialog`` receives
     ``negotiation_source=lambda: result.negotiation_result`` and is ``exec()``d
-    at app.py:3009-3015, i.e. before the commit at app.py:3019.
+    inside ``app.py::_on_solve_finished``, i.e. before that same method's
+    ``apply_reschedule`` commit.
     """
     state = _grid(2, 2, ["R001", "R002"], _distinct_specs(14))
     workflow, result = _solve(state)
@@ -361,7 +363,7 @@ def test_drop_accounting_closes_on_a_real_solve(oversubscribed_grid):
     dropped = []
     for cls, day, slot, room in result.placed:
         if cls["pinned"]:
-            # A rejected pin is reported but NOT unplaced (workflow.py:527-532
+            # A rejected pin is reported but NOT unplaced (apply_reschedule
             # deliberately leaves the user's instruction alone), so it is not a
             # drop and must not be counted as one. There are no pins in this
             # fixture; the branch exists so the identity stays correct if one is
@@ -486,8 +488,8 @@ def test_lecturer_oversubscription_names_the_lecturer(oversubscribed_lecturer):
     the timetabler is left to work that out from a list of unplaced courses,
     when the app already knows the name and the numbers.
 
-    NOTE for the implementer: ``build_diagnostic_summary`` (constraint_-
-    negotiator.py:962-973) already produces this fact at a 50 %-utilisation
+    NOTE for the implementer: ``build_diagnostic_summary``
+    (``constraint_negotiator.py``) already produces this fact at a 50 %-utilisation
     threshold. The work is surfacing it on ``summary`` with hard numbers, not
     inventing the detector.
     """
@@ -671,7 +673,7 @@ _SCORING_GOLDEN = [
 
 
 def _scoring_rig(weight_override=None):
-    """Build the exact scorer configuration schedule_optimizer.py:412-417 uses.
+    """Build the exact scorer configuration schedule_optimizer.py::optimize uses.
 
     Namely: conflict graph AND propagator attached, no parallel pool. That is
     the only configuration in which ``_neighbor_impact`` can be reached at all
@@ -798,11 +800,11 @@ def test_scoring_digest_is_unchanged():
 def test_neighbor_impact_weight_lives_in_two_places_or_neither():
     """Pins ST-SCHED-015 (Low) — the deletion is not a one-line deletion.
 
-    ``optimization_goals._GOAL_WEIGHT_MAP`` (optimization_goals.py:129) maps the
+    ``optimization_goals._GOAL_WEIGHT_MAP`` maps the
     user-facing "minimal disruption" slider onto ``neighbor_impact_penalty``,
-    and ``goals_to_weights`` accumulates into ``{k: 0.0 for k in
-    DEFAULT_WEIGHTS}`` with **no membership guard** (optimization_goals.py:158,
-    167). Delete the key from ``DEFAULT_WEIGHTS`` alone and every reschedule
+    and ``optimization_goals.goals_to_weights`` accumulates into
+    ``{k: 0.0 for k in DEFAULT_WEIGHTS}`` with **no membership guard**.
+    Delete the key from ``DEFAULT_WEIGHTS`` alone and every reschedule
     that carries custom goals dies with ``KeyError:
     'neighbor_impact_penalty'`` — verified by removing the key and calling
     ``goals_to_weights(DEFAULT_GOALS)``.

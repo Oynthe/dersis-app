@@ -16,15 +16,173 @@ what has changed since. Per-finding state also lives in the
 | **6 — Architecture & maintainability** | 🟡 Mostly complete | `fix/phase-6-architecture` |
 | **7 — Testing, observability & release** | 🟢 Complete | `fix/phase-7-release` |
 | **8 — Closing the remaining work** | 🟢 Complete | `fix/phase-8-remaining` |
+| **9 — Convergence: the B and C backlogs** | 🟢 Complete | `fix/phase-9-convergence` |
+
+---
+
+## Phase 9 — complete
+
+> **Picking the work up?** → [`HANDOFF-PHASE10.md`](HANDOFF-PHASE10.md).
+
+**Suite: 1271 selected — 1269 pass, 2 known-defect pins, 0 failures.** Both lanes
+exit 0. (1144 / 1142 / 2 at the start: **+127 tests**, and the two survivors are
+still the ST-DATA-013 documentation pair.) Slow engine lane 52, exit 0. `mypy`
+clean over 42 source files. All four layering ratchets still `0`, and **the
+translation ratchet never moved**: every one of the phase's new user-facing
+strings shipped in all 22 locales, so the backlog is 2548 against its unchanged
+2548 ceiling.
+
+The phase ran in the order the user set — **section B first, section C last, and
+for C "is this real?" before "how do we fix it?"** — and every item, without
+exception, ran the loop: reproduce → fix → re-run the same probe →
+regression-check → resolved. Nothing was marked resolved on inspection.
+
+### Section B: nine defects, nine reproduced, nine fixed
+
+All nine reproduced on the first attempt; none evaporated. The headline is that
+**the reproduction round found three things the handoff did not say**, and each
+changed the fix:
+
+* **B4 is worse than "Low".** `AddClassDialog` rebuilds both room fields from
+  its checkbox registry, so opening an affected class and pressing OK *deletes*
+  the constraint — the defect erased its own evidence. And `excluded_classrooms`
+  fails the opposite way: a dangling exclusion silently stops applying, so a
+  renamed room becomes eligible for a class the user forbade from it.
+* **B6's "49 096 px" is one measurement, not the number.** Real Windows
+  platform: 24 110 px on a 912 px screen. Offscreen: 56 100 px. It is font- and
+  width-dependent, so chasing 49 096 would have looked like a failure to
+  reproduce.
+* **B9's framing was wrong about its own subject.** Nothing checks the container
+  format before deciding to report; the legacy path dies on the same `< 5` gate.
+  And the two `lost == -1` shapes — the *entire* history unreadable, the severe
+  ones — are unreachable by relaxing that gate, because the unreadability that
+  sets `-1` is what makes `log_entry_count` return 0. That settled the
+  architecture: **the integrity read must happen before the gates, not after a
+  relaxed one.**
+
+### The adversarial round earned its keep, six times out of six
+
+It ran only after the fixes were believed done, and its job was to validate them.
+It found **two regressions this phase's own fixes introduced** — the shape Phase 8
+named: the measured case improves, an unmeasured neighbour degrades in silence.
+
+* **B5's fix broke joint sessions that used to work.** The merge unioned
+  `excluded_classrooms` across the group while `required_classrooms` came from a
+  different row. Measured against `f049964`: candidates `['Oda 1']` → `[]`,
+  `is_valid` True, `warnings` `[]`. Not order-specific.
+* **B3's fix made honesty destructive.** The prompt said "Choose No to go back";
+  nothing went back — all three call sites were a bare `return` after the dialog
+  had closed. Answering the question *truthfully* discarded the class name,
+  targets, duration, participants and room constraints the user had just typed.
+
+And one was a **policy violation added by the main agent**: `core/models.py`
+says in writing that unplacing orphans at load time "would silently discard the
+user's own placements with no way to see or undo it", and prescribes warn / list
+/ offer. Phase 9 put `_reconcile_after_setup()` on exactly that path and chose
+none of the three. Measured on a real `.egu` from an older build: 6 of 6 lessons
+unplaced, undo depth 0, and `mark_current_state_as_baseline()` then recorded the
+wrecked state as having no unsaved changes. Reverted, with the policy quoted at
+the site.
+
+It also found **B1/B2 surviving verbatim in the sibling gesture** — Ctrl+P and a
+multi-select sidebar drag both reach `_place_classes_batch`, which pushed undo
+before the outcome was known — and **a guard that nothing measured**: two lines
+deletable *together* with the whole suite green, whose removal let a sidebar drag
+plus one Ctrl+Z resurrect an abandoned gesture's placement under the wrong label.
+No test noticed because the existing one **hand-assigned** the cleared state
+instead of letting production clear it. That is verbatim the Phase 8 pattern, one
+phase later, and it is the single most repeated mistake in this project.
+
+### Section C: six of ten real, four not — and one "fix" would have been a defect
+
+Putting C last was right: **40% of it did not survive measurement.**
+
+| | verdict | |
+|---|---|---|
+| C1 | REAL, High | but not for the filed reason — see below |
+| C2 | **NOT_REPRODUCIBLE** | exact equality is the *guard* against ST-FUNC-010, not a regression of it |
+| C3 | REAL, Low | a typo'd excluded room forbids nothing, silently |
+| C4 | **NOT_REPRODUCIBLE** | outcome happens; the claimed fix does not touch the claimed cause |
+| C5 | REAL, Low | two of four warnings are outright *false* of the row |
+| C6 | REAL, Low | the same contradiction, reported in one column and silent in the other |
+| C7 | REAL, severity **None** | crash is real; no production path can construct it |
+| C8 | **NOT_REPRODUCIBLE** | dead for grid drags; live only where no snapshot is held |
+| C9 | REAL, Low | and the one-off fix is the wrong answer — 39 more like it |
+| C10 | **NOT_REPRODUCIBLE** | the proposed fix would *create* an ST-SEC blind spot |
+
+**C10 is the one to remember.** Adding the `$` anchor — the obvious fix — was
+disproved by mutation: move `exit /b 1` into `build_embed.bat`'s else branch (a
+failed build exits 0, a clean build exits 1) and the *current* pattern catches it
+red, while the anchored version runs past `) else (` into the success branch,
+finds the wrong `exit /b 1`, and goes **green**. Acting on that item would have
+created exactly the ST-SEC blind spot Phases 7 and 8 both found in that file.
+
+**C1's filed consequence is unreachable and the real one is worse.** "A solve
+before the first save" cannot happen — `_import_from_excel` ends in a *modal*
+whose nested event loop lets the 1500 ms autosave debounce fire, so the window is
+~1.5 s and self-closing. The permanent defect is that there is no days sheet in
+the workbook schema, so nothing forces Setup to run first, and on an empty week
+`normalize_state_day_keys` computes `allowed = set()` and prunes **every** day
+out of **every** availability record, which autosave writes to disk. The hours
+survive, which is what makes it quiet: Setup still shows an availability record
+for each teacher — one that no longer restricts a single day. Fixing the filed
+claim would have fixed a self-closing window and left the data loss in place.
+
+### What the briefs got wrong, and how it was found
+
+Four times a prescribed fix was wrong, and **every one was established by
+building it and watching it fail** — never by argument.
+
+1. **"Gate `_place_classes_batch` on `placed_count > 0`."** `placed_count` counts
+   only the candidates, while Phase 2 of `optimized_batch_schedule` re-solves
+   every already-placed unpinned lesson — so a batch can report 0 placed while
+   having relocated lessons on the timetable, and that gate records no undo entry
+   for a real edit. `result.rescheduled` fails too: it is returned `True`
+   unconditionally, i.e. `True` in precisely the reported no-op.
+2. **"Silence the query and leave `register_lecturer` alone."** With roster
+   `['Ilgın','İlgin']` and typed `'İlgin'`, *both* returned `'Ilgın'`. Silencing
+   only the query moves the failure from loud-and-wrong to silent-and-wrong.
+3. **"Invert the third test into a guard against bare line numbers."** Built to
+   the letter, that anchors a regex on `.py:` — which does not match
+   ``ui/app.py::_execute_drop`` (:3910-3984), because the symbol sits between the
+   filename and the colon. It would have shipped green while permitting the exact
+   defect it was written for.
+4. **B1/B2's prescribed shape missed a commit point.** `DraggableUnplacedList.dropEvent`
+   records nothing and was undoable only by accident. Built as sketched,
+   unplacing by drag becomes un-undoable — and nothing under `tests/` referenced
+   `dropEvent` or either of its toasts, so no test would have said so.
+
+### Ratchets
+
+`MAX_SCHEDULERAPP_METHODS` was **not** raised. Four separate pieces of behaviour
+went to module scope or a new module instead — `_commit_undo_entry`,
+`_confirm_lecturer_reassignment`, `ui/validation_report.py`, and
+`_repair_report_message` + `_conflict_label` — leaving the class at **153**
+against its 154 ceiling.
+
+`MAX_APP_PY_TOTAL_MCCABE` **was** raised, 915 → 920, with the per-function
+accounting in the constant's docstring: B3's shared `_class_form_result` is +6
+against −6 across the three call sites it replaced (a net zero), and the real +6
+is `_repair_report_message` (+5) and `_place_classes_batch` (+1), both defects
+measured happening. Neither could go anywhere cheaper — `core/` is deliberately
+`tr()`-free, and `ui/validation_report.py` is a different widget for a different
+report.
+
+### Known gaps left behind
+
+Recorded with their measurements in [`HANDOFF-PHASE10.md`](HANDOFF-PHASE10.md).
+The largest is that `open_file` and `_auto_load` both still carry B4's exposure,
+and the honest fix there is the one `models.py` prescribes — warn, list, or offer
+— not a silent repair. That needs a decision, not a patch.
 
 ---
 
 ## Phase 8 — complete
 
-> **Picking the work up?** → [`HANDOFF-PHASE9.md`](HANDOFF-PHASE9.md). It lists
-> what is still open **in the order the user set**: section B (nine verified
-> defects) first, section C (ten unverified incidentals) last, and for C the
-> first question is "is this real?" rather than "how do we fix it?".
+> Superseded by Phase 9. Its handoff, [`HANDOFF-PHASE9.md`](HANDOFF-PHASE9.md),
+> is retained as the record of what Phase 9 was asked to do — but see the Phase 9
+> section above for the three places its Section B descriptions were wrong and
+> the four Section C items that did not survive measurement.
 
 **Suite: 1144 tests — 1142 pass, 2 known-defect pins, 0 failures.** Both lanes
 exit 0. (954 / 946 / 8 at the start of the phase: **+190 tests, and 6 of the 8

@@ -184,7 +184,20 @@ def test_a_cancelled_setup_leaves_the_history_alone(make_app):
 
     src = inspect.getsource(SchedulerApp.edit_setup)
     before = src.index("dlg.exec()")
-    pushed = src.index("self._undo_stack.append(")
+    # Either spelling of "record it" counts. Phase 9 factored the
+    # append/evict/clear-redo triple out of the three places that wrote it by
+    # hand into `_commit_undo_entry`, which took this test's literal with it;
+    # both are accepted so that neither the refactor NOR a revert to a raw
+    # append can make this assertion quietly stop looking at anything. What is
+    # pinned is WHERE the recording happens, not how it is spelled.
+    markers = [m for m in ("_commit_undo_entry(", "self._undo_stack.append(")
+               if m in src]
+    assert markers, (
+        "edit_setup records no undo entry by any spelling this test knows "
+        "about; it looked for _commit_undo_entry( and "
+        "self._undo_stack.append(. If the call was renamed again, add the new "
+        "name here rather than deleting the test.")
+    pushed = min(src.index(m) for m in markers)
     assert pushed > before, (
         "edit_setup records the undo entry before the dialog runs, so a "
         "cancelled Setup still mutates the history")

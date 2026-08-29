@@ -267,12 +267,21 @@ def test_import_merges_workbook_into_state(
     # to drop in a rewrite; a lecturer whose availability vanished would be
     # rescheduled into hours they told the app they cannot teach.
     #
-    # Availability is compared by lecturer *name* only, on purpose: the app
-    # legitimately rewrites the day values (localized labels like "Pazartesi"
-    # from the workbook -> stable keys like "monday") and prunes days that are
-    # not in state["days"], via normalize_state_day_keys. Asserting raw equality
-    # here would canonize the pre-normalization shape and go red on a correct
-    # app. What must not happen is the dict going missing.
+    # Availability is compared by lecturer *name* only. The REASON changed in
+    # Phase 9 and the old one is worth not leaving here, because it described a
+    # design that was itself the C1 defect. It used to read: "the app
+    # legitimately rewrites the day values (localized labels like 'Pazartesi'
+    # from the workbook -> stable keys like 'monday') ... via
+    # normalize_state_day_keys". That rewrite happened on the AUTOSAVE path,
+    # long after the import returned, and on a schedule whose week had not been
+    # laid out yet it did not convert the labels — it deleted every one of them,
+    # permanently, and wrote the emptied roster to disk.
+    #
+    # C1 moved the label -> key conversion into `_process_teachers`, so both
+    # sides of this comparison already hold keys and there is no rewrite left on
+    # this path. What can still legitimately differ is PRUNING: a day that is
+    # not in `state["days"]` is dropped once a week exists. What must not happen
+    # is the dict going missing.
     assert set(s["lecturer_availability"]) == set(expected["lecturer_availability"])
     assert s["classroom_capacities"] == expected["classroom_capacities"]
     assert _strip_uids(s["classes"]) == _strip_uids(expected["classes"])

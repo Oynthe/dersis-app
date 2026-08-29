@@ -289,9 +289,9 @@ class TestScheduleNewClassesIsTransactional:
 
         This pins TODAY's workflow contract so the new try/except cannot change
         the path that already works. Be aware it is one side of an unresolved
-        contradiction: ``ui/app.py:2452`` comments "class stays in state
-        (unplaced)", returns True and pushes an undo entry, while
-        ``workflow.py:268-270`` removes the class. If the maintainer resolves
+        contradiction: ``ui/app.py::_schedule_new_classes`` comments "class
+        stays in state (unplaced)", returns True and pushes an undo entry, while
+        ``workflow.py::schedule_new_classes`` removes the class. If the maintainer resolves
         that in favour of keeping the class, this test is the one to rewrite —
         see the implementation plan.
         """
@@ -317,7 +317,8 @@ class TestScheduleNewClassesIsTransactional:
         opens — otherwise the dialog describes classes that no longer exist.
 
         Regression guard: nobody may "fix" ST-DATA-011 by making the
-        returned-failure multi path self-cleaning, because ``ui/app.py:2465``
+        returned-failure multi path self-cleaning, because
+        ``ui/app.py::_schedule_new_classes``
         commits it with ``apply_schedule_result`` on the accept branch.
         """
         state = placed_state

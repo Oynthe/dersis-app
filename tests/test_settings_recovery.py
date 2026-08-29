@@ -38,7 +38,7 @@ Implementation-agnostic on purpose:
   ``SchedulerApp.__init__`` / ``_auto_save`` / ``refresh_grid`` returns.  These
   tests never spin the Qt event loop, and that is deliberate, not an oversight:
   ``processEvents()`` also fires the ``QTimer.singleShot(100, self.refresh_grid)``
-  that ``__init__`` (app.py:896-897) arms whenever a settings file loaded, and
+  that ``__init__`` (app.py) arms whenever a settings file loaded, and
   ``refresh_grid`` writes one ``WarningLogPanel`` entry per unplaced class.
   Measured: adding a ``processEvents()`` flush before the assertions made
   ``..._autosave_write_failure_reaches_the_user`` **pass on the unfixed tree**
@@ -529,7 +529,7 @@ def test_corrupt_settings_are_reported_to_the_user(
 
     # Tripwire against a wrong-reason pass: channels() counts WarningLogPanel
     # entries, and refresh_grid() writes one per *unplaced class* all on its own
-    # (_run_auto_negotiation, app.py:3011-3040). With nothing loaded there are
+    # (app.py::_run_auto_negotiation). With nothing loaded there are
     # no classes, so any channel that fires can only be about the settings file.
     # If a future fix restores the schedule from a backup instead, this assert
     # fires and whoever changed it must re-derive the signal check rather than
@@ -601,8 +601,8 @@ def test_write_flag_does_not_destroy_a_corrupt_settings_container(
 
     ``_write_flag`` has the identical read-modify-write-and-swallow shape as
     ``_auto_save``, and on a container that fails to load every first-run flag
-    reads as unset, so ``run_language_gate`` (``scheduler_gui.py:172``, which
-    runs *before* ``SchedulerApp()`` at line 180) and ``FirstRunController``
+    reads as unset, so ``run_language_gate`` (called by ``scheduler_gui.main``,
+    which runs it *before* ``SchedulerApp()``) and ``FirstRunController``
     both call it on the way in.  A fix confined to ``_auto_save`` therefore
     still loses the file. A failure means the corrupt container is destroyed
     before the user ever clicks anything.
@@ -657,8 +657,8 @@ def test_a_failing_autosave_never_crashes_refresh_or_close(
         make_window, feedback, make_preset, monkeypatch, caplog):
     """ST-DATA-005 — the failure must be *reported*, not merely *raised*.
 
-    ``_auto_save`` is called from ``refresh_grid()`` (app.py:1967) and from
-    ``closeEvent`` (app.py:4986). Both are Qt entry points where an escaping
+    ``_auto_save`` is called from ``refresh_grid()`` and from
+    ``closeEvent`` (both in app.py). Both are Qt entry points where an escaping
     exception aborts the process under a real platform plugin, so the cheapest
     conceivable fix — deleting ``except Exception: pass`` and adding nothing —
     is not a fix at all. Measured against the pre-repair version of this file,
@@ -687,11 +687,11 @@ def test_a_failing_autosave_never_crashes_refresh_or_close(
     monkeypatch.setattr(storage_mod, "save_encrypted", boom)
 
     # Every one of these is a bare call: an escaping exception fails the test.
-    win.refresh_grid()              # app.py:1967
+    win.refresh_grid()              # calls _auto_save
     win._auto_save()                # also driven directly, so that debouncing
                                     # autosave out of refresh_grid (ST-PERF-002)
                                     # cannot turn the assertion below vacuous
-    win.closeEvent(QCloseEvent())   # app.py:4986
+    win.closeEvent(QCloseEvent())   # calls _auto_save
 
     assert feedback.channels(caplog), (
         "a failing autosave told the user nothing: " + feedback.describe(caplog))

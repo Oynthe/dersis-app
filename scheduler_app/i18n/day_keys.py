@@ -100,8 +100,38 @@ def normalize_state_day_keys(state):
             if cls.get("placed") and cls["placed_day"] is None:
                 cls["placed"] = False
 
+    # C1 -- an UNCONFIGURED week means "there is no grid to prune against", not
+    # "no day is allowed". With `state["days"] == []`, `allowed` is the empty
+    # set and this loop used to strip every day out of every availability
+    # record; `_auto_save` (ui/app.py:2406) then wrote the emptied roster to
+    # disk. Measured on a fresh schedule imported from the app's own template:
+    # immediately after the import 'Prof.Emile Laurent' had
+    # allowed_days=['Pazartesi', 'Çarşamba', 'Cuma'] and after 2.5 s of event
+    # loop -- one autosave debounce, AUTOSAVE_DEBOUNCE_MS=1500 -- it had
+    # allowed_days=[]. The hours survived, which is what made it quiet: the
+    # Setup lecturer table still showed an availability record, just one that
+    # no longer restricted a single day. The workbook has no days sheet
+    # (data_io/schema.WORKBOOK_SHEETS), so importing before laying out the week
+    # in Setup is a normal order of work, not a misuse.
+    #
+    # Scoped to AVAILABILITY on purpose. Leaving an off-grid key in
+    # `allowed_days` is harmless because every reader intersects it with the
+    # live day list (`apply_lecturer_availability_filters`,
+    # core/models.py:529-548); an off-grid `placed_day` is the ST-DATA-004
+    # orphan the class/pin half above exists to kill, and that half must keep
+    # firing on an empty week.
+    #
+    # The guard is on the GRID being absent, not on the field. Written instead
+    # as "never prune availability" it would break
+    # `test_opening_a_turkish_file_gives_the_engine_day_keys_not_day_labels`
+    # (tests/test_day_key_normalization.py), which pins the pruning against a
+    # non-empty week -- and that pruning is wanted: with a real grid, an
+    # off-grid day in `allowed_days` is a day the user deleted from the week.
+    keep_off_grid = not day_keys
     for _, av in state.get("lecturer_availability", {}).items():
-        av["allowed_days"] = [d for d in normalize_day_list(av.get("allowed_days", [])) if d in allowed]
-        av["excluded_days"] = [d for d in normalize_day_list(av.get("excluded_days", [])) if d in allowed]
+        av["allowed_days"] = [d for d in normalize_day_list(av.get("allowed_days", []))
+                              if keep_off_grid or d in allowed]
+        av["excluded_days"] = [d for d in normalize_day_list(av.get("excluded_days", []))
+                               if keep_off_grid or d in allowed]
 
     return state

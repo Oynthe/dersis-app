@@ -44,7 +44,7 @@ Traps this module has to defend against (all measured, see the report)
 **Trap A — the acceptance gate hides the bug.** ``optimize()`` keeps the CP-SAT
 answer only when it beats the heuristic (``cpsat_placed_count >
 heur_placed_count``, or an equal count with better quality —
-``schedule_optimizer.py:544-546``). The obvious ST-SCHED-005 end-to-end fixture
+``schedule_optimizer.py::optimize``). The obvious ST-SCHED-005 end-to-end fixture
 (one duration-3 class, lecturer free at 09:00 *and* 13:00-15:00) is silently
 repaired by that gate: the heuristic finds the legal 13:00 slot, CP-SAT proposes
 the illegal 09:00 one, the qualities tie, and the heuristic answer wins. Every
@@ -111,7 +111,7 @@ requires_ortools = pytest.mark.skipif(
 # comfortably larger than that.
 CPSAT_TIME_LIMIT = 5.0
 
-# The suite-wide fixed seed (scheduler_app/core/models.py:178).
+# The suite-wide fixed seed (scheduler_app/core/models.DEFAULT_OPTIMIZER_SEED).
 SEED = 20260101
 
 
@@ -365,7 +365,7 @@ def test_cpsat_reschedule_honors_locked_protection():
 
     ``protection='locked'`` is the user saying "never touch this one", and it is
     the only level ``CPSATScheduler.solve`` currently understands
-    (cpsat_scheduler.py:122-124). A failure means a deep-optimization run
+    (cpsat_scheduler.py::CPSATScheduler.solve). A failure means a deep-optimization run
     relocated a lesson the user had frozen.
 
     Kept alongside the three failing levels on purpose: it is what proves the
@@ -391,7 +391,7 @@ def test_cpsat_reschedule_honors_soft_protection():
     """Pins ST-SCHED-006 (High) — ``soft``.
 
     ``optimize()`` treats a placed ``PROTECTION_SOFT`` class as immovable
-    (schedule_optimizer.py:272-283 puts it in ``protected``), and the heuristic
+    (``schedule_optimizer.py::optimize`` puts it in ``protected``), and the heuristic
     engine honours that. Turning on deep optimization silently drops the
     promise: a lesson the user asked to leave alone is relocated.
 
@@ -416,8 +416,8 @@ def test_cpsat_reschedule_honors_same_day_protection():
     """Pins ST-SCHED-006 (High) — ``same_day``.
 
     ``protection='same_day'`` means "move it within its day if you must, but
-    never off that day" (models.py:183). The heuristic honours it through
-    ``same_day_map`` (schedule_optimizer.py:288-292); CP-SAT has no such notion,
+    never off that day" (models.py). The heuristic honours it through
+    ``same_day_map`` (schedule_optimizer.py::optimize); CP-SAT has no such notion,
     so a lesson a school had fixed to Tuesday reappears on Monday.
 
     Moving it is the *only* way to place all five classes here, so the wrong
@@ -445,10 +445,10 @@ def test_cpsat_reschedule_honors_improve_only_protection():
     """Pins ST-SCHED-006 (High) — ``improve_only``.
 
     ``protection='improve_only'`` means "move it only to somewhere at least as
-    good" (models.py:184). "As good" is measured with the very function that
+    good" (models.py). "As good" is measured with the very function that
     builds the production baseline, ``TimetableScorer.placement_score``
-    (schedule_optimizer.py:327), where a lower score is better; the greedy engine
-    enforces ``score <= baseline`` at schedule_optimizer.py:743-747.
+    (schedule_optimizer.py), where a lower score is better; the greedy engine
+    enforces ``score <= baseline`` inside ``schedule_optimizer.py::optimize``.
 
     A failure means the app took a lesson sitting in a good mid-morning slot and
     demoted it to a worse hour to suit some other class, which is exactly the
@@ -545,7 +545,8 @@ def test_cpsat_reschedule_commits_every_class_it_reports_as_placed():
     ``apply_reschedule``), because losing a lesson is only observable after the
     commit. From the user's side: they press "optimize", the dialog reports the
     class as scheduled, and it is not on the timetable afterwards — no message,
-    because ``ui/app.py:3019`` throws ``apply_reschedule``'s rejected list away.
+    because ``ui/app.py::_on_solve_finished`` throws ``apply_reschedule``'s
+    rejected list away.
 
     The lecturer is free at 09:00 only, and the class needs three hours, so the
     heuristic engine correctly leaves it unplaced. CP-SAT "places" it at 09:00

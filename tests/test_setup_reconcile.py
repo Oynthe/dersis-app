@@ -1,8 +1,8 @@
 """Setup-dialog placement reconciliation (ST-DATA-004).
 
-ST-DATA-004 (High): ``SetupDialog._ok`` (``ui/dialogs.py:1813-1821``) assigns the
+ST-DATA-004 (High): ``SetupDialog._ok`` (``ui/dialogs.py``) assigns the
 new ``days`` / ``slots`` / ``classrooms`` / ``lecturers`` lists straight into the
-live ``state`` dict, and ``SchedulerApp.edit_setup`` (``ui/app.py:2828-2838``)
+live ``state`` dict, and ``SchedulerApp.edit_setup`` (``ui/app.py``)
 just calls ``refresh_grid()`` afterwards. Nothing looks at ``state["classes"]``.
 So the moment a user unchecks a weekday, deletes a slot line, or removes a
 classroom / lecturer row, every class that was placed on the axis value they
@@ -32,8 +32,8 @@ Concretely, after the new setup is applied:
   ``pinned_classroom`` and ``lecturer`` -- a pin is a promise about a cell, and
   a cell that was deleted cannot be promised.
 
-Precedent for that reading already exists in production: ``ui/day_keys.py``
-``normalize_state_day_keys()`` lines 81-90 does exactly this for the *day* axis
+Precedent for that reading already exists in production:
+``i18n/day_keys.py::normalize_state_day_keys`` does exactly this for the *day* axis
 (``pinned_day=None`` + ``pinned=False``, ``placed_day=None`` + ``placed=False``).
 It just never runs at setup-OK time -- it is reached only as a side effect of
 ``_auto_save()`` at the tail of ``refresh_grid()`` (ST-ARCH-007), silently and
@@ -87,7 +87,7 @@ Fail-now / pass-after: no ``xfail`` markers.
 Status observed on ``fix/phase-1-data-correctness`` before the fix
 ------------------------------------------------------------------
 * ``slot`` -- ``edit_setup()`` raises ``ValueError: '12:00' is not in list``
-  (``core/logic.py:18`` ``slot_index`` via ``_refresh_open_slots``). The app
+  (``core/logic.py::slot_index`` via ``_refresh_open_slots``). The app
   throws in the user's face on a plain Setup edit.
 * ``classroom`` / ``lecturer`` -- no crash, 5 dangling references survive
   (4 placed victims + 1 dangling pin).
@@ -585,7 +585,7 @@ def _dangling(state):
                     f"{label}: placed_classroom={cls.get('placed_classroom')!r}")
             # A blank lecturer references nothing, so it cannot dangle. The core
             # treats it as "no lecturer constraint" (``logic.find_conflicts``
-            # line 267: ``if lecturer:``) and ``new_class()`` ships ``""`` as the
+            # ``if lecturer:``) and ``new_class()`` ships ``""`` as the
             # default, so blank is a supported value, not an orphan.
             if (cls.get("lecturer") or "") and cls["lecturer"] not in lecturers:
                 problems.append(f"{label}: placed, lecturer={cls.get('lecturer')!r}")
@@ -785,7 +785,8 @@ def test_pinned_and_locked_classes_are_reconciled_coherently(
       cell stops existing the promise is unsatisfiable, so the pin is cleared
       (``pinned=False``, the dangling ``pinned_*`` coordinate set to ``None``)
       and the class is unplaced. Not invented for the test:
-      ``ui/day_keys.py:81-90`` already implements exactly this for the day axis;
+      ``i18n/day_keys.py::normalize_state_day_keys`` already implements exactly
+      this for the day axis;
       the fix generalizes it to slots, rooms and lecturers.
     * **locked** (``protection="locked"``) — the lock says *the optimizer may
       not move this*, which cannot be read as *this may sit in a deleted slot*.
@@ -925,8 +926,8 @@ def test_a_class_with_no_lecturer_survives_an_unrelated_removal(
     by the bug.
 
     This is not a hypothetical. ``lecturer`` is ``""`` in ``new_class()``
-    (``core/models.py:436``) and the core deliberately reads blank as "no
-    lecturer constraint" (``core/logic.py:266-267`` ``if lecturer:``), so an
+    (``core/models.py``) and the core deliberately reads blank as "no
+    lecturer constraint" (``core/logic.py::find_conflicts`` ``if lecturer:``), so an
     unassigned teacher is a supported state, not an orphan. A reconciliation
     written as ``cls["lecturer"] in state["lecturers"]`` -- which is exactly the
     candidate in the module's implementation plan -- treats every one of those

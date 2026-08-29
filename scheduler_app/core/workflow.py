@@ -9,6 +9,7 @@ imports, no dialog references, no widget manipulation.
 from __future__ import annotations
 
 import copy
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -162,6 +163,34 @@ class EditClassResult:
     placement_cleared: bool = False
 
 
+class ReconcileReport(list):
+    """What ``reconcile_placements`` repaired: the classes, AND what it took.
+
+    A ``list`` subclass and not a dataclass, because the list *is* the existing
+    contract. Four production sites and six tests read the return value, all of
+    them through ``len()``, truthiness or ``any(c is cls for c in ...)``:
+    ``ui/app.py`` (the Setup, context-menu-Setup and import repairs),
+    ``tests/test_phase9_b4.py``, ``tests/test_setup_reconcile.py``,
+    ``tests/test_form_affordances.py`` and ``tests/test_dashboard_metrics.py``.
+    Every one of them keeps working unchanged; only a caller that wants the
+    extra detail has to know this type exists.
+
+    ``lost_room_requirements`` is a list of ``(cls, dropped_room_names)`` for
+    the classes whose ``required_classrooms`` went from **non-empty to empty**
+    — the one outcome of the sweep that is not a repair but a reversal. See
+    ``reconcile_placements``' room-name comment for why those two cases cannot
+    share a sentence.
+    """
+
+    def __init__(self, iterable: Any = ()) -> None:
+        super().__init__(iterable)
+        # Annotated, and the signature annotated with it: an annotation inside
+        # an UNtyped def makes mypy print an `annotation-unchecked` note, and
+        # the gate for this repo is a clean `mypy --config-file mypy.ini` run
+        # (42 source files), not merely a zero exit.
+        self.lost_room_requirements: list = []
+
+
 # ── Snapshot helpers ─────────────────────────────────────────────────────────
 
 def snapshot_placements(state):
@@ -183,6 +212,145 @@ def restore_placements(state, snapshots):
             # Class was placed during the operation but wasn't in the
             # original snapshot — unplace it to restore original state.
             mark_unplaced(cls)
+
+
+def _same_name_other_case(first, second) -> bool:
+    """True when two spellings are one name shouted, whispered or typed plainly.
+
+    NOT a second identity rule, and never consulted as one: ``fold_text`` alone
+    decides whether two names are the same teacher (ST-FUNC-012), and this is
+    read only AFTER it has already said "yes". It answers the different, purely
+    presentational question ``fold_text`` cannot -- *is the difference between
+    these two strings worth interrupting a human over?* -- which it cannot
+    answer precisely because it throws that difference away.
+
+    Turkish casing, not Python's. ``str.casefold`` sends ``I`` to ``i`` and
+    ``İ`` to ``i``+U+0307, so on this tree a bare ``casefold()`` calls four of
+    these six measured pairs "different names" that any Turkish reader reads as
+    one, and would have made the class form ask about all four:
+
+        'İlgin' / 'İLGİN'              casefold: differ   here: same
+        'Ilgın' / 'ILGIN'              casefold: differ   here: same
+        'İlhan Demir' / 'ilhan demir'  casefold: differ   here: same
+        'Işıl' / 'IŞIL'                casefold: differ   here: same
+        'Ilgın' / 'İlgin'              casefold: differ   here: DIFFER (two
+            people -- this is the pair the whole B3 fix exists for)
+        'İlhan Demir' / 'Ilhan Demir'  casefold: differ   here: DIFFER (an
+            ASCII-keyboard typing of İlhan is indistinguishable from a name
+            really spelled with a dotless I, so the user is the only one who
+            knows; asking is correct)
+
+    Mapping the two Turkish capitals to their own lowercase before folding is
+    the entire difference from ``str.casefold``. A Turkish school's rosters are
+    routinely half shouted -- Excel's ``=UPPER()`` writes them that way -- so
+    without this the prompt fires on the ordinary re-typing of a teacher who is
+    already listed, and a prompt that fires on the common harmless case is a
+    prompt users learn to click through before it ever reaches the harmful one.
+
+    TWO folds, because one of them was measurably not enough. Turkish casing
+    alone answers "no" to the plainest ASCII shout there is::
+
+        'Ayse Yilmaz' / 'AYSE YILMAZ'   turkish: 'ayse yilmaz' / 'ayse yılmaz'
+
+    -- the capital I in YILMAZ becomes a dotless ı and the lowercase i does
+    not, which is *correct Turkish casing* and the wrong answer to the question
+    this function asks. Measured on the shipped Phase 9 fix: that pair raised
+    the prompt, i.e. exactly the harmless case the paragraph above says must
+    stay quiet. Reading ``str.casefold`` as a second, weaker "yes" fixes it
+    without loosening the pair the whole guard exists for -- neither fold
+    merges 'Ilgın'/'İlgin' (turkish: ılgın/ilgin; casefold: ılgın/i̇lgin) or
+    'İlhan Demir'/'Ilhan Demir', so all six verdicts listed above are
+    unchanged. Verified pair by pair in
+    ``tests/test_phase9_b3.py::test_the_form_keeps_quiet_when_it_has_nothing_to_say``.
+
+    NFC first, because the two strings must be compared the way they RENDER.
+    ``fold_text`` collapses ``i``+U+0307 onto ``i`` and this did not -- the
+    ``İ``->``i`` replace runs before ``casefold`` and never sees a combining
+    mark -- so a name pasted from an NFD source (macOS; this repo ships
+    ``Dersis-mac.spec``) raised "is this the same teacher?" over two strings
+    that are the same picture on screen. Composing first makes ``I``+U+0307
+    the single codepoint U+0130 that the rest of this function already knows.
+    """
+    if _turkish_fold_case(first) == _turkish_fold_case(second):
+        return True
+    return _nfc(first).casefold() == _nfc(second).casefold()
+
+
+def _nfc(text) -> str:
+    """Strip, and compose to the shortest spelling of the same picture.
+
+    ``normalize("NFC", "İlgin") == "İlgin"``. Without it every
+    comparison below is between a decomposed string and a composed one, which
+    is a difference no user can see and none of them meant.
+    """
+    return unicodedata.normalize("NFC", (text or "").strip())
+
+
+def _turkish_fold_case(text) -> str:
+    return _nfc(text).replace("I", "ı").replace("İ", "i").casefold()
+
+
+def _resolve_roster_spelling(roster, clean):
+    """Which roster entry a typed lecturer name resolves to, and whether that
+    resolution is a reassignment worth interrupting a human over.
+
+    Returns ``(spelling, is_collision)``. ``spelling`` is None only when
+    nothing on the roster folds onto *clean* -- the caller then has a genuinely
+    new teacher and may append. ``is_collision`` is True only for the case B3
+    exists for: the roster holds a DIFFERENT human whose name happens to fold
+    onto this one.
+
+    ONE function because two were measurably one too many.
+    ``register_lecturer`` (what happens) and ``find_lecturer_collision`` (what
+    the user is told is about to happen) each had their own loop over the same
+    roster, and the loops disagreed: both returned at the first fold match, so
+    neither could see an EXACT match sitting later in the list. With
+    ``['Ilgın', 'İlgin']`` on the roster -- which ``SetupDialog._ok`` builds
+    without any fold check, so a school with both teachers has both -- typing
+    'İlgin' was measured as::
+
+        find_lecturer_collision -> 'Ilgın'      (docstring promised None)
+        register_lecturer       -> 'Ilgın'      (a different human)
+
+    so İlgin, a teacher who IS on the roster with their own availability
+    record, could not be given a class from the form at all: Yes handed the
+    lesson to Ilgın, No threw the form away. Silencing only the prompt would
+    have turned that into the silent reassignment B3 was written to stop, so
+    both halves read this one answer.
+
+    The preference order is exact, then re-casing, then first-listed:
+
+    * an EXACT match wins wherever it sits, because it is the string the user
+      typed, it is on the roster, and it is the key its own
+      ``lecturer_availability`` record is under;
+    * failing that, a match differing only in case wins, for the same reason
+      one entry earlier: 'İLGİN' is 'İlgin' shouted, and handing it to the
+      'Ilgın' that happens to be listed first would be the same defect;
+    * failing both, the first fold match -- ``register_lecturer``'s
+      long-standing rule, unchanged for every roster that holds one spelling
+      of a name, which is every roster the app itself can build.
+
+    This is the fold site ``tests/test_text_fold.py::_SHARED_FOLD_SITES``
+    names as ``core/workflow.py::register_lecturer``; the entry should follow
+    the code here.
+    """
+    folded = fold_text(clean)
+    first_match = None
+    variant = None
+    for known in roster:
+        if fold_text((known or "").strip()) != folded:
+            continue
+        if known == clean:
+            return known, False
+        if variant is None and _same_name_other_case(known, clean):
+            variant = known
+        if first_match is None:
+            first_match = known
+    if variant is not None:
+        return variant, False
+    if first_match is None:
+        return None, False
+    return first_match, True
 
 
 # ── SchedulingWorkflow ───────────────────────────────────────────────────────
@@ -951,7 +1119,12 @@ class SchedulingWorkflow:
         ``_process_teachers`` in the importer folds with the same function, so
         the two sides cannot drift apart. The FIRST spelling wins and is
         returned, because the existing one is the one availability records are
-        keyed on.
+        keyed on -- with the one exception ``_resolve_roster_spelling``
+        documents and measures: when the roster holds the typed spelling
+        EXACTLY, that entry wins wherever it sits, because it is on the roster
+        and it has its own availability record. Only a roster carrying two
+        spellings that fold together can tell the two rules apart, and only
+        ``SetupDialog`` can build one.
         Returns ``None`` for a blank name, which ``new_class()`` ships as the
         default and the core reads as "no lecturer constraint".
         """
@@ -959,22 +1132,83 @@ class SchedulingWorkflow:
         if not clean:
             return None
         existing = state.setdefault("lecturers", [])
-        folded = fold_text(clean)
-        for known in existing:
-            if fold_text((known or "").strip()) == folded:
-                return known
+        spelling, _collides = _resolve_roster_spelling(existing, clean)
+        if spelling is not None:
+            return spelling
         existing.append(clean)
         return clean
 
     @staticmethod
-    def reconcile_placements(state) -> list:
-        """Clear every placement or pin that points at an axis value the state
-        no longer has. Returns the affected class dicts.
+    def find_lecturer_collision(state, name) -> Optional[str]:
+        """The roster spelling that would quietly take this lesson, or None.
+
+        ST-UI-020's read-only half, for a caller that has a human in front of
+        it. ``register_lecturer`` answers a fold match by returning the spelling
+        already on the roster, and all three ``ui/app.py`` call sites write that
+        string straight onto ``cls["lecturer"]``. When the match is a genuine
+        collision rather than a re-casing, that is a lesson changing owner: a
+        class typed for *İlgin* becomes *Ilgın's*, is checked against *Ilgın's*
+        availability, and *İlgin* never enters ``state["lecturers"]`` at all --
+        so no UI can ever record their unavailable hours. Two real Turkish given
+        names collide that way (Ilgın/İlgin, Sıla/Sila): ``fold_text`` sends
+        every dotted and dotless I to ASCII ``i``.
+
+        The importer refuses an entire workbook for that same collision
+        (``errors.teacher_names_fold_together``), which is right where nobody is
+        watching; the form used to accept it in silence, which is the one policy
+        of the two that cannot be defended. This query is what lets the form
+        speak while leaving ``register_lecturer``'s contract alone -- returning
+        a tuple from it instead breaks all nine tests that pin the current
+        return value, measured, whereas nothing that only *adds* a query breaks
+        any of them.
+
+        Returns None -- "nothing to say" -- for a blank name, for no match, for
+        an exact match ANYWHERE on the roster, and for a match that differs
+        only by case (``_same_name_other_case``). Those last two exemptions are
+        load-bearing in two directions: re-typing a listed teacher in another
+        casing must keep resolving silently to the roster spelling, and a
+        dialog raised on an exact match would block
+        ``tests/test_ui_affordances.py``'s ``_add_class_at`` run forever under
+        the offscreen platform -- measured, a mutation that made an exact match
+        prompt hung that module past a 150 s timeout rather than failing it.
+
+        "Anywhere" is the word this got wrong when it shipped: the loop
+        returned at the first fold match and so never reached a later exact
+        one. ``_resolve_roster_spelling`` holds the corrected rule, and holds
+        it for ``register_lecturer`` too, so the answer here cannot drift from
+        the assignment it describes again.
+
+        Read-only on purpose: ``.get`` rather than ``register_lecturer``'s
+        ``setdefault``, no append. A UI asking "what would happen?" must not be
+        what makes it happen. Both go through one resolver, so the name
+        reported is exactly the name that would be assigned.
+        """
+        clean = (name or "").strip()
+        if not clean:
+            return None
+        spelling, collides = _resolve_roster_spelling(
+            state.get("lecturers") or [], clean)
+        return spelling if collides else None
+
+    @staticmethod
+    def reconcile_placements(state) -> "ReconcileReport":
+        """Clear every placement, pin or room constraint that points at an axis
+        value the state no longer has. Returns the affected class dicts.
 
         ST-DATA-004. Removing a day, hour, room or lecturer in Setup used to
         leave the classes already placed there pointing at something that no
         longer exists — orphans reachable through completely ordinary UI use,
         which then crashed analytics, export and reschedule (ST-DATA-003).
+
+        The constraint half is B4 and arrived three phases later: a dangling
+        room name in ``required_classrooms`` / ``excluded_classrooms`` is the
+        same orphan wearing different clothes. See the comment at the sweep.
+
+        The return value is a ``ReconcileReport`` — a ``list`` of the affected
+        classes, exactly as before, carrying one extra attribute
+        (``lost_room_requirements``) for the subset whose room requirement was
+        not narrowed but **erased**. Additive on purpose: every existing caller
+        reads the list and nothing else.
 
         It lives in core rather than in ``SetupDialog`` so that import, undo and
         any future entry point get the same repair; dialogs writing live state
@@ -991,7 +1225,7 @@ class SchedulingWorkflow:
         slots = set(state.get("slots") or [])
         rooms = set(state.get("classrooms") or [])
         lecturers = set(state.get("lecturers") or [])
-        affected = []
+        affected = ReconcileReport()
         for cls in state.get("classes", []):
             physical = needs_physical_room(cls)
             name = (cls.get("lecturer") or "").strip()
@@ -1017,6 +1251,110 @@ class SchedulingWorkflow:
                     or not lecturer_ok):
                 mark_unplaced(cls)
                 touched = True
+
+            # B4 — the same repair, applied to the two fields that hold room
+            # NAMES rather than a placement.
+            #
+            # `required_classrooms` / `excluded_classrooms` are literal names by
+            # design: the importer resolves `required_room_type` down to names
+            # (data_io/importer.py:456-468) because that is the one room
+            # constraint the solver, the conflict graph, the negotiator and the
+            # class dialog all already read. A name is not a stable key.
+            # `SetupDialog._ok` assigns `state["classrooms"] = rooms` as a plain
+            # list (ui/dialogs.py:1966), so renaming "Lab 1" to "Lab A" reaches
+            # state as nothing but a different string and leaves the constraint
+            # naming a room that no longer exists.
+            #
+            # Left alone the two fields fail in OPPOSITE directions, both
+            # silently:
+            #   required — `get_physical_room_candidates` (core/models.py:557)
+            #     keeps only rooms that are IN the list, so a stale name
+            #     intersects nothing, the candidate set collapses to [] and the
+            #     class can never be placed again: not by drag, not by the
+            #     greedy pass, not by the solver.
+            #   excluded — the filter at core/models.py:559 matches nothing, so
+            #     the exclusion quietly stops applying and the class becomes
+            #     eligible for the very room the user forbade. That one produces
+            #     a WRONG schedule rather than none, which is the worse of the
+            #     two and is why this sweep covers both fields.
+            #
+            # Dropping the name is safe ONLY because the class then lands in
+            # `affected`. `[]` means "any room" everywhere in core
+            # (models.py:557), so an unreported drop would turn "must be in the
+            # physics lab" into "anywhere at all" — ST-FUNC-009, the exact
+            # failure the importer's type resolution was written to prevent.
+            # `affected` is what raises the toast at ui/app.py; a version of
+            # this sweep that repaired the field without reporting would be a
+            # second bug, not a fix.
+            #
+            # That argument needed one more piece than it had, because
+            # `affected` is a COUNT to both call sites and the two outcomes it
+            # was covering are not the same event. Measured on one Setup OK
+            # renaming "Lab 1" -> "Lab A" over two classes:
+            #
+            #   required ['Lab 1','Lab 2'] -> ['Lab 2']  candidates ['Lab 2']
+            #   required ['Lab 1']         -> []         candidates ALL rooms
+            #
+            # and one message for both: "2 class(es) were repaired". Driven to
+            # the end through `place_batch`, the second class — a physics lab
+            # lesson — was auto-placed into "Hall A", the lecture hall. That is
+            # the ST-FUNC-009 inversion arriving through the repair written to
+            # prevent it. So the erasure is recorded separately, WITH the class
+            # and the room names, in `lost_room_requirements`.
+            #
+            # Why erase at all, rather than keep the dangling name? Because
+            # keeping it is not a state the app can hold. `AddClassDialog._ok`
+            # rebuilds both room fields from the LIVE room list
+            # (ui/dialogs.py:2695-2696), so opening Edit Class on that lesson
+            # and pressing OK deletes the name anyway — no toast, no undo entry,
+            # on a field the user never touched. Meanwhile the class is
+            # unplaceable by every path in the app for a reason no screen
+            # displays (`get_physical_room_candidates` -> []). The real choice
+            # is between two deletions, and only one of them names the lesson
+            # and the room in the warning log, where a human can read it and
+            # type the room back. Undo covers the two Setup entry points and
+            # the import transaction rolls back, so with the message there is a
+            # way back from all three; without it there is none.
+            #
+            # Narrowing is deliberately NOT reported this way. The class is
+            # still constrained, the schedule it produces is still legal, and a
+            # school that renames one room must not get a wall of text —
+            # `tests/test_setup_reconcile.py` holds the quiet cases quiet.
+            #
+            # `excluded_classrooms` is not tracked here either, and that is a
+            # judgement, not an oversight: an exclusion naming a room that does
+            # not exist forbids nothing already (models.py:559 matches on the
+            # same exact `in`), so emptying it changes no scheduling outcome.
+            # The residual harm is that the NAME is gone if the room comes
+            # back, which is a smaller and different claim than "this lesson
+            # can now go anywhere".
+            #
+            # Not guarded by `physical`, unlike the three placement checks
+            # above. An online class carrying a stale room name is inert today
+            # and becomes the bug above the moment the user switches it back to
+            # face-to-face, and the cost of sweeping it is one toast the user
+            # can act on rather than a constraint that silently evaporated.
+            #
+            # Repairing this here rather than in the dialog also matters because
+            # the dialog DESTROYS the evidence: `AddClassDialog.__init__` builds
+            # its room checkboxes from the live room list (ui/dialogs.py:2500,
+            # 2513) and `_ok` rebuilds both fields from those same registries
+            # (:2695-2696), so a stale name has no checkbox and merely opening
+            # Edit Class and pressing OK deletes the constraint — no toast, no
+            # undo entry, on a field the user never touched.
+            for field in ("required_classrooms", "excluded_classrooms"):
+                named = cls.get(field) or []
+                kept = [r for r in named if r in rooms]
+                if len(kept) != len(named):
+                    cls[field] = kept
+                    touched = True
+                    if field == "required_classrooms" and named and not kept:
+                        # `named` is the pre-sweep list object; `cls[field]`
+                        # has already been rebound, so copy it rather than
+                        # handing the caller a reference it could mutate.
+                        affected.lost_room_requirements.append(
+                            (cls, list(named)))
+
             if touched:
                 affected.append(cls)
         return affected

@@ -6,9 +6,9 @@ Phase 6 deleted the app's original solver family from ``core/logic.py``
 enforced a weaker rule set than the optimized path. The deletion removed the
 definitions and left **three calls to two of them standing**::
 
-    core/logic.py:729   find_conflicting_classes(state, cls, day, slot, room)
-    core/logic.py:754   find_conflicting_classes(state, new_cls, day, time_, room)
-    core/logic.py:1036  _get_valid_slots(state, cls, room_occ, lect_occ, group_occ)
+    core/logic.py   find_conflicting_classes(state, cls, day, slot, room)
+    core/logic.py   find_conflicting_classes(state, new_cls, day, time_, room)
+    core/logic.py   _get_valid_slots(state, cls, room_occ, lect_occ, group_occ)
 
 Nothing noticed for a phase, because Python resolves a global at *call* time
 and the three functions holding these calls — ``_find_candidate_slots``,

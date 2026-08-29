@@ -64,6 +64,19 @@ class InfeasibilityAnalyzer:
     """
 
     def __init__(self, state, validator, generator):
+        """All three are REQUIRED. ``validator`` and ``generator`` are
+        dereferenced unconditionally by ``analyze_class``, so passing ``None``
+        for either raises ``AttributeError`` on the first call rather than at
+        construction.
+
+        Recorded rather than guarded, deliberately (Phase 9, section C item 7).
+        The crash reproduces in one line, but ``ConstraintNegotiator`` is the
+        only site in the whole package that constructs this class and it cannot
+        pass ``None``: there is no menu action, no import and no solve that
+        reaches it, so a guard clause would buy a different exception message
+        for a caller that does not exist. This sentence is the cheap half — it
+        stops the next reader finding out by running it.
+        """
         self.state = state
         self.validator = validator
         self.generator = generator

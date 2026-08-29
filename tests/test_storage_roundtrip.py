@@ -590,11 +590,11 @@ def test_a_real_fernet_token_is_still_routed_to_the_fernet_branch(dersis_home):
 # ``scratchpad/probe_data013.py``), across every producer that reaches
 # ``storage.save_encrypted`` / ``append_encrypted_entry``:
 #
-#   learning/feedback_logger.py:66      the feedback log
-#   learning/preference_learner.py:304  the learned weights
-#   ui/app.py:2150                      the settings container
-#   ui/app.py:2934                      File > Save
-#   ui/first_run.py:80                  the first-run starter file
+#   learning/feedback_logger.py::_write_entry     the feedback log
+#   learning/preference_learner.py::_save_weights the learned weights
+#   ui/app.py::_auto_save                         the settings container
+#   ui/app.py::_do_save                           File > Save
+#   ui/first_run.py::_write_flag                  the first-run starter file
 #
 # * ``new_state()`` + ``new_class()`` + ``mark_placed()`` carry no non-string
 #   key and no non-finite float; ``years``, ``classroom_capacities`` and
@@ -605,11 +605,11 @@ def test_a_real_fernet_token_is_still_routed_to_the_fernet_branch(dersis_home):
 #   100 steps of momentum, measured;
 # * the importer coerces every name through ``_cell_text``, so an Excel room
 #   literally named ``42`` arrives as ``"42"`` (and a ``NaN`` cell as ``""``);
-# * the package's only non-finite float is ``schedule_optimizer.py:385``
+# * the package's only non-finite float is ``schedule_optimizer.py::optimize``'s
 #   ``global_best_quality = float("inf")``, a loop sentinel that is compared
 #   and reassigned and never leaves its scope;
 # * the only numeric dict keys anywhere in the package are local lookup tables
-#   (``ui/app.py:4963``/``:5015`` tab-index to export mode) and splitter size
+#   (``ui/app.py``'s tab-index to export mode maps) and splitter size
 #   lists — nothing that is persisted.
 #
 # The pins stay ``strict``: they are the contract on the *format*, so the day
@@ -717,10 +717,11 @@ def test_no_persisted_payload_needs_the_two_pins_above(dersis_home, make_preset)
 
     So this walks what the three real producers actually hand to
     ``storage.save_encrypted`` / ``append_encrypted_entry``: a fully-shaped
-    saved state (``ui/app.py:2934``, and the ``"state"`` half of the settings
-    container at ``ui/app.py:2150``), the learned-weights payload
-    (``learning/preference_learner.py:304``), and a feedback entry read back
-    off the log (``learning/feedback_logger.py:66``).
+    saved state (``ui/app.py::_do_save``, and the ``"state"`` half of the
+    settings container written by ``ui/app.py::_auto_save``), the
+    learned-weights payload (``learning/preference_learner.py::_save_weights``),
+    and a feedback entry read back off the log
+    (``learning/feedback_logger.py::_write_entry``).
 
     A failure does not mean this test is wrong. It means ST-DATA-013 has
     acquired a production producer and has stopped being a library curiosity —
@@ -1210,7 +1211,8 @@ def test_appending_to_an_unreadable_legacy_log_quarantines_its_bytes(dersis_home
 
     ``append_encrypted_entry`` only appends in place when it finds the ``EGL1``
     magic. Anything else — a legacy single-array log, or a file too damaged to
-    identify — takes the conversion branch (``storage.py``:544-549), which
+    identify — takes the conversion branch in
+    ``storage.py::append_encrypted_entry``, which
     *does* replace the file. That branch is allowed to, but only because it
     moves the original into ``backups/`` first, under a ``_corrupt_<ts>`` name
     so a quarantined file is distinguishable from a healthy backup.

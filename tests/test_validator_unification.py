@@ -4,8 +4,8 @@ DERSİS decides "may this lesson sit in this cell?" in four different places, an
 they do not agree:
 
 **A — the authority.** ``scheduler_app/core/constraint_validator.py``,
-``ConstraintValidator``: ``respects_constraints`` (:51), ``check_placement``
-(:90), ``check_placement_explained`` (:116), ``find_conflicts`` (:212). It is
+``ConstraintValidator``: ``respects_constraints``, ``check_placement``,
+``check_placement_explained``, ``find_conflicts``. It is
 occupancy-map based and checks grid membership, allow/exclude days and times,
 required/excluded rooms, room capacity, and lecturer availability across the
 class's *whole* duration.
@@ -86,7 +86,7 @@ nothing at all. Every §5 test therefore carries a companion class with an
 unrestricted lecturer that the same call *must* place.
 
 **Trap 3 — self-conflict.** ``logic.find_conflicts`` skips the candidate by
-object identity (``existing is candidate``, logic.py:255) while
+object identity (``existing is candidate``, in ``logic.py``) while
 ``ConstraintValidator`` skips it only via an explicit ``exclude_ids``. Comparing
 the two on an already-placed class without passing ``exclude_ids`` produces a
 fake divergence. ``_authority`` below always excludes the class under test.
@@ -177,7 +177,7 @@ def _authority_verdict(state, cls, day, slot):
 def _drop_verdict(state, cls, day, slot):
     """(valid, room, stage) — the production drag-and-drop verdict.
 
-    Mirrors ``ui/app.py::_execute_drop`` (:3910-3984) phase for phase: basic
+    Mirrors ``ui/app.py::_execute_drop`` phase for phase: basic
     validation, then room selection, then classroom-level constraints, then the
     conflicts gate. Everything below the QMessageBox calls is reproduced; the
     QMessageBox calls themselves are the only thing left out, which is why this
@@ -491,8 +491,8 @@ def test_drop_room_picker_returns_a_room_the_authority_would_accept():
     ``models.get_room_candidates`` considers legal for the lesson.
 
     A failure means a drag-and-drop commits a *physical classroom* onto an
-    online lesson (``ui/app.py:3979`` calls ``mark_placed(cls, day, slot,
-    room)`` unconditionally), while ``apply_reschedule`` stores ``None`` for the
+    online lesson (``ui/app.py::_execute_drop`` calls ``mark_placed(cls, day,
+    slot, room)`` unconditionally), while ``apply_reschedule`` stores ``None`` for the
     same lesson — so the same online lesson shows a room or no room depending
     on whether the user dragged it or the optimizer placed it, and exports and
     room-load analytics disagree with the timetable.
@@ -817,7 +817,7 @@ def test_batch_schedule_keeps_locked_classes_put():
     """Regression guard for ST-SCHED-007 (passes today — keep it passing).
 
     ``batch_schedule`` is the one member of the legacy family that already
-    excludes ``protection == "locked"`` from its flexible set (logic.py:888-891).
+    excludes ``protection == "locked"`` from its flexible set (in ``logic.py``).
     Phase 3 rewrites all three together; if this guard goes red, the rewrite
     dropped the one protection check that was already there and locked lessons
     become movable in the entry point that ``ui/dialogs.py`` actually imports.
@@ -885,8 +885,8 @@ def test_find_conflicts_explains_a_midblock_availability_rejection():
 
     A duration-2 lesson whose lecturer is free at 09:00 but not at 10:00.
     ``check_placement`` refuses it (``respects_constraints`` walks the whole
-    duration, constraint_validator.py:76-87) but ``find_conflicts`` only tests
-    ``start_slot`` (:250), so it returns an empty list.
+    duration, in ``constraint_validator.py``) but ``find_conflicts`` only tests
+    ``start_slot``, so it returns an empty list.
 
     A failure means the user drops a lesson, DERSİS refuses it, and the
     "why not?" panel is blank — there is nothing to read and nothing to fix.

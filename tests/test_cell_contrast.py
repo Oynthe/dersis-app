@@ -57,8 +57,11 @@ from scheduler_app.core.logic import lighten_color
 AA_NORMAL_TEXT = 4.5
 
 # The three factors renderer.py applies to a year colour to get a cell
-# background: 0.45 joint cell (renderer.py:95), 0.50 sequential sub-block
-# (renderer.py:673), 0.60 everything-matrix (renderer.py:303).
+# background: 0.45 joint cell (renderer.py::_filtered_entries), 0.50
+# sequential sub-block (renderer.py::_paint_sequential), 0.60
+# everything-matrix (renderer.py::everything_blocks). Named, not numbered:
+# the line numbers that stood here were measured wrong — ":673" for the 0.50
+# factor landed in _paint_joint, and the call is in _paint_sequential.
 LIGHTEN_FACTORS = (0.45, 0.50, 0.60)
 
 

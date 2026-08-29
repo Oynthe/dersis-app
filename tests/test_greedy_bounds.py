@@ -134,7 +134,7 @@ the code.
 
 **Which lane this module runs in.** Not the one an earlier version of this
 paragraph claimed. ``test_greedy_phase_respects_the_wall_clock_budget`` carries
-``@pytest.mark.slow`` (line 482) and so does everything else expensive here, so
+``@pytest.mark.slow`` and so does everything else expensive here, so
 the Validate job's ``-m "not slow"`` skips exactly the halves that matter. Since
 ac4ac17 the whole module — slow half included — is collected unfiltered by the
 engine job in ``.github/workflows/ci.yml``, which is where its wall-clock

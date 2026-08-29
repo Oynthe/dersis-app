@@ -1,8 +1,7 @@
 """A repaint must not be a disk write, and a click must not be a repaint.
 
-ST-PERF-002 (High) · ``app.py:2098-2102`` (``refresh_grid``),
-``app.py:1951-1986`` (``_auto_save``), ``app.py:1887-1926``
-(``_read_settings_container``)
+ST-PERF-002 (High) · ``app.py::refresh_grid``, ``app.py::_auto_save``,
+``app.py::_read_settings_container``
     ``refresh_grid`` ends with ``self._auto_save()``, and ``_auto_save``
     *decrypts, re-serialises, re-encrypts and rewrites the entire settings
     container* every single time. The audit measured one such round trip at
@@ -12,9 +11,9 @@ ST-PERF-002 (High) · ``app.py:2098-2102`` (``refresh_grid``),
     ``save_encrypted`` calls** — 467 KB of AES-GCM traffic at 25 classes,
     1.5 MB at 80, 4.6 MB at 250, to persist a state that never changed.
 
-ST-UI-009 (Medium) · ``app.py:3269-3322`` (``_apply_class_selection``),
-``app.py:3233-3244`` (``_clear_class_selection``), ``app.py:3367-3379``
-(``_select_empty_slot``), ``app.py:1484`` (``unplaced_list.itemSelectionChanged``)
+ST-UI-009 (Medium) · ``app.py::_apply_class_selection``,
+``app.py::_clear_class_selection``, ``app.py::_select_empty_slot``,
+``unplaced_list.itemSelectionChanged`` (wired in ``app.py::_build_main``)
     Every selection — clicking a lesson, clicking an empty slot, clicking a row
     in the Unplaced list — runs a full ``_refresh_open_slots``: the panel's
     entire widget tree is torn down and rebuilt and the whole validity analysis
@@ -48,7 +47,7 @@ non-negotiable:
 And one thing the fix must **not** do. "Skip side-panel recompute on
 selection-only changes" cannot be read as "the open-slots panel never recomputes
 on selection": that panel is *deliberately* contextual — with one class selected
-it answers "where can this class legally go?" (app.py:3022-3040) — so the
+it answers "where can this class legally go?" (app.py::_refresh_open_slots) — so the
 cheapest way to zero every count in section 2 is also the way that deletes a
 feature. What is waste is a recompute for a selection that **did not change**,
 and that is what section 2 asserts, alongside a guard
@@ -115,7 +114,8 @@ through a Qt signal that was connected to a *bound method* at ``__init__`` time:
 PyQt captured the original function then, and a later attribute rebind is
 invisible to it. Exactly one counted name is connected that way —
 ``self.unplaced_list.itemSelectionChanged.connect(self._refresh_open_slots)``
-(app.py:1484) — so ``..._selecting_in_the_unplaced_list_...`` deliberately does
+(wired in ``app.py::_build_main``) — so ``..._selecting_in_the_unplaced_list_...``
+deliberately does
 not count that edge and proves the signal fired by its observable effect
 instead. Everything the unplaced path could newly reach (``refresh_grid`` and
 its callees) is still counted, because those go through ``self.``.
@@ -729,7 +729,7 @@ def test_selecting_a_lesson_still_filters_the_open_slots_panel_to_it(clicky):
 
     The one side panel that legitimately depends on the selection is Open Slots:
     with a single class selected it switches from "every free room-slot" to
-    "every slot this class could legally go in" (app.py:3022-3040). "Skip
+    "every slot this class could legally go in" (app.py::_refresh_open_slots). "Skip
     side-panel recompute on selection" must therefore not be implemented by
     deleting that call — the cheapest way to make every count in this module
     zero is also the way that silently removes the feature.
@@ -781,7 +781,7 @@ def test_reselecting_the_lesson_that_is_already_selected_does_no_work(clicky):
     """ST-UI-009 — clicking the selected lesson again must cost nothing.
 
     ``_apply_class_selection`` ends in an unconditional ``_refresh_open_slots()``
-    (app.py:3322), so a second click on the same lesson tears down and rebuilds
+    (app.py), so a second click on the same lesson tears down and rebuilds
     the entire open-slots panel and re-runs ``find_valid_options`` over the whole
     grid to arrive at the answer already on screen. Measured on this tree:
     9 ms at 25 classes, 39 ms at 80.
@@ -814,7 +814,7 @@ def test_reselecting_the_lesson_that_is_already_selected_does_no_work(clicky):
 def test_reselecting_the_empty_slot_that_is_already_selected_does_no_work(clicky):
     """ST-UI-009 — clicking the selected empty slot again must cost nothing.
 
-    ``_select_empty_slot`` (app.py:3367-3379) calls ``_clear_class_selection()``
+    ``_select_empty_slot`` (app.py) calls ``_clear_class_selection()``
     — and therefore ``_refresh_open_slots()`` — *before* the ``is`` check that
     would have told it the slot was already selected. Measured on this tree:
     36 ms at 25 classes, 81 ms at 80, every time the user clicks the same blank
@@ -846,7 +846,8 @@ def test_selecting_in_the_unplaced_list_writes_nothing(clicky, saves, qapp):
     """ST-UI-009 — the third selection path must be free too.
 
     ``unplaced_list.itemSelectionChanged`` is wired straight to
-    ``_refresh_open_slots`` (app.py:1484). Highlighting a row in a list is the
+    ``_refresh_open_slots`` (wired in ``app.py::_build_main``). Highlighting a
+    row in a list is the
     least consequential thing a user can do, and it must not reach the disk.
 
     Note on what is *not* asserted: that signal was connected to a **bound

@@ -176,7 +176,7 @@ def test_an_immovable_legacy_file_still_lets_the_app_start(
         dersis_home, tmp_path, monkeypatch):
     """``migrate_legacy_files()`` runs before any window exists, so it must return.
 
-    Both callers — ``scheduler_gui.main()`` at line 196 and
+    Both callers — ``scheduler_gui.main()`` and
     ``SchedulerApp.__init__`` — call it unguarded, so anything it raises becomes
     a startup crash box with no window behind it. Every failure path was already
     contained except one: the ``_backup_original`` in the

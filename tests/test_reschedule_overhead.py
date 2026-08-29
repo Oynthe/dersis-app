@@ -94,7 +94,8 @@ unplaced class.** Concretely, ``RescheduleResult.negotiation_result``:
 * is computed on first attribute read, doing exactly one ``analyze_class``
   and one ``suggest_for_class`` per unplaced class;
 * is cached, so the three reads the UI already performs
-  (``scheduler_app/ui/app.py`` lines 2842, 2881, 2882) cost one computation;
+  (all three in ``scheduler_app/ui/app.py::_on_solve_finished``) cost one
+  computation;
 * returns the *same dict whenever it is read* — in particular a read after
   ``apply_reschedule()`` returns what a read before it would have returned;
 * stays ``None``, with zero work done, when nothing is unplaced.
@@ -113,8 +114,9 @@ The trap laziness sets, and why the last bullet above is not optional
 --------------------------------------------------------------------
 ``negotiate_after_optimization`` analyses ``self.state``, and the reschedule
 proposal is **not** committed until ``apply_reschedule()``. ``ui/app.py``
-reads ``result.negotiation_result`` on *both* sides of that call — line 2842
-feeds ``BulkResultsDialog`` before, lines 2881-2882 feed the warning log
+reads ``result.negotiation_result`` on *both* sides of that call, all inside
+``_on_solve_finished`` — the first read feeds ``BulkResultsDialog`` before, two
+more feed the warning log
 after. A lazy property naively evaluated against the live state would
 therefore hand the dialog and the warning log **different answers for the
 same reschedule**. Measured on this module's own fixture, recomputing after
@@ -138,17 +140,17 @@ What this module does NOT prove — read before calling ST-PERF-007 closed
 **Deferring the pass in ``workflow.py`` alone saves the shipped app exactly
 zero.** Every test here stops at the ``SchedulingWorkflow`` boundary, and at
 that boundary laziness is worth the full 5.8 s. But the only production
-caller reads the value immediately anyway: ``ui/app.py:2842`` passes
-``result.negotiation_result`` **by value** into ``BulkResultsDialog(...)``,
-and ``dialogs.py:3941-3983`` builds the negotiation tab inline in that
-dialog's ``__init__`` — the truthiness test at 3941 and the
-``.get("class_reports")`` at 3942 both run before the dialog is ever shown.
+caller reads the value immediately anyway: ``ui/app.py::_on_solve_finished``
+passes ``result.negotiation_result`` **by value** into
+``BulkResultsDialog(...)``, and ``dialogs.py::BulkResultsDialog.__init__``
+builds the negotiation tab inline — its truthiness test and its
+``.get("class_reports")`` both run before the dialog is ever shown.
 So a lazy property whose first read is that constructor argument moves the
 work a few lines later in the same blocking stretch and changes nothing the
 user can feel.
 
 The workflow-level deferral is a **precondition** for the saving, not the
-saving. Collecting it requires the second half: ``ui/app.py:2842`` must hand
+saving. Collecting it requires the second half: ``ui/app.py::_on_solve_finished`` must hand
 the dialog a deferred source rather than a materialised dict, and
 ``dialogs.py`` must build the negotiation tab when that tab is first shown.
 The de-duplication in §3a is the part that pays off unconditionally today —
@@ -451,7 +453,7 @@ def test_negotiation_result_is_computed_once_and_cached(partial_schedule,
     """ST-PERF-007 — repeated reads must be free.
 
     ``ui/app.py`` reads ``result.negotiation_result`` three times per
-    reschedule (lines 2842, 2881, 2882). A failure means a lazy fix that
+    reschedule, all three inside ``_on_solve_finished``. A failure means a lazy fix that
     recomputes on every read has made the common path *slower* than the eager
     version it replaced.
     """
@@ -511,8 +513,9 @@ def test_negotiation_result_still_says_what_it_used_to(partial_schedule,
         "the user is told nothing about why those lessons are missing.")
     assert isinstance(negotiation, dict), (
         "negotiation_result must stay a plain attribute read yielding the "
-        f"report dict, not a {type(negotiation).__name__}. ui/app.py:2842, "
-        "ui/app.py:2881-2882 and stress-test/tests/scheduler_benchmark.py:92 "
+        f"report dict, not a {type(negotiation).__name__}. "
+        "ui/app.py::_on_solve_finished and "
+        "stress-test/tests/scheduler_benchmark.py "
         "all read it as an attribute; turning it into a method is a breaking "
         "API change, not a deferral.")
     assert set(negotiation) >= {"class_reports", "diagnostic_summary",
@@ -548,8 +551,9 @@ def test_negotiation_result_survives_apply_unchanged(partial_schedule,
     """ST-PERF-007 — the answer must not depend on *when* it is read.
 
     ``ui/app.py`` reads ``negotiation_result`` before ``apply_reschedule()``
-    (line 2842, feeding the dialog) and again after it (lines 2881-2882,
-    feeding the warning log). A failure means the dialog and the warning log
+    (feeding the dialog) and again after it (feeding the warning log), all
+    three reads inside ``_on_solve_finished``. A failure means the dialog and
+    the warning log
     describe the same reschedule differently — the user is told a class has
     six free slots, then told it has none.
     """
@@ -615,8 +619,8 @@ def test_negotiation_pass_leaves_constraints_untouched(partial_schedule):
     form of this test still passes under the proposed fix, while the form
     below fails both before and after it. ST-DATA-011 is a property of the
     negotiator, so it is asserted against the negotiator — on the live state,
-    which is also how ``ui/app.py``'s "why unplaced?" negotiators (lines 3831,
-    3845) invoke it.
+    which is also how ``ui/app.py``'s "why unplaced?" negotiator
+    (``_run_auto_negotiation``) invokes it.
     """
     state, placed, unplaced = partial_schedule
 

@@ -70,6 +70,7 @@ from scheduler_app.dialogs import (
 )
 from scheduler_app.widgets import Toast, WarningLogPanel, YearLegend
 from scheduler_app.ui.bug_report import BugReportButton, BugReportDialog
+from scheduler_app.ui.validation_report import show_validation_report
 from scheduler_app.icons import (
     icon_add_class, icon_placement, icon_reschedule, icon_setup,
     icon_add_single, icon_bulk_add, icon_place, icon_unplace, icon_delete,
@@ -706,8 +707,11 @@ class DraggableUnplacedList(QListWidget):
                 unique.append(cls)
         if not unique:
             return
-        # Undo snapshot was already pushed by _start_drag_gfx before the
-        # pre-emptive mark_unplaced, so it captures the correct placed state.
+        # No undo bookkeeping here. _start_drag_gfx took a snapshot before its
+        # pre-emptive mark_unplaced and is HOLDING it (Phase 9); setting
+        # _drag_success below is what tells its tail to record that snapshot,
+        # under the "unplace" label it already carries. Pushing one here would
+        # deep-copy the lesson as already unplaced and land a second entry.
         for cls in unique:
             mark_unplaced(cls)
         self.app._drag_success = True
@@ -840,6 +844,218 @@ MIN_ON_SCREEN_FRACTION = 0.25
 SIDEBAR_REOPEN_HYSTERESIS = 24
 
 
+def _commit_undo_entry(undo_stack, redo_stack, max_undo, label, snapshot):
+    """Record *snapshot* as a COMPLETED action: append, evict, kill redo.
+
+    The three statements are one invariant. Before Phase 9 they were written
+    out twice — `SchedulerApp._push_undo` and `SchedulerApp.edit_setup` — and
+    the drag path was about to make it three; three copies of an invariant is
+    how they drift, and the drag's copy had already drifted.
+
+    Both statements after the append are irreversible, which is why every
+    caller must be a commit point and not a hopeful one:
+
+      * at `max_undo` the eviction drops `undo_stack[0]`, and the only
+        compensation anyone ever wrote for a speculative push is a `pop()` —
+        which takes from the TOP. The oldest entry does not come back.
+      * `redo_stack.clear()` throws away a future the user can still ask for
+        with Ctrl+Y, and nothing anywhere reconstructs it.
+
+    Phase 4 learned this on Setup, which is why `edit_setup` holds
+    `before_setup` in a local and only records it `if dlg.result`. Phase 9
+    learned it again on drag: `_start_drag_gfx` recorded before `drag.exec()`
+    and popped on cancel, so an abandoned or refused gesture — a complete
+    no-op on the timetable — destroyed the whole redo stack and, at the cap,
+    one undo step that no pop could put back.
+
+    Module scope, not a `SchedulerApp` method: it touches nothing on the
+    window, and `SchedulerApp` is sitting exactly on the 154-method ceiling
+    `tests/test_ui_complexity_ratchet.py` holds it to (ST-ARCH-005).
+    """
+    undo_stack.append((label, snapshot))
+    if len(undo_stack) > max_undo:
+        undo_stack.pop(0)
+    # Any new action clears the redo stack
+    redo_stack.clear()
+
+
+def _conflict_label(cls):
+    code = cls.get("class_code", "")
+    return f"[{code}] {cls['name']}" if code else cls["name"]
+
+
+# Three lessons named, then "…". A room a school actually deletes can be
+# required by every class in a department, and the message goes to a 3 s
+# toast 350 px wide (widgets.py:48) as well as to the warning log — an
+# unbounded list there is the ST-UI-B6 shape (500 rows measured at
+# 24 110 px tall). The COUNT in the sentence is the true total, so the
+# truncation costs the user names, never the size of the problem. Same
+# bound and same reason as `_MAX_CONFLICT_LOG_ENTRIES` above.
+_MAX_LISTED_LOST_REQUIREMENTS = 3
+
+
+def _repair_report_message(affected):
+    """What to tell the user about a finished reconcile, or "" for nothing.
+
+    Two sentences, not two toasts: `Toast.__init__` pins every toast to the
+    same bottom-right corner of the window (widgets.py:65-70), so a second
+    one raised in the same breath lands on top of the first and the user
+    reads whichever won. One message, word-wrapped, reaches both channels
+    `_show_toast` writes to.
+
+    The first sentence is the count and is unchanged — the total is what
+    `tests/test_setup_reconcile.py::test_removal_tells_the_user_how_many_classes_were_unplaced`
+    asks for, and an ordinary Setup edit must not grow past it.
+
+    The second exists because the count could not tell two different events
+    apart. `reconcile_placements` narrows one class's room requirement and
+    empties another's in the same sweep, and an empty `required_classrooms`
+    means "any room" everywhere in core (core/models.py:557). Measured
+    before this, one rename "Lab 1" -> "Lab A" over two classes:
+
+        required ['Lab 1','Lab 2'] -> ['Lab 2']   still constrained
+        required ['Lab 1']         -> []          any room at all
+        the one message for both:  "2 class(es) were repaired ..."
+
+    and `place_batch` then put the physics-lab lesson in "Hall A", the
+    lecture hall. The user cannot act on that without the lesson and the
+    room name, and the room name is the half the sweep destroyed — so it is
+    carried in `lost_room_requirements` and printed here.
+
+    `getattr` rather than an attribute read: the import path initialises
+    its own `reconciled` to a plain `[]` before the transaction opens
+    (a rolled-back import must not report anything), and a plain list has
+    no such attribute.
+    """
+    if not affected:
+        return ""
+    parts = [tr("status.classes_repaired_count", n=len(affected))]
+    lost = list(getattr(affected, "lost_room_requirements", ()))
+    if lost:
+        listed = [
+            "%s (%s)" % (_conflict_label(c), ", ".join(rooms))
+            for c, rooms in lost[:_MAX_LISTED_LOST_REQUIREMENTS]
+        ]
+        if len(lost) > len(listed):
+            listed.append("…")
+        parts.append(tr("status.room_requirement_lost",
+                        n=len(lost), lessons="; ".join(listed)))
+    return "\n".join(parts)
+
+
+def _confirm_lecturer_reassignment(parent, state, typed) -> bool:
+    """Ask before the shared fold hands this lesson to a different teacher.
+
+    Returns True to carry on -- the caller then registers the name exactly as
+    before -- and False if the user said this is somebody else, in which case
+    the caller must abandon the operation without touching state.
+
+    ST-UI-020 / ST-FUNC-012. ``fold_text`` is deliberately one rule for both
+    surfaces that ask "is this the same teacher?", and until Phase 9 the two
+    surfaces did opposite things with its answer: the Excel importer refuses a
+    whole workbook (``errors.teacher_names_fold_together``), while this form
+    silently rewrote the class's lecturer to whichever spelling was on the
+    roster first. Ilgın/İlgin and Sıla/Sila are two real pairs of Turkish given
+    names that collide, so "silently" meant a lesson handed to a different
+    human, checked against that human's availability, with the typed teacher
+    never entering ``state["lecturers"]`` at all -- and no dialog, no toast and
+    no log line to look at.
+
+    A prompt rather than the importer's refusal, because the two surfaces
+    differ in exactly one way that matters: there is a human here, holding one
+    name, who is the only party who knows whether these are two people.
+    Refusing would also break the everyday case the fold was added for --
+    re-typing a listed teacher in another casing -- which
+    ``find_lecturer_collision`` keeps silent anyway. Yes is the default, so
+    Enter reproduces the old behaviour for the user who meant the teacher they
+    were offered.
+
+    The message lives here and NOT in ``register_lecturer``: a QMessageBox
+    raised from core opened a real modal under the offscreen platform and hung
+    the whole run when a QApplication happened to be alive, and aborted the
+    process outright when one was not (measured -- ``register_lecturer`` is
+    called directly by non-UI tests).
+
+    Module scope, and *not* a fourth method on ``SchedulerApp``, for the reason
+    ``tests/test_ui_complexity_ratchet.py`` states: the class sits exactly on
+    its 154-method ceiling, and "a new method on this class is a new piece of
+    behaviour that no seam and no test is being asked for". Written this way it
+    is a seam -- it takes the parent widget and the state explicitly, so it can
+    be exercised without building a window. Same move as ``_commit_undo_entry``
+    above and ``ui/validation_report.py``, both of which this phase preferred
+    to raising the ceiling.
+    """
+    existing = SchedulingWorkflow.find_lecturer_collision(state, typed)
+    if existing is None:
+        return True
+    answer = QMessageBox.question(
+        parent, tr("dialogs.lecturer_collision.title"),
+        tr("dialogs.lecturer_collision.body").format(
+            typed=(typed or "").strip(), existing=existing),
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.Yes)
+    return answer == QMessageBox.StandardButton.Yes
+
+
+def _class_form_result(parent, state, edit_cls):
+    """Run the class form until it comes back with a lecturer the user owns.
+
+    Returns the class dict the form produced, or None if the user cancelled.
+    The single entry point for all three call sites that open
+    ``AddClassDialog``, and the reason it exists is the half of B3 that
+    shipped broken.
+
+    "No" HAS to give the form back. The message the guard above shows ends,
+    in all 22 locales, "Choose No to go back and give the new teacher a name
+    that differs by more than that". Nothing went back: each call site was a
+    bare ``return`` executed AFTER the modal had already closed, so the answer
+    that is *honest* -- no, this is a different teacher -- destroyed the class
+    name, targets, duration, participant count and room constraints the user
+    had just typed. Measured on the shipped tree::
+
+        add_class,   No -> classes [], roster unchanged, toasts [], undo 0
+        _edit_class, No -> name 'Fizik II' and participants 27 discarded,
+                           toasts [], undo 0
+
+    with no toast and no undo entry, so there was nothing to see and nothing
+    to recover. Before B3 no path in the app did this, because there was no
+    prompt: the measured case improved and its unmeasured neighbour degraded
+    in silence. Re-showing the dialog seeded with ``dlg.result`` is what makes
+    the sentence true; the alternative was to reword the promise in 22
+    locales, which is fixing the message rather than the behaviour.
+
+    ``edit_cls`` is a class dict, or ``{}`` on the two add paths -- never
+    None. Every read of it in ``AddClassDialog.__init__`` is guarded by ``if
+    edit_cls``, so an empty dict is indistinguishable from None there, and it
+    lets ``unchanged`` be read with one ``.get`` instead of a second branch
+    this module cannot afford: ``ui/app.py`` sits exactly on
+    ``MAX_APP_PY_TOTAL_MCCABE`` (915, measured this phase), and the net of
+    this function against the three call sites it replaces is zero.
+
+    ``typed == unchanged`` is B3's other regression. An edit that leaves the
+    lecturer string exactly as it found it does not get to raise a modal about
+    the lecturer: measured, opening a class already on 'İlgin' and changing
+    ONLY the participant count from 10 to 11 raised the prompt, and Yes then
+    rewrote the lecturer to 'Ilgın'. A dialog may ask about the field the user
+    touched. This is the same shape as B4's "the dialog erases its own
+    evidence", on a different field.
+    """
+    unchanged = edit_cls.get("lecturer")
+    seed = edit_cls
+    while True:
+        dlg = AddClassDialog(parent, state, edit_cls=seed)
+        if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
+            return None
+        typed = dlg.result.get("lecturer")
+        if typed == unchanged or _confirm_lecturer_reassignment(
+                parent, state, typed):
+            return dlg.result
+        # "No" == "these are two different people". Carry everything the user
+        # entered into the next showing so the only thing they have to redo is
+        # the one field the question was about.
+        seed = dlg.result
+
+
 class SchedulerApp(QMainWindow):
     def __init__(self, session=None, server_url=''):
         super().__init__()
@@ -900,13 +1116,25 @@ class SchedulerApp(QMainWindow):
         self._dragging_classes = []
         self._drag_backup = None
         self._drag_success = False
-        # ST-ARCH-012. True between _start_drag_gfx's pre-emptive _push_undo
-        # and whoever consumes it. _execute_drop has to know whether the
-        # entry on top of the stack is THIS drag's: a drag that starts in the
-        # unplaced sidebar (_start_drag_unplaced) pushes nothing, and popping
-        # there destroyed an unrelated action's only snapshot. Measured: the
-        # previous 'unplace' entry was replaced by the drag's, depth unchanged
-        # at 1, and that unplace became permanently un-undoable.
+        # ST-ARCH-012 / Phase 9. `(label, snapshot)` while a grid drag is
+        # live, None otherwise. `_start_drag_gfx` has to snapshot BEFORE its
+        # own pre-emptive `mark_unplaced` — that snapshot is the only record
+        # of where the lesson was — but the gesture may still evaporate, so
+        # the snapshot is HELD here and handed to `_commit_undo_entry` only at
+        # a commit point. It used to go straight onto the undo stack, which
+        # cleared redo and, at the cap, evicted the oldest entry for a gesture
+        # the user then abandoned.
+        self._drag_undo_entry = None
+        # True exactly while `_drag_undo_entry` is held. Two names for one
+        # bit, deliberately: this one states OWNERSHIP — "the pre-gesture
+        # snapshot is this drag's to consume" — and it is what `_execute_drop`
+        # reads to tell a grid drag from a sidebar one. A sidebar drag
+        # (_start_drag_unplaced) holds nothing, and code that consumed the
+        # stack top unconditionally destroyed an unrelated action's only
+        # snapshot: the previous 'unplace' entry was replaced by the drag's,
+        # depth unchanged at 1, so nothing on screen said a thing. The name
+        # predates Phase 9 and now means "held", not "pushed"; it is kept
+        # because renaming it buys no behaviour.
         self._drag_undo_pushed = False
 
         # Undo / Redo stacks (snapshot-based)
@@ -1891,6 +2119,13 @@ class SchedulerApp(QMainWindow):
     def _push_undo(self, label=""):
         """Snapshot the whole application state before a change.
 
+        Snapshot AND commit in one statement, so this is only for a change
+        that is already certain. A gesture that can still be abandoned — the
+        Setup dialog, a drag — must hold its own `copy.deepcopy` and call
+        `_commit_undo_entry` at the commit point instead; that function
+        records what the eviction and the redo clear cost when they fire for
+        an action that never happens.
+
         ST-ARCH-012. This used to deep-copy ``state_data["classes"]`` and
         nothing else, which made Setup permanently un-undoable: Setup rewrites
         the day, slot, classroom, lecturer and year axes, so restoring only the
@@ -1910,12 +2145,8 @@ class SchedulerApp(QMainWindow):
         action stacked on the per-refresh encryption write" -- is stale: Phase 2
         removed that write.
         """
-        snapshot = copy.deepcopy(self.state_data)
-        self._undo_stack.append((label, snapshot))
-        if len(self._undo_stack) > self._max_undo:
-            self._undo_stack.pop(0)
-        # Any new action clears the redo stack
-        self._redo_stack.clear()
+        _commit_undo_entry(self._undo_stack, self._redo_stack, self._max_undo,
+                           label, copy.deepcopy(self.state_data))
 
     def _restore_state(self, snapshot):
         """Replace the live state's CONTENTS with *snapshot*, in place.
@@ -2950,6 +3181,43 @@ class SchedulerApp(QMainWindow):
                 self.state_data["lecturers"] = []
             if "classroom_capacities" not in self.state_data:
                 self.state_data["classroom_capacities"] = {}
+            # DO NOT reconcile here. `core/models.py`'s
+            # `find_off_grid_placements` states the rule this load path lives
+            # under, and states it about itself: it is "Deliberately NOT
+            # called from ``normalize_state_classes`` (and so not from the
+            # .egu load path): unplacing orphans at load time would silently
+            # discard the user's own placements with no way to see or undo it,
+            # which is the same class of bug in a new place. Callers decide
+            # what to do — warn, list, or offer to reconcile."
+            #
+            # Phase 9 put `self._reconcile_after_setup()` on exactly this line
+            # and chose none of the three. Measured on a saved .egu whose
+            # lessons name a teacher absent from `state["lecturers"]` — the
+            # "file from an older build" case it was added for:
+            #
+            #     placed after open      0 of 6
+            #     toasts                 one 3-second count-only warning
+            #     undo depth             0
+            #     placed after Ctrl+Z    0
+            #
+            # and the ORDER is what makes it unrecoverable rather than merely
+            # rude: the three statements below are `_undo_stack.clear()`,
+            # `_redo_stack.clear()` and `mark_current_state_as_baseline()`.
+            # The repair runs, its only witness is thrown away, and the
+            # wrecked state is recorded as "no unsaved changes" — one save and
+            # the term's placements are gone from disk. Every other
+            # `_reconcile_after_setup` call site follows a gesture the user
+            # made and (since this phase) an undo entry; File > Open is the
+            # one place where neither is true.
+            #
+            # The exposure this was meant to close is real and is still open:
+            # a file stranded by an older build opens with dangling
+            # constraints, and `AddClassDialog` rebuilds both room fields from
+            # the LIVE room list (ui/dialogs.py:2695-2696), so merely pressing
+            # OK deletes them. The fix for that is the one the policy names —
+            # warn, or list the affected lessons, or offer to reconcile — not
+            # a silent sweep on a path with no undo. `_auto_load` has the same
+            # exposure for the same reason.
             self.current_file = fname
             self._undo_stack.clear()
             self._redo_stack.clear()
@@ -3143,10 +3411,13 @@ class SchedulerApp(QMainWindow):
         current_count = len(self.state_data.get("classes", []))
         if not enforcer.require_entity_limit(ENTITY_CLASSES, current_count, self):
             return
-        dlg = AddClassDialog(self, self.state_data)
-        if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
+        # The form, plus the collision question and its re-open loop: the name
+        # typed here may fold onto a DIFFERENT teacher already listed, and
+        # registering it would give them the lesson. Nothing below has run
+        # yet, so declining costs the user nothing but the one field.
+        cls = _class_form_result(self, self.state_data, {})
+        if cls is None:
             return
-        cls = dlg.result
         # ST-UI-020: the lecturer combo is editable, so this name may be
         # one the user just typed. Register it BEFORE the undo snapshot,
         # or undo restores a class pointing at a lecturer the restored
@@ -3287,8 +3558,49 @@ class SchedulerApp(QMainWindow):
         if not candidates:
             return 0, 0, False
 
-        self._push_undo(tr("actions.bulk_schedule"))
+        # B1/B2, second site. This was `self._push_undo(...)` right here,
+        # BEFORE `place_batch` had said what it managed to do — the exact
+        # shape Phase 9 removed from `_start_drag_gfx`, in the sibling
+        # gesture. Two shipped gestures reach it: Ctrl+P / "place all
+        # unplaced" (`place_class`), and a multi-selection dragged out of the
+        # sidebar and dropped off-cell (`_execute_drop_anywhere`).
+        #
+        # Phase 9's own commit message analysed this function and picked the
+        # wrong branch: it argued about the `0 placed / 0 unresolved` early
+        # return below and called that unreachable from the UI. The reachable
+        # no-op is `0 placed / N unresolved` — every candidate needs a room
+        # the setup does not contain, say — which sails PAST that early
+        # return, raises an error toast, and used to leave the speculative
+        # entry on the stack. Measured through `win.place_class()`:
+        # placements identical before and after, undo `['toplu planlama']`
+        # left behind, redo depth 0 where it was 1; and at the 50-entry cap
+        # the stack came back starting at 'action-01' — the user's oldest
+        # undoable action evicted for a gesture that moved nothing.
+        #
+        # The gate is the PLACEMENTS, not `result.placed_count`. `placed_count`
+        # counts only the candidates, and Phase 2 of `optimized_batch_schedule`
+        # (core/facade.py) re-solves every existing flexible lesson, so a batch
+        # can place none of its candidates and still have moved lessons that
+        # were already on the grid. `result.rescheduled` is no use either: it
+        # is True whenever Phase 2 ran, including when Phase 2 placed nothing
+        # at all, which is precisely the no-op above.
+        #
+        # The unconditional deepcopy costs 0.8 ms at 80 classes and 2.5 ms at
+        # 250 (measured in `_push_undo`'s docstring) against a solver pass, so
+        # taking it before the outcome is known and discarding it is free.
+        before_batch = copy.deepcopy(self.state_data)
+        placements_before = snapshot_placements(self.state_data)
         result = self._workflow.place_batch(candidates)
+
+        # Above the early return deliberately: `place_batch` can `mark_unplaced`
+        # a candidate whose placement failed live validation without that
+        # candidate reaching either count, so `0/0` is not a guarantee that
+        # nothing moved. The comparison decides; the counts only shape the
+        # message.
+        if snapshot_placements(self.state_data) != placements_before:
+            _commit_undo_entry(self._undo_stack, self._redo_stack,
+                               self._max_undo, tr("actions.bulk_schedule"),
+                               before_batch)
 
         if result.placed_count == 0 and result.unresolved_count == 0:
             return 0, 0, False
@@ -3627,15 +3939,19 @@ class SchedulerApp(QMainWindow):
 
     def _edit_class(self, cls):
         snap_before = capture_snapshot(self.state_data)
-        dlg = AddClassDialog(self, self.state_data, edit_cls=cls)
-        if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
+        # See add_class: nothing is mutated until the user confirms that the
+        # name they typed is not a second teacher the fold merges away — and
+        # passing `cls` is what tells the form which lecturer the user has NOT
+        # touched, so an edit to some other field cannot raise the question.
+        edited = _class_form_result(self, self.state_data, cls)
+        if edited is None:
             return
-        # ST-UI-020: see add_class. The edited name is in dlg.result.
-        dlg.result["lecturer"] = SchedulingWorkflow.register_lecturer(
-            self.state_data, dlg.result.get("lecturer")) or ""
+        # ST-UI-020: see add_class. The edited name is in `edited`.
+        edited["lecturer"] = SchedulingWorkflow.register_lecturer(
+            self.state_data, edited.get("lecturer")) or ""
         self._push_undo(tr("actions.edit").format(name=cls["name"]))
         edit_result = SchedulingWorkflow.apply_class_edit(
-            self.state_data, cls, dlg.result)
+            self.state_data, cls, edited)
         if edit_result.placement_cleared:
             self._show_toast(tr("status.class_unplaced_after_edit"), "warning")
         self._show_toast(tr("status.class_updated"), "success")
@@ -3690,25 +4006,59 @@ class SchedulerApp(QMainWindow):
         snap_before = capture_snapshot(self.state_data)
         lecturer_name = (cls.get("lecturer") or "").strip()
         dlg = SetupDialog(self, self.state_data, focus_lecturer=lecturer_name)
+        # The SAME dialog `edit_setup` opens — every tab editable, only
+        # `focus_lecturer=` differs — so it gets the same undo contract, taken
+        # the same way and gated the same way. It had none, and B4 made that
+        # expensive: `_reconcile_after_setup` now deletes dangling room NAMES
+        # out of `required_classrooms` / `excluded_classrooms`, and a name is
+        # not recoverable by putting the room back. Measured, same rename
+        # through the two entry points:
+        #
+        #     edit_setup                -> undo 0->1, one Ctrl+Z restores ['Lab 1']
+        #     _edit_lecturer_from_class -> undo 0->0, Ctrl+Z a no-op, and
+        #                                  renaming the room BACK still gives []
+        #
+        # Reached from the unplaced-list context menu (Edit > Edit Lecturer),
+        # so a user who opens Setup to fix a teacher and touches a room name
+        # while there loses "this lesson must be in the physics lab" for good.
+        #
+        # Snapshot held in a local and committed only `if dlg.result`, never
+        # pushed-then-popped: `_commit_undo_entry` clears the redo stack and,
+        # at `_max_undo`, evicts `_undo_stack[0]`, and a `pop()` puts back
+        # neither. That is Phase 4's Setup mistake and Phase 9's B1/B2, and
+        # `test_a_cancelled_lecturer_edit_records_nothing` is what holds this
+        # to the accepted case.
+        before_setup = copy.deepcopy(self.state_data)
         dlg.exec()
         if dlg.result:
+            _commit_undo_entry(self._undo_stack, self._redo_stack,
+                               self._max_undo, tr("actions.setup"),
+                               before_setup)
             self._reconcile_after_setup()
         self.refresh_grid()
         if dlg.result:
             self._run_impact_analysis(snap_before)
 
     def _reconcile_after_setup(self):
-        """Repair placements orphaned by a setup change, and say how many.
+        """Repair placements orphaned by a setup change, and say what it cost.
 
         Must run BEFORE the repaint: refresh_grid -> _update_side_panels ->
         _refresh_open_slots reaches slot_index, which cannot resolve a slot the
         user has just deleted (ST-DATA-003).
+
+        Says "repaired", not "placements were cleared", since B4. The sentence
+        used to be `status.placements_cleared_count`, shared with
+        `edit_classes`, and it stopped being true here the moment
+        `reconcile_placements` also began dropping dangling
+        `required_classrooms` / `excluded_classrooms` names: a class whose room
+        CONSTRAINT was repaired keeps its placement, so the count was right and
+        the noun was wrong. `edit_classes` still uses the old key, where every
+        entry it counts really is a cleared placement.
         """
         affected = SchedulingWorkflow.reconcile_placements(self.state_data)
-        if affected:
-            self._show_toast(
-                tr("status.placements_cleared_count", n=len(affected)),
-                "warning")
+        message = _repair_report_message(affected)
+        if message:
+            self._show_toast(message, "warning")
         return affected
 
     def edit_setup(self):
@@ -3736,11 +4086,9 @@ class SchedulerApp(QMainWindow):
         before_setup = copy.deepcopy(self.state_data)
         dlg.exec()
         if dlg.result:
-            self._undo_stack.append(
-                (tr("actions.setup"), before_setup))
-            if len(self._undo_stack) > self._max_undo:
-                self._undo_stack.pop(0)
-            self._redo_stack.clear()
+            _commit_undo_entry(self._undo_stack, self._redo_stack,
+                               self._max_undo, tr("actions.setup"),
+                               before_setup)
             self._reconcile_after_setup()
         self.refresh_grid()
         if dlg.result:
@@ -4102,11 +4450,6 @@ class SchedulerApp(QMainWindow):
         "target": "conflicts.student_group",
     }
 
-    @staticmethod
-    def _conflict_label(cls):
-        code = cls.get("class_code", "")
-        return f"[{code}] {cls['name']}" if code else cls["name"]
-
     def _conflict_log_entries(self):
         """Warning-log lines for the conflicts found this refresh."""
         conflicts = self._conflicts = find_schedule_conflicts(self.state_data)
@@ -4119,8 +4462,8 @@ class SchedulerApp(QMainWindow):
             entries.append((
                 tr("conflicts.cell_pair").format(
                     day=day_label(rec["day"]), slot=rec["slot"],
-                    a=self._conflict_label(rec["a"]),
-                    b=self._conflict_label(rec["b"]),
+                    a=_conflict_label(rec["a"]),
+                    b=_conflict_label(rec["b"]),
                     kinds=kinds),
                 "error"))
         extra = len(conflicts) - self._MAX_CONFLICT_LOG_ENTRIES
@@ -4473,9 +4816,21 @@ class SchedulerApp(QMainWindow):
             "placed_time": cls["placed_time"],
             "placed_classroom": cls["placed_classroom"],
         }
-        # Push undo BEFORE the pre-emptive mark_unplaced so the snapshot
-        # captures the original placed state.  Popped later if drag fails.
-        self._push_undo(tr("actions.unplace").format(name=cls["name"]))
+        # Snapshot BEFORE the pre-emptive mark_unplaced, so it captures the
+        # original placed state — it is the only record of where the lesson
+        # was once mark_unplaced has run.
+        #
+        # HELD, not recorded. The gesture has not happened yet: the user can
+        # still press Esc, and every validation phase in _execute_drop can
+        # still refuse the drop. `_commit_undo_entry` clears the redo stack
+        # and, at _max_undo, evicts _undo_stack[0]; doing either for a gesture
+        # that evaporates is Phase 9's B1/B2, and the `pop()` this used to end
+        # with put back neither. The commit points are _execute_drop (which
+        # re-labels it "move") and the tail below (a drop onto the unplaced
+        # sidebar, which keeps the "unplace" label).
+        self._drag_undo_entry = (
+            tr("actions.unplace").format(name=cls["name"]),
+            copy.deepcopy(self.state_data))
         self._drag_undo_pushed = True
         mark_unplaced(cls)
 
@@ -4530,32 +4885,29 @@ class SchedulerApp(QMainWindow):
         if not self._drag_success:
             for k, v in self._drag_backup.items():
                 cls[k] = v
-            # Drag was cancelled — discard the pre-emptive undo snapshot.
-            #
-            # The flag is belt-and-braces HERE and the old comment overstated
-            # it. It claimed the guard stops us popping an entry
-            # `_execute_drop` has already consumed; measured 2026-08-29, the
-            # enclosing `if not self._drag_success` already excludes that —
-            # `_execute_drop` sets `_drag_success = True` on the only path that
-            # consumes the entry, so control never reaches this line in the
-            # state the old text described. Within `_start_drag_gfx`,
-            # `_drag_undo_pushed` is assigned True above and never cleared
-            # before this read, so `if self._drag_undo_pushed and
-            # self._undo_stack` cannot differ from a bare `if self._undo_stack`
-            # on any path the user can reach.
-            #
-            # It stays because it states the entry's OWNERSHIP rather than its
-            # existence: the flag is this drag's claim on the top of the stack,
-            # and it is what keeps the guard correct if the outer
-            # `if not self._drag_success` is ever refactored or if a second
-            # starter learns to reach this code. `_start_drag_unplaced` pushes
-            # nothing, and a bare `if` there popped an unrelated action —
-            # depth unchanged, which is why it went unnoticed. One cheap
-            # attribute read; no test can tell it from being absent.
-            if self._drag_undo_pushed and self._undo_stack:
-                self._undo_stack.pop()
+            # Cancelled or refused: the held snapshot is simply dropped by the
+            # unconditional reset below. There is nothing to pop and nothing
+            # to repair, which is the entire point of holding it — Phase 9's
+            # B1/B2 were that the old `pop()` here was not the inverse of the
+            # push at drag start. It could not put back the redo stack
+            # `_push_undo` had cleared, and at the _max_undo cap it popped from
+            # the TOP while the eviction had taken _undo_stack[0]: the stack
+            # came back one short and the user's oldest undoable action was
+            # gone. Measured before the fix, 50 entries in: depth 50 -> 49 and
+            # the list started at 'action-01'.
+        elif self._drag_undo_entry is not None:
+            # Committed, and nobody consumed the snapshot: the drop landed on
+            # the unplaced sidebar (DraggableUnplacedList.dropEvent), which
+            # unplaces the lesson and does not touch the stacks. Record the
+            # pre-gesture snapshot under its own "unplace" label — dragging a
+            # lesson off the grid IS an unplace, and that is what the user
+            # gets back with one Ctrl+Z. (_execute_drop takes the other exit:
+            # it consumes the entry itself so it can re-label it "move".)
+            _commit_undo_entry(self._undo_stack, self._redo_stack,
+                               self._max_undo, *self._drag_undo_entry)
 
         self._drag_undo_pushed = False
+        self._drag_undo_entry = None
         self._dragging_cls = None
         self._dragging_classes = []
         self._drag_backup = None
@@ -4582,9 +4934,11 @@ class SchedulerApp(QMainWindow):
             "placed_time": None,
             "placed_classroom": None,
         }
-        # A sidebar drag pushes NO pre-emptive snapshot: nothing has been
+        # A sidebar drag holds NO pre-gesture snapshot: nothing has been
         # unplaced, so there is nothing to restore if it is cancelled.
-        # _execute_drop therefore has to PUSH a new entry, not pop one.
+        # _execute_drop therefore has to push a new entry of its own, and must
+        # not consume whatever unrelated action is on top of the stack.
+        self._drag_undo_entry = None
         self._drag_undo_pushed = False
         self._dragging_cls = drag_classes[0]
         self._dragging_classes = drag_classes
@@ -4741,42 +5095,48 @@ class SchedulerApp(QMainWindow):
         self._workflow.log_manual_move(
             cls, old_day, old_slot, old_room, day, slot, room)
 
-        # ST-ARCH-012. RE-LABEL the pre-emptive snapshot; do not push a fresh
-        # one. _start_drag_gfx took its snapshot BEFORE its own
-        # mark_unplaced, so it is the only record of where the lesson was --
-        # by the time control gets here mark_unplaced has already run, and a
-        # fresh _push_undo deep-copies the lesson as UNPLACED. That is why one
-        # Ctrl+Z after a drag unplaced the lesson instead of putting it back.
-        # The old comment here claimed "the snapshot data is identical";
-        # measured, the popped entry held (True, 'monday', '09:00', 'R001')
-        # and the replacement held (False, None, None, None).
+        # ST-ARCH-012. RECORD _start_drag_gfx's held snapshot under the "move"
+        # label; do not take a fresh one. That snapshot was taken BEFORE the
+        # starter's own mark_unplaced, so it is the only record of where the
+        # lesson was -- by the time control gets here mark_unplaced has
+        # already run, and a fresh _push_undo deep-copies the lesson as
+        # UNPLACED. That is why one Ctrl+Z after a drag unplaced the lesson
+        # instead of putting it back. An older comment here claimed "the
+        # snapshot data is identical"; measured, the drag's entry held
+        # (True, 'monday', '09:00', 'R001') and a fresh one held
+        # (False, None, None, None).
         #
-        # The FLAG decides, not `if self._undo_stack`. A drag that started in
-        # the unplaced sidebar pushed nothing, and the bare `if` popped
-        # whatever unrelated action was on top and destroyed it -- depth
-        # unchanged, which is why it went unnoticed.
+        # OWNERSHIP decides, not `if self._undo_stack`. A drag that started in
+        # the unplaced sidebar holds nothing, and a bare `if` popped whatever
+        # unrelated action was on top and destroyed it -- depth unchanged,
+        # which is why it went unnoticed.
         #
-        # pop + append keeps the depth, so nothing is evicted at _max_undo;
-        # the redo clear that _push_undo would have done is made explicit.
+        # Both halves of that ownership test, honestly. This comment used to
+        # say "the FLAG decides", and post-Phase-9 that overstates the code:
+        # `_start_drag_unplaced` clears `_drag_undo_entry` as well as the
+        # flag, so on every REACHABLE path `_drag_undo_entry is not None`
+        # already carries the whole decision and the flag adds nothing. The
+        # conjunct stays because the two lines were measured deletable
+        # TOGETHER with the suite green, and with both gone a sidebar drag
+        # that places one lesson followed by one Ctrl+Z resurrects an
+        # abandoned grid gesture's placement under the wrong label. Each half
+        # now has its own test:
+        # test_a_sidebar_drag_does_not_commit_an_abandoned_grid_drags_snapshot
+        # kills the clear, test_execute_drop_will_not_consume_a_snapshot_it_
+        # does_not_own kills this conjunct.
         #
-        # That clear is INERT on every path production reaches, and stays
-        # anyway. Measured 2026-08-29 by instrumenting `_redo_stack.clear`
-        # through a real drag: plant a genuine redo entry (an action, then
-        # Ctrl+Z) — depth 1 — arm a grid drag, and depth is already 0 by the
-        # time control gets here, because `_start_drag_gfx`'s pre-emptive
-        # `_push_undo` cleared it one statement before raising
-        # `_drag_undo_pushed`. No arrangement of the shipped code can leave a
-        # pending redo entry at this line, so no test can tell it from being
-        # absent — one that hand-poked `_redo_stack` in between would pin a
-        # state production cannot produce. It is kept because it makes this
-        # branch's postcondition match `_push_undo`'s in the `else` below
-        # rather than depending on an invariant held in another method; it is
-        # one call on an empty list.
+        # Phase 9: the entry now arrives HELD rather than already on the
+        # stack, so this is where the drag's redo clear and its eviction at
+        # _max_undo happen for the first time. Both used to fire at drag
+        # start, where they were wrong for the gestures that never commit
+        # (B1/B2) and merely early for this one. The `else` is the sidebar
+        # drag, which has no snapshot to record and must take a live one.
         move_label = tr("actions.move").format(name=cls["name"])
-        if self._drag_undo_pushed and self._undo_stack:
-            _stale_label, snapshot = self._undo_stack.pop()
-            self._undo_stack.append((move_label, snapshot))
-            self._redo_stack.clear()
+        if self._drag_undo_pushed and self._drag_undo_entry is not None:
+            _stale_label, snapshot = self._drag_undo_entry
+            self._drag_undo_entry = None
+            _commit_undo_entry(self._undo_stack, self._redo_stack,
+                               self._max_undo, move_label, snapshot)
         else:
             self._push_undo(move_label)
         self._drag_undo_pushed = False
@@ -4923,10 +5283,11 @@ class SchedulerApp(QMainWindow):
         current_count = len(self.state_data.get("classes", []))
         if not enforcer.require_entity_limit(ENTITY_CLASSES, current_count, self):
             return
-        dlg = AddClassDialog(self, self.state_data)
-        if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
+        # See add_class: the same collision reaches the grid's double-click
+        # path, and the same prompt — and the same re-open on No — guards it.
+        cls = _class_form_result(self, self.state_data, {})
+        if cls is None:
             return
-        cls = dlg.result
         # ST-UI-020: the lecturer combo is editable, so this name may be
         # one the user just typed. Register it BEFORE the undo snapshot,
         # or undo restores a class pointing at a lecturer the restored
@@ -5207,9 +5568,14 @@ class SchedulerApp(QMainWindow):
         report = dataset.report
 
         if not report.is_valid:
-            QMessageBox.warning(
-                self, tr("status.import_failed"),
-                report.summary())
+            # Same helper as the success path below, and for the same reason:
+            # `report.summary()` is unbounded in the number of ERRORS exactly
+            # as it is in the number of warnings, so a point fix in the success
+            # branch would have left this twin building the same 24 000 px box
+            # (ST-UI-B6).
+            show_validation_report(
+                self, tr("status.import_failed"), "", report.summary(),
+                kind="warning")
             return
 
         # Tier enforcement: check limits before importing
@@ -5241,6 +5607,7 @@ class SchedulerApp(QMainWindow):
         # including the repaint, restores the state the user had before.
         s = self.state_data
         rollback = {k: copy.deepcopy(s.get(k)) for k in self._IMPORT_MERGED_KEYS}
+        reconciled = []
         try:
             if dataset.state["lecturers"]:
                 s["lecturers"] = dataset.state["lecturers"]
@@ -5255,7 +5622,18 @@ class SchedulerApp(QMainWindow):
 
             # An import that replaces the lecturer or room lists orphans any
             # placement referring to one the workbook omitted (ST-DATA-004).
-            SchedulingWorkflow.reconcile_placements(s)
+            #
+            # The return value is not optional here, and discarding it is what
+            # made this the quiet call site of the two. Since B4 this repair
+            # also drops a dangling `required_classrooms` / `excluded_classrooms`
+            # name, and an EMPTY required list means "any room"
+            # (core/models.py:557) — so a drop nobody is told about silently
+            # turns "must be in the physics lab" into "anywhere at all", which
+            # is the ST-FUNC-009 inversion the importer itself was written to
+            # prevent. The Setup path has always reported this; the import path
+            # replaces `s["classrooms"]` wholesale and can strand a
+            # pre-existing class just as easily.
+            reconciled = SchedulingWorkflow.reconcile_placements(s)
             self.refresh_grid()
             self._update_status()
         except Exception as exc:
@@ -5268,10 +5646,33 @@ class SchedulerApp(QMainWindow):
             QMessageBox.critical(self, tr("status.import_failed"), str(exc))
             return
 
-        msg = tr("status.import_successful")
-        if report.warnings:
-            msg += "\n\n" + report.summary()
-        QMessageBox.information(self, tr("dialogs.import.excel_title"), msg)
+        # Deliberately outside the transaction. A toast raised between the
+        # merge and the repaint would be caught by the `except` above and roll
+        # back an import that had already succeeded.
+        #
+        # Same sentence-builder as the Setup path, so an import that empties a
+        # class's `required_classrooms` names the lesson and the room here too.
+        # `reconciled` is still the plain `[]` from before the `try` on a
+        # rolled-back import, which `_repair_report_message` reads as "nothing
+        # to say" — the rollback restored the constraints, so there is nothing.
+        message = _repair_report_message(reconciled)
+        if message:
+            self._show_toast(message, "warning")
+
+        # ST-UI-B6: the report is per-row on purpose — ~10 assertions in
+        # tests/test_import_roundtrip.py pin "Row 214: ..." because that is the
+        # only form a user can act on — so the number of lines is not bounded
+        # here. The WIDGET is: `show_validation_report` keeps the plain message
+        # box for a short report and hands a long one to a scrollable dialog.
+        # Measured before that split, 500 classes naming a room type no room
+        # has: 500x24110 px on a 912 px screen, OK button at y=24098.
+        # `summary()` is passed only when there is something to say; with no
+        # warnings it would add a "validation passed" line the success dialog
+        # has never carried.
+        show_validation_report(
+            self, tr("dialogs.import.excel_title"),
+            tr("status.import_successful"),
+            report.summary() if report.warnings else "")
 
     def _generate_excel_template(self):
         if not self._ensure_excel_deps():

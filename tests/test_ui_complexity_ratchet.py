@@ -85,12 +85,44 @@ DIALOGS_PY = os.path.join(REPO, "scheduler_app", "ui", "dialogs.py")
 # Measured by this file's own counter on the tree at the commit that
 # introduced it. They may go DOWN.
 
-MAX_APP_PY_TOTAL_MCCABE = 915
-"""Sum of every function's cyclomatic complexity in `ui/app.py`. 885 -> 915.
+MAX_APP_PY_TOTAL_MCCABE = 920
+"""Sum of every function's cyclomatic complexity in `ui/app.py`. 885 -> 915 -> 920.
 
 Was 885 at the audit (65de83a) and 878 after Phase 6, which is flat only
 because Phase 6 deleted `_write_excel` (574 lines, the second Excel engine of
 ST-ARCH-003). Phase 7's release work put it at 915.
+
+Phase 9 raised it to 920, deliberately, and this is the accounting the raise
+owes. Measured per function against a1e1d13 (914 actual under a 915 ceiling):
+
+    +6  _class_form_result          0 -> 6     new
+    -6  add_class / _edit_class / _add_class_at   (-2 each)
+    +5  _repair_report_message      0 -> 5     new
+    +1  _place_classes_batch       10 -> 11
+
+The first pair is a net ZERO: `_class_form_result` is the re-show loop the three
+class-form call sites now share, so the branching moved rather than grew. The
+other +6 is what is actually being bought, and both halves are defects that were
+measured happening rather than reasoned about:
+
+  * `_repair_report_message` (+5) exists because a count-only toast could not
+    tell "this class's room requirement was NARROWED" from "this class's room
+    requirement is GONE". An empty `required_classrooms` means "any room"
+    everywhere in core (core/models.py::get_physical_room_candidates), and
+    after one Setup rename
+    `place_batch` put a physics-lab lesson in "Hall A", the lecture hall, under
+    a message that said only "2 class(es) were repaired".
+  * `_place_classes_batch` (+1) is the undo gate. Without it, Ctrl+P with
+    lessons that cannot fit left a no-op undo entry, killed Ctrl+Y, and at the
+    50-entry cap evicted the user's oldest recoverable action.
+
+Neither could go somewhere cheaper. `core/` is deliberately `tr()`-free (zero
+calls in `core/workflow.py`, which is what keeps it head-less), and
+`ui/validation_report.py` is a different widget for a different report. What
+DID move out is everything that could: `_conflict_label` and
+`_repair_report_message` are module-scope functions rather than methods, which
+is why `MAX_SCHEDULERAPP_METHODS` did not have to move — see it below, still
+154 with the class at 153.
 """
 
 MAX_DIALOGS_PY_TOTAL_MCCABE = 885

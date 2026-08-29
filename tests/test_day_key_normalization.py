@@ -21,7 +21,8 @@ here:
    function and the expectation breaks with it, in the same direction. Every
    expectation in this module is therefore a hand-written literal. Nothing below
    may call the function under test to work out what the answer should be.
-2. **Deliberate abstention.** ``tests/test_import_ui_flow.py:269-275`` compares
+2. **Deliberate abstention.**
+   ``tests/test_import_ui_flow.py::test_import_merges_workbook_into_state`` compares
    imported lecturer availability by lecturer *name* only, on purpose, so as not
    to canonize the pre-normalization shape. Reasonable in isolation; the
    consequence was that nothing asserted the post-normalization shape either.
