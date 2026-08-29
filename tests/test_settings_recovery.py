@@ -754,6 +754,153 @@ def test_repeated_autosave_failures_do_not_open_a_modal_per_refresh(
         "autosave fires on every grid refresh, so this must be rate-limited")
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  ST-DATA-002 — a damaged feedback log must reach the user too
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _damage_feedback_log(n_entries=6):
+    """Write an EGL1 feedback log and flip one ciphertext bit in every record.
+
+    The framing is left intact on purpose: ``log_entry_count`` walks the length
+    prefixes without decrypting, so it still reports *n_entries* and
+    ``PreferenceLearner``'s ``MIN_ENTRIES_TO_LEARN`` gate is still cleared —
+    otherwise ``learn()`` would return before reaching the code under test and
+    the assertions here would pass for the wrong reason.
+    """
+    import struct
+
+    from scheduler_app import storage
+
+    path = storage.feedback_log_path()
+    storage.save_encrypted_lines(
+        [{"event": "manual_move", "n": i} for i in range(n_entries)], path)
+    blob = bytearray(open(path, "rb").read())
+    assert bytes(blob[:4]) == storage.storage._LOG_MAGIC, (
+        "the fixture did not produce an EGL1 log (%r)" % (bytes(blob[:4]),))
+    off = struct.calcsize(storage.storage._LOG_HEADER_FMT)
+    wrecked = 0
+    while off + 4 <= len(blob):
+        (rec_len,) = struct.unpack_from(
+            storage.storage._LOG_RECLEN_FMT, blob, off)
+        if rec_len <= 0 or off + 4 + rec_len > len(blob):
+            break
+        blob[off + 4 + 43] ^= 0x01
+        wrecked += 1
+        off += 4 + rec_len
+    with open(path, "wb") as f:
+        f.write(bytes(blob))
+
+    assert wrecked == n_entries, "the fixture damaged %d of %d records" % (
+        wrecked, n_entries)
+    assert storage.log_entry_count(path) == n_entries, (
+        "the damage broke the framing, so the learner's entry-count gate would "
+        "reject the log before it ever tried to read it")
+    assert storage.load_encrypted_lines(path) == [], (
+        "the fixture left readable records; the branch under test is the one "
+        "where nothing decrypts")
+    return path
+
+
+def _distinctive_text(key):
+    """The longest placeholder-free run of a translation's own text.
+
+    Matching on the *key's own* text rather than a hardcoded sentence, so a
+    reworded message does not fail these tests but reporting the wrong message
+    does.
+
+    Deliberately the longest run between placeholders and NOT "everything
+    before the first ``{``". That simpler version was written first and was
+    **vacuous in Turkish**, which is the language this suite pins: the Turkish
+    ``errors.feedback_log_damaged`` opens with ``{path}``, so the stem was the
+    empty string and ``"" in anything`` is True. Measured — it made both tests
+    below pass with the report deleted from the app entirely. The assertion
+    here is what stops that from coming back.
+    """
+    import re
+
+    from scheduler_app.translations import tr
+
+    parts = [p.strip() for p in re.split(r"\{[^}]*\}", tr(key))]
+    longest = max(parts, key=len) if parts else ""
+    assert len(longest) >= 20, (
+        "no placeholder-free run of %r is long enough to identify it (%r); "
+        "matching on it would pass for the wrong reason" % (key, longest))
+    return longest
+
+
+def _all_user_text(feedback, caplog):
+    """Every string that reached a user-visible channel, from all of them."""
+    out = [m for m, _kind in feedback.toasts]
+    out += [m for m, _kind in feedback.log_entries]
+    out += [t for r in feedback.modals.values() for t in r.texts()]
+    out += [r.getMessage() for r in _app_log_records(caplog)]
+    return out
+
+
+def test_a_damaged_feedback_log_reaches_the_user(make_window, feedback, caplog):
+    """ST-DATA-002: the user must be told their history stopped being readable.
+
+    A failure means DERSİS quietly stops learning from everything the user has
+    ever corrected and the user never finds out — which is the finding, not the
+    storage-layer return value. The storage half is guarded in
+    ``tests/test_storage_roundtrip.py``; this is the half that reaches a person.
+    """
+    _damage_feedback_log()
+
+    win = make_window(with_grid=False)
+
+    # The module's own tripwire against a wrong-reason pass: channels() counts
+    # WarningLogPanel entries, and refresh_grid() writes one per *unplaced
+    # class* all on its own. With nothing loaded there are no classes, so any
+    # channel that fires can only be about the feedback log.
+    assert not win.state_data.get("classes"), (
+        "classes in state would let refresh_grid's own scheduling warnings "
+        "satisfy channels() for the wrong reason")
+
+    assert feedback.channels(caplog), (
+        "a damaged feedback log produced no user-visible signal at all: "
+        + feedback.describe(caplog))
+    assert any(_distinctive_text("errors.feedback_log_damaged") in t
+               for t in _all_user_text(feedback, caplog)), (
+        "something was reported, but not that the feedback history is "
+        "unreadable: " + feedback.describe(caplog))
+
+
+def test_a_damaged_feedback_log_and_corrupt_settings_both_reach_the_user(
+        make_window, feedback, make_preset, caplog):
+    """ST-DATA-002: the two startup reports must not overwrite each other.
+
+    This is the test that pins the *placement* of the report, and nothing else
+    does. ``_pending_settings_report`` is a SINGLE slot, and the learner runs
+    from ``__init__`` before ``_auto_load()`` — so reporting the damaged log
+    from the learn() call site (the obvious place) stashes a message that the
+    settings report then silently overwrites. Emitting it from
+    ``_flush_startup_settings_report`` instead, after ``_build_status()`` has
+    created ``status_label``, makes ``_report_settings_problem`` take its
+    immediate non-stashing branch and both messages land.
+
+    A failure means a user with two damaged files is told about one of them.
+    """
+    _write_good_settings(make_preset)
+    _corrupt_in_place(_settings_path())
+    _damage_feedback_log()
+
+    win = make_window(with_grid=False)
+
+    assert not win.state_data.get("classes"), (
+        "a corrupt container left classes in state; refresh_grid's own "
+        "scheduling warnings would satisfy channels() for the wrong reason")
+
+    texts = _all_user_text(feedback, caplog)
+    assert any(_distinctive_text("errors.feedback_log_damaged") in t for t in texts), (
+        "the damaged feedback log was not reported when the settings "
+        "container was damaged too — the single-slot overwrite: "
+        + feedback.describe(caplog))
+    assert any(_distinctive_text("errors.settings_corrupt") in t for t in texts), (
+        "the corrupt settings container stopped being reported once the "
+        "feedback-log report was added: " + feedback.describe(caplog))
+
+
 # ── read-only helpers ────────────────────────────────────────────────────────
 
 def _make_unwritable(path):

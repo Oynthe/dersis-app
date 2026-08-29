@@ -48,6 +48,10 @@ class PreferenceLearner:
         self.train_count = 0
         self._learned_through = 0
         self._learned_size = 0
+        # ST-DATA-002: how many records the last read could not decode. Read by
+        # SchedulerApp._flush_startup_settings_report, which is what turns it
+        # into something the user sees.
+        self.last_read_lost = 0
 
         self._load_weights()
 
@@ -92,8 +96,26 @@ class PreferenceLearner:
         if self._learned_through >= total:
             return 0  # nothing new; costs one stat call, no decryption
 
-        entries = self.feedback_logger.get_entries_since(self._learned_through)
+        entries, lost = self.feedback_logger.get_entries_since_report(
+            self._learned_through)
+        # Reset on every pass that actually reads, so a repaired log stops
+        # reporting. The size fast-path above returns before this and leaves
+        # the previous value standing, which is what the UI wants: it reads
+        # this once at startup, after the first real read.
+        self.last_read_lost = lost
         if not entries:
+            if lost:
+                # ST-DATA-002: the records are unreadable, not absent. The old
+                # code returned here without advancing, so the cursor stayed at
+                # 0 forever — measured, 4 consecutive learn() calls on a
+                # 12-record log with one flipped bit, cursor 0 every time — and
+                # every future pass re-decrypted and re-discarded the same
+                # bytes (27.8 ms burned per call on a 2 000-record log, on
+                # every manual move). Damaged bytes do not heal and the log is
+                # append-only, so stepping past them loses nothing.
+                self._learned_through = total
+                self._learned_size = self.feedback_logger.log_size()
+                self._save_weights()
             return 0
 
         signals_processed = 0

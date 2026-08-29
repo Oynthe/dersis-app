@@ -69,10 +69,13 @@ far from it in the other, and the "linear" / "quadratic" / "ideal" reference
 values are written into the failure message so a future reader can tell a
 regression from noise.
 
-Findings guarded here: ST-PERF-005. ST-DATA-002 (a corrupt log must *raise*
-rather than read as empty) is pinned in ``tests/test_storage_roundtrip.py`` and
-is deliberately not restated; what is asserted here is the separate, destructive
-half of that bug — the append path overwriting the damaged bytes.
+Findings guarded here: ST-PERF-005, plus the ST-DATA-002 cursor. The storage
+layer's half of ST-DATA-002 (a damaged log must return the records that still
+decrypt, and must report the ones it lost instead of letting "unreadable" pass
+for "empty") is guarded in ``tests/test_storage_roundtrip.py`` and is
+deliberately not restated. What is asserted here is what that costs the
+*learner*: the append path must not overwrite the damaged bytes, and the
+learning cursor must not sit at 0 re-reading them forever.
 """
 import builtins
 import contextlib
@@ -80,6 +83,7 @@ import copy
 import io
 import os
 import statistics
+import struct
 
 from scheduler_app.learning.feedback_logger import FeedbackLogger
 from scheduler_app.learning.preference_learner import PreferenceLearner
@@ -712,3 +716,76 @@ def test_logger_append_does_not_destroy_a_corrupt_log(dersis_home):
     assert _bytes_survive(str(dersis_home), damaged), (
         "FeedbackLogger overwrote a damaged feedback log; because _write_entry "
         "swallows exceptions the user is never told")
+
+
+# ── 6. ST-DATA-002 — the learning cursor must step past unreadable bytes ────
+
+def _wreck_every_record(path):
+    """Flip one ciphertext bit inside every framed record of an EGL1 log.
+
+    Damages the payloads and leaves the framing intact, which is what a bad
+    sector looks like: ``log_entry_count`` still walks the length prefixes and
+    still says 12, so the ``MIN_ENTRIES_TO_LEARN`` gate is still cleared and
+    ``learn()`` really does reach the code under test.
+    """
+    blob = bytearray(open(path, "rb").read())
+    assert bytes(blob[:4]) == storage._LOG_MAGIC, (
+        "not an EGL1 log (%r); this helper's frame arithmetic would be "
+        "meaningless" % (bytes(blob[:4]),))
+    off = struct.calcsize(storage._LOG_HEADER_FMT)
+    wrecked = 0
+    while off + 4 <= len(blob):
+        (rec_len,) = struct.unpack_from(storage._LOG_RECLEN_FMT, blob, off)
+        if rec_len <= 0 or off + 4 + rec_len > len(blob):
+            break
+        blob[off + 4 + 43] ^= 0x01   # inside the record's ciphertext
+        wrecked += 1
+        off += 4 + rec_len
+    with open(path, "wb") as handle:
+        handle.write(bytes(blob))
+    return wrecked
+
+
+def test_the_learner_does_not_re_read_an_unreadable_log_forever(dersis_home):
+    """ST-DATA-002: an unreadable prefix must be stepped over, not re-read.
+
+    Measured before the fix: the cursor stayed at 0 across four consecutive
+    ``learn()`` calls on a damaged 12-entry log, and a 2 000-record log with one
+    flipped bit burned 27.8 ms of decryption on *every* call — and ``learn()``
+    runs after every manual move, so the cost never ends and the learning
+    outage is permanent.
+
+    A failure means DERSİS quietly stops learning for good the first time a
+    single byte of the feedback log goes bad, while paying full price to
+    re-decrypt and re-discard it forever. Asserted on the cursor, never on the
+    clock (``tests/README.md``).
+    """
+    path = storage.feedback_log_path()
+    logger = FeedbackLogger()
+    for i in range(12):
+        _log_move(logger, i)
+    assert logger.entry_count() == 12
+
+    assert _wreck_every_record(path) == 12, "the fixture damaged the wrong count"
+    assert storage.load_encrypted_lines(path) == [], (
+        "the fixture left readable records, so the empty-read branch under "
+        "test is never reached")
+
+    learner = PreferenceLearner()
+    assert learner._learned_through == 0
+
+    assert learner.learn() == 0, "unreadable records produced training signals"
+    assert learner._learned_through == learner.feedback_logger.entry_count(), (
+        "the cursor stayed at %r on a %r-frame log: every future learning pass "
+        "will decrypt and discard the same unreadable bytes again"
+        % (learner._learned_through, learner.feedback_logger.entry_count()))
+    assert learner.last_read_lost == 12, (
+        "the learner did not record the loss, so the UI has nothing to report "
+        "to the user (last_read_lost=%r)" % (learner.last_read_lost,))
+
+    # And a healthy log must not report a loss — otherwise the UI warns every
+    # user on every launch and the signal is worthless.
+    fresh_home_path = os.path.join(_logs_dir(), "healthy.egu")
+    storage.save_encrypted_lines([_raw_entry(i) for i in range(6)],
+                                 fresh_home_path)
+    assert storage.load_encrypted_lines_report(fresh_home_path).lost == 0
