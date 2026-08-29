@@ -221,12 +221,24 @@ def test_the_fold_is_idempotent_and_blank_safe():
 
 
 # ===========================================================================
-# ANTI-DIVERGENCE: one definition, three call sites
+# ANTI-DIVERGENCE: one definition, four call sites
 # ===========================================================================
+#: ``data_io/schema.py`` is here because it is the half that decides whether a
+#: Turkish workbook imports *at all*. Its reverse header map and
+#: ``canonicalize_workbook_columns`` fold the header row, and a bare
+#: ``.casefold()`` there sends the shouted ``ADI`` to ASCII ``adi`` while the
+#: shipped label ``Adı`` folds to dotless ``adı`` — so six column headers stop
+#: resolving and four sheets are refused with "required columns missing". The
+#: module docstring above has named schema.py as a call site since Phase 8, but
+#: nothing pinned it: the whole fast lane stays green with those folds reverted,
+#: because every workbook the suite builds writes its header row from
+#: ``schema.get_workbook_sheet_header_map`` — that is, in the exact shipped
+#: casing — and never shouts it.
 _SHARED_FOLD_SITES = [
     ("scheduler_app/i18n/day_keys.py", None),
     ("scheduler_app/core/workflow.py", "register_lecturer"),
     ("scheduler_app/data_io/importer.py", "_process_teachers"),
+    ("scheduler_app/data_io/schema.py", None),
 ]
 
 

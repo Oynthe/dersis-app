@@ -63,6 +63,7 @@ from scheduler_app.core.models import (  # noqa: E402
     LOCATION_LECTURER_OFFICE,
     LOCATION_ONLINE,
     get_location_label,
+    get_physical_room_candidates,
     new_class,
     new_state,
 )
@@ -90,12 +91,19 @@ def _fields(sheet_id, omit=()):
 
 
 def build_workbook(path, *, classes, teachers=None, rooms=None, branches=None,
-                   omit_columns=None, sheets=SHEET_IDS, description_row=False):
+                   omit_columns=None, sheets=SHEET_IDS, description_row=False,
+                   shout_headers=False):
     """Write a workbook whose sheet titles and headers come from the schema.
 
     A field simply left out of a row dict is written as a *truly empty* cell,
     which is what pandas turns into ``NaN`` — the exact shape that triggers
     ST-FUNC-002 and ST-FUNC-003.
+
+    ``shout_headers`` writes each header as ``label.upper()`` instead of the
+    shipped casing. Every other workbook in this module writes the header row
+    straight from ``schema.get_workbook_sheet_header_map``, i.e. in exactly the
+    case the app itself would have written, so nothing here exercised the
+    header fold until this option existed.
     """
     omit_columns = omit_columns or {}
     rows_by_sheet = {
@@ -112,7 +120,9 @@ def build_workbook(path, *, classes, teachers=None, rooms=None, branches=None,
         fields = _fields(sheet_id, omit_columns.get(sheet_id, ()))
         headers = schema.get_workbook_sheet_header_map(sheet_id)
         for col, field in enumerate(fields, start=1):
-            ws.cell(row=1, column=col, value=headers[field])
+            label = headers[field]
+            ws.cell(row=1, column=col,
+                    value=label.upper() if shout_headers else label)
 
         excel_row = 2
         if description_row:
@@ -734,6 +744,26 @@ def test_the_generated_template_reimports_in_every_shipped_locale(
         f"Rooms sheet types as {tr('template.workbook_example.room_type_lab')!r}, "
         f"got {lab_class['required_classrooms']}")
 
+    # ...and that room must be able to seat it. Resolving the type was only
+    # half the job: the assertion above passed while the template shipped C001
+    # with 25 students and its only lab with 20 seats, so
+    # `get_physical_room_candidates` returned [] and the app's own example
+    # workbook contained a course that could never be placed by any means --
+    # reported by the importer as `is_valid=True`, `warnings: []`. The
+    # capacities and the head count are hard-coded integers in template.py, so
+    # this was identical in all 22 locales and no single-locale test would have
+    # been worth more; it is asserted here because this is the only test that
+    # imports the shipped template at all.
+    for cls in ds.state["classes"]:
+        if not cls.get("required_classrooms"):
+            continue
+        assert get_physical_room_candidates(ds.state, cls), (
+            f"{lang}: the shipped template resolves {cls['name']!r} "
+            f"({cls['participants']} students) into "
+            f"{cls['required_classrooms']} — capacities "
+            f"{ds.state['classroom_capacities']} — leaving no room that can "
+            f"seat it, so this example course can never be scheduled")
+
 
 @pytest.mark.parametrize("workbook_lang", TEMPLATE_LOCALES)
 def test_sheet_titles_resolve_per_workbook_not_by_the_current_ui_language(
@@ -831,6 +861,61 @@ def test_lecturer_names_differing_only_in_case_are_not_silently_split(tmp_path):
     assert collapsed or ds.report.is_valid is False, (
         f"a roster holding one teacher twice was reported as valid; "
         f"lecturers={lecturers}, report={messages(ds.report)}")
+
+
+def test_the_dotted_i_refusal_names_both_spellings_the_rule_and_the_row(tmp_path):
+    """The refusal above is the *only* thing the user gets, so it must explain.
+
+    ``_import_from_excel`` throws the whole dataset away on ``not is_valid``
+    (ui/app.py shows ``report.summary()`` in a QMessageBox and returns), so a
+    Turkish school whose roster holds both *Sıla* and *Sila* loses its teachers,
+    rooms, branches and classes on the strength of one sentence.
+
+    That sentence used to be the generic ``errors.duplicate_values`` — the same
+    key ``_check_duplicates`` uses for two identical ``teacher_id`` cells. For
+    identical cells it explains itself. Here it rendered as
+
+        [Öğretmenler] Öğretmen Adı için yinelenen değerler: Sıla Kaya, Sila Kaya
+
+    with no row number: two names the user can see are *not* the same string,
+    asserted to be duplicates, with no statement of the rule that merged them
+    and no hint of the remedy. The natural reading is that the app is broken.
+
+    Three things are pinned, all of which the generic key failed:
+      * both spellings appear, so the user knows which two rows are meant;
+      * the message is the dedicated key, not the generic duplicate one;
+      * it carries the colliding row number, like every other error this
+        function raises.
+    """
+    first, second = "Sıla Kaya", "Sila Kaya"
+    teachers = [{"teacher_id": "T001", "name": first},
+                {"teacher_id": "T002", "name": second}]
+    path = build_workbook(tmp_path / "dotted_i.xlsx", teachers=teachers,
+                          classes=[klass("C001")])
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid is False
+    lines = [ln for ln in messages(ds.report) if second in ln]
+    assert len(lines) == 1, (
+        f"expected exactly one line about the folded pair, got "
+        f"{messages(ds.report)}")
+    line = lines[0]
+
+    assert first in line, (
+        f"the refusal never names the spelling that was already taken: {line}")
+
+    generic = tr("errors.duplicate_values").format(
+        id_col=schema.get_workbook_sheet_header_map("teachers")["name"],
+        values=f"{first}, {second}")
+    assert generic not in line, (
+        "the refusal is still the generic duplicate-values message, which "
+        "asserts that two visibly different names are the same string and "
+        f"never says why: {line}")
+
+    # Row 3 is the second teacher row: header, T001, T002.
+    assert line.startswith(row_prefix("teachers", 3)), (
+        f"the refusal carries no row number, so a 200-row roster gives the "
+        f"user nowhere to look: {line}")
 
 
 @pytest.mark.parametrize("first,second", [
@@ -974,6 +1059,58 @@ def test_a_turkish_roster_header_typed_in_capitals_still_names_the_roster(
         f"capitalised header row is rejected as if it were a budget sheet")
 
 
+def test_a_turkish_workbook_whose_header_row_is_shouted_still_imports(tmp_path):
+    """The other half of the capitalised-header story: File ▸ Import Excel.
+
+    ``is_lecturer_name_header`` above covers Setup ▸ Lecturers ▸ Import Excel.
+    The whole-workbook importer takes a different road — ``_read_sheet`` calls
+    ``schema.canonicalize_workbook_columns``, which folds each header against
+    ``get_workbook_sheet_reverse_header_map`` — and nothing exercised it with
+    anything but the shipped casing, because ``build_workbook`` writes the
+    header row from the very map the importer reverses.
+
+    Under a bare ``.casefold()`` this is not a cosmetic miss. Turkish ``ADI``
+    casefolds to ASCII ``adi`` while the shipped ``Adı`` casefolds to dotless
+    ``adı``, so six headers across all four sheets stop resolving and the
+    import is refused outright:
+
+        [Öğretmenler] Zorunlu sütunlar eksik: name
+        [Derslikler]  Zorunlu sütunlar eksik: name
+        [Şubeler]     Zorunlu sütunlar eksik: name
+        [Dersler]     Zorunlu sütunlar eksik: class_id
+
+    A school that ran its header row through Excel's ``UPPER()``, or typed it
+    on a Turkish keyboard, loses its entire roster, room list, branch list and
+    class list from a workbook that looks perfectly correct on screen — and the
+    reason (which of the two capital I's the keyboard emitted) is invisible.
+
+    Asserted against the shipped-casing import rather than against literals, so
+    the two spellings have to agree rather than merely both being non-empty.
+    """
+    rows = [klass("C001"), klass("C002")]
+    plain = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "plain.xlsx", classes=rows))
+    shouted = load_scheduler_data_from_excel(
+        build_workbook(tmp_path / "shouted.xlsx", classes=rows,
+                       shout_headers=True))
+
+    assert plain.report.is_valid, plain.report.summary()
+    assert shouted.report.is_valid, (
+        "a Turkish workbook whose header row was typed in capitals was "
+        "refused:\n" + shouted.report.summary())
+
+    assert shouted.state["lecturers"] == plain.state["lecturers"]
+    assert shouted.state["classrooms"] == plain.state["classrooms"]
+    assert course_names(shouted) == course_names(plain)
+    assert [e["class_id"] for e in shouted.raw_classes] == \
+        [e["class_id"] for e in plain.raw_classes]
+    # student_count is one of the six headers that stops resolving, so a class
+    # that imported with the default head count instead of its own would pass
+    # every assertion above.
+    assert [c["participants"] for c in shouted.state["classes"]] == \
+        [c["participants"] for c in plain.state["classes"]]
+
+
 # ── Room type constrains the class (ST-FUNC-009) ────────────────────────────
 
 def test_required_room_type_constrains_the_class_to_matching_rooms(tmp_path):
@@ -1042,6 +1179,69 @@ def test_a_room_type_no_room_has_is_reported_and_never_widens_the_class(tmp_path
 
     # (b) The unmatchable type did not empty a list the user typed by hand.
     assert ds.state["classes"][1]["required_classrooms"] == ["Oda 1"]
+
+
+@pytest.mark.parametrize("head_count,should_warn", [
+    (25, True),    # every lab seats 20 — nowhere to go
+    (20, False),   # exact fit; `room_fits_class` is cap >= participants
+    (18, False),
+    (0, False),    # head count not filled in; the importer defaults it to 0
+])
+def test_a_room_type_that_resolves_only_to_rooms_too_small_is_reported(
+        tmp_path, head_count, should_warn):
+    """ST-FUNC-009, third contradiction — the resolved list versus the head count.
+
+    ``get_physical_room_candidates`` filters by ``required_classrooms`` first
+    and by ``room_fits_class`` second, so a type resolving only to rooms that
+    cannot seat the class collapses the candidate set to ``[]`` exactly as an
+    unmatchable type or an all-excluded type does — and those two both warn.
+    This one did not: both halves are in ``dataset.state`` at that moment
+    (``_process_rooms`` writes ``classroom_capacities`` two sheets earlier) and
+    neither was compared against the other.
+
+    The app's own shipped template was such a row — 25 students, one 20-seat
+    lab — and imported as ``is_valid=True`` with ``warnings: []``.
+
+    Left to the solver this is not silent forever: measured on the template,
+    the unplaced list said "İzin verilen hiçbir dersliğin yeterli kapasitesi
+    yok", which is accurate and localized. But that sentence only arrives after
+    the user has entered days and times and run a solve, mixed in with classes
+    that failed for ordinary reasons, whereas this is a contradiction between
+    two cells of one row that File ▸ Import Excel is holding at the time and
+    promises to report.
+
+    A warning that changes nothing, never a relaxation: widening back to "any
+    room" is the inversion the test above exists to catch, and a school may
+    genuinely be about to buy chairs.
+    """
+    rows = [klass("C001", student_count=head_count,
+                  required_room_type=ROOM_TYPE_LAB)]
+    path = build_workbook(tmp_path / f"small_{head_count}.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    cls = ds.state["classes"][0]
+    # Whatever is reported, the constraint the user typed stands untouched.
+    assert cls["required_classrooms"] == ["Lab 1", "Lab 2"]
+
+    reported = [m for m in messages(ds.report)
+                if ROOM_TYPE_LAB in m and row_prefix("classes", 2) in m]
+    if not should_warn:
+        assert not reported, (
+            f"{head_count} students fit a 20-seat lab; nothing should be "
+            f"reported, got {reported}")
+        assert get_physical_room_candidates(ds.state, cls), (
+            f"{head_count} students should still have a room to go to")
+        return
+
+    assert get_physical_room_candidates(ds.state, cls) == [], (
+        "fixture drift: this row is supposed to be the unplaceable one")
+    assert len(reported) == 1, messages(ds.report)
+    # The user is told which room is the biggest and by how much it falls
+    # short, so they can act without opening the Rooms sheet to compare.
+    assert "20" in reported[0] and str(head_count) in reported[0], (
+        f"the warning does not name both the capacity and the head count: "
+        f"{reported[0]}")
 
 
 def test_required_room_type_and_allowed_rooms_that_disagree_keep_the_named_rooms(
