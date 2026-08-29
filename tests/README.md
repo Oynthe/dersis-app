@@ -14,6 +14,15 @@ test here that failed before it and passes after.
 .venv-audit/Scripts/python.exe -m mypy                # the engine type gate
 ```
 
+**Two things about running this suite on the audit machine.** The fast lane is
+now ~11 minutes and **exceeds a 600 s command timeout** — run it in the
+background, or run single modules (5–20 s), which is what you want almost every
+time. And `pytest`'s final summary line (`N passed, M xfailed in Xs`) is
+**swallowed** in captured output here: it ends at the "slowest durations" block
+and the words "passed"/"failed" never appear. **Gate on the exit code**, and
+count outcomes from the progress characters on the lines ending `[ NN%]`. Two
+agents in Phase 8 hung permanently waiting for a summary line that never comes.
+
 CI runs two jobs. **Validate** runs `pytest -m "not slow"` on Ubuntu with
 `QT_QPA_PLATFORM=offscreen`, plus `mypy` over the five Qt-free packages
 (`mypy.ini`), gated at **zero** errors. **Scheduling invariants** runs the
@@ -82,6 +91,10 @@ throwaway temp directory at conftest-import time, before pytest collects anythin
 | `test_form_affordances.py` | ST-UI-018/020 — a typed lecturer is registered; every error is shown |
 | `test_year_legend.py` | ST-UI-006 — the colour key groups years that share a swatch |
 | `test_smoke_environment.py` | the harness itself — proves HOME is sandboxed |
+| `test_text_fold.py` | ST-ARCH-001 item 9 — the one case-folding rule, swept over all 22 locales. Mostly a **falsification harness**: it exists to stop the next agent building the Turkish fold the Phase 7 handoff prescribed |
+| `test_drag_and_drop.py` | ST-ARCH-012 — the gesture end to end, including the **real** `_start_drag_gfx` driven through both a commit and a cancel |
+| `test_pdf_locale_coverage.py` | the PDF font property: what cannot be drawn must be a subset of what needs shaping — asserted as a property, never as a host outcome |
+| `test_packaging_manifest.py` · `test_release_pipeline.py` | installer/workflow files read as **data**, not grepped as text; every executable the installer's shortcuts point at must be verified by the release lane |
 
 ## Fixtures
 
@@ -155,6 +168,31 @@ title — an unpinned locale makes template round-trip tests irreproducible.
   Phase 5's contrast fix landed on the untested-by-users copy and shipped
   broken for a phase; two data-loss bugs in the live writer were invisible.
   Green is not coverage if it is coverage of the wrong module.
+- **Confirm the mutation landed before believing its result.** `git diff --stat`
+  after applying it. Phase 7 measured an *unmutated* tree for 13 of 24 patterns
+  because every workflow file is CRLF and the patterns silently did not apply,
+  and concluded "your test pins nothing" when nothing had happened. Phase 8 then
+  found four tests that pinned nothing — and **every one was caught only because
+  the mutation was actually run**: a redo assertion that could not fail; a
+  matcher that reduced to `"" in anything` because it sliced a translated string
+  opening with a placeholder (two tests passed with the production code deleted);
+  a warning test whose discriminator alone already changed the wording; and a
+  substring check that had to become an exact-sentence check before it could see
+  its own mutation. **A green mutation is a finding about your test, not a fact
+  about the code.**
+- **A hand copy of production is not production.** Phase 8's headline drag fix
+  passed a green suite with its production trigger deleted, because the test
+  helpers set the flag themselves. If a module reproduces production's field
+  assignments in a helper, at least one test must drive the **real** entry point
+  — substituting a module-level name (e.g. `scheduler_app.ui.app.QDrag`) is
+  usually enough and is cheaper than a Qt harness.
+- **Translate a new user-facing string into all 22 locales rather than raising
+  the translation ratchet.** It adds zero missing pairs, so the ceiling never
+  moves, and it costs one scripted insert. And **count the backlog the way
+  `test_translation_coverage.py` counts it** — with
+  `import scheduler_app.i18n.tier_translations` first, which merges 52 further
+  `en` keys. Three consecutive phases have taken that count without the import
+  and been ~850 pairs wrong.
 - **Never assert an absolute pixel measurement.** `QT_QPA_PLATFORM=offscreen` has
   no Segoe UI at all — `QFontInfo(QFont("Segoe UI", 9)).family()` is `""` — and
   advances run 1.5–2x native. That changes which cell rows get *dropped*, not

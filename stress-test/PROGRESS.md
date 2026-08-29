@@ -15,14 +15,188 @@ what has changed since. Per-finding state also lives in the
 | **5 — UI consistency & accessibility** | 🟡 Mostly complete | `fix/phase-5-consistency` |
 | **6 — Architecture & maintainability** | 🟡 Mostly complete | `fix/phase-6-architecture` |
 | **7 — Testing, observability & release** | 🟢 Complete | `fix/phase-7-release` |
+| **8 — Closing the remaining work** | 🟢 Complete | `fix/phase-8-remaining` |
+
+---
+
+## Phase 8 — complete
+
+> **Picking the work up?** → [`HANDOFF-PHASE9.md`](HANDOFF-PHASE9.md). It lists
+> what is still open **in the order the user set**: section B (nine verified
+> defects) first, section C (ten unverified incidentals) last, and for C the
+> first question is "is this real?" rather than "how do we fix it?".
+
+**Suite: 1140 tests — 1138 pass, 2 known-defect pins, 0 failures.** Both lanes
+exit 0. (954 / 946 / 8 at the start of the phase: **+186 tests, and 6 of the 8
+pins closed by fixing the defect**.) `mypy` clean over 42 source files. **All
+four layering ratchets are still `0`, and the translation ratchet was never
+raised** — every one of the six new user-facing strings ships in all 22 locales.
+
+The two surviving pins are the **ST-DATA-013** pair, which are documentation
+rather than defects: true at the library level, no production producer.
+
+### The phase changed shape halfway through, on the user's instruction
+
+It began as "close the remaining work" and, once the backlog was enumerated,
+the user redirected it:
+
+> "The goal should no longer be to keep discovering new issues indefinitely…
+> I need convergence, not another expanding audit cycle… I want the adversarial
+> stage to validate completed fixes, not to discover that the fixes were
+> incomplete in the first place."
+
+Everything after that point ran one loop, per item, with no exceptions:
+**reproduce the original failure → fix → re-run the same probe → regression-check
+→ mark resolved.** Nothing was marked resolved on inspection. Two candidates were
+marked `NOT_REPRODUCIBLE` and left alone, which is the loop working.
+
+### What the handoff got wrong
+
+Phase 8's own brief was wrong or incomplete on **six of its eight items**. As in
+every previous phase, each was established by building the proposed version and
+watching it fail.
+
+1. **Item 2's prescribed fix is the bug.** The handoff specified a *Turkish*
+   fold — `'İ'→'i'`, `'I'→'ı'` before the ordinary fold. Built and measured
+   across 22 locales × 7 days × 4 casings, it **breaks 42 locale/weekday pairs**,
+   including plain ASCII `FRIDAY`, `DIENSTAG`, `LUNDI`, `DOMINGO` and every
+   Portuguese `-FEIRA` form — and `PAZARTESI`/`CUMARTESI`, which the suite
+   already pins **green**. The correct rule is neither Turkish nor
+   locale-dependent: fold every dotted and dotless I (`I`, `i`, `İ`, `ı`, and the
+   two-codepoint `i`+U+0307 that `casefold()` actually emits) onto plain ASCII
+   `i`. Locale-free, idempotent, and a strict superset of what `casefold` already
+   merged, so nothing that is one thing today becomes two.
+   The defect was also **larger** than recorded: three Turkish weekdays break,
+   not two, plus two Azerbaijani ones that break under plain ASCII `.upper()`
+   with no Turkish keyboard involved. And it is **destructive**, not merely a
+   dropped constraint — `normalize_state_day_keys` runs from `_auto_save` on a
+   debounce timer, so a week written in capitals is read back short and the
+   shortened week is written to disk.
+2. **Item 1 hid a second defect nobody had pinned.** The recorded defect was
+   "one Ctrl+Z after a drag unplaces the lesson". Measured, the same
+   unconditional `pop()` also meant a drag **from the sidebar** destroyed an
+   unrelated action's only undo snapshot — depth unchanged, which is exactly why
+   nobody noticed. **Both fixes the handoff itself proposed were built and both
+   fail that case.**
+3. **Item 3's prescribed wiring says nothing, ever.** "Wire into
+   `InfeasibilityAnalyzer`'s existing `required_room_missing` message" — that
+   branch is unreachable when `required_classrooms` is empty, which is precisely
+   the state the finding is about. Measured: 8 valid slots, `bottleneck: None`,
+   zero blocking categories. An import-time warning was used instead.
+4. **Item 4's pin was wrong about its own subject.** It built its damage with
+   `_corrupt(blob, "truncated")` — the one shape the reader already handled — so
+   it failed on "DID NOT RAISE", not on the defect it named, and a *correct* fix
+   left it quietly xfailed rather than turning it red. It was rewritten into
+   three guards that assert which records survived, how many were lost, and that
+   the two readers agree. The handoff also missed `load_encrypted_lines_since`,
+   which carried the identical swallow and is the function the learner actually
+   calls.
+5. **Item 7's blocking premise is false on the installed reportlab.** "reportlab
+   has no bidi and no shaping" — 5.0.1 declares both as optional extras
+   (`rlbidi`, `uharfbuzz`) with live code paths. And the shipped figure is
+   **3 of 22 locales, not 9**: `_resolve_pdf_fonts` recovers 6 of the 9 from host
+   faces. The decision not to act still stands, for a *structural* reason the
+   handoff did not give — the resolver **short-circuits on shaped scripts**, so
+   no substitute face, bundled or host, is ever tried for ar/fa/hi.
+6. **Item 6 was incomplete in the direction it warned about.** It said of the
+   last read-found defect, "there is no reason to assume it was the only one."
+   It was not: Phase 7's `release.yml` dropped `"$dist\Dersis.exe"` from the
+   verify list the deleted `build-release.yml` had carried, while
+   `installer.iss` still points the Start Menu shortcut, the Desktop shortcut
+   and the post-install launch at that file. `build_embed.bat` compiles it with
+   `Add-Type … 2>$null`, never checks it, and had no `exit /b 1`. A failed
+   launcher compile would have shipped an installer that installs cleanly and
+   whose every shortcut points at nothing.
+7. **Item 8f's stated consequence is false.** "The UI cannot tell a cancelled
+   solve from a failed one" — `solver_task.py` declares finished/failed/cancelled
+   as three separate signals and `app.py` connects three distinct handlers. The
+   write-only flag is real; the consequence is not.
+8. **The translation ratchet had zero headroom, and two agents measured it
+   wrong in the same hour.** Both reported "1700 against 2548" — the count taken
+   *without* `import scheduler_app.i18n.tier_translations`. The real figure was
+   **2548 against 2548**. This is the third consecutive phase to fall into a trap
+   that is written down by name in the handoff.
+
+### The fix for the ratchet, which is better than the handoff's advice
+
+The handoff prescribed "the next English string must move the ratchet in the same
+commit". Phase 8 added **six** new user-facing strings and moved the ratchet
+**zero** times, by shipping each key in all 22 locales. That adds no missing
+pairs at all, and 21 locales get a native message instead of an English fallback.
+It costs one scripted insert. Raising the ceiling is the second-best option.
+
+### Findings closed
+
+| ID | Sev | What changed |
+|---|---|---|
+| **ST-ARCH-012** | 🟡 Medium | One Ctrl+Z after a drag puts the lesson back where it was — and a sidebar drag no longer destroys an unrelated action's snapshot. |
+| **ST-ARCH-001** item 9 | 🔴 Critical | One case-folding rule (`i18n/text_fold.py`) shared by day keys, the class form, the importer and the workbook schema. A Turkish week typed in capitals no longer loses half its days on the next autosave. |
+| [ST-FUNC-009](12-findings-register.md) | 🟡 Medium | `required_room_type` is consumed: resolved to real rooms at import, intersecting with `allowed_rooms`, never widening, never emptying, and warned when it cannot narrow. |
+| [ST-FUNC-007](12-findings-register.md) | 🟡 Medium | Legacy plain-ASCII JSON saves load. `_is_fernet_token` asks a positive question (`startswith(b"gAAAAA")`) instead of "do the first 80 bytes decode as ASCII". |
+| [ST-DATA-002](12-findings-register.md) | 🟠 High | A damaged feedback log costs the damaged records only, and the user is told. The count, the reader and the learner's cursor now share one framing rule. |
+| [ST-FUNC-012](12-findings-register.md) | 🟢 Low | Two teacher names that fold together are reported with a message that names both spellings and says why. |
+| **ST-SEC** (packaging) | 🟠 High | The release lane verifies the launcher every installer shortcut points at; `build_embed.bat` fails where the failure happens. |
+
+### Defects this phase introduced, and caught
+
+Three, all found by the adversarial stage attacking work that had already passed
+review with a green suite. This is the reason the stage exists.
+
+* **The ST-DATA-002 fix reintroduced ST-DATA-002.** When a record's container
+  magic was the damaged byte, the new resync stepped over a whole record and
+  reported `lost == 0` — where the reader it replaced reported `lost == 1`. It
+  made the common case recoverable and the uncommon case **silent**.
+* **`log_entry_count` and the shared walk disagreed.** An inflated length prefix
+  (201 → 1225, still passing both guards) left the seek 1 byte from EOF and
+  returned 1 where the walk recovered 6. That count is the unit the learner's
+  cursor is expressed in.
+* **`required_room_type` + `excluded_rooms` stranded a class.** Candidates went
+  from `['Oda 1']` at `82f558e` to `[]` — a class the school had been
+  timetabling became impossible to place, with an empty import report.
+
+And one the phase caught in its own *testing*: deleting
+`self._drag_undo_pushed = True` from production left the entire suite **green**,
+because the test helpers set the flag themselves. The headline fix worked and its
+wiring was pinned by nothing — verbatim the Phase 7 pattern, one layer down,
+inside `tests/`.
+
+### Tests that pinned nothing, caught by mutation
+
+Four, each found only because the mutation was actually run:
+
+* a redo assertion that **could not fail** — every real action clears the redo
+  stack, so it was green under both the fix and the wrong fix;
+* a matcher that reduced to `"" in anything`, because it sliced a translated
+  string that opens with a placeholder — **two tests passed with the production
+  report deleted entirely**;
+* a room-type warning test that stayed green under its own mutation, because the
+  discriminator alone already changed the wording;
+* a substring assertion that had to become an exact-sentence assertion before it
+  could see its mutation.
+
+The rule this phase would restate: **confirm the mutation actually landed
+(`git diff --stat`) before believing any result**, and treat a green mutation as
+a finding about your test, not a fact about the code.
+
+### Known gaps left behind
+
+1. **Nine verified defects** are recorded in
+   [`HANDOFF-PHASE9.md`](HANDOFF-PHASE9.md) §B, to be fixed first in Phase 9.
+   The two drag residues (B1, B2) share one root cause and one cure.
+2. **Ten unverified incidentals** are in §C, to be *checked* before being fixed.
+3. **Nothing in the release/packaging cluster was executed** — the user declined
+   the rehearsal. `main` has never been pushed: `origin/main` is still at the
+   Phase 6 merge, 81 commits behind.
 
 ---
 
 ## Phase 7 — complete
 
-> **Picking the work up?** → [`HANDOFF-PHASE8.md`](HANDOFF-PHASE8.md). The
-> roadmap has no rows left; that file lists what is still open, in the order
-> worth doing, with the two live defects that produce a wrong timetable first.
+> Superseded by Phase 8. The handoff this section points at
+> ([`HANDOFF-PHASE8.md`](HANDOFF-PHASE8.md)) is retained because its §6 carries
+> the release-rehearsal script, which is still unrun — but **six of its eight
+> items were wrong or incomplete**, and the corrections are recorded in the
+> Phase 8 section above. Read that first.
 
 **Suite: 1026 tests — 1018 pass, 8 known-defect pins, 0 failures.** Both lanes
 exit 0. (725 at the start of the phase: **+301 tests, and 7 pins deleted**; two
