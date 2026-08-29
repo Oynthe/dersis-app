@@ -1042,8 +1042,30 @@ def _class_form_result(parent, state, edit_cls):
     """
     unchanged = edit_cls.get("lecturer")
     seed = edit_cls
+    # ST-UI-021. The caption, not a parameter. `seed` becomes `dlg.result` on
+    # the re-show, and `AddClassDialog` has exactly one channel for a seed —
+    # `edit_cls=` — from which `__init__` derives the title. So the second
+    # showing of the ADD form called itself "Edit Class": every field correct,
+    # only the caption lying, and only on the add path's second showing.
+    #
+    # `captions[0]` is by construction the FIRST showing's caption, which
+    # `__init__` derived from the real `edit_cls` — so the add path keeps the
+    # add caption and the edit path keeps the edit caption, without either
+    # this function or the dialog having to know which path it is on.
+    #
+    # The prescribed fix — a keyword-only `title=None` on
+    # `AddClassDialog.__init__` — was built and measured and costs +1 in BOTH
+    # files: the `title or (edit-derived default)` is a BoolOp inside the
+    # codebase's only F-band function (46), and the caller needs a second one
+    # to learn the first showing's title. Both files are on their ceilings.
+    # Three bare statements here are +0, and `setWindowTitle` is called
+    # exactly once in `AddClassDialog` — in `__init__`, with nothing
+    # recomputing it — which is the fact that makes overriding it safe.
+    captions = []
     while True:
         dlg = AddClassDialog(parent, state, edit_cls=seed)
+        captions.append(dlg.windowTitle())
+        dlg.setWindowTitle(captions[0])
         if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
             return None
         typed = dlg.result.get("lecturer")

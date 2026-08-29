@@ -25,8 +25,8 @@ locale string uses a          0          HARD FAIL — this is the one that
 placeholder ``en`` lacks                 *crashes*; see below
 locale string that cannot     0          HARD FAIL — a stray ``}`` renders
 be parsed as a format string             literally
-locale missing a key ``en``   1          RATCHET — a translation backlog, not
-has (subset placeholders)                a defect; may shrink, never grow
+locale missing a key ``en``   0 (was 1)  RATCHET — the last one was fixed in
+has (subset placeholders)                Phase 10 and the ceiling went with it
 locale missing a key          2408       RATCHET — needs a translator, not a
 entirely                                 build failure
 ===========================  ==========  =====================================
@@ -47,10 +47,16 @@ drifted from English does not degrade, it **raises**:
 That last one is why "just machine-translate the backlog" is not available: it
 passes a key-count check and a format check, and loses the user's data anyway.
 
-Exactly one mismatch exists today (``hi``/``errors.unsupported_egu_version``
-has ``{version}`` where ``en`` has ``{version}`` and ``{supported}``). It is a
-*subset*, which ``str.format`` tolerates because it ignores extra kwargs — so
-it is caught by the ratchet, not the hard assertion.
+**No mismatch exists today.** Exactly one did until Phase 10:
+``hi``/``errors.unsupported_egu_version`` carried ``{version}`` where ``en``
+carries ``{version}`` and ``{supported}``, so a Hindi user opening a ``.egu``
+from another build was told the file's version but not which version their copy
+can read. It is a *subset*, which ``str.format`` tolerates because it ignores
+extra kwargs — so it was caught by the ratchet, not by the hard assertion, and
+it sat there for nine phases. It was the ratchet's sole occupant, so fixing the
+string let ``MAX_PLACEHOLDER_SUBSETS`` go to **0** in the same commit: the
+banked-headroom rule working as designed, and the ceiling now forbids the class
+of defect outright rather than tolerating one instance of it.
 """
 import ast
 import os
@@ -112,7 +118,7 @@ EN = TRANSLATIONS["en"]
 # that two keys had landed. Anyone planning a batch of new English strings
 # should measure **with the tier catalogue imported** before assuming room.
 MAX_MISSING_LOCALE_KEY_PAIRS = 2548
-MAX_PLACEHOLDER_SUBSETS = 1
+MAX_PLACEHOLDER_SUBSETS = 0
 
 
 def _iter_source_files():
@@ -319,8 +325,10 @@ def test_placeholder_subsets_do_not_grow():
     """ST-UI-011 — the silent half: a translation that drops a placeholder.
 
     ``str.format`` ignores extra kwargs, so this never raises — the number just
-    vanishes from the sentence. One such string exists today
-    (``hi``/``errors.unsupported_egu_version``).
+    vanishes from the sentence. The ceiling is **0**: the one string that used
+    to sit under it (``hi``/``errors.unsupported_egu_version``) was fixed in
+    Phase 10 and the ceiling was lowered in the same commit, so this is now an
+    absolute prohibition rather than a tolerance of one.
     """
     subsets = []
     for lang, catalogue in sorted(TRANSLATIONS.items()):
