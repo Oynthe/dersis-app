@@ -3581,10 +3581,32 @@ class SchedulerApp(QMainWindow):
             QMessageBox.information(self, tr("dialogs.edit_classes.title"),
                                    tr("dialogs.edit_classes.no_classes"))
             return
+        # The snapshot used to be taken HERE, unconditionally, above
+        # `dlg.exec()`. Opening Edit Classes and closing it unchanged
+        # therefore cleared the redo stack — measured: redo depth 1 -> 0 for a
+        # gesture that left `state_data` byte-identical — and at the 50-entry
+        # cap it also evicted `_undo_stack[0]`, which no `pop()` puts back.
+        #
+        # It is not moved BELOW `dlg.exec()`, which is the obvious repair and
+        # is wrong: `edit_callback` is `_edit_class`, which pushes its own
+        # entry while the modal is still up. An entry committed after `exec()`
+        # returns is then younger than entries recorded before it, and one
+        # Ctrl+Z jumps forward in time — measured on delete-then-rename, the
+        # second undo re-deleted the class the first had just restored.
+        # Re-ordering the stack afterwards fixes that below the cap and is
+        # silently off by one AT the cap, because the inner push has already
+        # shifted every index left.
+        #
+        # So the snapshot goes where the mutation is. `_delete_selected` is
+        # the only place this dialog writes `state_data` directly; everything
+        # else it does goes through `_edit_class`, which already records its
+        # own entry at its own instant. Nothing speculative is ever pushed and
+        # the ordering question cannot arise.
         snap_before = capture_snapshot(self.state_data)
-        self._push_undo(tr("actions.edit").format(name="classes"))
-        dlg = EditClassesDialog(self, self.state_data,
-                                edit_callback=self._edit_class)
+        dlg = EditClassesDialog(
+            self, self.state_data, edit_callback=self._edit_class,
+            snapshot_callback=lambda: self._push_undo(
+                tr("actions.edit").format(name="classes")))
         dlg.exec()
         # Validate placements via workflow
         invalidated = SchedulingWorkflow.validate_placements_after_edit(

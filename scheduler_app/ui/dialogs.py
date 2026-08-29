@@ -4464,18 +4464,41 @@ class RescheduleDialog(QDialog):
 class EditClassesDialog(QDialog):
     """Dialog for viewing, searching, editing, deleting, and exporting classes."""
 
-    def __init__(self, parent, state, edit_callback=None):
+    def __init__(self, parent, state, edit_callback=None,
+                 snapshot_callback=lambda: None):
         """
         Args:
             parent: parent widget (SchedulerApp)
             state: the full scheduler state dict
             edit_callback: callable(cls) to open edit form for a single class
+            snapshot_callback: called immediately before ``_delete_selected``
+                mutates ``state``, and only then \u2014 this dialog is the only one
+                that writes ``state["classes"]`` directly, so the caller cannot
+                record an undo entry for the deletion any other way.
+
+                It exists because the caller used to snapshot unconditionally
+                BEFORE ``exec()``, which destroyed the user's redo history for
+                merely opening the dialog and closing it (Phase 10 item 5).
+                Deferring that snapshot to after ``exec()`` returns is NOT the
+                fix and was measured wrong: ``edit_callback`` is
+                ``SchedulerApp._edit_class``, which pushes its own undo entry
+                while this modal is still up, so an entry committed afterwards
+                lands ABOVE entries recorded earlier in time and one Ctrl+Z
+                then jumps FORWARD \u2014 measured, on delete-then-rename, as the
+                second undo re-deleting the class the first had restored.
+                Recording at the instant of the mutation is what makes the
+                ordering question unable to arise.
+
+                The ``lambda: None`` default keeps every existing caller
+                working without a guard at the call site; a guard would be an
+                ``if`` in a file sitting on its complexity ceiling.
         """
         super().__init__(parent)
         self.setStyleSheet(DIALOG_STYLESHEET())
         self.setWindowTitle("\u270E  " + tr("dialogs.edit_classes.title"))
         self.state = state
         self._edit_callback = edit_callback
+        self._snapshot_callback = snapshot_callback
         self.result = None  # will be set to list of deleted class refs
         self._deleted_classes = []
         self._edited_classes = []
@@ -4661,6 +4684,11 @@ class EditClassesDialog(QDialog):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
+        # Below the confirmation and above the mutation, deliberately: this is
+        # the commit point. The user has said yes and nothing can now abandon
+        # the deletion, which is the precondition `SchedulerApp._push_undo`'s
+        # docstring sets for snapshot-and-commit in one statement.
+        self._snapshot_callback()
         # Collect classes to delete (reverse order for safe removal)
         classes_to_delete = [self._class_refs[r] for r in rows if r < len(self._class_refs)]
         for cls in classes_to_delete:
