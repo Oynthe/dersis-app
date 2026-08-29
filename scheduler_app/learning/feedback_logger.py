@@ -192,6 +192,15 @@ class FeedbackLogger:
         """Entries after the first *skip*, decrypting only those (ST-PERF-005)."""
         return storage.load_encrypted_lines_since(self.log_file, skip)
 
+    def get_entries_since_report(self, skip):
+        """``get_entries_since`` that also says how many records were lost.
+
+        ST-DATA-002: the learner is the only caller in a position to notice
+        that the history stopped being readable, so it is the one that has to
+        be told. Returns ``(entries, lost)``; ``lost`` is 0 for a healthy log.
+        """
+        return storage.load_encrypted_lines_since_report(self.log_file, skip)
+
     def clear(self):
         """Clear all feedback entries."""
         try:

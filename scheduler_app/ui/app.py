@@ -1973,6 +1973,10 @@ class SchedulerApp(QMainWindow):
 
     def _flush_startup_settings_report(self):
         """Surface a settings problem detected before the window existed."""
+        # FIRST, and deliberately above the `if not pending: return` early exit
+        # below — a damaged feedback log is its own report and must not be
+        # skipped just because the settings container was fine.
+        self._report_damaged_feedback_log()
         from scheduler_app.ui import first_run as _first_run
         quarantined = getattr(_first_run, "LAST_QUARANTINE", None)
         if quarantined:
@@ -2049,6 +2053,35 @@ class SchedulerApp(QMainWindow):
         except Exception:
             pass
         self._deferred_warning(tr("status.settings_problem_title"), message)
+
+    def _report_damaged_feedback_log(self):
+        """ST-DATA-002: tell the user their feedback history stopped being readable.
+
+        Routed through ``_report_settings_problem`` rather than a second
+        channel: it is already rate-limited per *kind* per session, already
+        mirrors into the toast and the warning panel, and is already the place
+        a storage problem found before the widgets existed comes out. The
+        learner runs from ``__init__`` long before ``_build_main()``.
+
+        Called from ``_flush_startup_settings_report``, NOT from the learn()
+        call site in ``__init__``: ``_pending_settings_report`` is a single slot
+        and ``learn()`` runs before ``_auto_load()``, so a message stashed there
+        would be silently overwritten by a settings message.
+
+        Nothing is quarantined here, deliberately. ``quarantine_corrupt`` moves
+        the whole file, and on an EGL1 log the records around the damage are
+        still readable — ST-DATA-014's principle is that nothing is deleted,
+        and here nothing needs to be moved either.
+
+        The message carries no count: ``LogRead.lost`` is a floor, not an exact
+        number of records (a torn tail is one loss however many it swallowed).
+        """
+        lost = getattr(self._preference_learner, "last_read_lost", 0)
+        if not lost:
+            return
+        self._report_settings_problem(
+            "feedback_log", tr("errors.feedback_log_damaged").format(
+                path=self._feedback_logger.log_file))
 
     def _read_settings_container(self):
         """Read the settings container, distinguishing the three outcomes.

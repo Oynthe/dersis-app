@@ -43,6 +43,7 @@ import secrets
 import shutil
 import struct
 import sys
+from typing import NamedTuple
 
 from scheduler_app.core.models import normalize_state_classes
 from scheduler_app.translations import tr
@@ -184,6 +185,25 @@ _LOG_MAGIC = b"EGL1"
 _LOG_VERSION = 1
 _LOG_HEADER_FMT = "!4sH"
 _LOG_RECLEN_FMT = "!I"
+
+
+class LogRead(NamedTuple):
+    """What one log read produced, and what it could not read.
+
+    A plain tuple so ``load_encrypted_lines`` can stay a one-line wrapper and
+    every existing caller keeps its list. ``lost`` is 0 for a healthy or absent
+    log, the number of records that would not decode for a damaged one, and -1
+    when the file could not be identified as a log at all (bad magic,
+    unsupported version, an unreadable legacy container) — there is no framing
+    left to count with, and reporting 0 there would be the ST-DATA-002 lie in a
+    new place.
+
+    ``lost`` is a floor, not an exact count: a torn tail is one loss however
+    many records it swallowed, because the framing that would have counted them
+    is exactly what is missing. Nothing user-facing may print it as a number.
+    """
+    entries: list
+    lost: int
 
 
 def _key_path() -> str:
@@ -355,15 +375,29 @@ def _try_load_fernet(blob: bytes) -> bytes:
 
 
 def _is_fernet_token(blob: bytes) -> bool:
-    """Heuristic check: Fernet tokens are base64-encoded and start with version byte."""
-    if len(blob) < 10:
-        return False
-    # Fernet tokens are URL-safe base64 — all printable ASCII
-    try:
-        blob[:80].decode("ascii")
-        return True
-    except (UnicodeDecodeError, ValueError):
-        return False
+    """Is this blob a legacy Fernet token?
+
+    ST-FUNC-007. This used to ask "do the first 80 bytes decode as ASCII",
+    which is true of every plain-JSON file ever written in ASCII. So a legacy
+    unencrypted save was routed here and rejected as undecryptable, while the
+    SAME file with a Turkish letter in its first 80 bytes fell through to the
+    plain-JSON branch and loaded. The docstring already claimed the check was
+    about the version byte; it never was.
+
+    A Fernet token is urlsafe-base64 of ``0x80`` + an 8-byte big-endian
+    timestamp + IV + ciphertext + HMAC. The version byte is fixed at ``0x80``
+    by the spec and the top four timestamp bytes stay zero until 2106, so the
+    first six characters are literally ``gAAAAA``. Measured against tokens
+    generated with this venv's ``cryptography``: version byte 0x80, and 20 of
+    20 tokens began ``gAAAAABq``.
+
+    Anything this now rejects falls through to the plain-JSON branch below,
+    which either parses it or reports ``unrecognized_file_format`` — a more
+    accurate story than ``egu_could_not_decrypt`` for a file that was never
+    encrypted.
+    """
+    token = blob.strip()
+    return len(token) >= 10 and token.startswith(b"gAAAAA")
 
 
 # ── Public save / load API ────────────────────────────────────────────────
@@ -466,7 +500,30 @@ def _write_log(entries: list, path: str) -> None:
 
 
 def _read_log_records(blob: bytes) -> list:
-    """Decode an EGL1 blob. A damaged tail costs only the records after it."""
+    """Decode an EGL1 blob, keeping every record that still decrypts."""
+    return _read_log_records_report(blob).entries
+
+
+def _read_log_records_report(blob: bytes) -> LogRead:
+    """Decode an EGL1 blob. Returns ``(entries, lost)``.
+
+    ST-DATA-002. The old reader kept a torn *tail* but let damage anywhere
+    else out as an exception, and the caller one frame up turned that into
+    ``[]`` — so one flipped bit in record 0 cost all 12 records. Measured on a
+    3-record log: 0 recovered, where 2 were intact and framed.
+
+    Skipping a bad record is safe because of the framing, not in spite of it:
+    every record carries its own length prefix, EGU1 magic, SHA-256 and
+    AES-GCM tag, so a reader that resyncs can lose records but cannot invent
+    one — a window of arbitrary bytes fails all three checks. Measured with
+    record 0's length prefix rewritten to 40: ``([], 2)``, no fabricated entry.
+    The loop terminates because ``rec_len <= 0`` breaks and ``off`` otherwise
+    grows by at least ``len_size`` each turn.
+
+    ``lost`` is a floor, not a count: a torn tail is one loss however many
+    records it swallowed, because the framing that would have counted them is
+    exactly what is missing.
+    """
     header_size = struct.calcsize(_LOG_HEADER_FMT)
     magic, version = struct.unpack_from(_LOG_HEADER_FMT, blob, 0)
     if magic != _LOG_MAGIC:
@@ -476,17 +533,22 @@ def _read_log_records(blob: bytes) -> list:
             tr("errors.unsupported_egu_version").format(
                 version=version, supported=_LOG_VERSION))
     entries = []
+    lost = 0
     off = header_size
     len_size = struct.calcsize(_LOG_RECLEN_FMT)
     while off + len_size <= len(blob):
         (rec_len,) = struct.unpack_from(_LOG_RECLEN_FMT, blob, off)
         off += len_size
         if rec_len <= 0 or off + rec_len > len(blob):
-            break  # torn tail: keep every complete record before it
-        entries.append(json.loads(
-            _parse_container(blob[off:off + rec_len]).decode("utf-8")))
+            lost += 1  # torn tail: keep every complete record before it
+            break
+        try:
+            entries.append(json.loads(
+                _parse_container(blob[off:off + rec_len]).decode("utf-8")))
+        except Exception:
+            lost += 1  # one unreadable record; the next frame is still framed
         off += rec_len
-    return entries
+    return LogRead(entries, lost)
 
 
 def save_encrypted_lines(entries: list, path: str) -> None:
@@ -501,19 +563,39 @@ def load_encrypted_lines(path: str) -> list:
     legacy single-array .egu/.uva/Fernet/plain-JSON forms so a log written by an
     older build keeps loading.
 
-    Returns an empty list if the file doesn't exist.
+    Returns an empty list if the file doesn't exist. A DAMAGED log returns the
+    records that still decrypt; use :func:`load_encrypted_lines_report` when the
+    caller needs to know that anything was lost.
+    """
+    return load_encrypted_lines_report(path).entries
+
+
+def load_encrypted_lines_report(path: str) -> LogRead:
+    """``load_encrypted_lines`` that also reports what it could not read.
+
+    ST-DATA-002. Deliberately still does not raise, and this is the whole
+    reason the fix is shaped this way: ``append_encrypted_entry`` calls this on
+    its conversion branch and depends on getting a *value*, because an empty
+    value is what routes an unreadable log to ``quarantine_corrupt`` instead of
+    letting it be overwritten. Measured with a raising variant substituted: the
+    append raised ``EguFileError``, ``FeedbackLogger._write_entry``
+    (``learning/feedback_logger.py``) swallowed it with ``except Exception:
+    pass``, and ``backups/`` stayed empty — a silent learning outage traded for
+    a silent write outage with the quarantine lost too. The loss is reported
+    through the return value instead, and ``ui/app.py`` turns it into the same
+    user-facing message a corrupt settings container gets.
     """
     if not os.path.exists(path):
-        return []
+        return LogRead([], 0)
     try:
         with open(path, "rb") as f:
             blob = f.read()
         if blob[:4] == _LOG_MAGIC:
-            return _read_log_records(blob)
+            return _read_log_records_report(blob)
         data = load_encrypted(path)
-        return data if isinstance(data, list) else []
+        return LogRead(data, 0) if isinstance(data, list) else LogRead([], -1)
     except Exception:
-        return []
+        return LogRead([], -1)
 
 
 def append_encrypted_entry(entry: dict, path: str) -> None:
@@ -593,36 +675,61 @@ def load_encrypted_lines_since(path: str, skip: int) -> list:
     ST-PERF-005: ``PreferenceLearner.learn()`` runs after every manual move and
     at every launch. Slicing the tail out of a full read would still decrypt the
     whole history, which is the cost being removed.
+
+    A DAMAGED log returns the records after *skip* that still decrypt; use
+    :func:`load_encrypted_lines_since_report` when the caller needs to know
+    that anything was lost.
+    """
+    return load_encrypted_lines_since_report(path, skip).entries
+
+
+def load_encrypted_lines_since_report(path: str, skip: int) -> LogRead:
+    """``load_encrypted_lines_since`` that reports what it could not read.
+
+    ST-DATA-002, second half. This function had the identical blanket
+    ``except Exception: return []`` around its whole loop, and it disagreed
+    with ``load_encrypted_lines`` about the same file: measured on a 3-record
+    log with one bit flipped inside record 0, ``since(path, 1)`` returned
+    ``[{'b': 2}, {'c': 3}]`` (record 0 is skipped, so it is never decrypted and
+    never noticed) while ``load_encrypted_lines`` returned ``[]``.
     """
     if skip <= 0:
-        return load_encrypted_lines(path)
+        return load_encrypted_lines_report(path)
     if not os.path.exists(path):
-        return []
+        return LogRead([], 0)
     try:
         with open(path, "rb") as f:
             blob = f.read()
     except OSError:
-        return []
+        return LogRead([], -1)
     if blob[:4] != _LOG_MAGIC:
-        return load_encrypted_lines(path)[skip:]
+        whole = load_encrypted_lines_report(path)
+        return LogRead(whole.entries[skip:], whole.lost)
     entries = []
+    lost = 0
     off = struct.calcsize(_LOG_HEADER_FMT)
     len_size = struct.calcsize(_LOG_RECLEN_FMT)
     seen = 0
-    try:
-        while off + len_size <= len(blob):
-            (rec_len,) = struct.unpack_from(_LOG_RECLEN_FMT, blob, off)
-            off += len_size
-            if rec_len <= 0 or off + rec_len > len(blob):
-                break
-            if seen >= skip:
+    while off + len_size <= len(blob):
+        (rec_len,) = struct.unpack_from(_LOG_RECLEN_FMT, blob, off)
+        off += len_size
+        if rec_len <= 0 or off + rec_len > len(blob):
+            lost += 1
+            break
+        if seen >= skip:
+            try:
                 entries.append(json.loads(
                     _parse_container(blob[off:off + rec_len]).decode("utf-8")))
-            seen += 1
-            off += rec_len
-    except Exception:
-        return []
-    return entries
+            except Exception:
+                lost += 1
+        # Counts FRAMES, not decoded records, so the learner's cursor stays in
+        # the same unit as log_entry_count() — which walks length prefixes
+        # without decrypting — even when a record in the middle is unreadable.
+        # If log_entry_count ever starts skipping undecodable frames, the two
+        # drift and the learner re-learns or skips entries.
+        seen += 1
+        off += rec_len
+    return LogRead(entries, lost)
 
 
 # ── Migration helpers ────────────────────────────────────────────────────
