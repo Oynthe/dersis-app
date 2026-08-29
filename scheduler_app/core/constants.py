@@ -90,6 +90,41 @@ CELL_FG_SEQUENTIAL = "#0F172A"  # #7C3AED  2.87:1  ->  8.38:1
 # Secondary text in the open-slots sidebar panel, painted on #FFFFFF.
 OPEN_SLOTS_FG_ROOM = "#4B5563"  # was #9CA3AF, 2.54:1 -> 7.56:1
 
+# ── Status text in dialogs and badges (ST-UI-013, Phase 10 item 15) ───
+#
+# The traffic-light encoding — this went well / watch this / this went badly —
+# as it appears in `ui/dialogs.py` (the bulk-results grades, the negotiation
+# tab, the class list's status column) and in `ui/app.py`'s impact badge.
+#
+# Separate from the CELL_FG_* block above and NOT reusable from it: those were
+# tuned against the darkest lightened YEAR_COLORS cell (#f69898) and are far
+# darker than a dialog needs, while these are painted on the five backgrounds
+# the two dialog files actually use. Worst ratio across all five
+# (#FFFFFF, #F8FAFC, #F1F5F9, #FEF3C7, #FDE68A):
+#
+#                          was       was-worst   now-worst
+STATUS_FG_OK = "#166534"   # #16A34A   2.65:1  ->  5.73:1
+STATUS_FG_WARN = "#92400E"  # #D97706  2.51:1  ->  5.69:1
+STATUS_FG_POOR = "#9A3412"  # #EA580C  2.83:1  ->  5.87:1
+# The one place the green is a FILL rather than ink, under a white label.
+# Lighter than STATUS_FG_OK on purpose: #166534 clears the threshold at 7.13:1
+# but reads almost black for a primary action button.
+STATUS_BG_OK = "#15803D"   # #16A34A   white label 2.78:1 -> 5.02:1
+#
+# All of this is body text under 14 pt, so 4.5:1 governs throughout — none of
+# it qualifies for the 3:1 large-text allowance, and the button's label is text
+# too, so 4.5:1 governs it rather than the 3:1 of WCAG 1.4.11.
+#
+# The 800-step values rather than the 4.5:1 minimum, for the reason the block
+# above already applies: #15803D and #B45309 would pass by 1.8%, and a margin
+# that thin is spent by the next background change. These clear every surface
+# in the product by more than 25% and stay unmistakably green / amber / orange
+# (hues 143 / 23 / 15 degrees), so the encoding survives.
+#
+# Here rather than inline, because a private copy of a palette in a fourth file
+# is exactly how `data_io/exporter.py` drifted from `ui/renderer.py` for a
+# whole phase — the drift ST-UI-005 and ST-ARCH-003 spent two phases closing.
+
 MIN_CELL_W = 150
 MIN_CELL_H = 70
 EMPTY_BG = "#F8FAFC"

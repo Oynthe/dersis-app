@@ -12,6 +12,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QCursor, QShortcut, QKeySequence
 
+from scheduler_app.core.constants import (
+    STATUS_BG_OK, STATUS_FG_OK, STATUS_FG_POOR, STATUS_FG_WARN,
+)
 from scheduler_app.core.text_safety import escape_qt_rich
 from scheduler_app.data_io.schema import is_lecturer_name_header
 from scheduler_app.translations import TRANSLATIONS, tr
@@ -3961,13 +3964,14 @@ class BulkResultsDialog(QDialog):
                 f"{tr('status.could_not_place')}</span>")
         else:
             summary_text = (
-                f"<span style='color:#16A34A'><b>{tr('labels.all')} {total} "
+                f"<span style='color:{STATUS_FG_OK}'><b>{tr('labels.all')} {total} "
                 f"{tr('status.classes_placed_count')}</b></span>")
         if analytics:
             grade = analytics.get("grade", "")
             score = analytics.get("global_score", 0)
-            grade_color = {"A": "#16A34A", "B": "#2563EB", "C": "#D97706",
-                           "D": "#EA580C", "F": "#DC2626"}.get(grade, "#6B7280")
+            grade_color = {"A": STATUS_FG_OK, "B": "#2563EB",
+                           "C": STATUS_FG_WARN, "D": STATUS_FG_POOR,
+                           "F": "#DC2626"}.get(grade, "#6B7280")
             summary_text += (
                 f"<br><span style='color:{grade_color}'>"
                 f"{tr('analytics.schedule_quality')}: <b>{score:.0f}/100</b> "
@@ -4059,7 +4063,8 @@ class BulkResultsDialog(QDialog):
                 for imp in reschedule_explanation.get("improvements", []):
                     imp_label = QLabel(
                         f"  + {imp['description']}")
-                    imp_label.setStyleSheet("color: #16A34A; font-size: 9pt;")
+                    imp_label.setStyleSheet(
+                        "color: %s; font-size: 9pt;" % STATUS_FG_OK)
                     insights_layout.addWidget(imp_label)
                 for deg in reschedule_explanation.get("degradations", []):
                     deg_label = QLabel(
@@ -4089,7 +4094,8 @@ class BulkResultsDialog(QDialog):
 
                 for insight in analytics["insights"]:
                     itype = insight.get("type", "info")
-                    color = {"success": "#16A34A", "warning": "#D97706",
+                    color = {"success": STATUS_FG_OK,
+                             "warning": STATUS_FG_WARN,
                              "info": "#2563EB"}.get(itype, "#6B7280")
                     icon = {"success": "+", "warning": "!", "info": "*"}.get(
                         itype, "-")
@@ -4126,7 +4132,8 @@ class BulkResultsDialog(QDialog):
         if placed:
             ok_btn = QPushButton(tr("buttons.accept_results"))
             ok_btn.setStyleSheet(
-                "background: #16A34A; color: white; font-weight: bold; padding: 6px 16px;")
+                "background: %s; color: white; font-weight: bold;"
+                " padding: 6px 16px;" % STATUS_BG_OK)
             ok_btn.clicked.connect(self.accept)
             bottom.addWidget(ok_btn)
         cancel_btn = QPushButton(tr("buttons.discard_all"))
@@ -4172,8 +4179,8 @@ class BulkResultsDialog(QDialog):
 
                 for report in neg_reports:
                     status_color = {"infeasible": "#DC2626",
-                                    "constrained": "#D97706",
-                                    "ok": "#16A34A"}.get(
+                                    "constrained": STATUS_FG_WARN,
+                                    "ok": STATUS_FG_OK}.get(
                         report["status"], "#6B7280")
                     name_label = QLabel(
                         f"<b style='color:{status_color}'>"
@@ -4606,9 +4613,9 @@ class EditClassesDialog(QDialog):
         status = tr("dialogs.edit_classes.placed_badge") if placed else tr("dialogs.edit_classes.unplaced_badge")
         status_item = QTableWidgetItem(status)
         if placed:
-            status_item.setForeground(QColor("#16A34A"))
+            status_item.setForeground(QColor(STATUS_FG_OK))
         else:
-            status_item.setForeground(QColor("#D97706"))
+            status_item.setForeground(QColor(STATUS_FG_WARN))
         self.table.setItem(row, 7, status_item)
         prot = cls.get("protection", "none")
         self.table.setItem(row, 8, QTableWidgetItem(

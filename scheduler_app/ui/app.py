@@ -33,7 +33,7 @@ try:
 except ImportError:
     openpyxl = None
 
-from scheduler_app.constants import OPEN_SLOTS_FG_ROOM
+from scheduler_app.constants import OPEN_SLOTS_FG_ROOM, STATUS_FG_WARN
 from scheduler_app.translations import tr, get_language, set_language, is_rtl
 from scheduler_app.core.text_safety import csv_safe
 from scheduler_app.i18n.day_keys import (
@@ -2007,8 +2007,8 @@ class SchedulerApp(QMainWindow):
             badge.setStyleSheet(
                 "QToolButton { background: #FEF3C7; border: 1px solid #F59E0B;"
                 " border-radius: 6px; padding: 5px 14px; font-size: 9pt;"
-                " font-weight: bold; color: #D97706; }"
-                "QToolButton:hover { background: #FDE68A; }")
+                " font-weight: bold; color: %s; }"
+                "QToolButton:hover { background: #FDE68A; }" % STATUS_FG_WARN)
             if container:
                 container.setVisible(True)
             if action:

@@ -1,7 +1,7 @@
 """Bug report and crash report dialogs for the DERSİS desktop app.
 
 Provides:
-    - BugReportDialog: polished dark-themed dialog for manual bug reports
+    - BugReportDialog: dialog for manual bug reports
     - CrashReportDialog: minimal safe dialog for crash/exception reporting
     - BugReportButton: subtle status-bar bug icon widget
 """
@@ -25,81 +25,82 @@ BUG_REPORT_EMAIL = "dersis.app@gmail.com"
 BUG_REPORT_SUBJECT = "DERSİS Bug Report"
 
 
-# ── Dark-themed stylesheet for bug report dialogs ───────────────────
+# ── Stylesheet for the bug report dialogs (ST-UI-018) ───────────────
 
 _BUG_DIALOG_STYLE = """
 QDialog {
-    background: #0f172a;
-    color: #e2e8f0;
+    background: #F8FAFC;
+    color: #1E293B;
     font-family: "Segoe UI", -apple-system, sans-serif;
 }
 QLabel {
-    color: #cbd5e1;
+    color: #1E293B;
     font-family: "Segoe UI", -apple-system, sans-serif;
     font-size: 9pt;
 }
 QLabel#headingLabel {
-    color: #e2e8f0;
+    color: #1E293B;
     font-size: 11pt;
     font-weight: bold;
 }
 QLabel#subheadingLabel {
-    color: #94a3b8;
+    color: #475569;
     font-size: 8pt;
 }
 QLabel#errorLabel {
-    color: #f87171;
+    color: #B91C1C;
+    background: #FEF2F2;
     font-size: 8pt;
 }
 QLineEdit {
-    background: #1e293b;
-    color: #e2e8f0;
-    border: 1px solid #334155;
+    background: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #CBD5E1;
     border-radius: 6px;
     padding: 8px 10px;
     font-size: 9pt;
     font-family: "Segoe UI", -apple-system, sans-serif;
 }
 QLineEdit:focus {
-    border-color: #6366f1;
+    border-color: #4F46E5;
 }
 QLineEdit:disabled {
-    background: #1e293b;
-    color: #64748b;
+    background: #FFFFFF;
+    color: #94A3B8;
 }
 QTextEdit {
-    background: #1e293b;
-    color: #e2e8f0;
-    border: 1px solid #334155;
+    background: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #CBD5E1;
     border-radius: 6px;
     padding: 6px 8px;
     font-size: 9pt;
     font-family: "Segoe UI", -apple-system, sans-serif;
 }
 QTextEdit:focus {
-    border-color: #6366f1;
+    border-color: #4F46E5;
 }
 QComboBox {
-    background: #1e293b;
-    color: #e2e8f0;
-    border: 1px solid #334155;
+    background: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #CBD5E1;
     border-radius: 6px;
     padding: 6px 10px;
     font-size: 9pt;
     min-width: 120px;
 }
 QComboBox:focus {
-    border-color: #6366f1;
+    border-color: #4F46E5;
 }
 QComboBox::drop-down {
     border: none;
     width: 24px;
 }
 QComboBox QAbstractItemView {
-    background: #1e293b;
-    color: #e2e8f0;
-    border: 1px solid #334155;
-    selection-background-color: #6366f1;
+    background: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #CBD5E1;
+    selection-background-color: #4F46E5;
 }
 QPushButton {
     font-size: 9pt;
@@ -109,29 +110,29 @@ QPushButton {
     font-weight: 600;
 }
 QPushButton#submitBtn {
-    background: #6366f1;
+    background: #4F46E5;
     color: white;
     border: none;
 }
 QPushButton#submitBtn:hover {
-    background: #4f46e5;
+    background: #4338CA;
 }
 QPushButton#submitBtn:disabled {
-    background: #334155;
-    color: #64748b;
+    background: #CBD5E1;
+    color: #94A3B8;
 }
 QPushButton#cancelBtn {
     background: transparent;
-    color: #94a3b8;
-    border: 1px solid #334155;
+    color: #475569;
+    border: 1px solid #CBD5E1;
 }
 QPushButton#cancelBtn:hover {
-    background: #1e293b;
-    color: #e2e8f0;
+    background: #F1F5F9;
+    color: #1E293B;
 }
 QPushButton#tracebackToggle {
     background: transparent;
-    color: #94a3b8;
+    color: #475569;
     border: none;
     padding: 4px 8px;
     font-size: 8pt;
@@ -139,7 +140,7 @@ QPushButton#tracebackToggle {
     text-align: left;
 }
 QPushButton#tracebackToggle:hover {
-    color: #e2e8f0;
+    color: #1E293B;
 }
 """
 
@@ -228,7 +229,16 @@ def _open_mailto(subject, body, parent=None):
 # ── BugReportDialog ─────────────────────────────────────────────────
 
 class BugReportDialog(QDialog):
-    """Polished dark-themed bug report dialog.
+    """Bug report dialog, in the application's light theme.
+
+    It was dark until Phase 10 (ST-UI-018), in a product with no dark mode:
+    measured from painted pixels, its ground was #0F172A against #F8FAFC for
+    every other dialog and #F1F5F9 for the main window — 17.06:1 and 16.30:1
+    apart. The greys did not survive the inversion either, so the ink was
+    re-picked rather than swapped: #94A3B8 subheadings went 2.45:1 -> 7.24:1,
+    #F87171 error text 2.64:1 -> 6.18:1, and the indigo accent, which already
+    missed AA by 0.03 against its white label, went 4.47:1 -> 6.29:1.
+
 
     Parameters
     ----------
@@ -463,8 +473,8 @@ class CrashReportDialog(QDialog):
         error_text = f"{exc_type_name}: {exc_message}"
         error_label = QLabel(error_text)
         error_label.setStyleSheet(
-            'color: #f87171; font-family: "SF Mono", "Fira Code", monospace; '
-            'font-size: 8.5pt; padding: 8px; background: #1e293b; '
+            'color: #B91C1C; font-family: "SF Mono", "Fira Code", monospace; '
+            'font-size: 8.5pt; padding: 8px; background: #FEF2F2; '
             'border-radius: 4px;')
         error_label.setWordWrap(True)
         error_label.setTextInteractionFlags(
@@ -494,8 +504,8 @@ class CrashReportDialog(QDialog):
             self._tb_view.setMaximumHeight(120)
             self._tb_view.setStyleSheet(
                 'font-family: "SF Mono", "Fira Code", monospace; '
-                'font-size: 7.5pt; background: #1e293b; color: #e2e8f0; '
-                'border: 1px solid #334155; border-radius: 4px;')
+                'font-size: 7.5pt; background: #FFFFFF; color: #1E293B; '
+                'border: 1px solid #CBD5E1; border-radius: 4px;')
             self._tb_view.setVisible(False)
             layout.addWidget(self._tb_view)
             self._tb_expanded = False
@@ -597,6 +607,15 @@ class BugReportButton(QPushButton):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         # Draw a subtle bug icon
+        # DELIBERATELY still the dark-surface greys, and the ONLY colours in
+        # this module that are. This widget is added with
+        # `statusBar().addPermanentWidget()`, and the status bar is one of the
+        # app's dark surfaces (#1E293B) -- #94A3B8 is 5.71:1 there, well past
+        # WCAG 1.4.11's 3:1 for a non-text control, and only 2.34:1 on the
+        # light #F1F5F9. A blanket relight of this file breaks the icon.
+        # `tests/test_phase10_i11.py::test_the_status_bar_bug_icon_is_left_alone`
+        # is the guard: it reads the status-bar background out of ui/app.py and
+        # these two hexes out of this method, so it stays honest if either moves.
         color = QColor('#94a3b8') if not self.underMouse() else QColor('#a5b4fc')
         pen = QPen(color, 1.4)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
