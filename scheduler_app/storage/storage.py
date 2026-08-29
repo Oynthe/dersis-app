@@ -248,6 +248,25 @@ def _load_or_create_key() -> bytes:
     os.makedirs(os.path.dirname(kp), exist_ok=True)
     with open(kp, "wb") as f:
         f.write(key)
+    # Owner-only on the platforms where that means something, and a measured
+    # no-op on the platform most users are on.
+    #
+    # Windows: this does nothing. Measured — st_mode is 0o100666 before the
+    # call and 0o100666 after, and `icacls` reports the same inherited DACL
+    # (SYSTEM:(F), BUILTIN\Administrators:(F), OWNER RIGHTS:(F)) either way.
+    # CPython maps os.chmod onto the FAT read-only attribute alone, so the only
+    # bit it can move is write-vs-read (0o400 does turn st_mode into 0o100444);
+    # the 0o077 half of the mode has no representation to land in. The key file
+    # is protected here by living under the user's profile, not by this line.
+    #
+    # POSIX: it does exactly what it says, and both platforms that run this in
+    # anger are POSIX — the ubuntu-latest CI runner and macOS — so the call is
+    # load-bearing there and stays.
+    #
+    # Deliberately NOT replaced with a Windows ACL. Writing an explicit DACL
+    # would add a permanent new way for first-run to fail (roaming profiles,
+    # redirected folders, non-English SIDs) in exchange for no measured gain
+    # over the profile directory's own inherited permissions.
     try:
         os.chmod(kp, 0o600)
     except OSError:
