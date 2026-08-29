@@ -17,8 +17,10 @@ open. The user then set the split explicitly:
 > "1'den 17'e kadar olan sorunların hepsini çözelim phase 10'da aynı mantıkla.
 > ayrıca B, C, D, E, F, G, H'de düzeltilmeli ama phase 11'de, A şimdilik dursun."
 
-* **Phase 10 = items 1–17.** Every open defect a *user* can reach. That is the
-  whole of the application-facing backlog: 1 High, 4 Medium, 12 Low.
+* **Phase 10 = items 1–18.** Every open defect a *user* can reach. That is the
+  whole of the application-facing backlog: **2 High, 5 Medium, 11 Low**.
+  Item 18 was outside the user's original 1–17 and was added on their
+  instruction; it is the same code path as 6 and 7.
 * **Phase 11 = items B–H.** Release, packaging and CI. Real, and none of it
   touches a running user — it hits whoever ships next.
 * **Item A is parked on the user's instruction.** `origin/main` stays 108
@@ -52,7 +54,7 @@ counter at `a561a71`:
 
 **Adding one `if`, `and`, `except`, ternary or comprehension `for` to
 `ui/app.py` or `ui/dialogs.py` turns the fast lane red on the very next commit.**
-At least ten of your seventeen items live in one of those two files.
+Eleven of your eighteen items live in one of those two files.
 
 So plan for it up front rather than discovering it item by item:
 
@@ -65,7 +67,7 @@ So plan for it up front rather than discovering it item by item:
 * **Several of these items are natural extractions**, not additions. Items 10,
   12 and 13 are widget behaviour that has no business in a 5 800-line window
   class; item 16 is a one-token fix in four files that *reduces* nothing but
-  costs nothing either.
+  costs nothing either; item 18 is a deletion.
 * **When you do raise a ceiling, the ratchet's contract demands a sentence in
   the commit message saying why**, and Phase 9's raise (915 → 920) set the bar:
   a per-function accounting of what moved and what it bought, in the constant's
@@ -166,19 +168,20 @@ sense of headroom. Three phases in a row fell into this; Phase 9 did not.
 
 ---
 
-## PHASE 10 — the seventeen items
+## PHASE 10 — the eighteen items
 
 **Verification state is marked on every item and it is not decoration.** Phase 9
 proved that a handoff item written against an old tree is often wrong: four of
-ten Section C items evaporated on measurement. Nine of the seventeen below come
+ten Section C items evaporated on measurement. Nine of the eighteen below come
 from register entries that have sat as a bare `OBSERVED` for nine phases and have
 **never been reproduced by anyone**. Reproduce first. `NOT_REPRODUCIBLE` is a
 result and the user has already accepted it as one.
 
 Key: **⬤ reproduced live** · **◐ code shape confirmed, not driven end to end** ·
-**○ located in code from a register entry, never reproduced**
+**○ located in code from a register entry, never reproduced** · **◒ latent — the
+code is provably wrong but nothing observable is wrong yet** (item 18 only)
 
-### The one High
+### The two Highs
 
 **1. ⬤ Ctrl+C on the Dashboard tab makes DERSİS announce that it has crashed.**
 `ui/app.py::_copy_to_clipboard`. The line is
@@ -194,8 +197,6 @@ Reproduced live twice by the audit — once by calling the method, once by a rea
 Medium, bare `OBSERVED`, for nine phases, pinned by no test.** The audit re-rated
 it High because "raises IndexError" understates what a user is shown. This is the
 most user-facing thing left in the application and it is one line.
-
-### The Mediums
 
 **2. ⬤ A file saved by an older build opens with dangling room rules, and the
 app then deletes them without saying so.** `ui/app.py::open_file` and
@@ -226,6 +227,13 @@ report, and `_pending_settings_report` is a single slot that is already contende
 (see `_flush_startup_settings_report`, which puts the damaged-log report first
 for exactly this reason).
 
+*Severity note:* two audit agents rated this item differently — High on the user
+consequence (a lesson that can never be placed again, or a forbidden room that
+silently becomes eligible) and Medium on the register's scale. It is carried as
+High here, which is what the user was shown.
+
+### The Mediums
+
 **3. ○ A multi-lesson drag from the timetable moves only the lesson under the
 cursor.** `ui/app.py::_start_drag_gfx` — `_dragging_classes` gets the whole
 selection, but `_drag_backup` and `mark_unplaced` touch only the primary, so
@@ -255,7 +263,7 @@ it fires whether or not anything happens. **Recorded nowhere before this file.**
 The fix shape already exists in the same file — copy the fingerprint guard.
 **Measure before and after; a performance claim without a number is not a fix.**
 
-### The undo family — 6 and 7, same root cause, do them together
+### The batch-gesture family — 6, 7 and 18, one code path, do them together
 
 **6. ◐ Bulk Add, then Cancel in the results dialog.** `ui/app.py::_bulk_schedule`
 — `_push_undo` fires above `_schedule_new_classes`, which can end in
@@ -285,14 +293,41 @@ Two warnings from Phase 9, both paid for:
   stopped there, because driving the BulkAdd + BulkResults dialog pair end to end
   is reproduction work. Do that first.
 
-**Related, and NOT in the user's 1–17.** `_execute_drop_anywhere` sets
-`_drag_success = True` unconditionally after `_place_classes_batch`, even when
-the batch placed nothing — so a multi-lesson drop can report success having done
-nothing. It is harmless *today* only because `_start_drag_unplaced` shows its
-toast solely for `len(drag_classes) == 1` while `_execute_drop_anywhere` only
-fires for `len > 1`: two lines apart, in different methods, with nothing pinning
-the coincidence. It is the same family and nearly free while you are in there.
-**Ask before folding it in** — the user scoped this phase at 1–17 explicitly.
+**18. ◒ A multi-lesson drop reports success even when it placed nothing.**
+`ui/app.py::_execute_drop_anywhere` sets `self._drag_success = True`
+**unconditionally** on the line after `self._place_classes_batch(drag_group)`,
+whatever the batch did. Verified by reading both sites at `a561a71`:
+
+    _execute_drop_anywhere        _place_classes_batch(drag_group)
+                                  self._drag_success = True      # unconditional
+    _start_drag_unplaced          if self._drag_success:
+                                      if len(drag_classes) == 1: ...toast
+
+It shows no false toast **today**, and only for a reason nothing states: the
+toast fires solely for `len(drag_classes) == 1`, while `_execute_drop_anywhere`
+only runs when `len(drag_group) > 1`. Those two conditions are disjoint by
+accident, two methods apart, and **no test pins the coincidence** — so the day
+anyone gives the batch path a toast, or relaxes either condition, the app starts
+telling users it placed lessons it did not place.
+
+`_drag_success` is not only a toast flag: `_start_drag_gfx` reads it to decide
+whether the gesture was a no-op, which is the mechanism Phase 9 rebuilt for
+B1/B2. Setting it True for a batch that did nothing is the same untruth that
+family is about, which is why it belongs here rather than on its own.
+
+**The loop's first step is different for this one, so read this before you start
+it.** There is nothing to reproduce: the defect is latent, and a probe that tries
+to observe a false toast today will pass and pin nothing. What the probe must pin
+is the *invariant* — that `_drag_success` is true only when the gesture changed
+something — and it must be written so it goes red under a mutation that removes
+the condition. Confirm that by running the mutation, because "a test that plants
+the state it is meant to observe is measuring nothing" is the rule below, and a
+latent defect is exactly where a vacuous test is easiest to write.
+
+The fix is a deletion or a condition, not an addition — worth knowing, given both
+McCabe ceilings are full. **This item was outside the user's original 1–17 and
+was added at their instruction**; it was found while fixing 6's sibling in Phase
+9 and recorded then in an agent's `notes`, not in any register.
 
 ### The Lows
 
