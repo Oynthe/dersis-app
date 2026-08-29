@@ -443,3 +443,184 @@ def test_every_installer_source_exists_or_is_explicitly_optional():
         "the optional-source allow-list names %s, which installer.iss no longer "
         "references" % sorted(optional - seen)
     )
+
+
+# ── ST-SEC-007: the launcher every shortcut points at ───────────────────────
+#
+# Phase 7 replaced build-release.yml with release.yml and, in the rewrite,
+# dropped `"$dist\Dersis.exe"` from the Windows "Verify build output" list that
+# the deleted workflow had carried. Nothing else in the chain would have
+# noticed: build_embed.bat compiles that file with `Add-Type ... 2>$null` and
+# used to print "[WARN] exe failed, using .vbs" and carry on; its end-of-build
+# gate did not count it; and its `if %ERRORS% GTR 0` branch had no `exit /b 1`,
+# so even a counted missing file left the script exiting 0. The installer's own
+# size gate is `-lt 1MB` against a ~113 MiB artefact, so it passes on a bundle
+# that is complete apart from the one file every shortcut names.
+#
+# The three tests below pin the three links of that chain independently.
+
+WORKFLOW_DIR = os.path.join(REPO, ".github", "workflows")
+
+
+def _verify_build_output_run():
+    """The `run:` body of release.yml's Windows `Verify build output` step."""
+    import yaml
+
+    with open(os.path.join(WORKFLOW_DIR, "release.yml"), encoding="utf-8") as fh:
+        workflow = yaml.safe_load(fh)
+    for job in (workflow.get("jobs") or {}).values():
+        for step in job.get("steps") or []:
+            if isinstance(step, dict) and step.get("name") == "Verify build output":
+                return str(step.get("run") or "")
+    raise AssertionError(
+        "release.yml has no step named 'Verify build output'. If it was renamed, "
+        "rename it here too — this test is the only thing standing between a "
+        "failed launcher build and a published installer."
+    )
+
+
+def _app_rooted_targets():
+    """Every `{app}\\…` file the [Icons] and [Run] sections *launch*.
+
+    The lookbehind matters: ``IconFilename:`` is a different key with a
+    different failure mode. A missing icon is cosmetic — Windows draws a
+    default one — while a missing ``Filename:`` target is a shortcut that does
+    nothing when clicked. Only the second is worth failing a release over.
+    """
+    sections = _iss_sections()
+    targets = set()
+    for name in ("icons", "run"):
+        for line in sections.get(name, []):
+            for match in re.finditer(
+                    r'(?<![A-Za-z])Filename:\s*"\{app\}\\([^"]+)"', line):
+                targets.add(match.group(1))
+    return targets
+
+
+def test_every_installer_shortcut_target_is_a_verified_build_output():
+    """ST-SEC-007 — a shortcut that points at a file the build never made.
+
+    A user installs DERSİS, the installer reports success, and the Start Menu
+    entry, the Desktop icon and the "Launch DERSİS" checkbox all do nothing,
+    because the file all three name was never produced and no step checked.
+
+    ``test_every_installer_source_exists_or_is_explicitly_optional`` cannot see
+    this: it reads ``[Files] Source:`` and ``continue``s on anything under
+    ``build\\``, and ``[Icons]``/``[Run]`` have no ``Source:`` at all.
+    """
+    verify = _verify_build_output_run()
+    targets = _app_rooted_targets()
+    assert targets, (
+        "installer.iss's [Icons]/[Run] name no {app}-rooted file at all. Either "
+        "the shortcut section was gutted or the parser above stopped matching."
+    )
+    for target in sorted(targets):
+        assert target in verify, (
+            "installer.iss points a user-facing entry at {app}\\%s, but "
+            "release.yml's 'Verify build output' step never checks that the "
+            "build produced it. That is exactly how Dersis.exe went unverified: "
+            "the build can exit 0 without it, the installer's `-lt 1MB` size "
+            "gate cannot see it, and the failure surfaces as a shortcut that "
+            "does nothing on the user's machine." % target
+        )
+
+
+def test_every_build_script_exits_nonzero_on_a_missing_critical_file():
+    """ST-SEC-007 — a build that counts its own errors and then returns success.
+
+    Both Windows lanes tally missing critical files into ``ERRORS``. If the
+    final branch does not ``exit /b 1``, the CI step that called the script sees
+    success and the release continues on an incomplete bundle.
+
+    ``build_nuitka.bat`` has always exited 1 here and its comment claimed both
+    lanes did; ``build_embed.bat`` printed a warning and exited 0. A comment is
+    not a test, which is why this one exists.
+    """
+    for script in ("build_embed.bat", "build_nuitka.bat"):
+        text = _read(script)
+        match = re.search(r"if %ERRORS% GTR 0 \((.*?)^\)", text, re.S | re.M)
+        assert match, (
+            "%s no longer has an `if %%ERRORS%% GTR 0 (` block. The counter is "
+            "only worth keeping if something branches on it." % script
+        )
+        assert "exit /b 1" in match.group(1), (
+            "%s counts missing critical files into %%ERRORS%% and then exits 0. "
+            "A CI step calling it reads that as a successful build, so the "
+            "release proceeds to compile an installer out of a bundle the "
+            "script itself just reported as incomplete." % script
+        )
+
+
+def test_the_launcher_compile_step_does_not_discard_its_error():
+    """ST-SEC-007 — the one build failure whose cause was thrown away.
+
+    ``Dersis.exe`` is compiled at build time rather than copied, so it is the
+    single critical file that can go missing without anything upstream having
+    failed to *find* something. With the compiler's stderr redirected to
+    ``$null`` there was no way to learn why from the build log — the only
+    evidence was a ``[WARN]`` line in an otherwise green run.
+    """
+    text = _read("build_embed.bat")
+    # `::` comment lines are excluded deliberately: the comment above the call
+    # quotes the redirection it is explaining, and a scanner that cannot tell
+    # code from the prose describing it fails on its own documentation.
+    add_type = [ln for ln in text.splitlines()
+                if "Add-Type" in ln and not ln.lstrip().startswith("::")]
+    assert add_type, "build_embed.bat no longer compiles a Dersis.exe launcher"
+    for line in add_type:
+        assert "2>$null" not in line, (
+            "build_embed.bat discards the C# compiler's stderr on the Add-Type "
+            "that produces Dersis.exe. Every installer shortcut points at that "
+            "file; when the compile fails, the reason is the only thing that "
+            "makes it fixable, and this redirection is what threw it away."
+        )
+
+
+# ── ST-SEC-004: the lock file against the floors it claims to satisfy ───────
+
+def _parse_pins(name, sep):
+    """`{package_lower: version_spec}` for a requirements file."""
+    out = {}
+    for raw in _read(name).splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or sep not in line:
+            continue
+        pkg, _, spec = line.partition(sep)
+        out[pkg.strip().lower().replace("_", "-")] = spec.strip()
+    return out
+
+
+def test_every_locked_pin_satisfies_the_requirements_floor():
+    """ST-SEC-004 — the shipped installer built against a version we disallow.
+
+    ``requirements-lock.txt`` is what the three BUILD lanes install into the
+    bundle users run (build-installer.yml:111, build_nuitka.bat:46,
+    build_embed.bat:133). The test lanes install the unpinned
+    ``requirements.txt``, so a lock pin below its own declared floor would ship
+    a version the suite never exercises and never turn anything red.
+
+    This deliberately does NOT assert ``lock == pip freeze``: the audit venv is
+    a development environment carrying 16 packages the lock does not describe,
+    so that test would be red by construction and deleted within a week.
+    """
+    from packaging.specifiers import SpecifierSet
+    from packaging.version import Version
+
+    floors = _parse_pins("requirements.txt", ">=")
+    locked = _parse_pins("requirements-lock.txt", "==")
+
+    assert floors, "requirements.txt declares no `>=` floors — did it change shape?"
+    missing = sorted(set(floors) - set(locked))
+    assert not missing, (
+        "requirements.txt requires %s, which requirements-lock.txt does not pin. "
+        "The build lanes install ONLY the lock file, so an unpinned direct "
+        "dependency is simply absent from the shipped app." % missing
+    )
+
+    for pkg, floor in sorted(floors.items()):
+        assert Version(locked[pkg]) in SpecifierSet(">=" + floor), (
+            "requirements-lock.txt pins %s==%s, below requirements.txt's floor "
+            "of >=%s. The build lanes read the lock and the test lanes read the "
+            "floors, so this ships a version nothing in CI has ever imported."
+            % (pkg, locked[pkg], floor)
+        )

@@ -83,8 +83,22 @@ datas = [
 # modules, 24 of them absent from the bundle. The .dmg built green and could not
 # open its window.
 #
-# collect_submodules walks the package on disk, so it sees all 58 regardless of
-# how they are imported. tests/test_packaging_manifest.py pins this.
+# (That 13/45/58 is the reading taken on the tree of the day and is left as
+# recorded — the arithmetic is its own. The package has since grown by one
+# module; do not "fix" the historical figures to match the current count.)
+#
+# collect_submodules walks the package on disk, so it sees all of them
+# regardless of how they are imported. The count today is 59: measured
+# 2026-08-29, `find scheduler_app -name "*.py"` is 59 files, and an on-disk
+# walk reproducing collect_submodules' semantics yields 8 package names + 51
+# module names = 59, so every .py lives inside a real package and there are no
+# namespace-package orphans. It was already 59 at the Phase 7 merge (82f558e),
+# so this is a stale figure rather than a drift.
+#
+# No test asserts the literal count, deliberately: it is a function of the tree
+# and pinning it would turn every new module into a red suite for no gain.
+# tests/test_packaging_manifest.py pins the PROPERTY instead — that every
+# shimmed module is reachable through collect_submodules.
 hiddenimports = [
     "PyQt6",
     "cryptography",

@@ -86,6 +86,11 @@ jobs:
   build:
     name: Build DERSİS Installer
     runs-on: windows-latest
+    # ~15 min observed; 3x headroom. windows-latest bills at a 10x multiplier
+    # and this job runs .bat files that end in `pause` — `< NUL` is supplied at
+    # the build_embed.bat call, but any other console prompt would otherwise sit
+    # on GitHub's 360-minute default.
+    timeout-minutes: 45
 
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -152,6 +157,15 @@ jobs:
           }
           Write-Host "ortools import verified"
 
+      # Dersis.exe is here because the installer's every shortcut points at it.
+      # installer.iss:151 (Start Menu), :153 (Desktop) and :160 (post-install
+      # "Launch program") all name {app}\Dersis.exe with no fallback, and in the
+      # embed lane that file is not a Python build product: build_embed.bat
+      # compiles a C# shim at build time. The build-release.yml this workflow
+      # replaced did check it; the replacement dropped the line, and nothing
+      # else in the chain would have noticed — build_embed.bat exits 0 on a
+      # failed shim, and the installer's `-lt 1MB` size gate passes on an
+      # installer that is complete apart from the one file users click.
       - name: Verify build output
         shell: pwsh
         run: |
@@ -161,6 +175,7 @@ jobs:
             "$dist\scheduler_gui.py",
             "$dist\VERSION",
             "$dist\scheduler_app",
+            "$dist\Dersis.exe",
             "build\version.iss"
           )
           foreach ($f in $checks) {
@@ -262,6 +277,7 @@ jobs:
             runner: macos-15-intel   # Intel; the label that replaced macos-13
 
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -321,6 +337,7 @@ jobs:
     needs: [test, build, build-macos]
     if: ${{ !cancelled() && needs.test.result == 'success' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Download installer artifact
