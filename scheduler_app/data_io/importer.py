@@ -490,6 +490,34 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
                             type_field=_column_label("classes", "required_room_type"),
                             rooms_field=_column_label("classes", "allowed_rooms")))
 
+            # ST-FUNC-009, second contradiction. The block above enforces "the
+            # type may only narrow" against `allowed_rooms`; `excluded_rooms`
+            # is written independently below and can empty the candidate set
+            # just as completely. `get_physical_room_candidates` intersects
+            # required with the live rooms and THEN subtracts excluded, so a
+            # row whose type matches only rooms the same row excludes ends up
+            # with nowhere to go.
+            #
+            # Measured: required_room_type='Laboratuvar' with
+            # excluded_rooms='Lab 1, Lab 2' gave candidates [] where 82f558e --
+            # which discarded the column entirely -- gave ['Oda 1']. So Phase 8
+            # turned a schedulable class into a permanently unplaceable one,
+            # and the import report was empty. Falling back to the pre-type
+            # list restores exactly the old behaviour and says why.
+            if required_type and cls["required_classrooms"] and excluded_rooms:
+                survivors = [r for r in cls["required_classrooms"]
+                             if r not in excluded_rooms]
+                if not survivors:
+                    cls["required_classrooms"] = (
+                        [r for r in allowed_rooms if r in room_names]
+                        if allowed_rooms else [])
+                    report.add_warning(
+                        tr("labels.classes"), row_num,
+                        tr("warnings.room_type_all_excluded").format(
+                            type=required_type,
+                            type_field=_column_label("classes", "required_room_type"),
+                            rooms_field=_column_label("classes", "excluded_rooms")))
+
         if excluded_rooms:
             cls["excluded_classrooms"] = excluded_rooms
 

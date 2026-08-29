@@ -38,6 +38,11 @@ import io
 
 import pytest
 
+from scheduler_app.core.models import (
+    LOCATION_LECTURER_OFFICE,
+    LOCATION_ONLINE,
+    parse_location_type_label,
+)
 from scheduler_app.i18n.day_keys import DAY_KEYS, normalize_day_value
 from scheduler_app.i18n.text_fold import fold_text
 from scheduler_app.translations import TRANSLATIONS
@@ -269,3 +274,35 @@ def test_one_fold_serves_the_day_keys_the_class_form_and_the_importer(
     assert not rogue, (
         "a second case-folding rule has appeared beside fold_text:\n  "
         + "\n  ".join(rogue))
+
+
+# ── the fold must reach every column of one imported row ────────────────────
+
+@pytest.mark.parametrize("raw,expected", [
+    ("ÇEVRİMİÇİ", LOCATION_ONLINE),
+    ("OFİS (ÖĞR. ELEM.)", LOCATION_LECTURER_OFFICE),
+    ("Çevrimiçi", LOCATION_ONLINE),
+    ("ONLINE", LOCATION_ONLINE),
+])
+def test_a_shouted_location_type_is_still_that_location_type(raw, expected):
+    """ST-ARCH-001 item 9 — the column the fold migration first missed.
+
+    Phase 8 routed four comparison sites through ``fold_text`` and left
+    ``core/models.py::parse_location_type_label`` on ``str.casefold()``, which
+    made the importer inconsistent inside a single row: two lines apart,
+    ``required_room_type`` matched a shouted Turkish cell and this did not.
+    Measured before the fix: ``'ÇEVRİMİÇİ'`` and ``'OFİS (ÖĞR. ELEM.)'`` both
+    resolved to ``face_to_face``.
+
+    That miss is silent, because the function's fallback is
+    ``LOCATION_FACE_TO_FACE`` and a blank cell means the same thing. A failure
+    means a school whose workbook is upper-cased — what a Turkish-locale
+    Excel ``=UPPER()`` writes — imports every online and office lesson as
+    face-to-face, and the solver then reserves a physical classroom for every
+    remote lecture, inflating room demand and printing a remote lecture into a
+    room on the exported timetable.
+
+    The last two rows are the control: they worked before the fix and must
+    keep working, so this cannot pass by folding everything to one string.
+    """
+    assert parse_location_type_label(raw) == expected

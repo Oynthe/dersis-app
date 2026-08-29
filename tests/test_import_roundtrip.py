@@ -1137,3 +1137,62 @@ def test_class_id_containing_a_space_is_not_silently_dropped(tmp_path):
     assert course_names(ds) == ["Ders C 001", "Ders C002"]
 
 
+
+
+def test_a_room_type_whose_every_room_is_excluded_does_not_strand_the_class(tmp_path):
+    """ST-FUNC-009 — the type must never leave a class with nowhere to go.
+
+    Phase 8 enforced "the type may only narrow" against ``allowed_rooms`` and
+    forgot ``excluded_rooms``, which is written independently and subtracts
+    from the same candidate set. Measured on the tree that shipped the fix:
+    ``required_room_type='Laboratuvar'`` with ``excluded_rooms='Lab 1, Lab 2'``
+    produced ``required_classrooms=['Lab 1','Lab 2']`` against
+    ``excluded_classrooms=['Lab 1','Lab 2']``, so
+    ``get_physical_room_candidates`` returned ``[]`` where 82f558e -- which
+    discarded the column entirely -- returned ``['Oda 1']``.
+
+    A failure means upgrading DERSİS turns a class the school had been
+    timetabling for years into one that can never be placed, by the optimizer
+    or by hand, with an empty import report and only a generic "no classroom
+    matches" in the unplaced sidebar to go on.
+    """
+    rows = [klass("C001", required_room_type=ROOM_TYPE_LAB,
+                  excluded_rooms="Lab 1, Lab 2")]
+    path = build_workbook(tmp_path / "type_all_excluded.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    cls = ds.state["classes"][0]
+    assert cls["required_classrooms"] == [], (
+        "the type was applied anyway, leaving %r required against %r excluded"
+        % (cls["required_classrooms"], cls["excluded_classrooms"]))
+
+    from scheduler_app.core.models import get_physical_room_candidates
+    assert get_physical_room_candidates(ds.state, cls) == ["Oda 1"], (
+        "the class has no room left to be placed in")
+
+    assert any(ROOM_TYPE_LAB in m and row_prefix("classes", 2) in m
+               for m in messages(ds.report)), (
+        "the user was not told the room type was dropped: %r"
+        % (messages(ds.report),))
+
+
+def test_a_room_type_still_narrows_when_only_some_rooms_are_excluded(tmp_path):
+    """ST-FUNC-009 guard — the excluded-rooms rescue must not over-fire.
+
+    The fallback above only applies when *every* type-matching room is
+    excluded. With one lab excluded and one surviving, the type must still do
+    its job. A failure means the rescue swallowed a constraint the user gave.
+    """
+    rows = [klass("C001", required_room_type=ROOM_TYPE_LAB,
+                  excluded_rooms="Lab 1")]
+    path = build_workbook(tmp_path / "type_some_excluded.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    cls = ds.state["classes"][0]
+    assert cls["required_classrooms"] == ["Lab 1", "Lab 2"], (
+        "the surviving lab was lost: %r" % (cls["required_classrooms"],))
+
+    from scheduler_app.core.models import get_physical_room_candidates
+    assert get_physical_room_candidates(ds.state, cls) == ["Lab 2"]
