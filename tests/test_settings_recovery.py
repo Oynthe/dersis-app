@@ -801,17 +801,31 @@ def _damage_feedback_log(n_entries=6):
     return path
 
 
-def _stem(key):
-    """The literal text of a translation up to its first placeholder.
+def _distinctive_text(key):
+    """The longest placeholder-free run of a translation's own text.
 
     Matching on the *key's own* text rather than a hardcoded sentence, so a
     reworded message does not fail these tests but reporting the wrong message
     does.
+
+    Deliberately the longest run between placeholders and NOT "everything
+    before the first ``{``". That simpler version was written first and was
+    **vacuous in Turkish**, which is the language this suite pins: the Turkish
+    ``errors.feedback_log_damaged`` opens with ``{path}``, so the stem was the
+    empty string and ``"" in anything`` is True. Measured — it made both tests
+    below pass with the report deleted from the app entirely. The assertion
+    here is what stops that from coming back.
     """
+    import re
+
     from scheduler_app.translations import tr
 
-    text = tr(key)
-    return text.split("{")[0].strip()
+    parts = [p.strip() for p in re.split(r"\{[^}]*\}", tr(key))]
+    longest = max(parts, key=len) if parts else ""
+    assert len(longest) >= 20, (
+        "no placeholder-free run of %r is long enough to identify it (%r); "
+        "matching on it would pass for the wrong reason" % (key, longest))
+    return longest
 
 
 def _all_user_text(feedback, caplog):
@@ -846,7 +860,7 @@ def test_a_damaged_feedback_log_reaches_the_user(make_window, feedback, caplog):
     assert feedback.channels(caplog), (
         "a damaged feedback log produced no user-visible signal at all: "
         + feedback.describe(caplog))
-    assert any(_stem("errors.feedback_log_damaged") in t
+    assert any(_distinctive_text("errors.feedback_log_damaged") in t
                for t in _all_user_text(feedback, caplog)), (
         "something was reported, but not that the feedback history is "
         "unreadable: " + feedback.describe(caplog))
@@ -878,11 +892,11 @@ def test_a_damaged_feedback_log_and_corrupt_settings_both_reach_the_user(
         "scheduling warnings would satisfy channels() for the wrong reason")
 
     texts = _all_user_text(feedback, caplog)
-    assert any(_stem("errors.feedback_log_damaged") in t for t in texts), (
+    assert any(_distinctive_text("errors.feedback_log_damaged") in t for t in texts), (
         "the damaged feedback log was not reported when the settings "
         "container was damaged too — the single-slot overwrite: "
         + feedback.describe(caplog))
-    assert any(_stem("errors.settings_corrupt") in t for t in texts), (
+    assert any(_distinctive_text("errors.settings_corrupt") in t for t in texts), (
         "the corrupt settings container stopped being reported once the "
         "feedback-log report was added: " + feedback.describe(caplog))
 
