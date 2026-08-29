@@ -1292,3 +1292,121 @@ def test_failed_save_leaves_the_previous_file_intact(dersis_home, monkeypatch):
     assert open(path, "rb").read() == original, "a failed rename clobbered the good file"
     assert not os.path.exists(path + ".tmp"), "the staging .tmp file was left behind"
     assert storage.load_encrypted(path) == {"ders": "iyi kopya", "n": 1}
+
+
+# ── the resync must not go silent where the reader it replaced spoke ────────
+
+def _padded_log(dersis_home, pad, name):
+    """A real EGL1 log whose records are wide enough to inflate a prefix into.
+
+    Distinct from ``_six_record_log`` above, which builds the minimal-payload
+    fixture the earlier tests measure against; the length-prefix case needs a
+    record big enough that an inflated length still lands inside the file.
+    """
+    path = os.path.join(str(dersis_home), storage.LOGS_DIR, name)
+    for i in range(6):
+        storage.append_encrypted_entry({"n": i, "pad": "x" * pad}, path)
+    return path
+
+
+def test_damage_to_a_records_own_magic_is_reported_not_swallowed(dersis_home):
+    """ST-DATA-002 — the resync must not hide a record it steps over.
+
+    Found by the adversarial pass, against Phase 8's own ST-DATA-002 fix. When
+    a record's container magic is the damaged byte, the frame before it still
+    parses, so the walk read "the length that follows does not land on a record
+    start" as *this* record's length being wrong, resynced onto the record
+    after next, and counted nothing. Measured on a 6-record log: flipping one
+    bit in the magic of records 1-4 returned 5 records with ``lost == 0`` —
+    while the reader this replaced reported ``lost == 1``. The fix made the
+    common case recoverable and the uncommon case SILENT, which is the finding
+    ST-DATA-002 is about, reintroduced by its own remedy.
+
+    A failure means DERSİS drops a slice of the user's feedback history and
+    tells them nothing, so preference learning quietly trains on less than it
+    reports.
+    """
+    path, healthy_bytes, frames = _six_record_log(dersis_home)
+    blob = bytearray(healthy_bytes)
+    healthy = storage.load_encrypted_lines_report(path)
+    assert len(healthy.entries) == 6 and healthy.lost == 0
+
+    for idx, (prefix_off, _rec_len) in enumerate(frames):
+        damaged = bytearray(blob)
+        damaged[prefix_off + 4] ^= 0x01   # one bit of this record's EGU1 magic
+        with open(path, "wb") as f:
+            f.write(bytes(damaged))
+
+        report = storage.load_encrypted_lines_report(path)
+        assert len(report.entries) == 5, (
+            "record %d: expected the other five back, got %d"
+            % (idx, len(report.entries)))
+        assert report.lost >= 1, (
+            "record %d's magic was destroyed and the reader reported lost=%d; "
+            "a lost record the user is not told about is ST-DATA-002"
+            % (idx, report.lost))
+
+
+def test_an_inflated_length_prefix_does_not_shrink_the_entry_count(dersis_home):
+    """ST-DATA-002 — the cheap count and the real walk must not disagree.
+
+    ``log_entry_count`` is the unit ``PreferenceLearner``'s cursor is expressed
+    in, so if it and ``load_encrypted_lines_since`` disagree about one file the
+    learner reads from the wrong place. Its seek loop returned its own count on
+    any short read at the end, and an inflated length prefix produces exactly
+    that: measured on a 6-record log, one flipped bit took record 0's length
+    from 201 to 1225 — still past ``_MIN_CONTAINER``, still inside the file —
+    so the seek landed 1 byte from EOF and the count came back 1 while the
+    shared walk recovered all 6.
+
+    A failure means the learner's cursor and the log's real contents drift, and
+    it either re-reads history forever or skips records it could have learned
+    from.
+    """
+    path = _padded_log(dersis_home, 98, "inflated.egu")
+    blob = bytearray(open(path, "rb").read())
+    prefix, original = _frames(bytes(blob))[0]
+    first_payload = prefix + 4
+
+    inflated = len(blob) - first_payload - 1    # fits, but swallows the rest
+    assert inflated > original >= storage._MIN_CONTAINER
+    struct.pack_into(storage._LOG_RECLEN_FMT, blob, prefix, inflated)
+    with open(path, "wb") as f:
+        f.write(bytes(blob))
+
+    walk = sum(1 for frame in storage._walk_log_frames(bytes(blob))
+               if frame is not None)
+    assert storage.log_entry_count(path) == walk, (
+        "log_entry_count says %d and the shared walk says %d for the same file"
+        % (storage.log_entry_count(path), walk))
+    assert storage.load_encrypted_lines_since(
+        path, storage.log_entry_count(path)) == [], (
+        "records remain at the cursor the count reported")
+
+
+def test_a_damaged_version_byte_is_not_counted_as_readable_history(dersis_home):
+    """ST-DATA-002 — the count must refuse what the reader refuses.
+
+    ``log_entry_count`` validated only the 4-byte EGL1 magic, while
+    ``_read_log_records_report`` also checks the version and raises on an
+    unsupported one. So a flipped bit in the VERSION byte made the count report
+    six records in a file from which zero records can be read. Measured over
+    all 48 single-bit flips of the 6-byte header: the 32 magic flips already
+    agreed (0 and 0), the 16 version flips all disagreed (6 against 0).
+
+    A failure means DERSİS reports history it cannot read, and the learner
+    advances a cursor over records that were never delivered to it.
+    """
+    path, healthy_bytes, _unused_frames = _six_record_log(dersis_home)
+    blob = bytearray(healthy_bytes)
+    assert storage.log_entry_count(path) == 6
+
+    blob[struct.calcsize(storage._LOG_HEADER_FMT) - 1] ^= 0x01   # version byte
+    with open(path, "wb") as f:
+        f.write(bytes(blob))
+
+    readable = storage.load_encrypted_lines_report(path)
+    assert readable.entries == []
+    assert storage.log_entry_count(path) == len(readable.entries), (
+        "count reports %d records in a log the reader cannot open at all"
+        % storage.log_entry_count(path))

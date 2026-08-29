@@ -590,12 +590,40 @@ def _walk_log_frames(blob: bytes) -> Iterator[Optional[Tuple[int, int]]]:
                     in (_MAGIC, _LEGACY_MAGIC)):
                 off = after  # the claimed length lands on the next record
                 continue
-            # It does not. The magic said "a record starts here" and the length
-            # said "the next one starts nowhere in particular", so the length is
-            # the damaged half. Following it is what desynchronised the old walk
-            # for the whole rest of the file; resync instead. No loss is counted
-            # when the scan succeeds: this record was already yielded and the
-            # scan lands on the very next record start, so nothing was skipped.
+            # It does not, and there are two ways that happens. Deciding
+            # between them is the difference between reporting a lost record
+            # and hiding one.
+            #
+            # (a) THIS record's length prefix is damaged, so `after` points
+            #     nowhere in particular. Resyncing on the next magic skips only
+            #     garbage, and nothing is lost that was not already counted.
+            # (b) The NEXT record's container magic is damaged. Then `after` is
+            #     the true next prefix and the length there is intact — so the
+            #     resync below would jump clean over a whole real record and
+            #     report nothing. That is ST-DATA-002's silence, and the first
+            #     version of this walk had it: measured on a 6-record log, a
+            #     single bit flipped in the magic of records 1-4 returned 5
+            #     records with `lost == 0`, where the reader this replaced
+            #     reported `lost == 1`.
+            #
+            # Tell them apart by asking whether `after` still parses as a
+            # well-formed prefix whose record ends on a record start (or on the
+            # end of the file). If it does, we are in case (b): count the
+            # record whose magic is gone and carry on from the one after it.
+            # Where both readings are possible, this picks the one that REPORTS
+            # a loss -- for a finding about silence, the conservative direction
+            # is to speak up.
+            if after + len_size <= end:
+                (nxt_len,) = struct.unpack_from(_LOG_RECLEN_FMT, blob, after)
+                nxt_after = after + len_size + nxt_len
+                if (nxt_len >= _MIN_CONTAINER and nxt_after <= end
+                        and (nxt_after == end
+                             or blob[nxt_after + len_size:
+                                     nxt_after + len_size + magic_size]
+                             in (_MAGIC, _LEGACY_MAGIC))):
+                    yield None
+                    off = nxt_after
+                    continue
             already_lost = False
         else:
             # This prefix cannot be trusted — it may itself be the damaged
@@ -786,16 +814,38 @@ def log_entry_count(path: str) -> int:
     len_size = struct.calcsize(_LOG_RECLEN_FMT)
     magic_size = len(_MAGIC)
     try:
+        header_size = struct.calcsize(_LOG_HEADER_FMT)
         with open(path, "rb") as f:
-            if f.read(4) != _LOG_MAGIC:
+            head = f.read(header_size)
+            # BOTH halves of the header, not just the magic. Checking only the
+            # magic let this function count records in a file the reader
+            # refuses: `_read_log_records_report` raises on an unsupported
+            # version and `load_encrypted_lines_report` turns that into
+            # `LogRead([], -1)`, so a single flipped bit in the VERSION byte
+            # gave count 6 against 0 records readable. Measured over all 48
+            # single-bit flips of the 6-byte header: the 32 magic flips already
+            # agreed (0/0), the 16 version flips all disagreed (6/0).
+            if (len(head) < header_size
+                    or struct.unpack_from(_LOG_HEADER_FMT, head, 0)
+                    != (_LOG_MAGIC, _LOG_VERSION)):
                 return len(load_encrypted_lines(path))
-            f.seek(struct.calcsize(_LOG_HEADER_FMT))
             total = log_size(path)
             count = 0
             while True:
                 raw = f.read(len_size)
+                if not raw:
+                    return count  # exact EOF: the seek walk consumed the file
                 if len(raw) < len_size:
-                    return count  # clean end, or a 1-3 byte torn tail
+                    # 1-3 bytes left. That is a torn tail on a healthy log, but
+                    # it is ALSO what an inflated length prefix looks like: a
+                    # rec_len that still clears _MIN_CONTAINER and still fits
+                    # inside the file seeks past every later record and leaves a
+                    # short read at the end. Measured on a 6-record log
+                    # (pad=98): one flipped bit took record 0's length from 201
+                    # to 1225, which lands 1 byte from EOF, and this path
+                    # returned 1 where the shared walk recovers all 6. Returning
+                    # here is only safe at an exact EOF, so anything else defers.
+                    break
                 (rec_len,) = struct.unpack(_LOG_RECLEN_FMT, raw)
                 start = f.tell()
                 if rec_len < _MIN_CONTAINER or start + rec_len > total:
