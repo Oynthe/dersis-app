@@ -1,29 +1,26 @@
 """Main application window: SchedulerApp (QMainWindow subclass) — PyQt6."""
 
+import base64
 import copy
 import json
 import csv
 import hashlib
 import os
-import sys
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QComboBox, QLabel, QPushButton, QFrame, QScrollArea,
-    QGridLayout, QMenu, QMenuBar, QToolBar, QStatusBar, QFileDialog,
-    QMessageBox, QListWidget, QSplitter, QSizePolicy, QToolButton, QDialog,
-    QTreeWidget, QTreeWidgetItem, QHeaderView, QAbstractItemView,
-    QSlider, QWidgetAction, QStackedWidget,
+    QMainWindow, QApplication, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
+    QComboBox, QLabel, QPushButton, QFrame, QScrollArea, QMenu, QToolBar,
+    QFileDialog, QMessageBox, QListWidget, QSplitter, QSizePolicy, QToolButton,
+    QDialog, QAbstractItemView, QSlider, QWidgetAction, QStackedWidget,
 )
 from PyQt6.QtCore import Qt, QPoint, QMimeData, QTimer, QSize
 from PyQt6.QtGui import (
-    QAction, QKeySequence, QColor, QPainter, QDrag, QFont, QCursor,
-    QShortcut, QIcon,
+    QAction, QKeySequence, QColor, QPainter, QDrag, QCursor, QShortcut, QIcon,
 )
 
 from scheduler_app.renderer import (
-    TimetableView, TimetableScene, LessonItem,
-    FILTER_MODE_DEFAULT, FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP,
+    TimetableView, TimetableScene, FILTER_MODE_DEFAULT,
+    FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP,
 )
 from scheduler_app.dashboard import DashboardWidget
 
@@ -36,38 +33,27 @@ try:
 except ImportError:
     openpyxl = None
 
-from scheduler_app.constants import (
-    MIN_CELL_W, MIN_CELL_H, EMPTY_BG, HEADER_BG_DARK, TIME_BG, CORNER_BG,
-    MATRIX_BORDER, MATRIX_DAY_BG, MATRIX_DAY_FG, MATRIX_BRANCH_BG,
-    MATRIX_BRANCH_FG, MATRIX_SESSION_BG, MATRIX_TIME_BG, MATRIX_CELL_FG,
-    MATRIX_CORNER_BG, OPEN_SLOTS_FG_ROOM,
-)
+from scheduler_app.constants import OPEN_SLOTS_FG_ROOM
 from scheduler_app.translations import tr, get_language, set_language, is_rtl
 from scheduler_app.core.text_safety import csv_safe
 from scheduler_app.i18n.day_keys import (
     normalize_state_day_keys, day_label, display_day, format_day_time,
 )
 from scheduler_app.models import (
-    new_state, split_non_joint,
-    LOCATION_FACE_TO_FACE, LOCATION_ONLINE, LOCATION_LECTURER_OFFICE,
-    get_location_label, is_virtual_location_type,
-    normalize_state_classes,
-    get_classroom_export_labels,
-    effective_day, effective_time, mark_placed, mark_unplaced,
-    needs_physical_room,
-    get_effective_room_resource_for_class,
-    cls_key,
+    new_state, split_non_joint, LOCATION_FACE_TO_FACE, LOCATION_ONLINE,
+    LOCATION_LECTURER_OFFICE, get_location_label, is_virtual_location_type,
+    normalize_state_classes, effective_day, effective_time, mark_placed,
+    mark_unplaced, needs_physical_room, get_effective_room_resource_for_class,
+    cls_key, slot_offset_for_target,
 )
 from scheduler_app.logic import (
-    get_placed_classes,
-    occupied_slots_of, classroom_of, total_duration,
-    build_virtual_classroom_day_layout,
-    find_schedule_conflicts, conflict_partner_index,
-    schedule_counts,
+    get_placed_classes, occupied_slots_of, classroom_of, find_slot_index,
+    find_schedule_conflicts, conflict_partner_index, schedule_counts,
     find_valid_options,
-    get_year_color, lighten_color,
-    apply_negotiation_suggestion,
 )
+# ST-ARCH-010: moved out of `logic.py` with the rest of the optimization
+# bridge; see `scheduler_app/core/facade.py`.
+from scheduler_app.core.facade import apply_negotiation_suggestion
 from scheduler_app.feedback_logger import FeedbackLogger
 from scheduler_app.preference_learner import PreferenceLearner
 from scheduler_app import storage
@@ -78,8 +64,9 @@ from scheduler_app.core.schedule_impact_analyzer import (
 from scheduler_app.dialogs import (
     SetupDialog, AddClassDialog,
     PlaceClassDialog, SelectClassDialog, MultiSelectClassDialog,
-    WarningsDialog, OpenSlotsDialog, PostAddDialog,
+    PostAddDialog,
     BulkAddDialog, BulkResultsDialog, EditClassesDialog,
+    _ensure_excel_deps,
 )
 from scheduler_app.widgets import Toast, WarningLogPanel, YearLegend
 from scheduler_app.ui.bug_report import BugReportButton, BugReportDialog
@@ -830,6 +817,28 @@ class DraggableUnplacedList(QListWidget):
 # short enough that a crash loses at most this much; every exit path flushes.
 AUTOSAVE_DEBOUNCE_MS = 1500
 
+# ST-UI-013. The size the window opened at for every user on every launch,
+# because nothing ever saved or restored a geometry. Measured natively at that
+# exact size, Turkish, 5 days x 8 periods: scene 841x607 into a viewport
+# 769x457 — both scrollbars, before the user has touched anything. It survives
+# only as the fallback a maximized first run starts from, so that un-maximizing
+# lands somewhere sane.
+DEFAULT_WINDOW_W = 1150
+DEFAULT_WINDOW_H = 720
+
+# Keys in the settings container (the same one the language flag uses).
+WINDOW_GEOMETRY_KEY = "window_geometry"
+SIDEBAR_INTENT_KEY = "sidebar_intent"
+
+# How much of a restored window frame must land on a connected screen before
+# the geometry is believed. A laptop undocked from a second monitor restores a
+# frame nobody can reach; a quarter on screen is enough to drag back.
+MIN_ON_SCREEN_FRACTION = 0.25
+
+# Extra width demanded before an auto-collapsed sidebar reopens, so a window
+# sitting exactly on the threshold does not flicker as it is dragged.
+SIDEBAR_REOPEN_HYSTERESIS = 24
+
 
 class SchedulerApp(QMainWindow):
     def __init__(self, session=None, server_url=''):
@@ -841,7 +850,9 @@ class SchedulerApp(QMainWindow):
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "docs", "dersis.png")
         if os.path.exists(_icon_path):
             self.setWindowIcon(QIcon(_icon_path))
-        self.resize(1150, 720)
+        # Provisional only — _restore_window_geometry() overrides this at the
+        # end of __init__, once there are widgets for a restored size to fit.
+        self.resize(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H)
         self.setMinimumSize(850, 550)
 
         # Apply global stylesheet
@@ -928,6 +939,13 @@ class SchedulerApp(QMainWindow):
         self._build_toolbar()
         self._build_main()
         self._build_status()
+
+        # ST-UI-013: after the widgets exist, so the restored sidebar intent
+        # has something to act on, and before show(), so the user never sees
+        # the window jump from the default size to the remembered one. Before
+        # the flush below, because this reads the settings container too and a
+        # problem it found would otherwise have nowhere to go.
+        self._restore_window_geometry()
 
         # _auto_load runs above, before any of these widgets exist, so a
         # settings problem found during load had nowhere to go. Flush it now
@@ -1045,7 +1063,22 @@ class SchedulerApp(QMainWindow):
         view_menu.addSeparator()
         self._toggle_sidebar_action = QAction(tr("menus.toggle_sidebar"), view_menu)
         self._toggle_sidebar_action.setCheckable(True)
-        self._toggle_sidebar_action.setChecked(True)
+        # ST-UI-013: this action is *recreated* on every language change, so a
+        # constant here is a tick that describes the sidebar only until someone
+        # switches language. Born ticked over a collapsed sidebar, the next
+        # Ctrl+B arrives as checked=False, is read as "close it", writes an
+        # intent and moves nothing — the whole keypress goes on resynchronising
+        # the menu. The getattr is load-bearing: _build_menu runs before
+        # _build_main creates _sidebar_is_collapsed on the first pass.
+        self._toggle_sidebar_action.setChecked(
+            not getattr(self, "_sidebar_is_collapsed", False))
+        # ST-UI-013: the sidebar is worth a flat 314 px of grid — two day
+        # columns at 1000 px — and until now the only ways to reclaim them
+        # were a 26 px icon and an unaccelerated menu item. Ctrl+B is free;
+        # Ctrl+Shift+B (Bulk Add) is the one already taken.
+        self._toggle_sidebar_action.setShortcut(QKeySequence("Ctrl+B"))
+        self._toggle_sidebar_action.setShortcutContext(
+            Qt.ShortcutContext.WindowShortcut)
         self._toggle_sidebar_action.triggered.connect(self._toggle_sidebar_panel)
         view_menu.addAction(self._toggle_sidebar_action)
         self._menu_actions.append(self._toggle_sidebar_action)
@@ -1447,7 +1480,7 @@ class SchedulerApp(QMainWindow):
             "  border-radius: 5px; padding: 2px; }"
             "QPushButton:hover { background: #E2E8F0; }")
         self._sidebar_collapse_btn.clicked.connect(
-            lambda: self._collapse_panel("sidebar"))
+            lambda: self._collapse_panel("sidebar", by_user=True))
         sidebar_header_row.addWidget(self._sidebar_collapse_btn)
         sidebar_layout.addLayout(sidebar_header_row)
 
@@ -1493,6 +1526,9 @@ class SchedulerApp(QMainWindow):
         osp_lay.setContentsMargins(4, 4, 4, 4)
         osp_lay.setSpacing(4)
         self._open_slots_filter_hint = QLabel("")
+        # ST-UI-007: the hint names the selected lesson, so its text is the
+        # user's. See _refresh_open_slots for the measurement.
+        self._open_slots_filter_hint.setTextFormat(Qt.TextFormat.PlainText)
         self._open_slots_filter_hint.setStyleSheet(
             "QLabel { font-size: 7pt; color: #4B5563; background: #E0F2FE;"
             "  border: 1px solid #BAE6FD; border-radius: 4px;"
@@ -1567,7 +1603,7 @@ class SchedulerApp(QMainWindow):
             "  border-radius: 6px; padding: 2px; }"
             "QPushButton:hover { background: #CBD5E1; }")
         self._sidebar_expand_btn.clicked.connect(
-            lambda: self._expand_panel("sidebar"))
+            lambda: self._expand_panel("sidebar", by_user=True))
         self._sidebar_expand_btn.setVisible(False)
 
         # Sidebar collapse state tracking
@@ -1577,6 +1613,16 @@ class SchedulerApp(QMainWindow):
         self._collapsed_width = 36
         self._collapse_threshold = 60
         self._in_collapse_sync = False
+        # ST-UI-013. Who last decided whether the sidebar is open:
+        #   "auto"   — nobody has said; the window width decides
+        #   "open"   — the user opened it and it stays open
+        #   "closed" — the user closed it and it stays closed
+        # A plain resizeEvent breakpoint without this was built and measured:
+        # at 1000 px the user clicks Expand and the next 1 px of drag closes it
+        # again. Hysteresis does not help, because the window is genuinely
+        # still below the threshold. Persisted, so the decision outlives the
+        # session that made it.
+        self._sidebar_intent = "auto"
 
         # Detect splitter-drag collapse
         self.splitter.splitterMoved.connect(self._on_splitter_moved)
@@ -2364,6 +2410,24 @@ class SchedulerApp(QMainWindow):
         elif tab_idx == 4:
             self.dashboard_widget.refresh(self.state_data)
 
+        # ST-UI-013: the threshold has two sides and only one of them is the
+        # window. Every other trigger — resizeEvent, _init_splitter_sizes,
+        # _set_language — fires when the *window* changes, so a schedule that
+        # grew two days, a freshly opened file, or a click on "Show everything"
+        # moved the *content* side by hundreds of pixels with the decision from
+        # startup still standing. Measured on 6x10 Turkish at 1366x768: the
+        # sidebar kept 314 px the sixth day needed, and only a 1 px nudge of
+        # the window would hand them over.
+        #
+        # Here rather than in `refresh_grid`, because `notebook.currentChanged`
+        # connects straight to this method and never reaches `refresh_grid`.
+        # The hasattr mirrors `resizeEvent`'s guard: the filter combo boxes
+        # this method returns on exist earlier in `_build_main` than the
+        # sidebar state does. No re-render can come back through here — the
+        # collapse only moves splitter sizes, and no view defines resizeEvent.
+        if hasattr(self, '_sidebar_intent'):
+            self._apply_sidebar_intent()
+
     def _update_side_panels(self):
         """Update unplaced panel, open slots, and warnings."""
         if not hasattr(self, 'lecturer_filter'):
@@ -2458,9 +2522,9 @@ class SchedulerApp(QMainWindow):
     def _toggle_sidebar_panel(self, checked):
         """Toggle entire sidebar visibility from View menu."""
         if checked:
-            self._expand_panel("sidebar")
+            self._expand_panel("sidebar", by_user=True)
         else:
-            self._collapse_panel("sidebar")
+            self._collapse_panel("sidebar", by_user=True)
 
     def _init_splitter_sizes(self):
         """Set initial splitter sizes once the window is laid out."""
@@ -2469,7 +2533,28 @@ class SchedulerApp(QMainWindow):
         nb = total - sw
         if nb < 400:
             nb = 400
-        self.splitter.setSizes([nb, sw])
+        # This setSizes() emits splitterMoved exactly as a drag does, and a
+        # startup layout is not the user saying anything about the sidebar.
+        self._in_collapse_sync = True
+        try:
+            self.splitter.setSizes([nb, sw])
+        finally:
+            self._in_collapse_sync = False
+        # ST-UI-013: a restored "closed" is a decision the user made in an
+        # earlier session, and it has two halves — switch the width-aware
+        # collapse off, *and* close the panel. `_restore_window_geometry` can
+        # only apply the first: it runs before show(), where the splitter still
+        # reports its own 640 px size hint and nothing measured off it is worth
+        # acting on. Applying only that half produced the one state this whole
+        # row exists to remove — an open sidebar in a window too narrow for it,
+        # now sticky on disk instead of one resize away from being fixed.
+        # `by_user` stays False deliberately: this is replaying the stored
+        # decision, not taking a new one.
+        if self._sidebar_intent == "closed" and not self._sidebar_is_collapsed:
+            self._collapse_panel("sidebar")
+        # Decide once, here, rather than waiting for the first resize the user
+        # happens to perform.
+        self._apply_sidebar_intent()
 
     def _on_splitter_moved(self):
         """Detect when a splitter drag shrinks the sidebar below threshold."""
@@ -2480,14 +2565,24 @@ class SchedulerApp(QMainWindow):
         if not self._sidebar_is_collapsed and sizes[1] <= thresh:
             self._sidebar_saved_width = max(self._sidebar_saved_width, 150)
             self._in_collapse_sync = True
-            self._collapse_panel("sidebar")
+            # Dragging the handle shut is the user closing the sidebar, and it
+            # has to stick for the same reason the button does.
+            self._collapse_panel("sidebar", by_user=True)
             self._in_collapse_sync = False
         elif not self._sidebar_is_collapsed and sizes[1] > thresh:
             self._sidebar_saved_width = sizes[1]
 
-    def _collapse_panel(self, which):
-        """Collapse the sidebar by shrinking it in the splitter."""
-        if which != "sidebar" or self._sidebar_is_collapsed:
+    def _collapse_panel(self, which, *, by_user=False):
+        """Collapse the sidebar by shrinking it in the splitter.
+
+        ``by_user`` records *whose* decision this was. Only a person's decision
+        becomes an intent that outranks the window width (ST-UI-013).
+        """
+        if which != "sidebar":
+            return
+        if by_user:
+            self._sidebar_intent = "closed"
+        if self._sidebar_is_collapsed:
             return
         cw = self._collapsed_width
         sizes = self.splitter.sizes()
@@ -2513,9 +2608,18 @@ class SchedulerApp(QMainWindow):
         self._update_collapsed_handles()
         self._position_expand_buttons()
 
-    def _expand_panel(self, which):
-        """Expand the collapsed sidebar back to its previous width."""
-        if which != "sidebar" or not self._sidebar_is_collapsed:
+    def _expand_panel(self, which, *, by_user=False):
+        """Expand the collapsed sidebar back to its previous width.
+
+        Note for anyone adding a width cap here later: the two lines below that
+        reset ``setMinimumWidth(0)`` / ``setMaximumWidth(16777215)`` throw any
+        such cap away on the first expand, so it has to be re-applied.
+        """
+        if which != "sidebar":
+            return
+        if by_user:
+            self._sidebar_intent = "open"
+        if not self._sidebar_is_collapsed:
             return
         sizes = self.splitter.sizes()
         self._sidebar_is_collapsed = False
@@ -2560,6 +2664,181 @@ class SchedulerApp(QMainWindow):
                 handle.setMinimumWidth(0)
                 handle.setMaximumWidth(16777215)
                 handle.resize(self.splitter.handleWidth(), handle.height())
+
+    # ── The window fits the screen, the sidebar fits the grid (ST-UI-013) ──
+
+    def _splitter_handle_width(self):
+        """The live handle width. ``handleWidth()`` is -1 under Fusion."""
+        handle = self.splitter.handle(1) if self.splitter.count() > 1 else None
+        if handle is not None and handle.width() > 0:
+            return handle.width()
+        return max(self.splitter.handleWidth(), 0)
+
+    def _grid_content_width(self):
+        """Notebook width that would show the visible timetable whole.
+
+        Read straight off the scene that is already on screen. This runs from
+        ``resizeEvent``, which fires on every frame of a window drag, so it must
+        never re-render anything — ``sceneRect()`` is current by the time any
+        resize arrives.
+        """
+        views = [self.grid_view1, self.grid_view2,
+                 self.grid_view3, self.grid_view4]
+        idx = self.notebook.currentIndex()
+        view = views[idx] if 0 <= idx < len(views) else self.grid_view1
+        scene = view.scene()
+        if scene is None:
+            return 0
+        zoom = getattr(view, "_zoom_pct", 100) or 100
+        scene_w = scene.sceneRect().width() * zoom / 100.0
+        # Everything between the notebook's own edge and the viewport the scene
+        # is painted into: tab-widget frame, page margins, vertical scrollbar.
+        chrome = max(self.notebook.width() - view.viewport().width(), 0)
+        return int(round(scene_w + chrome))
+
+    def _sidebar_open_width(self):
+        """The width the sidebar will actually take when it is open.
+
+        ``_sidebar_saved_width`` is only what we would *ask* for. The splitter
+        floors it at the panel's own ``minimumSizeHint``, which is
+        locale-dependent — ``12 + minSizeHint(open-slots) + 4 +
+        minSizeHint(unplaced)``, both buttons bold, padded and emoji-prefixed,
+        giving ko 210 ... tr 301 ... ru 362 natively — and exceeds the
+        hard-coded 350 in pl and ru, where it silently widens the sidebar.
+
+        Measured cost of using the remembered number instead: switching to
+        Azerbaijani after Arabic decided with 350 against a panel that then
+        took 564, and the sidebar kept 201 px the tab bar needed.
+
+        The hint reads as the layout's minimum, so it only means anything while
+        the panel's contents are visible; collapsed, the remembered width is
+        the best estimate there is, and ``_apply_sidebar_intent`` re-checks
+        once the panel is open again.
+        """
+        return max(self._sidebar_saved_width,
+                   self._sidebar_panel.minimumSizeHint().width())
+
+    def _sidebar_needed_width(self):
+        """Splitter width at which the sidebar costs the user nothing.
+
+        Two things compete for the notebook and the wider one wins:
+
+        *The tab bar.* It does not elide (``ElideNone``); a tab that does not
+        fit is a tab behind a scroll arrow, and the Quality Dashboard is the
+        last one. Its size hint spans 319 px across the 22 shipped locales —
+        ko 913 to id 1232 once the 359 px of sidebar and chrome are added — so
+        any constant here is 48 px short in Turkish and 132 short in
+        Indonesian.
+
+        *The timetable.* 5 days x 8 periods wants 1212 px with the sidebar
+        open and 898 with it closed; 6 x 10 wants 1377 and 1063.
+
+        Both are measured live, which is what makes this locale-correct and
+        day-count-correct by construction rather than by a table someone has to
+        maintain.
+        """
+        tab_w = self.notebook.tabBar().sizeHint().width()
+        return (max(tab_w, self._grid_content_width())
+                + self._sidebar_open_width() + self._splitter_handle_width())
+
+    def _apply_sidebar_intent(self):
+        """Give the grid the sidebar's 314 px when it needs them — if allowed.
+
+        Does nothing at all unless nobody has expressed an intent. The measured
+        cost of getting that wrong: with a bare breakpoint, expanding the
+        sidebar at 1000 px survives exactly until the window moves one pixel.
+        """
+        if self._sidebar_intent != "auto":
+            return
+        if self._in_collapse_sync or not self.isVisible():
+            return
+        # A window that has never been shown reports a splitter at its own
+        # 640 px size hint no matter what resize() was called with, so nothing
+        # measured off it is worth acting on.
+        total = self.splitter.width()
+        if total <= self._collapsed_width * 4:
+            return  # not laid out yet — _init_splitter_sizes has not run
+        needed = self._sidebar_needed_width()
+        if not self._sidebar_is_collapsed:
+            if total < needed:
+                self._collapse_panel("sidebar")
+        elif total > needed + 2 * self._splitter_handle_width() \
+                + SIDEBAR_REOPEN_HYSTERESIS:
+            self._expand_panel("sidebar")
+            # How wide the panel insists on being is only readable once its
+            # contents are visible, so the estimate that opened it may have
+            # been the previous language's. Re-check exactly once; the branch
+            # above cannot run again from here.
+            if self.splitter.width() < self._sidebar_needed_width():
+                self._collapse_panel("sidebar")
+
+    @staticmethod
+    def _rect_is_on_a_screen(frame, screen_rects,
+                             minimum=MIN_ON_SCREEN_FRACTION):
+        """True when enough of *frame* lands on one of *screen_rects*.
+
+        A geometry saved while a second monitor was plugged in restores to
+        coordinates no screen covers once it is unplugged, and the window opens
+        where nobody can reach it. Each screen is measured separately and the
+        best one wins: a frame straddling two monitors is on screen once, not
+        half on screen twice.
+        """
+        area = frame.width() * frame.height()
+        if area <= 0:
+            return False
+        best = 0
+        for rect in screen_rects:
+            overlap = frame.intersected(rect)
+            best = max(best, overlap.width() * overlap.height())
+        return best >= area * minimum
+
+    def _available_screen_rects(self):
+        app = QApplication.instance()
+        if app is None:
+            return []
+        return [screen.availableGeometry() for screen in app.screens()]
+
+    def _restore_window_geometry(self):
+        """Reopen where the user left the window, or maximized on a first run.
+
+        The alternative, and what shipped until now, is a hard-coded 1150x720
+        on every launch on every machine — measured to put an 841x607 timetable
+        into a 769x457 viewport in Turkish at 5 days x 8 periods, and to clear
+        the Turkish tab bar by exactly 0 px while failing id, pl and ru.
+        """
+        try:
+            data = self._read_settings_container() or {}
+        except Exception:
+            data = {}     # already reported; a bad container costs a size only
+        intent = data.get(SIDEBAR_INTENT_KEY)
+        if intent in ("auto", "open", "closed"):
+            self._sidebar_intent = intent
+        restored = False
+        blob = data.get(WINDOW_GEOMETRY_KEY)
+        if isinstance(blob, str) and blob:
+            try:
+                restored = bool(self.restoreGeometry(base64.b64decode(blob)))
+            except Exception:
+                restored = False   # truncated, re-encoded, hand-edited: ignore
+        if restored and not self._rect_is_on_a_screen(
+                self.frameGeometry(), self._available_screen_rects()):
+            restored = False
+        if not restored:
+            self.resize(DEFAULT_WINDOW_W, DEFAULT_WINDOW_H)
+            self.setWindowState(
+                self.windowState() | Qt.WindowState.WindowMaximized)
+
+    def _save_window_geometry(self):
+        """Remember the window and the sidebar decision for the next launch."""
+        from scheduler_app.first_run import _write_flag
+        try:
+            blob = base64.b64encode(bytes(self.saveGeometry())).decode("ascii")
+        except Exception:
+            return False
+        ok = _write_flag(self._config_path, WINDOW_GEOMETRY_KEY, blob)
+        ok = _write_flag(self._config_path, SIDEBAR_INTENT_KEY,
+                         self._sidebar_intent) and ok
+        return ok
 
     def _on_unplaced_dblclick(self, item):
         row = self.unplaced_list.row(item)
@@ -2698,15 +2977,66 @@ class SchedulerApp(QMainWindow):
         if not fname:
             return
         try:
-            with open(fname, "w", newline="") as f:
+            # ST-FUNC-006. This is the CSV a user actually gets -- the menu is
+            # wired here, not to data_io.export_schedule(..., "csv", ...),
+            # which has no production caller at all. Both halves of the finding
+            # lived on these two lines and nowhere else:
+            #
+            #   * no `encoding=`, so the file was written in the OS codepage.
+            #     Measured on this machine: locale.getpreferredencoding(False)
+            #     is cp1254, so colleagues abroad got mojibake -- and on a
+            #     cp1252 host "Işık Öğretmen".encode() raises
+            #     UnicodeEncodeError, which the bare `except Exception` below
+            #     turns into an unexplained "export failed".
+            #   * the raw internal day key ("monday") in a Turkish-headed file.
+            #
+            # utf-8-sig because the file is opened in Excel, which reads a
+            # BOM-less UTF-8 CSV in the local codepage; the suite's own
+            # read_csv_rows already decodes with utf-8-sig.
+            with open(fname, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
                 writer.writerow([tr("labels.class_item"), tr("labels.lecturer"), tr("labels.year"), tr("labels.branch"),
                                  tr("labels.day"), tr("labels.start_time"), tr("labels.duration"), tr("labels.classroom")])
                 for c in placed:
-                    day = effective_day(c)
+                    # display_day rather than tr("weekdays.<key>"): it falls
+                    # back to the stored value verbatim for a day the grid no
+                    # longer defines, instead of printing the lookup key.
+                    day = display_day(effective_day(c))
                     start = effective_time(c)
                     room = classroom_of(c)
-                    for t in c["targets"]:
+                    # ST-FUNC-013. `targets` is [] for every freshly created
+                    # class (core/models.py:578) and no class editor requires
+                    # one, so iterating it alone wrote NO row for a lesson the
+                    # user had placed -- the same silent drop the PDF had, in
+                    # the file that gets emailed. A flat file has room for it.
+                    si = find_slot_index(self.state_data, start)
+                    for t in c["targets"] or [{"year": "", "branch": ""}]:
+                        # A non-joint lesson gives each group its own
+                        # consecutive block ("If unchecked, each group gets its
+                        # own consecutive time block"), and the dialog writes
+                        # joint_session=False for every multi-target class, so
+                        # this is the default shape. `start` is the *class*
+                        # start; every other surface adds the group's offset --
+                        # renderer.py, the PDF everything table and the XLSX
+                        # everything matrix -- and this row's duration column
+                        # says 1, so without the offset it states group B's
+                        # session at group A's hour.
+                        #
+                        # `.index(t)` rather than enumerate, deliberately: the
+                        # other three surfaces index the same way (see the
+                        # consistency note at renderer.py:1477), so duplicate
+                        # targets resolve identically here and on screen.
+                        t_idx = c["targets"].index(t) if c["targets"] else 0
+                        row_start = start
+                        off = slot_offset_for_target(c, t_idx)
+                        if si is not None and si + off < len(self.state_data["slots"]):
+                            row_start = self.state_data["slots"][si + off]
+                        # else: the group's own hour is off the grid -- a
+                        # deleted slot, or a block that runs past the end of
+                        # the day. A grid can only drop that; a flat file
+                        # reports it at the stored start instead (ST-DATA-003,
+                        # the rule data_io/exporter.py's CSV already follows).
+                        #
                         # ST-UI-008. The .csv is emailed to colleagues and a
                         # leading "=" is executed by their spreadsheet. Safe to
                         # prefix here and ONLY here: nothing in DERSIS reads a
@@ -2715,7 +3045,7 @@ class SchedulerApp(QMainWindow):
                         writer.writerow([
                             csv_safe(c["name"]), csv_safe(c["lecturer"]),
                             csv_safe(t["year"]), csv_safe(t["branch"]),
-                            day, csv_safe(start), c["duration"],
+                            day, csv_safe(row_start), c["duration"],
                             csv_safe(room)])
             QMessageBox.information(self, tr("status.exported"),
                                    f"{tr('status.exported_to')} {os.path.basename(fname)}")
@@ -3550,7 +3880,21 @@ class SchedulerApp(QMainWindow):
                 row_layout.setContentsMargins(10, 6, 10, 6)
                 row_layout.setSpacing(0)
 
+                # ST-UI-007. A QLabel defaults to AutoText, so Qt decides PER
+                # STRING whether to parse markup -- and both of these carry
+                # free text the school typed into Setup. Measured offscreen on
+                # this panel, sizeHint width before -> after forcing PlainText:
+                # a slot labelled "09:00 <b>x</b>" 77 -> 154, a room called
+                # "Lab <b>A</b>" 50 -> 120. Qt was drawing "Lab A", so the
+                # panel disagreed with the classroom list about the room's
+                # name and the user had no way to tell which was right.
+                #
+                # Removing Qt's choice is the fix, NOT escaping: html.escape on
+                # a string Qt would have shown literally puts '&amp;' on the
+                # screen, and "R&D Lab" is a plausible room name. Same remedy
+                # as the toast in ui/widgets.py.
                 time_label = QLabel(slot_time)
+                time_label.setTextFormat(Qt.TextFormat.PlainText)
                 time_label.setStyleSheet(
                     "QLabel { font-size: 8pt; font-weight: 700;"
                     "  color: #111827; background: transparent; }")
@@ -3566,6 +3910,7 @@ class SchedulerApp(QMainWindow):
                     get_effective_room_resource_for_class(
                         selected_cls, room_override=room)
                     if selected_cls is not None and not room else (room or ""))
+                room_label.setTextFormat(Qt.TextFormat.PlainText)
                 room_label.setStyleSheet(
                     "QLabel { font-size: 7.5pt; color: %s;"
                     "  background: transparent; }" % OPEN_SLOTS_FG_ROOM)
@@ -4543,41 +4888,6 @@ class SchedulerApp(QMainWindow):
         self._clear_empty_slot_selection()
         self._apply_class_selection(items, anchor=items[0])
 
-    def _select_all(self):
-        focus = QApplication.focusWidget()
-        if hasattr(self, "unplaced_list"):
-            ul = self.unplaced_list
-            ul_focused = (
-                focus is ul
-                or (focus is not None and ul.isAncestorOf(focus))
-                or ul.hasFocus()
-                or ul.viewport().hasFocus()
-                or ul.underMouse()
-                or ul.viewport().underMouse()
-            )
-            if ul_focused:
-                ul.selectAll()
-                return
-
-        if hasattr(self, "_open_slots_scroll"):
-            ost = self._open_slots_scroll
-            ost_focused = (
-                focus is ost
-                or (focus is not None and ost.isAncestorOf(focus))
-                or ost.hasFocus()
-                or ost.underMouse()
-            )
-            if ost_focused:
-                return
-
-        tab_idx = self.notebook.currentIndex() if hasattr(self, "notebook") else -1
-        if tab_idx in (0, 1, 2, 3):
-            view = [self.grid_view1, self.grid_view2, self.grid_view3, self.grid_view4][tab_idx]
-            self._select_all_in_view(view)
-            return
-        self._selected_class = None
-
-
     def _copy_to_clipboard(self):
         s = self.state_data
         if not s["days"] or not s["slots"]:
@@ -4714,28 +5024,18 @@ class SchedulerApp(QMainWindow):
         from scheduler_app.plans import FEATURE_EXPORT_PDF
         if not TierEnforcement.instance().require_feature(FEATURE_EXPORT_PDF, self):
             return
-        # Check reportlab availability, offer to install if missing
+        # ST-SEC-005: report the missing dependency, do not install it. DERSİS
+        # reaches the network nowhere, and this was one of the three places it
+        # used to. See `dialogs._ensure_excel_deps` for the full argument;
+        # `errors.reportlab_required` already ends with the pip command, which
+        # remains accurate advice for the only audience that can reach this
+        # branch — a developer with an incomplete venv.
         try:
             import reportlab  # noqa: F401
         except ImportError:
-            reply = QMessageBox.question(
-                self, tr("dialogs.export.pdf_title"),
-                tr("errors.reportlab_required")
-                + "\n\n" + tr("dialogs.install.prompt"),
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-            import subprocess, sys
-            try:
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", "reportlab"],
-                    timeout=120,
-                )
-            except Exception as exc:
-                QMessageBox.warning(self, tr("dialogs.error.title"),
-                                    tr("errors.reportlab_install_failed") + f"\n{exc}")
-                return
+            QMessageBox.warning(self, tr("dialogs.export.pdf_title"),
+                                tr("errors.reportlab_required"))
+            return
 
         s = self.state_data
         if not s["days"] or not s["slots"] or not s["years"]:
@@ -4769,31 +5069,17 @@ class SchedulerApp(QMainWindow):
 
 
     def _ensure_excel_deps(self):
-        """Return True if pandas+openpyxl are available, auto-installing if needed."""
-        try:
-            import pandas  # noqa: F401
-            import openpyxl  # noqa: F401
-            return True
-        except ImportError:
-            pass
-        reply = QMessageBox.question(
-            self, tr("dialogs.import.excel_title"),
-            tr("errors.pandas_openpyxl_required")
-            + "\n\n" + tr("dialogs.install.prompt"),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return False
-        import subprocess, sys
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "pandas", "openpyxl"],
-                timeout=120,
-            )
-            return True
-        except Exception as exc:
-            QMessageBox.warning(self, tr("status.import_failed"), str(exc))
-            return False
+        """Return True if pandas+openpyxl are importable.
+
+        A one-line delegate to the module-level ``dialogs._ensure_excel_deps``,
+        which had 13 callers to this copy's 2 while the two bodies were
+        byte-identical modulo ``self``/``parent``. That is the
+        ``data_io/exporter.py`` shape Phase 6 was burned by — two copies, one
+        well-exercised, the next fix landing on the wrong one.
+        ``DataEditorDialog`` in dialogs.py already delegated the same way; this
+        now matches it.
+        """
+        return _ensure_excel_deps(self)
 
     # Every state key `_import_from_excel` may overwrite. The import rolls all
     # of them back together, so a failure cannot leave lecturers from the
@@ -5295,10 +5581,26 @@ class SchedulerApp(QMainWindow):
         # Retranslate impact badge
         self._update_impact_badge()
         self.refresh_grid()
+        # ST-UI-013: the tab bar's size hint is the locale-dependent number
+        # that decides whether all five tabs are reachable — 913 px in Korean,
+        # 1232 in Indonesian. Changing the language changes the threshold, so
+        # the sidebar decision has to be taken again here.
+        #
+        # activate() first, and it is load-bearing: setText() on the two
+        # sidebar buttons only *posts* a layout request, so the panel's
+        # minimumSizeHint still reports the previous language's number until it
+        # is applied. Measured without it, switching to Azerbaijani after
+        # Arabic decided against 350 and got a 564 px panel, and 201 px of tab
+        # bar went behind the scroll arrow.
+        sidebar_layout = self._sidebar_panel.layout()
+        if sidebar_layout is not None:
+            sidebar_layout.activate()
+        self._apply_sidebar_intent()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, '_sidebar_is_collapsed'):
+            self._apply_sidebar_intent()
             self._position_expand_buttons()
 
     def _on_quit(self):
@@ -5313,6 +5615,10 @@ class SchedulerApp(QMainWindow):
         self.close()
 
     def closeEvent(self, event):
+        # ST-UI-013: before anything that can fail or ask a question, because
+        # a geometry written for a close the user then cancels is simply the
+        # current geometry, and costs nothing.
+        self._save_window_geometry()
         # ST-DATA-005: quitting is the moment an unsaved change becomes
         # permanently lost, so a failure here is the one worth interrupting the
         # user for, even though _report_settings_problem has rate-limited it.

@@ -8,10 +8,13 @@ safety net for that pipeline.  It covers three separate concerns:
 * **fidelity** — everything the user typed (Turkish characters, nested structures,
   empty containers, placements) must survive a save/load cycle byte-for-byte
   equal at the Python-object level;
-* **confidentiality + integrity** — the bytes on disk must not contain the
-  plaintext, and any damage to them must be *detected* (including damage that
-  carries a valid checksum, which only the AES-GCM tag can catch), reported as
-  the right kind of problem, and never guessed around;
+* **opacity + integrity** — the bytes on disk must not contain the plaintext,
+  and any damage to them must be *detected* (including damage that carries a
+  valid checksum, which only the AES-GCM tag can catch), reported as the right
+  kind of problem, and never guessed around.  Note the word: *opacity*, not
+  *confidentiality*.  The master key is written to ``keys/key.bin`` beside the
+  saves, so these tests say nothing about whether a person with access to the
+  folder can read a timetable — measured, they can (ST-SEC-002);
 * **failure honesty** — a failed load must not mutate, truncate, relocate, or
   delete the very file (or key) the user is trying to recover, and a failed
   *save* must leave the copy it was replacing untouched.
@@ -26,6 +29,7 @@ Findings guarded here: ST-DATA-001, ST-DATA-002, ST-DATA-013, ST-FUNC-007.
 import copy
 import hashlib
 import json
+import math
 import os
 
 import pytest
@@ -247,7 +251,15 @@ def test_saved_file_is_encrypted_and_carries_the_egu1_magic(dersis_home, make_pr
     """Guard: the .egu container must be an EGU1 blob with no readable plaintext.
 
     A failure means the "encrypted" save is storing student and staff names in
-    the clear, readable by anyone with access to the Documents folder.
+    the clear, so `strings`, a text editor, or a backup indexer would show them.
+
+    Green does **not** mean the file is confidential.  ``keys/key.bin`` sits in
+    the same ``Documents/Dersis/`` tree as the ciphertext, and a from-scratch
+    container parser using only files under that root recovers the plaintext in
+    about ten lines.  What this test pins is opacity and the container shape —
+    integrity is pinned by the corruption tests below.  See ST-SEC-002 and
+    ``tests/test_readme_claims.py``, which keeps the READMEs from promising more
+    than that.
     """
     state = _realistic_state(make_preset)
     path = _save_path(dersis_home, "encrypted.egu")
@@ -499,19 +511,60 @@ def test_legacy_plain_json_with_turkish_text_loads(dersis_home):
 
 
 # ── 6. ST-DATA-013 — JSON type fidelity ──────────────────────────────────────
+#
+# READ THIS BEFORE SPENDING A DAY ON THE TWO PINS BELOW.
+#
+# Both fail, and both fail for the reason they state — but they are properties
+# of ``json.dumps``, not defects a user can reach. **No production code path
+# produces either payload. Measured Phase 7, 2026-08-28** (probe
+# ``scratchpad/probe_data013.py``), across every producer that reaches
+# ``storage.save_encrypted`` / ``append_encrypted_entry``:
+#
+#   learning/feedback_logger.py:66      the feedback log
+#   learning/preference_learner.py:304  the learned weights
+#   ui/app.py:2150                      the settings container
+#   ui/app.py:2934                      File > Save
+#   ui/first_run.py:80                  the first-run starter file
+#
+# * ``new_state()`` + ``new_class()`` + ``mark_placed()`` carry no non-string
+#   key and no non-finite float; ``years``, ``classroom_capacities`` and
+#   ``lecturer_availability`` are all str-keyed, and ``years`` keys come from
+#   ``tr("status.default_year_name")``;
+# * the learned weights are keyed by ``placement_scorer.DEFAULT_WEIGHTS``, all
+#   string literals, and every gradient is ``lr * <constant>`` — finite after
+#   100 steps of momentum, measured;
+# * the importer coerces every name through ``_cell_text``, so an Excel room
+#   literally named ``42`` arrives as ``"42"`` (and a ``NaN`` cell as ``""``);
+# * the package's only non-finite float is ``schedule_optimizer.py:385``
+#   ``global_best_quality = float("inf")``, a loop sentinel that is compared
+#   and reassigned and never leaves its scope;
+# * the only numeric dict keys anywhere in the package are local lookup tables
+#   (``ui/app.py:4963``/``:5015`` tab-index to export mode) and splitter size
+#   lists — nothing that is persisted.
+#
+# The pins stay ``strict``: they are the contract on the *format*, so the day
+# somebody starts persisting an int-keyed map, flipping them is part of that
+# change rather than an archaeology exercise. What stops the claim above from
+# rotting silently is the guard at the end of this section, which walks the
+# payloads production actually writes; if that one goes red, ST-DATA-013 has
+# acquired a producer and stops being theoretical.
 
 @pytest.mark.xfail(
     strict=True,
     reason="ST-DATA-013 — json.dumps silently coerces non-string dict keys "
-           "(42 -> '42') and the loader never converts them back; unscheduled "
-           "in 14-implementation-roadmap.md")
+           "(42 -> '42') and the loader never converts them back. Library-level "
+           "property: no production producer, measured Phase 7 (2026-08-28) — "
+           "see the section comment above and "
+           "test_no_persisted_payload_needs_the_two_pins_above")
 def test_non_string_dict_keys_survive_the_roundtrip(dersis_home):
     """ST-DATA-013: an int-keyed mapping must not come back string-keyed.
 
-    A failure (today) means any code that persists a dict keyed by year/slot
-    index gets a KeyError-shaped surprise on reload: ``d[42]`` is gone and
-    ``d['42']`` took its place. Refusing to persist such a dict is an equally
-    acceptable fix, so this test passes on either.
+    This documents a property of the persistence format, not a live defect: no
+    production code path builds such a mapping (measured Phase 7 — see the
+    section comment). A failure means any *future* code that persists a dict
+    keyed by year/slot index would get a KeyError-shaped surprise on reload:
+    ``d[42]`` is gone and ``d['42']`` took its place. Refusing to persist such
+    a dict is an equally acceptable fix, so this test passes on either.
     """
     path = _save_path(dersis_home, "int_keys.egu")
     payload = {42: "ikinci ders", 7: "yedinci ders"}
@@ -529,15 +582,20 @@ def test_non_string_dict_keys_survive_the_roundtrip(dersis_home):
 @pytest.mark.xfail(
     strict=True,
     reason="ST-DATA-013 — NaN/Infinity are written as bare JSON5-only tokens, "
-           "producing a payload no spec-compliant parser can read; unscheduled "
-           "in 14-implementation-roadmap.md")
+           "producing a payload no spec-compliant parser can read. Library-level "
+           "property: no production producer, measured Phase 7 (2026-08-28) — "
+           "see the section comment above and "
+           "test_no_persisted_payload_needs_the_two_pins_above")
 def test_persisted_payload_is_spec_valid_json(dersis_home):
     """ST-DATA-013: the encrypted payload must be RFC 8259-valid JSON.
 
-    A failure (today) means the .egu payload contains bare ``NaN``/``Infinity``
-    literals, so any external tool, recovery script, or future non-Python reader
-    cannot parse a DERSİS save at all. Refusing to persist non-finite floats is
-    an equally acceptable fix, so this test passes on either.
+    Like the pin above, this documents a property of the format rather than a
+    live defect: nothing in the app persists a non-finite float (measured
+    Phase 7 — see the section comment). A failure means the .egu payload of
+    such a *future* save would contain bare ``NaN``/``Infinity`` literals, so
+    no external tool, recovery script, or non-Python reader could parse it.
+    Refusing to persist non-finite floats is an equally acceptable fix, so this
+    test passes on either.
     """
     path = _save_path(dersis_home, "non_finite.egu")
     payload = {"score": float("nan"), "budget": float("inf"),
@@ -555,6 +613,95 @@ def test_persisted_payload_is_spec_valid_json(dersis_home):
             f"persisted payload contains the non-standard JSON token {token!r}")
 
     json.loads(plaintext, parse_constant=_reject)
+
+
+def _json_hazards(obj, where="<root>"):
+    """Every non-string dict key and non-finite float reachable in *obj*.
+
+    Returns a list of human-readable locations, so a failure names the field
+    rather than just the count.
+    """
+    found = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if not isinstance(k, str):
+                found.append(f"{where}: dict key {k!r} is {type(k).__name__}, "
+                             f"not str")
+            found.extend(_json_hazards(v, f"{where}[{k!r}]"))
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            found.extend(_json_hazards(v, f"{where}[{i}]"))
+    elif isinstance(obj, float) and not math.isfinite(obj):
+        found.append(f"{where}: non-finite float {obj!r}")
+    return found
+
+
+def test_no_persisted_payload_needs_the_two_pins_above(dersis_home, make_preset):
+    """ST-DATA-013's justification, made executable rather than remembered.
+
+    The two pins above are held open on one claim: *nothing the app persists
+    contains a non-string dict key or a non-finite float*. That claim was
+    measured by hand in Phase 6 and again in Phase 7, and a measurement that
+    lives in a comment is a measurement that rots — the register carried a
+    stale ST-DATA-002 reason for six phases the same way.
+
+    So this walks what the three real producers actually hand to
+    ``storage.save_encrypted`` / ``append_encrypted_entry``: a fully-shaped
+    saved state (``ui/app.py:2934``, and the ``"state"`` half of the settings
+    container at ``ui/app.py:2150``), the learned-weights payload
+    (``learning/preference_learner.py:304``), and a feedback entry read back
+    off the log (``learning/feedback_logger.py:66``).
+
+    A failure does not mean this test is wrong. It means ST-DATA-013 has
+    acquired a production producer and has stopped being a library curiosity —
+    fix ``storage``, then flip the two pins.
+    """
+    from scheduler_app.core.models import mark_placed, new_state
+    from scheduler_app.learning.feedback_logger import FeedbackLogger
+    from scheduler_app.learning.preference_learner import PreferenceLearner
+
+    # 1. the payload File > Save writes, and the state inside the settings
+    #    file. Built with the app's own constructors and NOT with
+    #    `_realistic_state`, whose `_audit_payload` decoration is this suite's
+    #    invention rather than anything production produces.
+    assert _json_hazards(new_state(), "new_state()") == []
+    state = make_preset("tiny")
+    mark_placed(state["classes"][0], state["days"][0], state["slots"][0],
+                state["classrooms"][0])
+    normalize_state_classes(state)
+    assert _json_hazards(state, "state") == []
+
+    # 2. the learned weights, after enough gradient steps for momentum to have
+    #    somewhere to diverge to if it ever could
+    learner = PreferenceLearner()
+    for _ in range(50):
+        learner._update_delta("lecturer_gap", 0.9)
+        learner._update_delta("student_gap", -0.9)
+    learner._save_weights()
+    assert _json_hazards(storage.load_encrypted(learner.weights_path),
+                         "learned_weights") == []
+
+    # 3. a feedback entry, through the public logger and back off the disk
+    logger = FeedbackLogger()
+    logger.log_manual_move(state["classes"][0], "monday", "09:00", "R001",
+                           "tuesday", "10:00", "R002")
+    entries = storage.load_encrypted_lines(logger.log_file)
+    assert entries, "the feedback log came back empty; this guard tested nothing"
+    assert _json_hazards(entries, "feedback_log") == []
+
+
+def test_the_json_hazard_walker_can_actually_see_a_hazard():
+    """Anti-vacuity for the guard above.
+
+    ``_json_hazards`` returning ``[]`` unconditionally would make the guard —
+    and with it the entire justification for leaving the two ST-DATA-013 pins
+    open — pass while looking at nothing.
+    """
+    assert _json_hazards({2024: ["A"]}) == [
+        "<root>: dict key 2024 is int, not str"]
+    assert _json_hazards({"scores": [1.0, float("nan")]}) == [
+        "<root>['scores'][1]: non-finite float nan"]
+    assert _json_hazards({"ok": {"nested": 1, "text": "42"}}) == []
 
 
 # ── 7. ST-DATA-002 — corrupt logs must not be swallowed then overwritten ─────
@@ -595,41 +742,91 @@ def test_load_encrypted_lines_does_not_swallow_corruption(dersis_home):
         storage.load_encrypted_lines(path)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="ST-DATA-002 — append_encrypted_entry rebuilds from the swallowed "
-           "empty list and overwrites the corrupt log, destroying history; "
-           "unscheduled by ID in 14-implementation-roadmap.md, listed as "
-           "Related on the Phase 1 ST-DATA-001 row")
 def test_append_does_not_overwrite_a_corrupt_log(dersis_home):
-    """ST-DATA-002: appending to an unreadable log must not destroy its bytes.
+    """ST-DATA-002 guard: an append leaves a damaged log's bytes where they are.
 
-    A failure (today) means one corrupt byte turns the whole feedback history
-    into a single-entry file on the very next append — the damaged original is
-    gone, so nothing can ever be recovered from it.
+    **This was a strict pin whose stated reason described deleted code.** It
+    read "append_encrypted_entry rebuilds from the swallowed empty list and
+    overwrites the corrupt log, destroying history". ST-PERF-005 replaced that
+    function with an O(1) append: on the ``EGL1`` hot path (``storage.py``
+    :532-539) it opens the file ``"ab"`` and writes one record, so there is no
+    rebuild and no rewrite. Measured on this tree (2026-08-28): 300 damaged
+    bytes in, 398 bytes out, damaged prefix byte-identical.
+
+    It went on failing only on its narrower final clause — the file is no
+    longer *equal* to ``damaged``, and no copy of exactly those bytes reached
+    ``backups/`` — which asked for a quarantine the hot path cannot perform
+    without giving back the O(n) that ST-PERF-005 removed. A strict pin whose
+    reason describes code with no callers is how ST-FUNC-005 survived six
+    phases, so this now asserts the behaviour that is true and desirable.
+
+    A failure means somebody put the read-modify-write back: the damaged
+    prefix is gone, and with it every record written before the corruption —
+    the one copy of the user's feedback history that a future recovery path
+    could still read.
+
+    The *other* half of ST-DATA-002 is still open and still pinned, one test
+    up: the damaged log reads back as ``[]`` rather than raising, so nothing
+    tells the user their history stopped being readable.
     """
     path = os.path.join(str(dersis_home), storage.LOGS_DIR, "feedback.egu")
     storage.save_encrypted_lines([{"a": 1}, {"b": 2}, {"c": 3}], path)
     blob = open(path, "rb").read()
+    assert blob[:4] == storage._LOG_MAGIC, (
+        "this test is about the EGL1 append path; the log came back in some "
+        "other format (%r) and the assertions below would be vacuous"
+        % (blob[:4],))
+
     damaged = _corrupt(blob, "flipped_checksum_byte")
     with open(path, "wb") as f:
         f.write(damaged)
+    assert storage.load_encrypted_lines(path) == [], (
+        "the damaged log became readable again — the premise of this test "
+        "(an append onto a log nothing can parse) no longer holds")
 
-    try:
-        storage.append_encrypted_entry({"d": 4}, path)
-    except Exception:
-        pass  # failing loudly is an acceptable fix
+    storage.append_encrypted_entry({"d": 4}, path)
 
-    if os.path.exists(path) and open(path, "rb").read() == damaged:
-        return  # the append refused to clobber it — correct
+    assert os.path.exists(path), "the append moved or deleted the damaged log"
+    after = open(path, "rb").read()
+    assert after[:len(damaged)] == damaged, (
+        "the append rewrote the log instead of extending it: %d damaged bytes "
+        "went in and the first %d bytes that came back are different, so the "
+        "records written before the corruption are unrecoverable"
+        % (len(damaged), len(damaged)))
+    assert len(after) > len(damaged), (
+        "the new entry was not appended (%d bytes in, %d out)"
+        % (len(damaged), len(after)))
 
+
+def test_appending_to_an_unreadable_legacy_log_quarantines_its_bytes(dersis_home):
+    """ST-DATA-002 / ST-DATA-014 guard: the other branch of the same promise.
+
+    ``append_encrypted_entry`` only appends in place when it finds the ``EGL1``
+    magic. Anything else — a legacy single-array log, or a file too damaged to
+    identify — takes the conversion branch (``storage.py``:544-549), which
+    *does* replace the file. That branch is allowed to, but only because it
+    moves the original into ``backups/`` first, under a ``_corrupt_<ts>`` name
+    so a quarantined file is distinguishable from a healthy backup.
+
+    A failure means one unreadable byte at the head of a log destroys it: the
+    file is replaced by a one-entry log and the original bytes are gone.
+    """
+    path = os.path.join(str(dersis_home), storage.LOGS_DIR, "legacy.egu")
+    junk = b"NOT-A-CONTAINER-AT-ALL " * 5
+    with open(path, "wb") as f:
+        f.write(junk)
+    assert storage.load_encrypted_lines(path) == []
+
+    storage.append_encrypted_entry({"d": 4}, path)
+
+    assert storage.load_encrypted_lines(path) == [{"d": 4}], (
+        "the log did not become a usable EGL1 log again")
     backups = os.path.join(str(dersis_home), storage.BACKUPS_DIR)
-    preserved = [
-        os.path.join(backups, n) for n in os.listdir(backups)
-        if os.path.isfile(os.path.join(backups, n))
-    ]
-    assert any(open(p, "rb").read() == damaged for p in preserved), (
-        "the corrupt log was overwritten and no copy of its bytes survives")
+    preserved = [os.path.join(backups, n) for n in os.listdir(backups)
+                 if os.path.isfile(os.path.join(backups, n))]
+    assert any(open(p, "rb").read() == junk for p in preserved), (
+        "the unreadable log was replaced and no copy of its bytes survives in "
+        "backups/ (found: %r)" % ([os.path.basename(p) for p in preserved],))
 
 
 # ── 8. Atomicity ─────────────────────────────────────────────────────────────

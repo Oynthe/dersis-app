@@ -17,9 +17,8 @@ from PyQt6.QtWidgets import (
     QLineEdit, QListWidget, QListWidgetItem, QAbstractItemView,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize
-from PyQt6.QtGui import QColor
 
-from scheduler_app.translations import tr, set_language, get_language, TRANSLATIONS
+from scheduler_app.translations import tr, set_language, TRANSLATIONS
 from scheduler_app.icons import (
     flag_gb, flag_tr, flag_de, flag_fr, flag_es, flag_cn, flag_ru,
     flag_br, flag_se, flag_dk, flag_it, flag_nl, flag_pl, flag_in, flag_id,

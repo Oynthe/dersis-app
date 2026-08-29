@@ -184,6 +184,17 @@ def main():
         sys.exit(0)
     atexit.register(_instance_lock.release)
 
+    # Carry a pre-Dersis installation forward BEFORE anything writes settings.
+    # The language gate below calls _write_flag, which CREATES
+    # settings/app_settings.egu — and storage._migrate_json_file refuses to
+    # migrate when its destination already exists, side-lining the source into
+    # backups/ on its way out. Called after the lock (which does ensure_dirs)
+    # and before the gate, this is the only window in which the legacy
+    # scheduler_config.json can still be recovered. SchedulerApp.__init__ also
+    # calls it, harmlessly: every migration step is a no-op once it has run.
+    from scheduler_app import storage as _storage
+    _storage.migrate_legacy_files()
+
     # First-run language selection (local only — no network).
     from scheduler_app.first_run import run_language_gate
     run_language_gate()

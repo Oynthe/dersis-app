@@ -25,22 +25,21 @@ import multiprocessing
 import random
 import time
 
-from scheduler_app.logic import (
-    slot_index, total_duration, get_placed_classes, classroom_of,
-)
 from scheduler_app.models import cls_key, DEFAULT_OPTIMIZER_SEED
 # Used by the unplaced-reason fallback below. Was missing, so the
 # `generator is None` branch raised NameError instead of reporting.
 from scheduler_app.translations import tr
-from scheduler_app.core.solver_worker import SolveCancelled
 from scheduler_app.core.infeasibility import diagnose_infeasibility
 
-# The shipped search budget. Named because the progress UI needs the same
-# denominators the optimizer actually runs (ST-PERF-001): a second copy of
-# these numbers elsewhere means the bar stops short of the end, or saturates
-# early, the moment the two drift.
-DEFAULT_MULTI_START_RUNS = 5
-DEFAULT_LNS_ITERATIONS = 200
+# The shipped search budget. Defined in `core/constants.py` and re-exported
+# here so that `schedule_optimizer.DEFAULT_MULTI_START_RUNS` keeps resolving:
+# `solver_worker` needs the same two numbers for the progress bar's
+# denominators (ST-PERF-001) and cannot import this module at module scope,
+# because this module imports it. That was `core`'s last mutually importing
+# pair (ST-ARCH-010).
+from scheduler_app.core.constants import (  # noqa: F401
+    DEFAULT_MULTI_START_RUNS, DEFAULT_LNS_ITERATIONS,
+)
 from scheduler_app.constraint_validator import (
     ConstraintValidator, screen_placements,
 )
@@ -48,7 +47,7 @@ from scheduler_app.candidate_generator import CandidateGenerator
 from scheduler_app.placement_scorer import PlacementScorer
 from scheduler_app.timetable_scorer import TimetableScorer
 from scheduler_app.lns_strategies import (
-    RepairStrategy, get_destroy_strategy, AdaptiveStrategySelector,
+    RepairStrategy, AdaptiveStrategySelector,
 )
 from scheduler_app.conflict_graph import ConflictGraphBuilder, ConflictAnalyzer
 from scheduler_app.constraint_propagator import ConstraintState, ConstraintPropagator
@@ -391,6 +390,13 @@ class ScheduleOptimizer:
             run = 0
             greedy_stats = {}
             lns_stats = {}
+            # Restarts that actually finished. NOT `run + 1`: the emergency cap
+            # below breaks at the TOP of iteration `run`, before that iteration
+            # does any work, so `run + 1` counts a restart that never happened
+            # and the user is shown one more than they got. This number reaches
+            # them twice -- the post-reschedule toast (ui/app.py) and the
+            # explanation dialog (core/explanation_engine.py).
+            completed_runs = 0
 
             for run in range(n_runs):
                 # Emergency wall-clock cap. `run > 0` guarantees at least one
@@ -509,7 +515,8 @@ class ScheduleOptimizer:
                     run_number=run, total_runs=n_runs,
                     conflict_graph=conflict_graph, analyzer=analyzer,
                     propagator=propagator, same_day_map=same_day_map,
-                    improve_only_scores=improve_only_scores)
+                    improve_only_scores=improve_only_scores,
+                    deadline=global_start + self.multi_start_time_limit)
 
                 # Evaluate this run's quality
                 run_placements = []
@@ -547,6 +554,11 @@ class ScheduleOptimizer:
                     global_best_quality = run_quality
                     global_best_ordered = ordered
                     global_best_generator = generator
+
+                # Last statement of the body: reached only by an iteration that
+                # produced and evaluated a solution. A run whose greedy or LNS
+                # phase was truncated by `_clock_capped` still did, so it counts.
+                completed_runs += 1
 
             # Build heuristic result for potential CP-SAT seeding
             ordered = global_best_ordered
@@ -679,8 +691,7 @@ class ScheduleOptimizer:
             after_detailed = tt_scorer.score_detailed(placed_list)
 
             summary = {
-                "runs_completed": min(n_runs, run + 1)
-                                  if global_best_solution else 0,
+                "runs_completed": completed_runs if global_best_solution else 0,
                 "total_time": time.time() - global_start,
                 "before": before_detailed,
                 "after": after_detailed,
@@ -1098,11 +1109,21 @@ class ScheduleOptimizer:
                      run_number=0, total_runs=1,
                      conflict_graph=None, analyzer=None,
                      propagator=None, same_day_map=None,
-                     improve_only_scores=None):
+                     improve_only_scores=None, deadline=None):
         """LNS improvement phase with adaptive strategy selection.
 
         Uses AdaptiveStrategySelector to learn which destroy strategies
         produce better improvements and adjust selection probabilities.
+
+        ``deadline`` is the absolute ``time.time()`` at which the *whole solve*
+        must stop — ``global_start + multi_start_time_limit``, the same value
+        ``_greedy_construct`` already receives. It is not the same thing as
+        ``time_limit_override``, which is a duration for this phase alone.
+        Passing the duration and comparing it against a clock started at the top
+        of this method is what let a capped solve overrun its budget: measured
+        through ``optimized_reschedule_all(make_preset('normal'), 8.0)``, the
+        run-0 LNS phase was entered at t=1.58 s and ran to t=9.71 s, 1.71 s past
+        a deadline it had no way to see.
         """
         placed_indices = [i for i, s in enumerate(solution) if s is not None]
         if len(placed_indices) < 3:
@@ -1160,10 +1181,22 @@ class ScheduleOptimizer:
         for iteration in range(self.lns_iterations):
             self._check_cancelled()
             elapsed = time.time() - start_time
+            # The solve-wide emergency cap, checked against the absolute
+            # deadline rather than this phase's own stopwatch. `elapsed` below
+            # measures only how long THIS phase has run; comparing it to
+            # `multi_start_time_limit`, the budget for the entire solve, let
+            # each phase spend the whole budget over again. Same shape as the
+            # greedy phase's check.
+            if deadline is not None and time.time() >= deadline:
+                self._clock_capped = True
+                break
             if deterministic_loop:
                 # Iteration-bounded: only the emergency cap can cut this short,
                 # and doing so costs reproducibility (reported in the summary).
-                if elapsed >= self.multi_start_time_limit:
+                # With no absolute deadline supplied -- a direct caller rather
+                # than optimize() -- fall back to the phase-local stopwatch so
+                # the cap still exists at all.
+                if deadline is None and elapsed >= self.multi_start_time_limit:
                     self._clock_capped = True
                     break
             elif elapsed >= time_limit:

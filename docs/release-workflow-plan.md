@@ -84,11 +84,14 @@ manually. To roll back:
 
 ## GitHub Actions CI/CD
 
-Three workflows automate validation, building, and release publishing.
+Four workflows automate validation, building, and release publishing.
+`tests/test_release_pipeline.py` checks the trigger sentences below against the
+parsed workflows, so a lane that changes shape turns this document red.
 
 ### CI (`.github/workflows/ci.yml`)
 
-Runs on every push to `master` and every pull request.
+Runs on every push to `main`, every version tag (`v*`), every pull request, and
+manual dispatch.
 
 **Checks performed:**
 - VERSION file exists and is valid semver
@@ -96,14 +99,24 @@ Runs on every push to `master` and every pull request.
 - Tag matches VERSION (on tag pushes)
 - Required build files exist (`build_embed.bat`, `installer.iss`, etc.)
 - Core Python module imports succeed (import-smoke check)
+- `mypy` over the Qt-free engine packages, gated at zero errors
+- The regression suite: `pytest -m "not slow"` over `tests/`
 - Installer script references are valid
 
-There are no test files in the repository; CI runs only the lightweight version,
-build-file, and import-smoke checks listed above.
+A second job, **Scheduling invariants**, runs the `slow`-marked engine modules
+(the hard-constraint oracle, the placement floors, the determinism pins and the
+solver-work ratchet) that `-m "not slow"` skips.
+
+The `v*` trigger is load-bearing: without it a tag push ran zero tests while the
+release lane built and published from that same tag.
 
 ### Build Installer (`.github/workflows/build-installer.yml`)
 
-Runs on `workflow_dispatch` (manual) and version tags (`v*`).
+Runs on `workflow_dispatch` (manual) only.
+
+The `v*` trigger was removed by ST-SEC-001: one human tag used to start two
+Windows builds and four macOS builds across three workflows, of which only
+`release.yml`'s ever reached a release.
 
 **How to trigger manually:**
 1. Go to Actions → "Build Installer"
@@ -112,12 +125,23 @@ Runs on `workflow_dispatch` (manual) and version tags (`v*`).
 4. Artifacts appear under the workflow run when complete
 
 **What it does:**
-1. Validates VERSION and tag consistency
-2. Runs `build_embed.bat` on a Windows runner
-3. Installs Inno Setup and runs `iscc installer.iss`
-4. Verifies installer output exists and is >1 MB
-5. Generates `Dersis_Setup_vX.Y.Z.exe.sha256` checksum
-6. Uploads installer + checksum as workflow artifacts (90-day retention)
+1. Runs `build_embed.bat` on a Windows runner
+2. Installs Inno Setup and runs `iscc installer.iss`
+3. Verifies installer output exists and is >1 MB
+4. Generates `Dersis_Setup_vX.Y.Z.exe.sha256` checksum
+5. Uploads installer + checksum as workflow artifacts (90-day retention)
+
+### Build macOS (`.github/workflows/build-macos.yml`)
+
+Runs on `workflow_dispatch` (manual) only.
+
+The on-demand macOS lane: `./build_mac.sh` on `macos-15` (arm64) and
+`macos-15-intel` (x64), producing a `.dmg`, a `.zip` and a `.sha256` for each
+architecture as workflow artifacts. It publishes nothing — `release.yml` builds
+its own macOS artifacts for a release.
+
+Each architecture is built on its matching runner because not all runtime wheels
+(notably `ortools`) ship `universal2` binaries.
 
 ### Release (`.github/workflows/release.yml`)
 
@@ -136,9 +160,20 @@ the `.exe` and `.sha256` attached.
 2. Enter the tag name (e.g. `v1.2.0`) — the tag must already exist
 3. Optionally mark as pre-release
 
+**Jobs, and what gates what:**
+1. **Test the tag** — `pytest -m "not slow"` on the exact ref being released.
+2. **Build DERSİS Installer** — the Windows installer and its checksum.
+3. **Build DERSİS macOS** — `.dmg` + `.zip` for arm64 and x64.
+4. **Publish GitHub Release** — waits for (1) and (2); (3) is
+   optional-but-expected. If a macOS runner is unavailable the release still
+   ships Windows-only, with a `::warning::` in the log. If the suite or the
+   Windows build fails, nothing is published.
+
 **Artifacts produced:**
 - `Dersis_Setup_vX.Y.Z.exe` — the installer
 - `Dersis_Setup_vX.Y.Z.exe.sha256` — SHA-256 checksum (format: `hash  filename`)
+- `Dersis-X.Y.Z-mac-arm64.dmg` / `-mac-x64.dmg` and their `.zip` and `.sha256`
+  counterparts, when the macOS legs succeed
 
 ### Secrets & Configuration
 

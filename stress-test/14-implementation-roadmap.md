@@ -177,17 +177,64 @@ Excel file), [ST-UI-006](12-findings-register.md),
 [ST-UI-007](12-findings-register.md) (its Qt half was written and never wired),
 and the live items of [ST-UI-017/018/020](12-findings-register.md).
 
-## Phase 7 — Testing, observability & release
+## Phase 7 — Testing, observability & release ✅ COMPLETE
+
+*Done on `fix/phase-7-release`; see [`PROGRESS.md`](PROGRESS.md#phase-7--complete)
+for what the register got wrong and for the eighteen corrections this phase
+measured.*
+
+> **The headline was not a Phase 7 row.** Auditing which of the "top-10 untested
+> behaviours" were genuinely untested turned up a **total data loss on the
+> upgrade path**: `run_language_gate()` creates `app_settings.egu`, and
+> `migrate_legacy_files()` ran only afterwards, so `_migrate_json_file` found its
+> destination already present, moved the user's schedule into `backups/` and
+> returned without migrating it. Measured: `classes_recovered=[]`, language
+> `tr → en`. Fixed first; one line.
 
 | Task | Findings | I/U/R/E | Effort |
 |---|---|---|---|
-| Expand suite to the [top-10 untested behaviors](10-code-architecture-audit.md#test-infrastructure-zero-tests-dead-ci-and-a-risk-ranked-plan); offscreen smoke launch in CI | [ST-ARCH-001](12-findings-register.md#st-arch-001) | 5/3/5/L | L |
-| Gate releases behind version tags; mark auto-builds prerelease; publish+verify checksums; sign installer | [ST-SEC-001](12-findings-register.md#st-sec-001), [ST-SEC-004](12-findings-register.md), [ST-SEC-006](12-findings-register.md) | 4/3/4/M | M |
-| Fix installer ACL (no users-modify); real AppId GUID | [ST-SEC-003](12-findings-register.md), [ST-SEC-007](12-findings-register.md) | 3/2/3/S | S |
-| Align crypto claims OR derive key from a user secret / OS keystore | [ST-SEC-002](12-findings-register.md#st-sec-002) | 3/2/3/L | L |
-| Redact username paths in crash log / bug report | [ST-SEC-008](12-findings-register.md) | 2/2/2/S | S |
-| Remove runtime `pip install` fallbacks | [ST-SEC-005](12-findings-register.md) | 2/2/3/S | S |
-| Perf benchmark + solver-quality regression in CI (reuse `tests/scheduler_benchmark.py`) | [ST-PERF-001](12-findings-register.md#st-perf-001) | 3/2/3/M | M |
+| Expand suite to the [top-10 untested behaviors](10-code-architecture-audit.md#test-infrastructure-zero-tests-dead-ci-and-a-risk-ranked-plan); offscreen smoke launch in CI ✅ | [ST-ARCH-001](12-findings-register.md#st-arch-001) | 5/3/5/L | L |
+| Gate releases behind version tags; mark auto-builds prerelease; publish+verify checksums; sign installer ✅ *(signing wired but inert — no certificate exists)* | [ST-SEC-001](12-findings-register.md#st-sec-001), [ST-SEC-004](12-findings-register.md), [ST-SEC-006](12-findings-register.md) | 4/3/4/M | M |
+| Fix installer ACL (no users-modify); real AppId GUID ✅ *(ACL deleted; the AppId is deliberately **kept** — see below)* | [ST-SEC-003](12-findings-register.md), [ST-SEC-007](12-findings-register.md) | 3/2/3/S | S |
+| Align crypto claims OR derive key from a user secret / OS keystore ✅ *(claims aligned; keystore rejected on measurement)* | [ST-SEC-002](12-findings-register.md#st-sec-002) | 3/2/3/L | **S**, not L |
+| Redact username paths in crash log / bug report ✅ *(mailto only; the on-disk log is left readable on purpose)* | [ST-SEC-008](12-findings-register.md) | 2/2/2/S | S |
+| Remove runtime `pip install` fallbacks ✅ | [ST-SEC-005](12-findings-register.md) | 2/2/3/S | S |
+| Perf benchmark + solver-quality regression in CI ✅ *(a work-count ratchet, **not** a wall-clock benchmark; `scheduler_benchmark.py` was not reusable)* | [ST-PERF-001](12-findings-register.md#st-perf-001) | 3/2/3/M | M |
+
+**Plus the four Phase 6 carry-overs, all resolved.** ST-ARCH-010 is **closed
+outright** — the `logic.py`/`facade.py` split takes the core SCC 15 → 0 and every
+layering ratchet to `0`. ST-ARCH-011 deleted a cluster containing three calls to
+functions that exist in no file. ST-UI-013 is **built**, on numbers corrected for
+the third time. ST-ARCH-005 is **closed as unactionable by extraction**, with the
+measurement that says so: six seams were built and all six leave the
+Maintainability Index at exactly 0.00, because the complexity term alone exceeds
+the formula's constant. What replaced it is a ratchet on the number that *can*
+move — `ui/app.py` is 47.7 % covered and 79 of its 145 methods never execute.
+
+**Three rows were not done as written, each with a measurement.** "Reuse
+`tests/scheduler_benchmark.py`" — it has 0 asserts, hard-codes an absolute path
+and appends to a tracked CSV; 28 of 432 lines port. "Real AppId GUID" — Inno keys
+uninstall detection on AppId and the shipped installer has 106 downloads, so a
+new GUID orphans every existing install; the placeholder is still a valid unique
+GUID and is now pinned in place. "Derive the key from a keystore" — DPAPI buys
+nothing against the actual threat and adds a permanent data-loss mode.
+
+**Also closed here, none of them scheduled by this roadmap:**
+[ST-FUNC-004](12-findings-register.md) (High — the printed timetable could not
+spell Turkish names), [ST-FUNC-006](12-findings-register.md),
+[ST-FUNC-011](12-findings-register.md), [ST-FUNC-012](12-findings-register.md),
+[ST-FUNC-013](12-findings-register.md), and half of
+[ST-DATA-002](12-findings-register.md). These were pinned by
+`xfail(strict=True)` for seven phases and appear nowhere in this document —
+`grep` for them returns **0 hits against 66 scheduled IDs**. Phase 7 being the
+last row, they would have shipped in v1.0.0.
+
+**Left open, deliberately and with reasons:** ST-FUNC-009 (`required_room_type`
+is the only one that adds solver input), ST-FUNC-010 (the `_read_sheet`
+description-row heuristic), ST-FUNC-007 (legacy ASCII saves; v1.0.0 is the first
+tagged release, so the affected population may be empty), the swallow half of
+ST-DATA-002, and both ST-DATA-013 pins — which are true at the library level and
+have **no production producer**, measured.
 
 ---
 

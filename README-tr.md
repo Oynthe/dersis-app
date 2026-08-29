@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <sub>Windows yükleyicisi · macOS <code>.dmg</code> · komut satırı için <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
+  <sub>Windows yükleyicisi · komut satırı için <a href="scripts/download_release.py"><code>scripts/download_release.py</code></a></sub>
 </p>
 
 ---
@@ -145,14 +145,19 @@ koordinatörleri ve çakışmasız haftalık programlara ihtiyaç duyan herkes.
 - Tamamlanan programı **Excel** (renk kodlu, çok sayfalı), **CSV** ve **PDF** olarak **dışa
   aktarma**.
 
-### Deneyim ve gizlilik
+### Deneyim ve verilerin ele alınışı
 - **Çok dilli arayüz** — 20'den fazla dil; ilk açılışta bayrak tabanlı bir seçiciden seçilir
   (22 bayrak seçeneği), Arapça ve Farsça için sağdan sola yazım desteği dâhil.
 - **Etkileşimli eğitim turu** — yeni kullanıcılar için rehberli, ışık-spot tarzı bir tanıtım.
 - **Tamamen çevrimdışı** — hiçbir türde ağ bağlantısı yoktur; tüm özellikler yerel olarak
   açıktır.
 - **Şifreli yerel depolama** — programlar, `Documents/Dersis/` klasörünüzde şifreli `.egu`
-  dosya biçiminde (AES-256-GCM) ve otomatik kaydetmeyle saklanır.
+  dosya biçiminde (AES-256-GCM) ve otomatik kaydetmeyle saklanır. Bunun size kazandırdığı şey
+  bütünlük ve okunmazlıktır: bozulmuş ya da elle değiştirilmiş bir dosya sessizce yüklenmek
+  yerine fark edilir ve kayıtlar bir metin düzenleyicide okunamaz. Bu bir **kilit değildir**.
+  Anahtar, kayıtların yanında `Documents/Dersis/keys/key.bin` dosyasında durur; yani o
+  klasörü açabilen herkes programları okuyabilir. Başkalarını dışarıda tutmanız gerekiyorsa
+  işletim sisteminizin hesap ve klasör izinlerini kullanın.
 - **Uygulama içi hata bildirimi** — yerleşik bir form sizin için bir e-posta hazırlar
   (bkz. [Hata Bildirimi](#hata-bildirimi)); uygulamanın kendisi hiçbir şey göndermez.
 
@@ -178,21 +183,20 @@ isteyenler içindir.
 
 ### macOS'ta
 
-1. [En son sürümden](https://github.com/Oynthe/dersis-app/releases/latest) Mac'inize uygun
-   `.dmg` dosyasını indirin:
-   - **Apple Silicon** (M1/M2/M3/M4): `Dersis-<sürüm>-mac-arm64.dmg`
-   - **Intel**: `Dersis-<sürüm>-mac-x64.dmg`
+**Mac için hazır bir indirme dosyası henüz yok.** Bugüne kadar yayımlanan her sürümde tek bir
+dosya vardır — Windows kurulum dosyası — ve hiçbir sürüme Mac paketi eklenmemiştir. Bu
+belgenin daha eski sürümleri, orada hiç bulunmamış Mac dosyalarını listeliyordu.
 
-   Emin değil misiniz? Apple menüsü →  **Bu Mac Hakkında**: "Apple silicon" → arm64,
-   "Intel" → x64.
-2. `.dmg` dosyasını açın ve **DERSİS**'i **Uygulamalar** klasörüne sürükleyin.
-3. Uygulamalar veya Launchpad üzerinden başlatın.
+macOS derlemesinin kendisi gerçektir ve çalışır: bir Mac üzerinde, bu depodaki kaynak koddan
+birkaç dakika içinde yerel bir `Dersis.app` üretip paketleyebilirsiniz. Derleme adımları için
+[Kaynak Koddan Çalıştırma](#kaynak-koddan-çalıştırma) bölümüne, Mac'e özgü ayrıntılar için
+[`docs/MACOS.md`](docs/MACOS.md) dosyasına bakın.
 
-> **İlk açılış — güvenlik uyarısı:** DERSİS şu anda Mac App Store dışında dağıtıldığı ve
-> henüz Apple tarafından noter onaylı (notarized) olmadığı için, macOS ilk açılışta bir
-> güvenlik uyarısı gösterebilir. Uygulamayı **Sistem Ayarları → Gizlilik ve Güvenlik**
-> üzerinden ya da uygulamaya **sağ tıklayıp “Aç”** diyerek açabilirsiniz. Ayrıntılı kılavuz
-> (`xattr -dr com.apple.quarantine` çözümü dahil): [`docs/MACOS.md`](docs/MACOS.md).
+> **İlk açılış — güvenlik uyarısı:** kendi derlediğiniz uygulama imzasız olduğundan macOS,
+> onu ilk açtığınızda bir güvenlik uyarısı gösterebilir. Uygulamayı **Sistem Ayarları →
+> Gizlilik ve Güvenlik** üzerinden ya da uygulamaya **sağ tıklayıp “Aç”** diyerek
+> açabilirsiniz. Ayrıntılı kılavuz (`xattr -dr com.apple.quarantine` çözümü dahil):
+> [`docs/MACOS.md`](docs/MACOS.md).
 
 ### Diğer sistemlerde
 
@@ -306,7 +310,7 @@ geldiği aşağıdadır.
 | Sezgisel arama | Özel sezgisel + Büyük Komşuluk Araması | Tavlama benzetimi, genetik algoritmalar, tabu arama |
 | Excel okuma/yazma | openpyxl + pandas | xlsxwriter, yalnızca csv modülü |
 | PDF çıktısı | reportlab | WeasyPrint, fpdf2 |
-| Diskte şifreleme | `cryptography` (AES-256-GCM) | SQLCipher, işletim sistemi anahtarlığı |
+| Diskte gizleme + bütünlük | `cryptography` (AES-256-GCM), anahtar verinin yanında saklanır | SQLCipher, işletim sistemi anahtarlığı |
 | Windows paketleme | Gömülebilir Python + Inno Setup | PyInstaller, Nuitka, MSIX |
 | macOS paketleme | PyInstaller `.app` → `.dmg` | py2app, Briefcase |
 
@@ -336,9 +340,10 @@ Bunlar **gerçekçi, henüz taahhüt edilmemiş** yönlerdir; fizibiliteyi
 değerlendirebilmeniz için listelenmiştir. Buradaki maddeler birer olasılıktır
 (*teyit edilecek*), vaat değildir.
 
-- **Linux için yerel paket.** Windows (Inno Setup) ve macOS (PyInstaller `.dmg`) artık
-  desteklenmektedir; uygulama kodu çapraz platform olduğundan, Linux için yerel bir paket
-  (AppImage / .deb) uygulanabilir bir sonraki adımdır.
+- **Yayımlanan Mac ve Linux derlemeleri.** Windows (Inno Setup) ve macOS (PyInstaller) için
+  derleme betikleri vardır, ancak sürümlere bugün yalnızca Windows kurulum dosyası eklenir;
+  uygulama kodu çapraz platform olduğundan hem Mac derlemesini yayımlamak hem de Linux için
+  yerel bir paket (AppImage / .deb) eklemek uygulanabilir sonraki adımlardır.
 - **macOS noter onayı.** macOS derlemeleri şu an imzasız/ad-hoc'tur; Apple Developer ID ile
   imzalama ve noter onayı (Gatekeeper uyarısını kaldırmak için) kimlik bilgileri sağlandığında
   çalışacak şekilde hazırdır ancak henüz CI'da otomatikleştirilmemiştir.

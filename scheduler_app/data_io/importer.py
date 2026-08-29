@@ -5,7 +5,6 @@ Does not modify scheduling logic or constraints.
 """
 
 from dataclasses import dataclass, field
-from typing import Any
 
 try:
     import pandas as pd
@@ -20,8 +19,9 @@ from scheduler_app.models import (
 from scheduler_app.translations import tr
 from scheduler_app.data_io.schema import (
     canonicalize_workbook_columns,
+    get_workbook_sheet_description_texts,
     get_workbook_sheet_header_map,
-    lookup_workbook_sheet_id,
+    resolve_workbook_sheet_ids,
 )
 
 
@@ -198,6 +198,20 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
 
     lecturers = []
     availability = {}
+    # ST-FUNC-012: the roster that leaves this function is keyed by display
+    # name, not by teacher_id — `state["lecturers"]` is a list of names,
+    # `state["lecturer_availability"]` is keyed by name, and `cls["lecturer"]`
+    # holds a name. The id is dropped at the door, so two teacher rows sharing
+    # a name are one lecturer everywhere downstream. Measured on two rows both
+    # named "Ada Lovelace": the second row's availability replaced the first's
+    # (T001's excluded day vanished), the name appeared twice in the lecturer
+    # list, and both teachers' classes came back carrying the same string, so
+    # the core reads them as one person and refuses to schedule them in
+    # parallel. Names are folded with `casefold()`, the same rule
+    # `SchedulingWorkflow.register_lecturer` uses (ST-UI-020), so the importer
+    # and the class form agree on what counts as a second teacher.
+    first_spelling: dict[str, str] = {}
+    duplicate_names: dict[str, list[str]] = {}
     for idx, row in df.iterrows():
         row_num = idx + 2  # Excel row (1-indexed header + 1-indexed data)
         tid = _cell_text(row["teacher_id"])
@@ -205,6 +219,12 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
         if not tid or not name:
             report.add_error(tr("labels.teachers"), row_num, tr("errors.teacher_id_required"))
             continue
+
+        folded = name.casefold()
+        if folded in first_spelling:
+            duplicate_names.setdefault(folded, [first_spelling[folded]]).append(name)
+        else:
+            first_spelling[folded] = name
 
         lecturers.append(name)
         dataset.raw_teachers.append({"teacher_id": tid, "name": name})
@@ -216,6 +236,19 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
         avail["excluded_hours"] = _parse_comma_list(row.get("excluded_hours"))
         if any(avail[k] for k in avail):
             availability[name] = avail
+
+    # Reported, not silently deduplicated: which of the two teachers a class
+    # meant is written in the workbook's teacher_id, and the state has nowhere
+    # to keep it, so merging them would throw away a distinction only the user
+    # can restore. An error rather than a warning because the import is refused
+    # whole (`_import_from_excel` returns on `not report.is_valid`) — a roster
+    # imported with one teacher's hours silently overwritten is worse than a
+    # roster the user is asked to give two distinct names.
+    for spellings in duplicate_names.values():
+        report.add_error(tr("labels.teachers"), None,
+                         tr("errors.duplicate_values").format(
+                             id_col=_column_label("teachers", "name"),
+                             values=", ".join(spellings)))
 
     dataset.state["lecturers"] = lecturers
     dataset.state["lecturer_availability"] = availability
@@ -420,12 +453,24 @@ def load_scheduler_data_from_excel(filepath: str) -> SchedulerDataset:
         report.add_error(tr("menus.file"), None, tr("errors.cannot_open_excel").format(err=e))
         return dataset
 
-    sheet_names = xls.sheet_names
-    sheet_lookup = {}
-    for actual_name in sheet_names:
-        sheet_id = lookup_workbook_sheet_id(actual_name)
-        if sheet_id and sheet_id not in sheet_lookup:
-            sheet_lookup[sheet_id] = actual_name
+    # Resolved against the whole workbook at once, not sheet by sheet: one
+    # title can name two different sheets in two different languages (Spanish
+    # *Aulas* is a classroom, Portuguese *Aulas* is a class), and only the
+    # company a title keeps can say which one this workbook means.
+    sheet_lookup = resolve_workbook_sheet_ids(xls.sheet_names)
+
+    # ST-FUNC-011: a workbook in which *no* sheet is recognized is not a
+    # half-filled roster, it is the wrong file. Measured on an unrelated
+    # workbook: errors=[], four warnings naming the four absent sheets, empty
+    # state, `is_valid=True` — and `_import_from_excel` shows exactly that as
+    # "import successful", so pointing the app at a budget spreadsheet ended in
+    # a success dialog over nothing. One recognized sheet is still enough to
+    # import (a school may keep its rooms in a separate file), so the error
+    # fires only on zero; the per-sheet warnings below still say which sheets
+    # were looked for.
+    if not sheet_lookup:
+        report.add_error(tr("menus.file"), None,
+                         tr("errors.unrecognized_file_format"))
 
     # Read available sheets
     teachers_df = None
@@ -434,20 +479,24 @@ def load_scheduler_data_from_excel(filepath: str) -> SchedulerDataset:
     classes_df = None
 
     def _read_sheet(sheet_id):
-        """Read a sheet, auto-detecting and skipping description rows."""
+        """Read a sheet, dropping the template's row-2 help text if it is there."""
         actual_name = sheet_lookup[sheet_id]
         df = pd.read_excel(xls, actual_name)
         df = df.rename(columns=canonicalize_workbook_columns(sheet_id, df.columns))
         if df.empty:
             return df
-        # If the first data row looks like descriptions (all strings, no
-        # valid IDs), skip it — this handles the template's row-2 descriptions.
-        first = df.iloc[0]
-        id_col = [c for c in df.columns if c.endswith("_id")]
-        if id_col:
-            val = str(first.get(id_col[0], ""))
-            # Heuristic: description rows have long text with spaces
-            if len(val) > 20 or " " in val:
+        # The generated template puts one row of help text under the headers.
+        # It is recognized by *being* one of the strings the template writes,
+        # in any of the shipped languages — not by being long or containing a
+        # space, which is a description in Turkish and a class id in Chinese.
+        # Getting that wrong cost data in both directions: the zh and ja
+        # templates imported their own help text as a lecturer, a classroom
+        # and a branch, and a class id written "C 001" was silently dropped
+        # (ST-FUNC-010).
+        id_cols = [c for c in df.columns if c.endswith("_id")]
+        if id_cols:
+            val = _cell_text(df.iloc[0].get(id_cols[0], ""))
+            if val and val in get_workbook_sheet_description_texts(sheet_id):
                 df = df.iloc[1:].reset_index(drop=True)
         return df
 

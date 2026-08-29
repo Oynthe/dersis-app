@@ -18,38 +18,19 @@ from __future__ import annotations
 import webbrowser
 from typing import Callable
 
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QIcon, QPainter, QColor, QPixmap, QFont, QAction
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QFont, QAction
 from PyQt6.QtWidgets import (
-    QApplication,
-    QDialog,
-    QGraphicsOpacityEffect,
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QSizePolicy,
-    QVBoxLayout,
-    QWidget,
+    QDialog, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QPushButton,
+    QVBoxLayout, QWidget,
 )
 
 from scheduler_app.translations import tr
 import scheduler_app.i18n.tier_translations  # noqa: F401 — registers upgrade.* keys
 from scheduler_app.plans import (
-    PLANS,
-    TIER_FREE,
-    TIER_INSTITUTIONAL,
-    TIER_ORDER,
-    TIER_STARTER,
-    UNLIMITED,
-    FeatureState,
-    check_entity_limit,
-    get_feature_state,
-    get_limit,
-    get_limit_state,
-    get_plan,
-    get_upgrade_tier,
-    get_required_tier_for_limit,
-    has_feature,
+    PLANS, TIER_FREE, TIER_INSTITUTIONAL, UNLIMITED, FeatureState,
+    check_entity_limit, get_feature_state, get_limit_state, get_plan,
+    get_upgrade_tier, get_required_tier_for_limit, has_feature,
 )
 
 # ---------------------------------------------------------------------------

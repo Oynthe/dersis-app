@@ -1,4 +1,34 @@
-"""Visual constants: colors, dimensions, theme values."""
+"""Shared constants: the search budget, colors, dimensions, theme values.
+
+This module imports nothing, from `scheduler_app` or anywhere else, and that
+is the point: it is where a number goes when two modules that must not import
+each other both need it.
+"""
+
+# ── The shipped search budget (ST-ARCH-010, ST-PERF-001) ─────────────
+# Named because the progress UI needs the same denominators the optimizer
+# actually runs: a second copy of these numbers elsewhere means the bar stops
+# short of the end, or saturates early, the moment the two drift.
+#
+# They live here rather than in `schedule_optimizer` because `solver_worker`
+# needs them too, and `schedule_optimizer` imports `solver_worker` for
+# `SolveCancelled`. Reading them back out of the optimizer meant a deferred
+# import inside `run_reschedule` and the last mutually importing pair in
+# `core`. `schedule_optimizer` re-exports both names, so
+# `schedule_optimizer.DEFAULT_MULTI_START_RUNS` still resolves.
+DEFAULT_MULTI_START_RUNS = 5
+DEFAULT_LNS_ITERATIONS = 200
+
+# The wall-clock budget one press of *Generate* is allowed to spend, in
+# seconds. It is NOT `ScheduleOptimizer`'s own default (3600.0): the library
+# default is deliberately effectively-unbounded for scripted callers, and the
+# 120 s the app runs was, until now, a literal in `core/facade.py`'s signature
+# -- a third copy that neither this module nor the optimizer could see. It is
+# named here because `ui/dialogs.py` quotes it to the user as "the production
+# budget" and `solver_worker` scales the progress bar against the same
+# arithmetic; `tests/test_solver_work.py` fails if the facade goes back to a
+# literal.
+DEFAULT_MULTI_START_TIME_LIMIT = 120.0
 
 YEAR_COLORS = [
     "#3B82F6",  # blue

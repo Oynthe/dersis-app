@@ -83,7 +83,35 @@ EN = TRANSLATIONS["en"]
 # The ratchet caught both additions on the very commits that introduced them,
 # which is the behaviour wanted: adding an English string is normal work, and
 # the test asks for an explicit acknowledgement rather than failing the build.
-MAX_MISSING_LOCALE_KEY_PAIRS = 2508
+#
+# Phase 7 adds **two** keys to en+tr, so the bound moves by exactly 2 x 20 = 40,
+# from 2508 to 2548:
+#
+#   * `export.unprintable_note` -- the one string that says which characters the
+#     printed timetable could not draw (ST-FUNC-004, `data_io/exporter.py`). No
+#     existing key means this; the appendix-reuse trick used a few lines away in
+#     that file does not apply, because "Not on the timetable" is about lessons,
+#     not glyphs.
+#   * `bug_report.no_mail_client` -- the last hardcoded English message box in
+#     `scheduler_app/ui`.
+#
+# In both cases the alternative to minting a key was leaving English on screen
+# in a Turkish-first app.
+#
+# **Measured, and it corrects a figure that circulated through this phase's own
+# briefings.** The backlog is *not* ~1660 with ~848 pairs of headroom. That
+# count comes from reading `TRANSLATIONS` without importing
+# `scheduler_app.i18n.tier_translations`, which merges 52 further `en` keys into
+# the catalogue on import. This module imports it (see above) precisely so the
+# check cannot be taken against a half-built catalogue. Counted the way this
+# test counts, the backlog stood at **2508 against a 2508 ceiling -- zero
+# slack**.
+#
+# Two independent agents hit this within the same hour, each moving the ceiling
+# by 20 for its own key and each arriving at 2528; the merge is what revealed
+# that two keys had landed. Anyone planning a batch of new English strings
+# should measure **with the tier catalogue imported** before assuming room.
+MAX_MISSING_LOCALE_KEY_PAIRS = 2548
 MAX_PLACEHOLDER_SUBSETS = 1
 
 

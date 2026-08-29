@@ -37,6 +37,25 @@
 #define AppURL         ""
 
 [Setup]
+; ── DO NOT CHANGE THIS APPID (ST-SEC-007) ───────────────────────────────────
+; It looks like a placeholder because it is the canonical tutorial GUID, and
+; every reviewer's instinct is to replace it. That instinct is the bug.
+;
+; Inno Setup keys BOTH upgrade detection and uninstall on AppId, and
+; Dersis_Setup_v1.0.0.exe carrying this value has 105+ downloads (build.8 and
+; build.10, published 2026-06-19). A new GUID makes every one of those installs
+; invisible to the next setup: it installs over the same files, leaves two
+; Add/Remove Programs entries, and uninstalling either deletes the other's
+; files. Colliding with some other product that pasted the same tutorial GUID is
+; strictly less bad than orphaning the installed base.
+;
+; If the collision risk is ever judged unacceptable, the only correct migration
+; is a [Code] InitializeSetup that reads the old
+; HKCU\...\Uninstall\{A1B2C3D4-...}_is1\UninstallString, runs it with
+; /SILENT /SUPPRESSMSGBOXES, and only then proceeds. That is a real feature with
+; real failure modes; it is not worth building to fix a cosmetic GUID.
+;
+; tests/test_packaging_manifest.py::test_the_installer_appid_is_frozen pins it.
 AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
 AppName={#AppFullName}
 AppVersion={#AppVersion}
@@ -105,8 +124,27 @@ Source: "installer\LICENSE.txt"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flag
 ; and place it in the installer\ folder. If not present, installer skips it.
 Source: "installer\vc_redist.x64.exe"; DestDir: "{tmp}"; Flags: ignoreversion deleteafterinstall skipifsourcedoesntexist
 
-[Dirs]
-Name: "{app}"; Permissions: users-modify
+; ── No [Dirs] section, deliberately (ST-SEC-003) ────────────────────────────
+; This script used to carry:
+;     [Dirs]
+;     Name: "{app}"; Permissions: users-modify
+; All three candidate justifications for it were measured false.
+;   1. "the app writes __pycache__ into {app}" — build_embed.bat compiles
+;      scheduler_app with `compileall -b` and then deletes every .py, so the
+;      shipped package is sourceless .pyc and nothing is ever cached there.
+;   2. "the bundled site-packages needs to be writable" — probed with
+;      `icacls /deny (WD,AD)`: import succeeds, rc=0, zero files written.
+;      CPython swallows the bytecode-write OSError. A read-only {app} costs
+;      recompilation per launch, not failure.
+;   3. "scheduler_gui.py needs {app} for its startup log" — it tries
+;      ~/Documents/Dersis/logs first and the temp directory third.
+; What the grant did do: PrivilegesRequired=lowest means {autopf} always
+; resolves to %LOCALAPPDATA%\Programs, whose fresh directories inherit exactly
+; SYSTEM, Administrators and the installing user — no BUILTIN\Users. Adding that
+; ACE turned a single-user directory into one every local account on a shared
+; staffroom or lab machine can modify, with {app}\python\Lib\site-packages
+; sitting inside it. If a writable location is ever genuinely needed it must be
+; a subdirectory, never {app} itself.
 
 [Icons]
 ; Start Menu — use the Dersis icon
@@ -122,10 +160,15 @@ Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; S
 Filename: "{app}\Dersis.exe"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent shellexec
 
 [UninstallDelete]
-Type: filesandordirs; Name: "{app}\__pycache__"
-Type: filesandordirs; Name: "{app}\scheduler_app\__pycache__"
-Type: filesandordirs; Name: "{app}\scheduler_app\core\__pycache__"
-Type: filesandordirs; Name: "{app}\scheduler_app\ui\__pycache__"
-Type: filesandordirs; Name: "{app}\scheduler_app\storage\__pycache__"
-Type: filesandordirs; Name: "{app}\scheduler_app\learning\__pycache__"
-Type: filesandordirs; Name: "{app}\scheduler_app\data_io\__pycache__"
+; Python writes __pycache__ beside every source file it imports, and the only
+; Python sources in the shipped tree are the ~2,639 .py files across ~626
+; package directories under {app}\python\Lib\site-packages (the stdlib lives in
+; python311.zip, and zipimport never writes bytecode). Those cache files are not
+; in Inno's install log, so without this entry the uninstaller cannot remove
+; them and every parent directory then fails to delete as non-empty.
+;
+; This replaces seven scheduler_app\...\__pycache__ entries that could never
+; match anything: build_embed.bat deletes every .py under scheduler_app, and a
+; Nuitka build emits no .py at all. They read as cleanup and were not.
+Type: filesandordirs; Name: "{app}\python"
+Type: dirifempty;     Name: "{app}"

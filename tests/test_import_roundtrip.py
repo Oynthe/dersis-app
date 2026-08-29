@@ -16,9 +16,19 @@ Findings guarded here
   the documented default silently), and a blank *required* cell (either, but
   never a crash). A single test demanding a report for all three would stay
   red after the register's own recommended fix.
-* **ST-FUNC-009 / 010 / 011 / 012** — pinned with ``xfail(strict=True)``; they
-  are scheduled for a later phase, and the suite must go red the moment they
-  start passing so the pins get flipped.
+* **ST-FUNC-011** (fixed in Phase 7) — a workbook with no recognized sheet at
+  all reports ``is_valid=True``, which the UI announces as a successful import.
+* **ST-FUNC-012** (fixed in Phase 7) — two teacher rows sharing a name fuse
+  into one lecturer and the first one's availability is overwritten.
+* **ST-FUNC-010** (fixed in Phase 7) — the row-2 help-text heuristic guessed
+  from shape, so a class id written ``9 A`` was eaten as help text and the
+  Chinese and Japanese templates' help text was imported as real data.
+* **ST-FUNC-009** — pinned with ``xfail(strict=True)``; scheduled for a later
+  phase, and the suite must go red the moment it starts passing so the pin
+  gets flipped.
+* **The generated template must re-import in all 22 shipped languages** —
+  Spanish could not (two languages disagree about what a sheet titled *Aulas*
+  holds) and Chinese and Japanese imported phantom rows.
 
 Two conventions used throughout
 -------------------------------
@@ -27,10 +37,10 @@ Two conventions used throughout
    the language pinned to Turkish by the session-wide ``_pinned_language``
    fixture in ``tests/conftest.py``.
 2. *Hand-built workbooks omit the template's row-2 description row.*
-   ``importer._read_sheet`` drops the first data row when the first ``*_id``
-   column of that row is longer than 20 characters **or** contains a space.
-   The workbooks below use short, space-free IDs (``T001``, ``C001``, …) in
-   row 2, so nothing is dropped. ``test_builder_*`` below proves this, so a
+   ``importer._read_sheet`` drops the first data row only when the first
+   ``*_id`` column of that row holds one of the help-text strings the template
+   writes, in any shipped language. The workbooks below put real IDs there, so
+   nothing is dropped. ``test_builder_*`` below proves this both ways, so a
    failure in any other test can never be blamed on the fixture builder.
 """
 
@@ -50,7 +60,12 @@ from scheduler_app.core.models import (  # noqa: E402
 from scheduler_app.data_io import schema  # noqa: E402
 from scheduler_app.data_io.importer import load_scheduler_data_from_excel  # noqa: E402
 from scheduler_app.data_io.template import generate_excel_template  # noqa: E402
-from scheduler_app.translations import tr  # noqa: E402
+from scheduler_app.translations import (  # noqa: E402
+    TRANSLATIONS,
+    get_language,
+    set_language,
+    tr,
+)
 
 pytestmark = pytest.mark.excel
 
@@ -550,56 +565,14 @@ def test_unknown_allowed_rooms_warn_and_are_filtered(tmp_path):
     assert any("Hayalet Oda" in line for line in ds.report.warnings)
 
 
-# ── Known-defect pins (later phases) ────────────────────────────────────────
+# ── ST-FUNC-011 — the wrong workbook must not look like a success ───────────
 
-@pytest.mark.xfail(strict=True, reason=(
-    "ST-FUNC-009 — required_room_type is advertised in the template and the "
-    "import schema but never consumed by the importer; fixed in a later phase"))
-def test_required_room_type_constrains_the_class_to_matching_rooms(tmp_path):
-    """ST-FUNC-009 — ``required_room_type`` must actually restrict rooms.
-
-    The template tells the user to write "Laboratory" here; today the value is
-    read, validated as a known column, and thrown away, so a physics lab can be
-    scheduled into a lecture hall.
-    """
-    rows = [klass("C001", required_room_type=_room_type("lab"))]
-    path = build_workbook(tmp_path / "req_type.xlsx", classes=rows)
-    ds = load_scheduler_data_from_excel(path)
-
-    assert ds.report.is_valid, ds.report.summary()
-    required = ds.state["classes"][0]["required_classrooms"]
-    assert "Lab 1" in required
-    assert "Oda 1" not in required
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "ST-FUNC-010 — a space in the first data row's class_id trips the "
-    "description-row heuristic and drops the row silently; fixed in a later phase"))
-def test_class_id_containing_a_space_is_not_silently_dropped(tmp_path):
-    """ST-FUNC-010 — ``_read_sheet`` mistakes ``'C 001'`` for a help-text row.
-
-    ``_read_sheet`` discards the first data row whenever its ID contains a
-    space, so a school that writes class IDs like ``9 A`` loses its first
-    course with no error at all. Only the *first* data row is affected, which
-    is why the space is placed there.
-    """
-    rows = [klass("C 001"), klass("C002")]
-    path = build_workbook(tmp_path / "spaced_id.xlsx", classes=rows)
-    ds = load_scheduler_data_from_excel(path)
-
-    assert [e["class_id"] for e in ds.raw_classes] == ["C 001", "C002"]
-    assert course_names(ds) == ["Ders C 001", "Ders C002"]
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "ST-FUNC-011 — a workbook with zero recognized sheets reports "
-    "is_valid=True; fixed in a later phase"))
 def test_workbook_with_no_recognized_sheets_is_invalid(tmp_path):
     """ST-FUNC-011 — importing the wrong file must not look like a success.
 
-    Pointing the importer at an unrelated spreadsheet currently produces four
-    warnings, an empty state and ``is_valid=True``, which the UI reports as a
-    successful import.
+    Pointing the importer at an unrelated spreadsheet produced four warnings,
+    an empty state and ``is_valid=True``; ``_import_from_excel`` only warns on
+    ``not report.is_valid``, so the user got the success dialog over nothing.
     """
     path = tmp_path / "unrelated.xlsx"
     wb = openpyxl.Workbook()
@@ -615,9 +588,129 @@ def test_workbook_with_no_recognized_sheets_is_invalid(tmp_path):
         f"report was: {ds.report.summary()}")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "ST-FUNC-012 — duplicate lecturer names are neither deduplicated nor "
-    "reported; fixed in a later phase"))
+def test_a_workbook_with_one_recognized_sheet_still_imports(tmp_path):
+    """Guard (ST-FUNC-011 discrimination): *some* sheets missing is not fatal.
+
+    A school may keep its teacher roster in its own file, and the importer has
+    always merged whatever sheets it finds. The ST-FUNC-011 fix must therefore
+    fire on *zero* recognized sheets, not on any missing one — a fix that
+    errors whenever a sheet is absent would make partial workbooks
+    un-importable and would show up here.
+    """
+    path = build_workbook(tmp_path / "teachers_only.xlsx", classes=[],
+                          sheets=("teachers",))
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.errors == [], ds.report.summary()
+    assert ds.report.is_valid is True
+    assert ds.state["lecturers"] == ["Ada Lovelace", "Bora Yildiz"]
+    # The three absent sheets are still named, as warnings.
+    assert len(ds.report.warnings) == 3, ds.report.summary()
+
+
+# ── Every shipped language must be able to read its own template back ───────
+
+TEMPLATE_LOCALES = sorted(TRANSLATIONS)
+
+
+@pytest.fixture
+def ui_language():
+    """Switch the UI language for the duration of one test, then put it back.
+
+    The session-wide ``_pinned_language`` fixture pins Turkish so that every
+    other test in this file is deterministic; these tests deliberately leave
+    that pin and must restore it however they end.
+    """
+    original = get_language()
+
+    def _switch(lang):
+        set_language(lang)
+        assert get_language() == lang, f"{lang!r} is not a shipped locale"
+
+    try:
+        yield _switch
+    finally:
+        set_language(original)
+
+
+@pytest.mark.parametrize("lang", TEMPLATE_LOCALES)
+def test_the_generated_template_reimports_in_every_shipped_locale(
+        tmp_path, lang, ui_language):
+    """File ▸ Generate Template then File ▸ Import Excel, in all 22 languages.
+
+    The template is written in whatever language the app is running in — sheet
+    titles, column headers, the row-2 help text and the example rows are all
+    translated — and it is the file the bulk-entry workflow hands users. So the
+    workbook the app writes is a workbook the app must be able to read, and
+    that had only ever been checked in Turkish (``conftest`` pins the suite to
+    ``tr``). Three of the 22 languages could not read their own output:
+
+    * ``es`` — the Spanish room sheet is *Aulas* and the Portuguese class sheet
+      is *Aulas* too, and the flat name→sheet-id map let one overwrite the
+      other, so a Spanish workbook came back with 0 classrooms, 0 classes and
+      "Faltan columnas obligatorias" against its rooms sheet.
+    * ``zh`` / ``ja`` — the row-2 help text was recognized by "longer than 20
+      characters or contains a space", which no CJK sentence satisfies, so the
+      help text was imported as a teacher, a classroom *and* a branch.
+
+    Asserted as an exact round-trip rather than "no errors": the zh failure
+    mode was extra data, not missing data, and a count-free assertion would
+    have passed straight over three phantom entities.
+    """
+    ui_language(lang)
+
+    path = tmp_path / f"template_{lang}.xlsx"
+    generate_excel_template(str(path))
+    ds = load_scheduler_data_from_excel(str(path))
+
+    assert ds.report.is_valid, ds.report.summary()
+    assert ds.report.errors == []
+
+    expected_teachers = [tr(f"template.workbook_example.teacher_{i}_name")
+                         for i in (1, 2, 3)]
+    expected_rooms = [tr(f"template.workbook_example.room_{i}_name")
+                      for i in (1, 2, 3)]
+    expected_branches = [tr(f"template.workbook_example.branch_{i}_name")
+                         for i in (1, 2, 3)]
+
+    assert ds.state["lecturers"] == expected_teachers
+    assert ds.state["classrooms"] == expected_rooms
+    assert sorted(b for names in ds.state.get("years", {}).values()
+                  for b in names) == sorted(expected_branches)
+    # The template ships five class rows, two of which share joint group J1.
+    assert [e["class_id"] for e in ds.raw_classes] == [
+        "C001", "C002", "C003", "C004", "C005"]
+    assert len(ds.state["classes"]) == 4, (
+        f"{lang}: expected the five template rows to merge into four classes, "
+        f"got {[c['name'] for c in ds.state['classes']]}")
+
+
+@pytest.mark.parametrize("workbook_lang", TEMPLATE_LOCALES)
+def test_sheet_titles_resolve_per_workbook_not_by_the_current_ui_language(
+        workbook_lang, ui_language):
+    """A workbook's own four titles must resolve the same whoever opens it.
+
+    *Aulas* means classrooms in Spanish and classes in Portuguese, so no flat
+    name→sheet-id table can be right for both. The tempting one-line repair —
+    let the active UI language's titles win — fixes Spanish by breaking the
+    Portuguese workbook opened on a Spanish desktop, which works today. This
+    test resolves each language's own title set under all 22 UI languages, so
+    that repair fails here even though the round-trip test above would pass.
+    """
+    ui_language(workbook_lang)
+    titles = [schema.get_workbook_sheet_title(s) for s in SHEET_IDS]
+    assert len(set(titles)) == len(SHEET_IDS), (
+        f"{workbook_lang} reuses one sheet title for two sheets: {titles}")
+    expected = dict(zip(SHEET_IDS, titles))
+
+    for ui_lang in TEMPLATE_LOCALES:
+        ui_language(ui_lang)
+        assert schema.resolve_workbook_sheet_ids(titles) == expected, (
+            f"a {workbook_lang} workbook is misread with the UI in {ui_lang}")
+
+
+# ── ST-FUNC-012 — two teachers must not fuse into one lecturer ──────────────
+
 def test_duplicate_lecturer_names_are_not_silently_accepted(tmp_path):
     """ST-FUNC-012 — two teacher IDs sharing a name corrupt the lecturer list.
 
@@ -641,3 +734,147 @@ def test_duplicate_lecturer_names_are_not_silently_accepted(tmp_path):
     assert reported or deduplicated, (
         f"duplicate lecturer name accepted silently; lecturers={lecturers}, "
         f"report={messages(ds.report)}")
+
+
+def test_lecturer_names_differing_only_in_case_are_not_silently_split(tmp_path):
+    """ST-FUNC-012 — the importer must use the app's own rule for "same teacher".
+
+    ``SchedulingWorkflow.register_lecturer`` (ST-UI-020, Phase 6) matches typed
+    lecturer names with ``casefold()``, so "ayşe yılmaz" is not a second
+    teacher beside "Ayşe Yılmaz". The importer compared nothing at all, so a
+    workbook with both spellings produced *two* lecturers for one person: the
+    two classes came back carrying different lecturer strings, which the core
+    compares with ``==``, so the same teacher could be booked twice in one
+    hour — while the class form went on treating the two spellings as one.
+
+    Asserted as a disjunction on purpose: collapsing the pair or reporting it
+    are both honest, and the register leaves the choice open. What is not
+    allowed is a silent split.
+    """
+    from scheduler_app.core.workflow import SchedulingWorkflow
+
+    first, second = "Ayşe Yılmaz", "ayşe yılmaz"
+
+    # Control: establish that the app really does read these as one teacher,
+    # instead of assuming it. If this ever stops holding, the assertion below
+    # is measuring the wrong rule and must be revisited, not relaxed.
+    probe = {"lecturers": [first]}
+    assert SchedulingWorkflow.register_lecturer(probe, second) == first
+    assert probe["lecturers"] == [first]
+
+    teachers = [
+        {"teacher_id": "T001", "name": first},
+        {"teacher_id": "T002", "name": second},
+    ]
+    path = build_workbook(tmp_path / "case_names.xlsx", teachers=teachers,
+                          classes=[klass("C001"), klass("C002", teacher_id="T002")])
+    ds = load_scheduler_data_from_excel(path)
+
+    lecturers = ds.state["lecturers"]
+    collapsed = len({n.casefold() for n in lecturers}) == len(lecturers)
+    reported = any(first in line or second in line for line in messages(ds.report))
+    assert collapsed or reported, (
+        f"two spellings of one teacher were accepted silently; "
+        f"lecturers={lecturers}, report={messages(ds.report)}")
+    # And the user must not be told the import was clean while the roster
+    # still holds the same teacher twice.
+    assert collapsed or ds.report.is_valid is False, (
+        f"a roster holding one teacher twice was reported as valid; "
+        f"lecturers={lecturers}, report={messages(ds.report)}")
+
+
+@pytest.mark.parametrize("first,second", [
+    ("Ada Lovelace", "ada lovelace"),
+    ("AYŞE YILMAZ", "Ayşe Yılmaz"),
+    ("DILEK KAYA", "Dilek Kaya"),
+    ("IRIS MURDOCH", "Iris Murdoch"),
+])
+def test_the_importer_and_the_class_form_agree_on_what_counts_as_one_teacher(
+        tmp_path, first, second):
+    """ST-FUNC-012 — one rule for "same teacher", not two.
+
+    ``state['lecturers']`` is a list of display names and ``cls['lecturer']``
+    holds one of those names, so whatever counts as the same teacher has to
+    count the same way wherever a name is typed. The class form's rule lives in
+    ``SchedulingWorkflow.register_lecturer``; the importer's lives in
+    ``_process_teachers``. This asserts they return the same verdict rather
+    than asserting either verdict, so it stays true whichever way the rule is
+    later sharpened — and goes red the moment only one side is sharpened.
+
+    That is not hypothetical. ``casefold()`` misses the Turkish dotted/dotless
+    I, so ``AYŞE YILMAZ`` and ``Ayşe Yılmaz`` are two teachers on both sides
+    today. Making just the importer Turkish-aware was proposed and measured
+    here: a Turkish fold merges that pair, and also *splits* ``DILEK KAYA`` from
+    ``Dilek Kaya`` and ``IRIS MURDOCH`` from ``Iris Murdoch``, which are one
+    person on both sides today — an ASCII ``I`` folds to ``ı``. So the fold is
+    not a strict improvement, it is a different set of mistakes, and a
+    locale-dependent fold would make one roster merge or split according to a
+    UI setting. Closing it means changing both sides together, with a rule that
+    handles all four rows; the register entry is "name-keyed lecturer identity
+    has no canonical form".
+    """
+    from scheduler_app.core.workflow import SchedulingWorkflow
+
+    probe = {"lecturers": [first]}
+    SchedulingWorkflow.register_lecturer(probe, second)
+    class_form_says_one = len(probe["lecturers"]) == 1
+
+    teachers = [{"teacher_id": "T001", "name": first},
+                {"teacher_id": "T002", "name": second}]
+    path = build_workbook(tmp_path / "agreement.xlsx", teachers=teachers,
+                          classes=[klass("C001"), klass("C002", teacher_id="T002")])
+    ds = load_scheduler_data_from_excel(path)
+    lecturers = ds.state["lecturers"]
+    importer_says_one = (
+        len({n for n in lecturers}) == 1
+        or any(first in line or second in line for line in messages(ds.report))
+    )
+
+    assert importer_says_one == class_form_says_one, (
+        f"the importer and the class form disagree about {first!r} / "
+        f"{second!r}: class form says one teacher = {class_form_says_one}, "
+        f"importer says one teacher = {importer_says_one} "
+        f"(lecturers={lecturers}, report={messages(ds.report)})")
+
+
+# ── Known-defect pins (later phases) ────────────────────────────────────────
+
+@pytest.mark.xfail(strict=True, reason=(
+    "ST-FUNC-009 — required_room_type is advertised in the template and the "
+    "import schema but never consumed by the importer; fixed in a later phase"))
+def test_required_room_type_constrains_the_class_to_matching_rooms(tmp_path):
+    """ST-FUNC-009 — ``required_room_type`` must actually restrict rooms.
+
+    The template tells the user to write "Laboratory" here; today the value is
+    read, validated as a known column, and thrown away, so a physics lab can be
+    scheduled into a lecture hall.
+    """
+    rows = [klass("C001", required_room_type=_room_type("lab"))]
+    path = build_workbook(tmp_path / "req_type.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert ds.report.is_valid, ds.report.summary()
+    required = ds.state["classes"][0]["required_classrooms"]
+    assert "Lab 1" in required
+    assert "Oda 1" not in required
+
+
+def test_class_id_containing_a_space_is_not_silently_dropped(tmp_path):
+    """ST-FUNC-010 — ``_read_sheet`` mistook ``'C 001'`` for a help-text row.
+
+    ``_read_sheet`` used to discard the first data row whenever its ID
+    contained a space, so a school that writes class IDs like ``9 A`` lost its
+    first course with no error at all. Only the *first* data row was affected,
+    which is why the space is placed there. Closed by matching the row against
+    the strings the template actually writes instead of guessing from shape —
+    the same change that stopped the Chinese template's help text from being
+    imported as data, because these are one defect seen from two sides.
+    """
+    rows = [klass("C 001"), klass("C002")]
+    path = build_workbook(tmp_path / "spaced_id.xlsx", classes=rows)
+    ds = load_scheduler_data_from_excel(path)
+
+    assert [e["class_id"] for e in ds.raw_classes] == ["C 001", "C002"]
+    assert course_names(ds) == ["Ders C 001", "Ders C002"]
+
+

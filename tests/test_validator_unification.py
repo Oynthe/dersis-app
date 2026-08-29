@@ -104,7 +104,7 @@ from scheduler_app.core.models import (
     new_state,
 )
 from scheduler_app.core.workflow import SchedulingWorkflow
-import scheduler_app.core.logic as engine
+import scheduler_app.core.facade as engine
 
 
 _T_A = {"year": "Year-1", "branch": "A"}
@@ -973,7 +973,7 @@ def test_a_rejected_placement_always_has_at_least_one_conflict(
     non-empty.
 
     ``ConstraintValidator.find_conflicts`` is read by the LIVE batch scheduler
-    (``logic.optimized_batch_schedule``, logic.py:1301 and :1349) to build the
+    (``facade.optimized_batch_schedule``) to build the
     "why is this lesson unplaced?" string. An empty list there falls through to
     a generic ``tr("conflicts.batch_conflict")`` / ``tr("conflicts.
     pinned_conflict")`` placeholder, so a failure here means the user is told
@@ -1019,10 +1019,10 @@ def test_a_rejected_placement_always_has_at_least_one_explained_reason(
 def test_batch_scheduler_names_the_reason_a_pinned_lesson_could_not_be_placed():
     """ST-SCHED-009 — the live consequence, on the path the app really runs.
 
-    ``logic.optimized_batch_schedule`` (the one ``SchedulingWorkflow`` calls at
-    workflow.py:276 and :369) explains an unplaceable pinned lesson with
+    ``facade.optimized_batch_schedule`` (the one ``SchedulingWorkflow`` calls)
+    explains an unplaceable pinned lesson with
     ``validator.find_conflicts(...)`` and falls back to a generic string when
-    that list is empty (logic.py:1301-1303, :1349-1351).
+    that list is empty.
 
     A failure means the user pins a two-hour lesson at 09:00, the lecturer is
     away at 10:00, and the report says only "conflict with a pinned lesson" —
@@ -1030,7 +1030,7 @@ def test_batch_scheduler_names_the_reason_a_pinned_lesson_could_not_be_placed():
     nothing to act on. Asserted against ``tr()`` rather than literal text, so
     this pins the *fallback*, not the wording.
     """
-    from scheduler_app.core.logic import optimized_batch_schedule
+    from scheduler_app.core.facade import optimized_batch_schedule
     from scheduler_app.translations import tr
 
     state = _grid()

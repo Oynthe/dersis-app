@@ -14,7 +14,6 @@ Each entry records the class context, placement details, and the
 scoring state at the time of the decision.
 """
 
-import json
 import os
 import time
 from datetime import datetime

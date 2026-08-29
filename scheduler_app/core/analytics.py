@@ -10,9 +10,8 @@ Computes metrics from the current timetable state:
 """
 
 from scheduler_app.logic import (
-    find_slot_index,
-    get_placed_classes, occupied_slots_of, classroom_of, slot_index,
-    total_duration, schedule_counts,
+    find_slot_index, get_placed_classes, classroom_of, total_duration,
+    schedule_counts,
 )
 from scheduler_app.models import effective_day, effective_time
 

@@ -1,33 +1,29 @@
 """All dialog windows: Setup, AddClass, PlaceClass, SelectClass, Warnings, OpenSlots, PostAdd, BulkAdd."""
 
-import html
 import os
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout,
-    QLabel, QLineEdit, QPushButton, QComboBox, QSpinBox, QCheckBox,
-    QTextEdit, QTabWidget, QTreeWidget, QTreeWidgetItem, QGroupBox,
-    QMessageBox, QScrollArea, QWidget, QHeaderView, QFrame, QSizePolicy,
-    QTableWidget, QTableWidgetItem, QAbstractItemView, QApplication,
-    QProgressDialog, QSlider, QFileDialog,
+    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QLabel,
+    QLineEdit, QPushButton, QComboBox, QSpinBox, QCheckBox, QTextEdit,
+    QTabWidget, QTreeWidget, QTreeWidgetItem, QGroupBox, QMessageBox,
+    QScrollArea, QWidget, QHeaderView, QFrame, QTableWidget, QTableWidgetItem,
+    QAbstractItemView, QApplication, QSlider, QFileDialog,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor, QCursor, QShortcut, QKeySequence
 
+from scheduler_app.core.text_safety import escape_qt_rich
+from scheduler_app.data_io.schema import is_lecturer_name_header
 from scheduler_app.translations import TRANSLATIONS, tr
 from scheduler_app.models import (
-    new_class, room_fits_class, new_lecturer_availability,
-    needs_physical_room, LOCATION_TYPES,
-    LOCATION_FACE_TO_FACE, LOCATION_ONLINE, LOCATION_LECTURER_OFFICE,
-    normalize_class_data, get_effective_room_resource_for_class,
-    get_location_label, get_protection_label, parse_location_type_label,
-    validate_class_fields,
+    new_class, new_lecturer_availability, needs_physical_room, LOCATION_TYPES,
+    LOCATION_FACE_TO_FACE, normalize_class_data,
+    get_effective_room_resource_for_class, get_location_label,
+    get_protection_label, parse_location_type_label, validate_class_fields,
 )
 from scheduler_app import storage
 from scheduler_app.logic import (
-    find_valid_options, get_placed_classes,
-    occupied_slots_of, classroom_of,
-    parse_slot_lines, slot_meaning_changes,
+    find_valid_options, classroom_of, parse_slot_lines, slot_meaning_changes,
     SLOT_ERROR_DUPLICATE,
 )
 from scheduler_app.widgets import MultiSelectButton
@@ -318,31 +314,46 @@ def _default_copy_table_rows(table):
 
 
 def _ensure_excel_deps(parent):
-    """Return True if pandas+openpyxl are available, auto-installing if needed."""
+    """Return True if pandas+openpyxl are importable; otherwise say so and stop.
+
+    ST-SEC-005. This used to offer "Install now?" and, on Yes, run
+    ``pip install pandas openpyxl`` as a child of ``sys.executable``. Three
+    reasons that is gone, in order of weight:
+
+    1. ``README-en.md:151`` promises "Fully offline — no network calls of any
+       kind". This function and the two beside it were the app's *only* network
+       reach — the remaining spawn is the local CP-SAT worker, and both
+       ``webbrowser.open`` calls sit behind ``if PRICING_PAGE_URL:`` with
+       ``PRICING_PAGE_URL = ""``. Deleting them makes the promise true rather
+       than aspirational, and ``tests/test_offline_guarantee.py`` now holds it.
+    2. The branch is unreachable in every shipped configuration. pandas,
+       openpyxl and reportlab are pinned in ``requirements-lock.txt``, the
+       Windows build gates on ``verify_deps.py``, and the mac spec lists all
+       three in ``hiddenimports``. Only a developer with a thin venv ever got
+       here, and a developer can run pip themselves — which is exactly what
+       ``errors.pandas_openpyxl_required`` already tells them to do, so that
+       string stays correct and no locale needed editing.
+    3. Under Nuitka and PyInstaller ``sys.executable`` is the *app binary*, so
+       "install" relaunched DERSİS with argv it ignores and blocked the Qt
+       event loop for up to 120 s until the user closed the second window,
+       then reported success.
+
+    Note what is *not* the reason: the recommended Windows embed build ships a
+    working pip on a user-writable prefix, and ``pip install`` from that
+    windowless process was measured to exit 0. "It could not have worked" is
+    false; "it should not be there" is the argument.
+    """
     try:
         import pandas  # noqa: F401
         import openpyxl  # noqa: F401
         return True
     except ImportError:
-        pass
-    reply = QMessageBox.question(
-        parent, tr("dialogs.import.excel_title"),
-        tr("errors.pandas_openpyxl_required")
-        + "\n\n" + tr("dialogs.install.prompt"),
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-    )
-    if reply != QMessageBox.StandardButton.Yes:
-        return False
-    import subprocess
-    import sys
-    try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "pandas", "openpyxl"],
-            timeout=120,
+        # A plain warning, not a Yes/No question: there is nothing to say Yes
+        # to. The message already carries the pip command to run by hand.
+        QMessageBox.warning(
+            parent, tr("dialogs.import.excel_title"),
+            tr("errors.pandas_openpyxl_required"),
         )
-        return True
-    except Exception as exc:
-        QMessageBox.warning(parent, tr("status.import_failed"), str(exc))
         return False
 
 
@@ -1707,10 +1718,16 @@ class SetupDialog(QDialog):
             if df.empty:
                 QMessageBox.information(self, tr("dialogs.import.excel_title"), tr("warnings.no_data_found"))
                 return
+            # A non-empty frame has at least one column, so cols[0] exists.
             cols = list(df.columns)
+            if not is_lecturer_name_header(cols[0]):
+                QMessageBox.warning(
+                    self, tr("status.import_failed"),
+                    tr("errors.missing_columns").format(cols=tr("labels.lecturer")))
+                return
             count = 0
             for _, row in df.iterrows():
-                name = str(row[cols[0]]).strip() if len(cols) > 0 else ""
+                name = str(row[cols[0]]).strip()
                 if not name:
                     continue
                 # Parse availability from comma-separated strings
@@ -2824,7 +2841,7 @@ class PlaceClassDialog(QDialog):
 
         parts = [f"<b>{tr('dialogs.place.no_options_title')}</b>"]
         for reason in report.get("blocking_reasons", [])[:3]:
-            parts.append(f"&nbsp;&nbsp;• {html.escape(str(reason))}")
+            parts.append(f"&nbsp;&nbsp;• {escape_qt_rich(reason)}")
         suggestions = report.get("suggestions", [])
         if suggestions:
             parts.append(f"<b>{tr('dialogs.place.what_to_change')}</b>")
@@ -2834,11 +2851,11 @@ class PlaceClassDialog(QDialog):
                 # impact_label there reads as a stutter.
                 if sug.get("type") == "move_conflicting":
                     parts.append(
-                        f"&nbsp;&nbsp;→ {html.escape(str(sug['description']))}")
+                        f"&nbsp;&nbsp;→ {escape_qt_rich(sug['description'])}")
                 else:
                     parts.append(
-                        f"&nbsp;&nbsp;→ {html.escape(str(sug['description']))} "
-                        f"<i>({html.escape(str(sug['impact_label']))})</i>")
+                        f"&nbsp;&nbsp;→ {escape_qt_rich(sug['description'])} "
+                        f"<i>({escape_qt_rich(sug['impact_label'])})</i>")
         n_off_grid = report.get("off_grid_blockers", 0)
         if n_off_grid:
             # ST-DATA-003: these lessons are skipped when counting blockers
@@ -3011,101 +3028,6 @@ class MultiSelectClassDialog(QDialog):
             tree_idx = self.tree.indexOfTopLevelItem(item)
             self.result.append(self._classes[tree_idx][0])
         self.accept()
-
-
-# ── Warnings Dialog ──────────────────────────────────────────────────────────
-
-class WarningsDialog(QDialog):
-    def __init__(self, parent, state):
-        super().__init__(parent)
-        self.setStyleSheet(DIALOG_STYLESHEET())
-        self.setWindowTitle("\u26A0  " + tr("panels.workload_warnings"))
-        self.setMinimumSize(520, 420)
-
-        layout = QVBoxLayout(self)
-        self.text = QTextEdit()
-        self.text.setReadOnly(True)
-        layout.addWidget(self.text)
-
-        placed = get_placed_classes(state)
-        if not placed:
-            self.text.append(tr("warnings.no_classes_placed"))
-        else:
-            for yr in sorted(state["years"].keys()):
-                for br in state["years"][yr]:
-                    day_counts = {}
-                    for day in state["days"]:
-                        count = 0
-                        for c in placed:
-                            if not any(t["year"] == yr and t["branch"] == br
-                                       for t in c["targets"]):
-                                continue
-                            occ = occupied_slots_of(state, c)
-                            count += sum(1 for d, s in occ if d == day)
-                        day_counts[day] = count
-
-                    total = sum(day_counts.values())
-                    self.text.append(f"\n<b>{yr} / {br}:</b>")
-                    if total == 0:
-                        self.text.append(f"  {tr('warnings.no_classes_scheduled')}")
-                        continue
-
-                    loads = ", ".join(f"{day_label(d)}={n}" for d, n in day_counts.items())
-                    self.text.append(f"  {tr('warnings.slots_per_day')} {loads}")
-
-                    heavy = [d for d, n in day_counts.items()
-                             if n >= len(state["slots"]) * 0.75]
-                    light = [d for d, n in day_counts.items() if n == 0]
-                    if heavy:
-                        self.text.append(
-                            f"  <span style='color:#DC2626'>{tr('warnings.heavy_days')} {', '.join(day_label(d) for d in heavy)}</span>")
-                    if light:
-                        self.text.append(
-                            f"  <span style='color:#DC2626'>{tr('warnings.empty_days')} {', '.join(day_label(d) for d in light)}</span>")
-                    if not heavy and not light:
-                        self.text.append(
-                            f"  <span style='color:#16A34A'>{tr('warnings.balanced')}</span>")
-
-        close_btn = QPushButton(tr("buttons.close"))
-        close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignCenter)
-
-
-# ── Open Slots Dialog ────────────────────────────────────────────────────────
-
-class OpenSlotsDialog(QDialog):
-    def __init__(self, parent, state):
-        super().__init__(parent)
-        self.setStyleSheet(DIALOG_STYLESHEET())
-        self.setWindowTitle("\u2B50  " + tr("panels.open_slots"))
-        self.setMinimumSize(520, 420)
-
-        layout = QVBoxLayout(self)
-        text = QTextEdit()
-        text.setReadOnly(True)
-        layout.addWidget(text)
-
-        placed = get_placed_classes(state)
-        for room in state["classrooms"]:
-            free = []
-            for day in state["days"]:
-                for slot in state["slots"]:
-                    occupied = False
-                    for c in placed:
-                        if classroom_of(c) != room:
-                            continue
-                        if (day, slot) in occupied_slots_of(state, c):
-                            occupied = True
-                            break
-                    if not occupied:
-                        free.append(f"{day_label(day)} {slot}")
-            text.append(f"\n<b>{room}: {len(free)} {tr('labels.free_slots')}</b>")
-            for f_slot in free:
-                text.append(f"  {f_slot}")
-
-        close_btn = QPushButton(tr("buttons.close"))
-        close_btn.clicked.connect(self.accept)
-        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
 
 # ── Post-Add Placement Dialog ──────────────────────────────────────────────
@@ -4070,7 +3992,7 @@ class BulkResultsDialog(QDialog):
         if infeasibility and infeasibility.get("message"):
             bottleneck = QLabel(
                 f"<b>{tr('dialogs.bulk_results.impossible_title')}</b><br>"
-                f"{html.escape(str(infeasibility['message']))}")
+                f"{escape_qt_rich(infeasibility['message'])}")
             bottleneck.setWordWrap(True)
             bottleneck.setStyleSheet(
                 "background: #FEE2E2; color: #991B1B; padding: 8px; "

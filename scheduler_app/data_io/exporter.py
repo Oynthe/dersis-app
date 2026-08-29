@@ -8,7 +8,6 @@ import csv
 import html
 import warnings
 import os
-from typing import Any
 
 try:
     import openpyxl
@@ -23,6 +22,7 @@ except ImportError:
 
 from scheduler_app.logic import (
     get_placed_classes, occupied_slots_of, classroom_of, total_duration,
+    target_for_slot_offset,
     get_year_color, lighten_color, build_virtual_classroom_day_layout,
     find_schedule_conflicts, conflict_partner_index,
 )
@@ -39,9 +39,7 @@ from scheduler_app.constants import (
 from scheduler_app.core.text_safety import escape_pdf_markup, csv_safe
 from scheduler_app.data_io.spreadsheet_safety import neutralize_formula_cells
 from scheduler_app.models import (
-    get_classroom_export_labels,
-    get_protection_label,
-    effective_day, effective_time,
+    get_classroom_export_labels, effective_day, effective_time,
     slot_offset_for_target, cls_key, find_off_grid_placements,
 )
 from scheduler_app.translations import tr
@@ -121,49 +119,6 @@ def plain_cell_text(entry):
 def _strip_hash(color):
     """Strip '#' from hex color string for openpyxl."""
     return color.lstrip("#")
-
-
-def _cell_text(entry):
-    """Format a schedule entry for a grid cell (plain text fallback)."""
-    return plain_cell_text(entry)
-
-
-def _rich_cell(entry):
-    """Build a CellRichText with color-coded lines matching the app view."""
-    blocks = []
-    code = entry.get("class_code", "")
-    if code:
-        blocks.append(TextBlock(
-            InlineFont(b=True, sz=9, color=_strip_hash(CELL_FG_CODE)), code + "\n"))
-    blocks.append(TextBlock(
-        InlineFont(b=True, sz=10, color=_strip_hash(CELL_FG_NAME)), entry["name"] + "\n"))
-    if entry["lecturer"]:
-        blocks.append(TextBlock(
-            InlineFont(sz=9, color=_strip_hash(CELL_FG_LECTURER)), entry["lecturer"] + "\n"))
-    if entry["room"]:
-        blocks.append(TextBlock(
-            InlineFont(sz=9, color=_strip_hash(CELL_FG_ROOM)), entry["room"]))
-
-    cls = entry.get("cls", {})
-    emoji, label, color = get_badge(cls)
-    if emoji:
-        blocks.append(TextBlock(
-            InlineFont(b=True, sz=8, color=_strip_hash(color)),
-            "\n" + f"{emoji} {label}"))
-
-    return CellRichText(*blocks)
-
-
-def _entry_bg_color(entry, state):
-    """Return the lightened background hex for a lesson cell."""
-    cls = entry.get("cls", {})
-    yr_name = ""
-    targets = cls.get("targets", [])
-    if targets:
-        yr_name = targets[0].get("year", "")
-    base = get_year_color(state, yr_name)
-    light = lighten_color(base, 0.45)
-    return _strip_hash(light)
 
 
 def _sheet_name_for_export(base, used):
@@ -847,7 +802,16 @@ def _export_excel(schedule, filepath, mode="everything"):
 # CSV export
 
 def _export_csv(schedule: FinalSchedule, filepath: str):
-    """Export to a flat CSV file."""
+    """Export to a flat CSV file.
+
+    Scope note, measured in Phase 7: ``export_schedule(..., "csv", ...)`` has
+    **no production caller**. The CSV a user gets comes from
+    ``ui/app.py::export_csv``, a separate writer emitting a different product
+    (a class list, not a timetable), wired to the menu at ``ui/app.py:1000``.
+    ST-FUNC-006's user-facing pin therefore lives against *that* function; this
+    one is fixed to match so the two writers cannot drift again, and so that
+    wiring this entry point up later does not reintroduce the defect.
+    """
     grid = schedule.build_grid()
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -865,30 +829,366 @@ def _export_csv(schedule: FinalSchedule, filepath: str):
             room = classroom_of(cls)
             code = cls.get("class_code", "")
             cells = occupied_slots_of(schedule.state, cls)
-            if not cells:
+            on_grid = bool(cells)
+            if not on_grid:
                 # Orphaned by a deleted hour. A flat file has room for it even
                 # though a grid does not, so write it at its stored position
                 # rather than dropping it (ST-DATA-003).
                 cells = [(effective_day(cls), effective_time(cls))]
-            for day, slot in cells:
-                targets = cls.get("targets", [])
-                if targets:
-                    for t in targets:
-                        writer.writerow([
-                            day, csv_safe(slot), csv_safe(code),
-                            csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
-                            csv_safe(room), csv_safe(t["year"]),
-                            csv_safe(t["branch"]),
-                        ])
+            targets = cls.get("targets", [])
+            unreported = set(range(len(targets)))
+
+            def _row(day_text, slot, t):
+                writer.writerow([
+                    day_text, csv_safe(slot), csv_safe(code),
+                    csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
+                    csv_safe(room),
+                    csv_safe(t["year"]) if t else "",
+                    csv_safe(t["branch"]) if t else "",
+                ])
+
+            for offset, (day, slot) in enumerate(cells):
+                # ST-FUNC-006: the header row is Turkish, so the day column
+                # must be too. display_day rather than tr("weekdays.<key>") so
+                # a day the grid no longer defines prints its stored value
+                # instead of the lookup key.
+                day_text = display_day(day)
+                # One hour of a non-joint lesson belongs to ONE group, not to
+                # all of them: this loop used to emit the cross product, so a
+                # two-group lesson claimed each group met in both hours. Half
+                # of those rows were false. target_for_slot_offset returns
+                # None for a joint session, where every group really does
+                # share every hour.
+                owner = target_for_slot_offset(cls, offset) if on_grid else None
+                if owner is not None:
+                    indexed = [(owner, targets[owner])]
                 else:
-                    writer.writerow([
-                        day, csv_safe(slot), csv_safe(code),
-                        csv_safe(cls["name"]), csv_safe(cls["lecturer"]),
-                        csv_safe(room), "", "",
-                    ])
+                    indexed = list(enumerate(targets))
+                if not indexed:
+                    _row(day_text, slot, None)
+                    continue
+                for idx, t in indexed:
+                    unreported.discard(idx)
+                    _row(day_text, slot, t)
+
+            # A group whose own hour ran off the end of the grid has no cell to
+            # be named in. Same rule as above: reported at the stored start
+            # rather than dropped (ST-DATA-003).
+            for idx in sorted(unreported):
+                _row(display_day(effective_day(cls)), effective_time(cls),
+                     targets[idx])
 
 
 # ── PDF export (optional) ───────────────────────────────────────────────────
+
+# ST-FUNC-004. Helvetica is a base-14 Type1 font limited to WinAnsi, so six of
+# the twelve Turkish letters -- ğ Ğ ş Ş ı İ -- have no codepoint in it. (ö ü ç
+# Ö Ü Ç do, and always drew correctly; the register's "every Turkish-specific
+# letter" was wrong about that.) What reportlab does with the other six is
+# worse than the missing-glyph box the register described: it splits the
+# paragraph at each unmappable codepoint and switches to ZapfDingbats, whose
+# ASCII `n` is a filled block. So "Şükrü Işık Öğretmen" printed as a name with
+# solid blobs in it, and -- because the substitution also rewrites the text
+# layer -- Ctrl-F for "Öğretmen" found nothing and copy-paste yielded
+# "Önretmen". A school archiving its timetables could not search them by
+# teacher name.
+#
+# The fix embeds a TrueType font instead. Nothing is bundled: reportlab ships
+# Bitstream Vera inside its own wheel (283 glyphs, missing none of the twelve),
+# under a permissive licence it already redistributes, and build_nuitka.bat:118
+# already carries --include-package-data=reportlab. Installer delta: 0 bytes.
+# Per-document delta: +40 KB for the embedded subset, measured.
+_PDF_FALLBACK_FONTS = ("Helvetica", "Helvetica-Bold")
+_PDF_UNICODE_FONTS = ("DersisSans", "DersisSans-Bold")
+
+# pdfmetrics keeps a module-global registry, so registration is once per
+# process rather than once per canvas -- measured: a second export in the same
+# process is byte-identical without re-registering. None means "not yet tried".
+_pdf_font_names: "tuple[str, str] | None" = None
+
+
+def _register_unicode_fonts() -> "tuple[str, str]":
+    """Register a Turkish-capable TrueType family; return ``(regular, bold)``.
+
+    Degrades to Helvetica rather than raising. That guard is not theoretical:
+    ``requirements-lock.txt`` pins ``reportlab==4.4.10`` while the audit venv
+    actually runs 5.0.1, and ``Dersis-mac.spec`` does not collect reportlab's
+    package data at all -- so a build where ``fonts/Vera.ttf`` is absent is a
+    real possibility, and it must cost the user unreadable letters, not a
+    failed export.
+    """
+    global _pdf_font_names
+    if _pdf_font_names is not None:
+        return _pdf_font_names
+
+    _pdf_font_names = _PDF_FALLBACK_FONTS
+    try:
+        import reportlab
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        return _pdf_font_names
+
+    font_dir = os.path.join(os.path.dirname(reportlab.__file__), "fonts")
+    regular_path = os.path.join(font_dir, "Vera.ttf")
+    bold_path = os.path.join(font_dir, "VeraBd.ttf")
+    if not (os.path.exists(regular_path) and os.path.exists(bold_path)):
+        return _pdf_font_names
+
+    regular, bold = _PDF_UNICODE_FONTS
+    try:
+        pdfmetrics.registerFont(TTFont(regular, regular_path))
+        pdfmetrics.registerFont(TTFont(bold, bold_path))
+        # The cell markup uses <b>, which reportlab resolves through the family
+        # map -- without this the bold runs fall back to Helvetica-Bold and the
+        # six letters break again inside every class name.
+        pdfmetrics.registerFontFamily(
+            regular, normal=regular, bold=bold,
+            italic=regular, boldItalic=bold)
+    except Exception:
+        return _pdf_font_names
+
+    _pdf_font_names = (regular, bold)
+    return _pdf_font_names
+
+
+# ── Which letters the PDF can actually draw ─────────────────────────────────
+#
+# ST-FUNC-004 was closed on twelve Turkish letters. The product ships 22
+# languages, and the bundled face is Vera: 283 glyphs, Latin-1 and no more.
+# Measured against the weekday names of every shipped locale, Vera cannot draw
+# a single character of ru (22), ar (18), fa (17), hi (17), zh (9), ja (8),
+# ko (8), pl (2) or az (1) -- 9 of the 22, all offered by the first-run
+# language gate. reportlab ships only Vera and DarkGarden, so there is no
+# bundled face to swap in; bundling DejaVu would cover ru/pl/az and nothing
+# else.
+#
+# Two things follow, and this section does both:
+#
+#   * where the host has a face that covers the document, use it. Measured on
+#     Windows: arial.ttf covers ru, pl, az, ar and fa; msgothic.ttc covers ja
+#     and zh; malgun.ttf covers ko.
+#   * where it does not, SAY SO on the page. A row of empty boxes with no
+#     explanation is the same silent-failure shape the appendix above exists
+#     to close.
+#
+# The one thing not done here is quietly drawing a script the layout engine
+# cannot lay out -- see _needs_text_shaping.
+
+# Scripts reportlab cannot lay out correctly even with a covering font.
+# Measured, not assumed: registering arial.ttf and drawing "العربية" emits
+# `(\001\002\003\004\005\006\007) Tj` -- the seven codepoints in LOGICAL order,
+# each as its isolated form. reportlab has no bidi and no shaping engine, so
+# for these scripts a covering font buys confidently wrong output (a word
+# spelled backwards in disconnected letters) in place of an honest box. The
+# note is the truthful answer there.
+_SHAPED_SCRIPT_RANGES = (
+    (0x0590, 0x05FF),  # Hebrew (bidi)
+    (0x0600, 0x06FF),  # Arabic
+    (0x0700, 0x074F),  # Syriac
+    (0x0750, 0x077F),  # Arabic Supplement
+    (0x0780, 0x07BF),  # Thaana
+    (0x07C0, 0x08FF),  # NKo .. Arabic Extended-A
+    (0x0900, 0x0DFF),  # Devanagari .. Sinhala (reordering matras)
+    (0x0E00, 0x0EFF),  # Thai, Lao
+    (0x0F00, 0x109F),  # Tibetan, Myanmar
+    (0x1780, 0x17FF),  # Khmer
+    (0x1800, 0x18AF),  # Mongolian
+    (0xFB1D, 0xFDFF),  # Hebrew/Arabic presentation forms
+    (0xFE70, 0xFEFF),  # Arabic presentation forms-B
+)
+
+
+def _needs_text_shaping(ch: str) -> bool:
+    """True if *ch* belongs to a script reportlab cannot lay out."""
+    o = ord(ch)
+    return any(lo <= o <= hi for lo, hi in _SHAPED_SCRIPT_RANGES)
+
+
+def _chars_without_glyphs(font_name: str, text: str) -> "set[str]":
+    """The characters of *text* that *font_name* has no glyph for.
+
+    Whitespace is excluded: reportlab never draws it as a glyph.
+    """
+    wanted = {ch for ch in text if not ch.isspace()}
+    if not wanted:
+        return set()
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        face = pdfmetrics.getFont(font_name).face
+    except Exception:
+        return set()
+    char_to_glyph = getattr(face, "charToGlyph", None)
+    if char_to_glyph is None:
+        # A base-14 Type1 face. reportlab encodes those as WinAnsi and answers
+        # anything outside it by switching to ZapfDingbats mid-word, which is
+        # the pre-ST-FUNC-004 failure: a filled blob on the page and a
+        # falsified text layer behind it.
+        missing = set()
+        for ch in wanted:
+            try:
+                ch.encode("cp1252")
+            except UnicodeEncodeError:
+                missing.add(ch)
+        return missing
+    return {ch for ch in wanted if ord(ch) not in char_to_glyph}
+
+
+# (regular, bold, subfont index). The bold twin may be the same file: a family
+# without one loses <b> weight, which is a far smaller loss than a box.
+_PDF_SYSTEM_FONT_CANDIDATES = (
+    ("arial.ttf", "arialbd.ttf", 0),        # Windows: Latin, Greek, Cyrillic
+    ("segoeui.ttf", "segoeuib.ttf", 0),
+    ("tahoma.ttf", "tahomabd.ttf", 0),
+    ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf", 0),   # Linux
+    ("NotoSans-Regular.ttf", "NotoSans-Bold.ttf", 0),
+    ("Arial Unicode.ttf", "Arial Unicode.ttf", 0),  # macOS
+    ("Arial.ttf", "Arial Bold.ttf", 0),
+    ("msgothic.ttc", "msgothic.ttc", 0),    # Windows: Japanese, Chinese
+    ("malgun.ttf", "malgunbd.ttf", 0),      # Windows: Korean
+    ("msyh.ttc", "msyh.ttc", 0),            # Windows: Simplified Chinese
+)
+
+
+def _system_font_dirs() -> "list[str]":
+    """Directories to look for a covering face in, most likely first."""
+    dirs = []
+    windir = os.environ.get("WINDIR")
+    if windir:
+        dirs.append(os.path.join(windir, "Fonts"))
+    home = os.path.expanduser("~")
+    dirs.extend([
+        "/Library/Fonts", "/System/Library/Fonts",
+        os.path.join(home, "Library", "Fonts"),
+        "/usr/share/fonts/truetype/dejavu",
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/TTF",
+        "/usr/share/fonts",
+    ])
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+# path -> registered (regular, bold) names, or None when the file cannot be
+# read. Registration is a pdfmetrics-global side effect, so it is done once per
+# process exactly like _register_unicode_fonts.
+_pdf_system_fonts: dict = {}
+
+
+def _register_covering_font(text: str) -> "tuple[str, str] | None":
+    """Register the first host face that can draw *every* character of *text*.
+
+    "Every character" and not "the missing ones": swapping in a face that
+    draws Cyrillic but not ğ would trade one locale's boxes for another's.
+    Measured on Windows, that is not hypothetical -- malgun.ttf covers Korean
+    and has no glyph for ı.
+    """
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+    except ImportError:
+        return None
+
+    dirs = _system_font_dirs()
+    for regular_file, bold_file, subfont in _PDF_SYSTEM_FONT_CANDIDATES:
+        for d in dirs:
+            path = os.path.join(d, regular_file)
+            if not os.path.exists(path):
+                continue
+            cached = _pdf_system_fonts.get(path, "unread")
+            if cached is None:
+                break  # known unreadable; try the next candidate family
+            if cached == "unread":
+                names = ("DersisSys-" + regular_file,
+                         "DersisSys-" + regular_file + "-Bold")
+                bold_path = os.path.join(d, bold_file)
+                if not os.path.exists(bold_path):
+                    bold_path = path
+                try:
+                    pdfmetrics.registerFont(
+                        TTFont(names[0], path, subfontIndex=subfont))
+                    pdfmetrics.registerFont(
+                        TTFont(names[1], bold_path, subfontIndex=subfont))
+                    pdfmetrics.registerFontFamily(
+                        names[0], normal=names[0], bold=names[1],
+                        italic=names[0], boldItalic=names[1])
+                except Exception:
+                    _pdf_system_fonts[path] = None
+                    break
+                _pdf_system_fonts[path] = names
+                cached = names
+            if not (_chars_without_glyphs(cached[0], text)
+                    or _chars_without_glyphs(cached[1], text)):
+                return cached
+            break  # this family is present but does not cover the document
+    return None
+
+
+def _resolve_pdf_fonts(text: str) -> "tuple[str, str, set[str]]":
+    """Return ``(regular, bold, unprintable)`` for a document containing *text*."""
+    regular, bold = _register_unicode_fonts()
+    missing = (_chars_without_glyphs(regular, text)
+               | _chars_without_glyphs(bold, text))
+    if not missing:
+        return regular, bold, set()
+    if not any(_needs_text_shaping(ch) for ch in missing):
+        covering = _register_covering_font(text)
+        if covering is not None:
+            return covering[0], covering[1], set()
+    return regular, bold, missing
+
+
+def _pdf_document_text(schedule) -> str:
+    """Every string the PDF may draw, concatenated.
+
+    Over-collecting is safe (a character listed but never drawn only widens
+    the search for a covering face); under-collecting is not, which is why
+    this reads the state rather than the built flowables.
+    """
+    state = schedule.state
+    parts = [tr(k) for k in (
+        "labels.time", "labels.type", "labels.class_code", "labels.class_name",
+        "labels.lecturer", "labels.day", "export.appendix_title",
+        "export.appendix_offgrid", "export.appendix_conflict",
+        "warnings.no_schedule_data",
+    )]
+    parts.extend(display_day(d) for d in state.get("days", []))
+    parts.extend(str(s) for s in state.get("slots", []))
+    parts.extend(str(r) for r in state.get("classrooms", []))
+    parts.extend(str(lect) for lect in state.get("lecturers", []))
+    for year, branches in (state.get("years") or {}).items():
+        parts.append(str(year))
+        parts.extend(str(b) for b in branches or [])
+    for cls in state.get("classes", []):
+        parts.extend(str(cls.get(k, "")) for k in
+                     ("class_code", "name", "lecturer"))
+        parts.append(str(classroom_of(cls) or ""))
+        for t in cls.get("targets", []) or []:
+            parts.append(f'{t.get("year", "")}/{t.get("branch", "")}')
+        _emoji, label, _color = get_badge(cls)
+        parts.append(str(label or ""))
+    return "".join(parts)
+
+
+def _unprintable_note(font_regular: str, unprintable: "set[str]") -> str:
+    """The page text explaining which characters the document could not spell.
+
+    Named by codepoint, not by the character: the characters in question are
+    precisely the ones this document cannot draw. The wording falls back to
+    English when the chosen face cannot draw the localized string either --
+    a note that is itself a row of boxes explains nothing.
+    """
+    from scheduler_app.translations import TRANSLATIONS
+
+    codes = " ".join(f"U+{ord(ch):04X}" for ch in sorted(unprintable))
+    text = tr("export.unprintable_note", count=len(unprintable),
+              codepoints=codes)
+    if _chars_without_glyphs(font_regular, text):
+        english = TRANSLATIONS["en"].get("export.unprintable_note", "")
+        try:
+            text = english.format(count=len(unprintable), codepoints=codes)
+        except (KeyError, IndexError, ValueError):
+            text = english
+    return text
 
 
 def _pdf_rich_markup(cls, include_room=False, include_targets=False):
@@ -944,6 +1244,31 @@ def _pdf_rich_paragraph(cls, cell_style, include_room=False, include_targets=Fal
         cell_style)
 
 
+def _note_cell_height(tall_rows, para, content_w, first_row, span, min_row_h):
+    """Grow *tall_rows* so ``para`` fits the rows it is drawn across.
+
+    ``rowHeights`` is fixed, and reportlab does not grow a fixed row to fit its
+    content -- it overprints the neighbours. The contested-cell branch already
+    measured itself for that reason; the ordinary occupied cell did not, and
+    measurement says it should have: at 7pt in the everything layout's narrow
+    columns, "Öğrenci Değerlendirme ve Ölçme Çalıştayı / Şükrü Işık Öğretmen /
+    A-101" needs 51pt against MIN_ROW_H's 50 under Helvetica and 60pt under the
+    embedded TrueType face (ST-FUNC-004 widens the glyphs). The lecturer layout
+    needs 51pt for even a one-word lesson, because it prints the group line
+    too. So the printed timetable has been overprinting the hour above and
+    below it all along, and the font fix would have made that worse silently.
+
+    A cell merged across *span* rows is drawn in the sum of their heights, so
+    the requirement is divided rather than applied to each row.
+    """
+    span = max(span, 1)
+    _w, _h = para.wrap(content_w, 1e6)
+    per_row = (_h + 6) / span
+    for off in range(span):
+        tall_rows[first_row + off] = max(
+            tall_rows.get(first_row + off, min_row_h), per_row)
+
+
 def _pdf_conflict_paragraph(classes, cell_style, conflicted,
                             include_room=False, include_targets=False):
     """One Paragraph holding every class that claims a contested PDF cell.
@@ -993,6 +1318,12 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     placed = schedule.placed_classes()
     days = schedule.days
     slots = schedule.slots
+    # ST-FUNC-013: every table builder records the lessons it actually put on a
+    # page here, so the appendix can name the ones no page had room for. Same
+    # mechanism the workbook's _write_unplaceable_sheet already uses, and it is
+    # a report on the built document rather than a second guess at the filter
+    # rules -- so a lesson lost for a reason nobody predicted still surfaces.
+    drawn: set = set()
     # ST-UI-001: one scan for the whole document, so every page marks the
     # same clashes and the printout agrees with the screen.
     conflicts = find_schedule_conflicts(state)
@@ -1007,29 +1338,40 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     avail_w = page_size[0] - 16 * mm
 
     # ── Paragraph styles ──────────────────────────────────────────────
+    # ST-FUNC-004: every style names the registered family, never Helvetica.
+    # A style left on Helvetica would still substitute ZapfDingbats for ğ ş ı,
+    # and the day-header row is exactly where "Çarşamba" lives.
+    #
+    # ...and no style can name a face that cannot draw this document's own
+    # alphabet. The bundled Vera covers Latin-1, which is 13 of the 22 shipped
+    # locales; for the other 9 the page was a row of empty boxes and nothing
+    # said so. _resolve_pdf_fonts upgrades to a host face that covers the
+    # document where one exists, and reports what is left.
+    FONT_REGULAR, FONT_BOLD, unprintable_chars = _resolve_pdf_fonts(
+        _pdf_document_text(schedule))
     cell_style = ParagraphStyle(
         "CellContent", fontSize=7, leading=9,
-        alignment=TA_CENTER, fontName="Helvetica",
+        alignment=TA_CENTER, fontName=FONT_REGULAR,
     )
     hdr_style = ParagraphStyle(
         "HdrContent", fontSize=9, leading=11, alignment=TA_CENTER,
-        textColor=rl_colors.white, fontName="Helvetica-Bold",
+        textColor=rl_colors.white, fontName=FONT_BOLD,
     )
     branch_hdr_style = ParagraphStyle(
         "BranchHdr", fontSize=8, leading=10, alignment=TA_CENTER,
-        textColor=rl_colors.white, fontName="Helvetica-Bold",
+        textColor=rl_colors.white, fontName=FONT_BOLD,
     )
     time_style = ParagraphStyle(
         "TimeContent", fontSize=8, leading=10, alignment=TA_CENTER,
-        textColor=rl_colors.white, fontName="Helvetica-Bold",
+        textColor=rl_colors.white, fontName=FONT_BOLD,
     )
     session_style = ParagraphStyle(
         "SessionNum", fontSize=8, leading=10, alignment=TA_CENTER,
-        textColor=rl_colors.HexColor("#333333"), fontName="Helvetica-Bold",
+        textColor=rl_colors.HexColor("#333333"), fontName=FONT_BOLD,
     )
     title_style = ParagraphStyle(
         "PageTitle", fontSize=11, leading=14, alignment=TA_CENTER,
-        fontName="Helvetica-Bold", textColor=rl_colors.HexColor("#1E293B"),
+        fontName=FONT_BOLD, textColor=rl_colors.HexColor("#1E293B"),
         spaceAfter=4 * mm,
     )
 
@@ -1093,6 +1435,8 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             for off in range(span):
                 claims.setdefault((start_si + off, c_day), []).append(entry)
 
+        drawn.update(cls_key(e["cls"]) for e in entries)
+
         overlapping = {id(e["cls"]) for cells in claims.values()
                        if len(cells) > 1 for e in cells}
 
@@ -1140,10 +1484,13 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                 key = (si, day)
                 if key in occupied_start:
                     cls, span = occupied_start[key]
-                    row.append(_pdf_rich_paragraph(
+                    para = _pdf_rich_paragraph(
                         cls, cell_style,
                         include_room=include_room,
-                        include_targets=include_targets))
+                        include_targets=include_targets)
+                    row.append(para)
+                    _note_cell_height(tall_rows, para, day_w - 4,
+                                      data_row_idx, span, MIN_ROW_H)
                     yr_name = cls["targets"][0]["year"] if cls.get("targets") else ""
                     base = get_year_color(state, yr_name)
                     light = lighten_color(base, 0.45)
@@ -1225,6 +1572,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             (block["row"], block["subcolumn"]): block
             for block in layout["blocks"]
         }
+        drawn.update(cls_key(block["cls"]) for block in layout["blocks"])
         covered = set(layout["occupied_subcolumns"])
 
         table_data = [header]
@@ -1246,6 +1594,7 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
         cell_bg_cmds = []
         row_heights = [24]
+        tall_rows = {}
         for si, slot in enumerate(slots):
             data_row_idx = si + 1
             row = [Paragraph(escape_pdf_markup(slot), time_style)]
@@ -1259,9 +1608,12 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                     block = starts[key]
                     cls = block["cls"]
                     span = block["span"]
-                    row.append(_pdf_rich_paragraph(
+                    para = _pdf_rich_paragraph(
                         cls, cell_style,
-                        include_room=False, include_targets=True))
+                        include_room=False, include_targets=True)
+                    row.append(para)
+                    _note_cell_height(tall_rows, para, data_w - 4,
+                                      data_row_idx, span, MIN_ROW_H)
                     yr_name = cls["targets"][0]["year"] if cls.get("targets") else ""
                     base = get_year_color(state, yr_name)
                     light = lighten_color(base, 0.45)
@@ -1287,6 +1639,9 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                          (col_idx, data_row_idx), COL_EMPTY))
             table_data.append(row)
             row_heights.append(MIN_ROW_H)
+
+        for _ri, _h in tall_rows.items():
+            row_heights[_ri] = _h
 
         style_cmds.extend(cell_bg_cmds)
         tbl = Table(table_data, colWidths=col_widths, rowHeights=row_heights,
@@ -1393,6 +1748,8 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                     if all(x is not entry for x in bucket):
                         bucket.append(entry)
 
+        drawn.update(cls_key(e["cls"]) for e in entries)
+
         overlapping = {id(e) for cells in claims.values() if len(cells) > 1
                        for e in cells}
         occupied = {}
@@ -1413,6 +1770,18 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
         cell_bg_cmds = []
         row_heights = [24, 18]  # header rows
         tall_rows = {}
+
+        # The branch sub-header is the one header cell holding free user text:
+        # branch names come from a comma-split line the user types
+        # (dialogs.py), so "9/A Fen Bilimleri Agirlikli Sube" is as legal as
+        # "A". 18pt fits one line, and a fixed row does not grow -- measured,
+        # a 2-line label spills 1pt past each border into padding (harmless),
+        # but a 4-line one is 60pt in an 18pt row and prints over the day
+        # header above and the first lesson below. Measured here for the same
+        # reason every other Paragraph in this table is.
+        for _hdr_cell in row1:
+            if isinstance(_hdr_cell, Paragraph):
+                _note_cell_height(tall_rows, _hdr_cell, data_col_w - 4, 1, 1, 18)
 
         for si, slot in enumerate(slots):
             data_row = si + 2  # after 2 header rows
@@ -1452,9 +1821,12 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
                         if kind == "span":
                             row.append("")
                             continue
-                        row.append(_pdf_rich_paragraph(
+                        para = _pdf_rich_paragraph(
                             cls, cell_style,
-                            include_room=True, include_targets=False))
+                            include_room=True, include_targets=False)
+                        row.append(para)
+                        _note_cell_height(tall_rows, para, data_col_w - 4,
+                                          data_row, span, MIN_ROW_H)
                         yr_hex = get_year_color(state, yr).lstrip("#")
                         light_hex = lighten_color(f"#{yr_hex}", 0.45)
                         bg = rl_colors.HexColor(light_hex)
@@ -1551,11 +1923,19 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
 
     # ── Appendix: everything the grid could not say ───────────────────
     #
-    # ST-FUNC-013 + ST-UI-001. Two different ways a lesson goes missing from a
-    # printed timetable, one page:
+    # ST-FUNC-013 + ST-UI-001. Three different ways a lesson goes missing from
+    # a printed timetable, one page:
     #
     #   * a placement on a day or hour the user has since deleted has no cell
     #     to be drawn in, so every grid-shaped page simply omits it;
+    #   * a lesson no page had a column for -- the everything and group layouts
+    #     are built by filtering each class's `targets`, so a lesson whose
+    #     targets list is empty matches no page. That is not exotic:
+    #     new_class() initializes targets to [] (core/models.py:578) and
+    #     neither class-editor path requires one (ui/dialogs.py:3694, :3915),
+    #     so it is the default state of every lesson placed before its groups
+    #     were ticked. classroom and lecturer filter on room and teacher and
+    #     kept it, which is why only two of the four layouts lost it;
     #   * a double-booking is now stacked into its cell rather than dropped,
     #     but a stacked cell is easy to miss on a dense page.
     #
@@ -1568,7 +1948,26 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
     # would make `elements` non-empty and silently delete the "no schedule
     # data" page that the empty-export test pins.
     appendix_rows = []
-    for cls, _reason in find_off_grid_placements(state):
+    off_grid = list(find_off_grid_placements(state))
+    off_grid_keys = {cls_key(cls) for cls, _reason in off_grid}
+    for cls, _reason in off_grid:
+        appendix_rows.append((
+            tr("export.appendix_offgrid"),
+            cls.get("class_code", ""),
+            cls.get("name", ""),
+            cls.get("lecturer", ""),
+            f"{display_day(effective_day(cls))} {effective_time(cls) or ''}",
+        ))
+    # The same heading, deliberately: "not on the timetable" is literally what
+    # happened to these too, the string is already translated in all 22
+    # locales, and _write_unplaceable_sheet reuses it for the workbook's
+    # version of this list for the same reason. Minting a key here would move
+    # the ST-UI-011 ratchet by 21 pairs for a phrase a reader cannot
+    # distinguish from the one above.
+    for cls in placed:
+        key = cls_key(cls)
+        if key in drawn or key in off_grid_keys:
+            continue
         appendix_rows.append((
             tr("export.appendix_offgrid"),
             cls.get("class_code", ""),
@@ -1609,6 +2008,22 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
         ]))
         elements.append(appendix)
+
+    # ── The characters this document could not spell ──────────────────
+    #
+    # ST-FUNC-004, the other 9 locales. Everything above draws the boxes; this
+    # is the page that admits to them. Same reasoning as the appendix: the
+    # printout is what gets pinned to a noticeboard, and a page that looks
+    # complete while a teacher's name is five empty rectangles is worse than
+    # one that says which characters are missing.
+    if unprintable_chars:
+        note = _unprintable_note(FONT_REGULAR, unprintable_chars)
+        elements.append(PageBreak())
+        elements.append(Paragraph(html.escape(note), title_style))
+        # And once out of band, the way an orphaned placement already is: the
+        # page says it to whoever reads the printout, the warning says it to
+        # whoever is reading a log or driving the exporter from code.
+        warnings.warn(note, stacklevel=2)
 
     doc.build(elements)
 

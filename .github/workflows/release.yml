@@ -33,6 +33,55 @@ permissions:
   contents: write
 
 jobs:
+  # ── Run the suite against the exact tag being published ────────────
+  # ST-SEC-001: ci.yml also triggers on `v*`, but it starts as an independent
+  # run on the same ref and nothing consumes its result — a red suite and a
+  # published installer were concurrent, unrelated events. `publish` waits on
+  # this job instead.
+  #
+  # It duplicates ci.yml's Validate suite deliberately. `workflow_run` does not
+  # chain cleanly off a tag event and resolves the ref a second time; an ubuntu
+  # test job costs minutes next to the ~15-minute Windows build that is already
+  # running in parallel with it.
+  test:
+    name: Test the tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # Qt runs offscreen, which still needs the platform plugin's shared
+      # libraries present. tests/conftest.py sandboxes HOME, so nothing here
+      # touches a real ~/Documents/Dersis.
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libdbus-1-3
+
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -m "not slow"
+
   # ── Build the installer via the reusable build workflow ────────────
   build:
     name: Build DERSİS Installer
@@ -123,11 +172,30 @@ jobs:
           Write-Host "Build output verified"
 
       # ── Installer ──────────────────────────────────────────────────
+      # The URL is an immutable GitHub release asset and the digest is checked
+      # before the file is executed. The old URL, jrsoftware.org/download.php/is.exe,
+      # is a redirector: on 2026-08-28 it 302'd to /isdl.php and returned 10478
+      # bytes of text/html. Invoke-WebRequest wrote that into innosetup.exe and
+      # exited 0; Start-Process then failed "The file or directory is corrupted and
+      # unreadable" — which is what killed build-release runs 11 and 13-16.
+      # Stay on 6.x. The download page also offers 7.1.0; taking it would be a
+      # silent major-version change of the compiler that builds what users run.
       - name: Install Inno Setup
         shell: pwsh
         run: |
-          $installer = "$env:TEMP\innosetup.exe"
-          Invoke-WebRequest -Uri "https://jrsoftware.org/download.php/is.exe" -OutFile $installer -UseBasicParsing
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe"
+          $expected = "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732"
+          $installer = "$env:TEMP\innosetup-6.7.3.exe"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+
+          $actual = (Get-FileHash -Path $installer -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) {
+            Write-Error "Inno Setup download failed verification.`n  expected $expected`n  actual   $actual`nRefusing to run it."
+            exit 1
+          }
+          Write-Host "Inno Setup 6.7.3 SHA-256 verified: $actual"
+
           Start-Process -FilePath $installer -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /DIR=C:\InnoSetup" -Wait -NoNewWindow
           echo "C:\InnoSetup" >> $env:GITHUB_PATH
 
@@ -176,6 +244,12 @@ jobs:
           if-no-files-found: error
 
   # ── Build the macOS distributables (.dmg + .zip), per architecture ─────
+  # Runner labels are checked against actions/runner-images' README by
+  # tests/test_release_pipeline.py. A label GitHub no longer offers does not
+  # fail loudly — the job never starts, and anything that `needs` it is simply
+  # never satisfied. `macos-13` was exactly that: retired 2025-12-08
+  # (runner-images #13046), which made every `needs: build-macos` unsatisfiable
+  # and skipped `publish` entirely.
   build-macos:
     name: Build DERSİS macOS (${{ matrix.arch }})
     strategy:
@@ -183,9 +257,9 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            runner: macos-14   # Apple Silicon
+            runner: macos-15         # Apple Silicon
           - arch: x64
-            runner: macos-13   # Intel
+            runner: macos-15-intel   # Intel; the label that replaced macos-13
 
     runs-on: ${{ matrix.runner }}
 
@@ -223,9 +297,29 @@ jobs:
           if-no-files-found: error
 
   # ── Publish GitHub Release ────────────────────────────────────────
+  # The `if:` is load-bearing, and so is its shape.
+  #
+  # A job with no `if:` carries an implicit `success()`: EVERY entry in `needs`
+  # must succeed. So the macOS matrix — an optional-but-expected extra — was a
+  # hard gate on the Windows release, and the "publishing Windows-only"
+  # fallback below could never print, because it lives inside the job that got
+  # skipped. `fail-fast: false` does not change that; it stops the sibling leg
+  # being cancelled, not the matrix job's conclusion.
+  #
+  # `!cancelled()` rather than `always()`: `always()` publishes out of a run an
+  # operator cancelled mid-flight. And the condition must name `test` as well as
+  # `build`, because an `if:` replaces the implicit `success()` for every need
+  # at once — gating on `needs.build.result` alone would silently stop waiting
+  # for the suite.
+  #
+  # Nothing downstream fails on a missing macOS artifact: download-artifact@v4
+  # only throws for the `name` and `artifact-ids` inputs, so a `pattern:` that
+  # matches nothing downloads nothing and succeeds, and the release step sets
+  # fail_on_unmatched_files: false.
   publish:
     name: Publish GitHub Release
-    needs: [build, build-macos]
+    needs: [test, build, build-macos]
+    if: ${{ !cancelled() && needs.test.result == 'success' && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
 
     steps:

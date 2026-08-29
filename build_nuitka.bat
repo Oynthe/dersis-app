@@ -120,6 +120,7 @@ python -m nuitka ^
     --include-data-dir=scheduler_app/assets=scheduler_app/assets ^
     --include-data-dir=flags=flags ^
     --include-data-files=docs/dersis.png=docs/dersis.png ^
+    --include-data-files=VERSION=VERSION ^
     --windows-icon-from-ico=scheduler_app/assets/app_icon.ico ^
     --company-name="%COMPANY%" ^
     --product-name="%APP_NAME%" ^
@@ -164,6 +165,14 @@ if not exist "%DIST_DIR%" (
     echo   Renamed folder to Dersis.dist
 )
 
+:: Generate the installer version include, exactly as build_embed.bat does.
+:: installer.iss does #ifexist "build\version.iss" / #else #define AppVersion
+:: "0.0.0", and OutputBaseFilename is Dersis_Setup_v{#AppVersion} — so without
+:: this the "Next step: iscc installer.iss" printed below produces
+:: Dersis_Setup_v0.0.0.exe and an Add/Remove Programs entry to match.
+echo #define AppVersion "%APP_VERSION%"> "build\version.iss"
+echo   Generated build\version.iss with version %APP_VERSION%
+
 :: ── Step 6: Verify assets ───────────────────────────────────────────────
 echo.
 echo [6/6] Verifying packaged assets...
@@ -181,6 +190,23 @@ if exist "%DIST_DIR%\docs\dersis.png" (
     echo   [OK] docs\dersis.png
 ) else (
     echo   [MISSING] docs\dersis.png
+    set /a ERRORS+=1
+)
+
+:: scheduler_app\_version.py reads VERSION from the dist root and silently
+:: returns _FALLBACK = "0.0.0" if it is not there — visible to the user in the
+:: bug-report dialog and the About box, with no error anywhere.
+if exist "%DIST_DIR%\VERSION" (
+    echo   [OK] VERSION ^(%APP_VERSION%^)
+) else (
+    echo   [MISSING] VERSION - the app will report itself as 0.0.0
+    set /a ERRORS+=1
+)
+
+if exist "build\version.iss" (
+    echo   [OK] build\version.iss
+) else (
+    echo   [MISSING] build\version.iss - iscc would emit Dersis_Setup_v0.0.0.exe
     set /a ERRORS+=1
 )
 
@@ -206,6 +232,18 @@ for /r "%DIST_DIR%" %%f in (*) do set /a FILE_COUNT+=1
 echo   Total files: %FILE_COUNT%
 
 echo.
+:: ERRORS was counted above and then ignored: this script printed
+:: "BUILD SUCCESSFUL!" over a missing-asset list. build_embed.bat already
+:: branches on it; now both do.
+if %ERRORS% GTR 0 (
+    echo ============================================
+    echo  BUILD INCOMPLETE: %ERRORS% critical file^(s^) missing.
+    echo  Do not run iscc installer.iss on this output.
+    echo ============================================
+    echo.
+    pause
+    exit /b 1
+)
 echo ============================================
 echo  BUILD SUCCESSFUL!
 echo.

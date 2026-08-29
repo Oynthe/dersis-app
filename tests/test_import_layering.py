@@ -31,12 +31,29 @@ Three ways to get this test wrong, all of which were built and measured first
 2. **"11 module-level import cycles" is not what is there.** Measured on this
    tree, module-level edges alone form **zero** cycles and zero mutually
    importing pairs -- nothing cyclic runs at import time, today or at the audit
-   commit. The cycles appear only when ``logic.py``'s function-level deferred
-   imports are counted as edges, and then it is not 11 discrete cycles but a
+   commit. The cycles appeared only when ``logic.py``'s function-level deferred
+   imports were counted as edges, and then it was not 11 discrete cycles but a
    single **15-module strongly connected component** covering nearly all of
-   ``core``. That distinction matters: you cannot fix a 15-node SCC one cycle
+   ``core``. That distinction mattered: you cannot fix a 15-node SCC one cycle
    at a time, which is why the register's remedy is a seam (split ``logic``)
    and not a list.
+
+   **Phase 7 cut that seam and the component is gone.** ``logic.py`` now holds
+   only the scheduling primitives; the eight ``optimized_*`` / scoring bridges
+   live in ``scheduler_app/core/facade.py``, which nothing inside the engine
+   imports, so it can import the engine normally. That took the component from
+   15 modules to 2 and mutually importing pairs from 7 to 1. The residual pair
+   was ``schedule_optimizer <-> solver_worker``, which had nothing to do with
+   ``logic`` and carried two integer constants; those moved to the leaf
+   ``core/constants.py``. Measured end state: **no strongly connected
+   component of size > 1 anywhere in the package, no mutually importing pair,
+   no deferred import in ``logic.py``.**
+
+   The three ceilings below are therefore ``== 0`` and are contracts, not
+   ratchets. The two ways someone will try to give that ground back --
+   re-exporting the bridges from ``logic.py``, or letting an engine module
+   import the facade -- each have their own contract as well, because both
+   were built and measured and neither is caught by the SCC number alone.
 
 3. **The contract must not go blind when the move lands.** Moving the leaf
    modules under ``scheduler_app/i18n/`` and adding shim aliases for the old
@@ -45,10 +62,16 @@ Three ways to get this test wrong, all of which were built and measured first
    without a single import changing. ``test_the_shim_map_cannot_launder_a_violation``
    below pins that the resolver is not doing the laundering.
 
-This module imports **no** ``scheduler_app`` code. It parses source with ``ast``.
+This module parses source with ``ast`` and never imports ``scheduler_app`` into
+the test process. The one contract that needs a real import --
+``test_logic_does_not_re_export_the_optimization_bridge``, which has to catch a
+lazy ``__getattr__`` an AST walker cannot see -- runs it in a **subprocess**,
+for the reason recorded there.
 """
 import ast
 import os
+import subprocess
+import sys
 from collections import defaultdict
 
 import pytest
@@ -82,36 +105,53 @@ Now **zero**, and this ceiling is therefore a hard contract: `translations`,
 pre-existing debt, so this must never be raised again.
 """
 
-MAX_DEFERRED_IMPORTS_IN_LOGIC = 13
-"""Function-level imports inside `core/logic.py`. 21 -> 13 in Phase 6.
+MAX_DEFERRED_IMPORTS_IN_LOGIC = 0
+"""Function-level imports inside `core/logic.py`. 21 -> 13 -> 0.
 
-These exist to keep `core` importable at all: `logic` is imported at module
-scope by its partners, so its own side of each edge has to be deferred. The
-register says 20 and cites lines 1129-1455; both are stale.
+These existed to keep `core` importable at all: `logic` is imported at module
+scope by its partners, so its own side of each edge had to be deferred. The
+register says 20 and cites lines 1129-1455; both were stale.
 
-Phase 6 took 21 to 13: two deferrals were measured NOT load-bearing and were
-promoted (`PROTECTION_LOCKED`, `ExplanationEngine` -- neither target imports
-`logic`), and deleting `analyze_conflict_graph` / `analyze_constraint_propagation`
-removed six more. The other 19 measured at the start of the phase genuinely do
-raise ImportError if promoted; each was tested by promoting it in a copy and
-importing `scheduler_app.core.workflow` in a fresh subprocess. Note that
-`python -c "import scheduler_app.core.logic"` is NOT the check -- it succeeds
-for all of them.
+Phase 6 took 21 to 13. Phase 7 took 13 to 0 by moving the eight functions that
+held every one of them into `core/facade.py`. Promoting them where they stood
+was measured and does not work -- 0 of 13 -- and the reason is not the cycle:
+`scheduler_app/__init__.py`'s `_ShimLoader` puts an **empty** alias module into
+`sys.modules` before `exec_module` runs, so a re-entrant
+`from scheduler_app.logic import X` cannot see names the real module has
+already bound, and 15 of `logic`'s 16 importers use that flat name. Note that
+`python -c "import scheduler_app.core.logic"` is NOT the check -- it succeeded
+for all 13 while `workflow`, `ui.app` and the CI smoke list were all broken.
+
+Now zero, and therefore a hard contract: with the facade in place there is no
+legitimate reason for `logic.py` to defer anything, and a new deferral means
+somebody has started re-attaching the engine to the primitives.
 """
 
-MAX_CORE_SCC_SIZE = 15
+MAX_CORE_SCC_SIZE = 0
 """Largest strongly connected component once deferred edges are counted.
 
-15 modules -- nearly all of `core`. The seam that decomposes it is splitting
-`logic.py` into primitives plus a facade holding the `optimized_*` bridges.
+Was 15 -- nearly all of `core`. Splitting `logic.py` into primitives plus
+`core/facade.py`, which holds the `optimized_*` bridges, took it to 2; moving
+two integer constants into `core/constants.py` took it to 0. There is now no
+component of size > 1 anywhere in `scheduler_app`.
+
+Zero, and therefore a hard contract: every remaining edge in the package is a
+dependency a module can declare, so a component appearing here is a new
+regression rather than pre-existing debt. Do not raise this again.
 """
 
-MAX_MUTUAL_IMPORT_PAIRS = 7
-"""Module pairs that import each other (deferred edges counted). 9 -> 7 in Phase 6.
+MAX_MUTUAL_IMPORT_PAIRS = 0
+"""Module pairs that import each other (deferred edges counted). 9 -> 7 -> 0.
 
-`core.logic` is in six of the seven. `schedule_optimizer <-> solver_worker` is
-the one the register never named. Deleting the two dead `analyze_*` bridges
-removed `conflict_graph <-> logic` and `constraint_propagator <-> logic`.
+`core.logic` was in six of the seven, and all six went with the facade split.
+The seventh was the one the register never named: `solver_worker` deferred an
+import of `DEFAULT_MULTI_START_RUNS` / `DEFAULT_LNS_ITERATIONS` out of
+`schedule_optimizer`, which imports `solver_worker` back for `SolveCancelled`.
+Two integers cannot justify a cycle; they live in the leaf `core/constants.py`
+now, and `schedule_optimizer` re-exports them so its own attribute access is
+unchanged. `test_progress_scale_matches_the_optimizers_own_default_budget` in
+`test_solver_worker.py` is what stops the two copies drifting, and it still
+passes -- both sides read the same definition.
 """
 
 
@@ -289,11 +329,12 @@ def test_no_import_cycle_runs_at_import_time():
 def test_the_core_knot_does_not_grow():
     """ST-ARCH-010 — the real shape of the finding, as a ratchet.
 
-    The register calls this "11 module-level cycles". Measured, it is one
+    The register calls this "11 module-level cycles". Measured, it was one
     strongly connected component of 15 modules, visible only once `logic.py`'s
-    deferred imports are counted as the dependencies they are. A failure means
-    a module was pulled into the knot; the fix is the `logic` split, not a
-    bigger number here.
+    deferred imports were counted as the dependencies they are. Phase 7's
+    `logic` / `facade` split took it to 2. A failure means a module was pulled
+    back into the knot; the fix is to move the offending import above the
+    seam, not a bigger number here.
     """
     graph = defaultdict(set)
     nodes = set()
@@ -317,18 +358,100 @@ def test_the_core_knot_does_not_grow():
 
 
 def test_logic_does_not_defer_more_imports():
-    """ST-ARCH-010 — `logic.py`'s deferred imports are the knot's mechanism.
+    """ST-ARCH-010 — `logic.py` must not defer any import. HARD contract.
 
-    Each one is a dependency the module has but cannot declare. A failure means
-    a new one was added, which deepens the coupling the finding is about.
+    Each deferral was a dependency the module had but could not declare, and
+    all 13 of them belonged to the eight bridge functions that now live in
+    `core/facade.py`. With the seam cut there is no legitimate reason for the
+    primitives to defer anything: a new one means somebody has started
+    re-attaching the engine to `logic`, and the SCC will follow.
+
+    This is the contract to read first when the split gets undone by accident,
+    because it names the exact line.
     """
     deferred = [e for e in _edges()
                 if e[0] == "scheduler_app.core.logic" and e[2]]
     assert len(deferred) <= MAX_DEFERRED_IMPORTS_IN_LOGIC, (
-        "core/logic.py now defers %d imports (ceiling %d):\n  %s"
+        "core/logic.py now defers %d imports (ceiling %d):\n  %s\n"
+        "A function-level import here means the module needs something it "
+        "cannot import at module scope, i.e. something that imports `logic` "
+        "back. Put the caller in core/facade.py instead."
         % (len(deferred), MAX_DEFERRED_IMPORTS_IN_LOGIC,
            "\n  ".join(sorted("logic.py:%d -> %s" % (e[3], e[1])
                               for e in deferred))))
+
+
+def test_the_engine_does_not_import_the_facade():
+    """ST-ARCH-010 — the seam only holds while the arrow points one way.
+
+    `core/facade.py` imports the engine (`schedule_optimizer`,
+    `constraint_validator`, `placement_scorer`, ...) at module scope, which it
+    can only do because nothing in the engine imports it back. `core/workflow`
+    is the sole permitted consumer inside the package; the UI reaches it from
+    above, which is downward and fine.
+
+    This is not covered by the SCC count alone: measured, adding
+    `from scheduler_app.core.facade import score_placement` to
+    `core/placement_scorer.py` makes `import scheduler_app.core.workflow`
+    raise ImportError immediately -- a red suite either way, but from here it
+    says *why*.
+    """
+    ALLOWED = {"scheduler_app.core.workflow", "scheduler_app.core.facade"}
+    offenders = [
+        "scheduler_app/%s.py:%d imports the facade"
+        % (a.split("scheduler_app.", 1)[-1].replace(".", "/"), ln)
+        for a, b, _deferred, ln, _shim in _edges()
+        if b == "scheduler_app.core.facade"
+        and _layer(a) == "core" and a not in ALLOWED
+    ]
+    assert not offenders, (
+        "the facade is the top of `core`, not part of it — these imports put "
+        "`logic` back inside the dependency knot and stop "
+        "`import scheduler_app.core.workflow` from working:\n  "
+        + "\n  ".join(sorted(offenders)))
+
+
+def test_logic_does_not_re_export_the_optimization_bridge():
+    """ST-ARCH-010 — the evasion the AST walker cannot see.
+
+    The split only pays if `logic.py` stops handing out the eight bridge
+    names. Keeping them "for compatibility" was built both ways and measured:
+    a `from ...facade import *` turns the cycle into a *module-level* one and
+    `import scheduler_app.core.workflow` raises ImportError; a lazy PEP 562
+    `__getattr__` runs perfectly and puts the component at **16 modules —
+    larger than the 15 the split removed**. The lazy form imports inside a
+    function body of a module the walker sees, so nothing above catches it.
+
+    So this one asks the real interpreter. It runs in a **subprocess** for two
+    reasons: this module must not drag `scheduler_app` into the test process,
+    and a fresh process is the only honest check of an import contract —
+    `sys.modules` in a suite that has already imported half the package can
+    make a broken graph look fine.
+    """
+    BRIDGE = ("optimized_auto_place", "optimized_reschedule_all",
+              "optimized_batch_schedule", "score_placement",
+              "score_placement_explained", "analyze_schedule",
+              "negotiate_after_optimization", "apply_negotiation_suggestion")
+    code = (
+        "import scheduler_app.core.workflow as W\n"
+        "import scheduler_app.core.logic as L\n"
+        "print(','.join(n for n in %r if hasattr(L, n)))\n"
+        "assert callable(W.optimized_batch_schedule)\n" % (BRIDGE,))
+    proc = subprocess.run(
+        [sys.executable, "-c", code], cwd=REPO,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONPATH=REPO))
+    assert proc.returncode == 0, (
+        "`import scheduler_app.core.workflow` failed in a fresh process — the "
+        "layering below is not merely untidy, the app does not start:\n%s"
+        % proc.stderr)
+    leaked = [n for n in proc.stdout.strip().split(",") if n]
+    assert not leaked, (
+        "core/logic.py hands out %s again. Re-exporting the bridge is the one "
+        "change that makes this finding worse rather than better: measured, "
+        "eagerly it breaks every entry path, lazily it takes the component to "
+        "16. Repoint the caller at scheduler_app.core.facade instead."
+        % ", ".join(leaked))
 
 
 def test_the_shim_map_cannot_launder_a_violation():

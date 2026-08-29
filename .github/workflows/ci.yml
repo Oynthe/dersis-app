@@ -7,9 +7,14 @@
 
 name: CI
 
+# ST-SEC-001: `tags` is load-bearing. Without it a tag push ran zero tests
+# while release.yml built and published from that same tag, and the
+# "Verify tag matches VERSION" step below — guarded on refs/tags/v — had never
+# once executed. A tag gate in a workflow tags cannot trigger gates on nothing.
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -188,6 +193,12 @@ jobs:
   # against the production optimizer, including the `slow` presets that the
   # Validate job skips. Separate job so a multi-minute solve never delays the
   # fast feedback. Needs no Qt: core/ and data_io/ import no PyQt6.
+  #
+  # ST-PERF-001: this job used to run tests/test_scheduler_invariants.py and
+  # nothing else, which left 13 of the suite's 19 `slow` tests executing in no
+  # CI job at all — including the solver-quality floors that were written for
+  # exactly this purpose. See the step at the bottom for the module list and
+  # the measured budget.
   engine:
     name: Scheduling invariants
     runs-on: ubuntu-latest
@@ -209,5 +220,53 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Run the invariant oracle (including slow presets)
-        run: pytest tests/test_scheduler_invariants.py
+      # ST-PERF-001 / ST-ARCH-001. Every module here is `slow`-marked in part,
+      # so `pytest -m "not slow"` in the Validate job skips exactly the halves
+      # that matter, and before Phase 7 nothing else collected them:
+      #
+      #   test_scheduler_invariants.py   the hard-constraint oracle (was the
+      #                                  only module this job ran)
+      #   test_greedy_bounds.py          ST-PERF-004's placement floors
+      #                                  (_PLACEMENT_FLOORS: small >= 20,
+      #                                  normal >= 72) and ST-SCHED-001's
+      #                                  repaired_conflicts == 0, at 80 classes
+      #   test_optimizer_determinism.py  ST-SCHED-013's slow reproducibility
+      #                                  pins
+      #   test_solver_work.py            the check_placement work ratchet, the
+      #                                  shipped search budget (one definition,
+      #                                  bounds the whole solve, counts the
+      #                                  restarts it ran), and a NON-strict
+      #                                  xfail on the 80-class configuration
+      #
+      # Budget, measured end to end rather than summed: this exact command runs
+      # 51 passed + 1 xpassed in 496 s on the audit machine, exit 0. (The four
+      # budget tests added after the first measurement cost ~8 s of that; the
+      # earlier 633 s figure was taken on a differently loaded box.)
+      # ubuntu-latest runs this workload 1.87x faster (measured over 11 runs),
+      # so the step should land near 4.5 minutes; the step it replaces ran
+      # 206 s. Against a 25-minute timeout that leaves ~20 minutes spare.
+      #
+      # The 80-class node reports xpassed on a fast runner and xfailed on a slow
+      # one -- measured, both on the same machine within an hour. Its marker is
+      # deliberately NOT strict, so neither outcome fails this step; see the
+      # marker's own reason string for what is asserted unconditionally instead.
+      #
+      # There is exactly one wall-clock assertion in it, and it is deliberate:
+      # test_greedy_bounds.py:552, `assert elapsed <= ceiling`, where the
+      # ceiling is a 5 s budget plus 25 s of grace. Measured three times on the
+      # audit machine under concurrent load: 5.18-5.28 s, a 5.7-5.8x margin, and
+      # the failing direction is one-sided (contention can only make elapsed
+      # larger, and the elapsed time of a bounded search is dominated by the
+      # budget, which does not stretch). Its anti-vacuity floor of 50 search
+      # nodes measured 137-149 on the same loaded runs and 158-159 idle, i.e.
+      # 2.7-3.2x. Everything else in this job gates on counts, and counts
+      # measured 1.000 -- which is the point: runner variance on identical code
+      # is 1.36-1.49x, and no useful *threshold* survives that. Do not add a
+      # second timing gate without a margin measured the same way.
+      - name: Run the invariant oracle and the engine gates (including slow presets)
+        run: |
+          pytest \
+            tests/test_scheduler_invariants.py \
+            tests/test_greedy_bounds.py \
+            tests/test_optimizer_determinism.py \
+            tests/test_solver_work.py

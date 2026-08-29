@@ -8,9 +8,7 @@ for O(1) conflict lookups.
 """
 
 from scheduler_app.logic import (
-    find_slot_index,
-    slot_index, slots_fit, total_duration, get_consecutive_slots,
-    get_placed_classes, classroom_of, _active_targets, targets_overlap,
+    find_slot_index, slot_index, total_duration, _active_targets,
     build_occupancy, occ_claim, occ_release,
 )
 from scheduler_app.translations import tr

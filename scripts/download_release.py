@@ -42,13 +42,25 @@ CHUNK_SIZE = 1 << 16  # 64 KiB
 
 
 def _open(url, accept="application/octet-stream"):
-    """Open *url* with the headers GitHub expects, honouring a token if present."""
+    """Open *url* with the headers GitHub expects, honouring a token if present.
+
+    ``add_unredirected_header``, not ``add_header``: ``browser_download_url``
+    302s to ``release-assets.githubusercontent.com``, a different host, on a URL
+    that already carries its own signed claim. Python's
+    ``HTTPRedirectHandler.redirect_request`` strips only ``content-length`` and
+    ``content-type`` — it does no host comparison and no credential handling — so
+    ``add_header`` forwarded the token to the CDN, measured 3/3 in a two-server
+    harness on 3.12 (and 3.11, which is what the app and every workflow use).
+    Unredirected headers are sent on the original request only, which keeps the
+    5,000 requests/hour API limit and private-repo access while the second hop
+    sees nothing.
+    """
     request = urllib.request.Request(
         url, headers={"User-Agent": USER_AGENT, "Accept": accept}
     )
     token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
     if token:
-        request.add_header("Authorization", "Bearer " + token)
+        request.add_unredirected_header("Authorization", "Bearer " + token)
     return urllib.request.urlopen(request)  # nosec B310 - fixed https GitHub endpoints
 
 
@@ -92,7 +104,7 @@ def pick_asset(release, pattern):
     )
 
 
-def _expected_sha256(asset):
+def _advertised_sha256(asset):
     """Return the lowercase hex SHA-256 the API advertises for *asset*, if any."""
     digest = asset.get("digest") or ""
     if digest.startswith("sha256:"):
@@ -100,11 +112,87 @@ def _expected_sha256(asset):
     return None
 
 
-def download_asset(asset, dest, verify=True):
-    """Stream *asset* to *dest*, verifying its SHA-256 when the API advertises one."""
+def _unreadable_sidecar(name, reason):
+    return (
+        "Cannot verify the download: the release publishes %s, but it could not "
+        "be read (%s).\nNothing was downloaded. Re-run with --no-verify if you "
+        "accept an unverified installer." % (name, reason)
+    )
+
+
+def _sha256_from_sibling(release, asset):
+    """Return the SHA-256 recorded in a published ``<asset>.sha256``.
+
+    The release workflow attaches a GNU-format ``<hash>  <filename>`` sidecar next
+    to every installer. This is *no stronger* than the API's own ``digest`` — same
+    API, same CDN, same trust root — but it is what a human with ``sha256sum``
+    checks, and reading it means a release whose ``digest`` field is empty still
+    verifies instead of refusing.
+
+    ``None`` means the release publishes no such file. A sidecar that *is*
+    published but cannot be read raises instead, because the only other thing to
+    say — "the release publishes no checksum" — would be false and would send
+    the reader hunting for a file that is right there in the release. The
+    ordering of the ``except`` clauses is load-bearing: ``HTTPError`` subclasses
+    ``URLError``, which subclasses ``OSError``, so a bare ``URLError`` handler
+    swallowed 404 and 503 and reported them as "no sidecar".
+    """
+    wanted = (asset.get("name") or "") + ".sha256"
+    for candidate in release.get("assets") or []:
+        if candidate.get("name") != wanted:
+            continue
+        try:
+            with _open(candidate["browser_download_url"]) as response:
+                text = response.read(4096).decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            raise SystemExit(
+                _unreadable_sidecar(wanted, "HTTP %s %s" % (exc.code, exc.reason))
+            )
+        except urllib.error.URLError as exc:
+            raise SystemExit(_unreadable_sidecar(wanted, str(exc.reason)))
+        except OSError as exc:
+            raise SystemExit(_unreadable_sidecar(wanted, str(exc)))
+        for token in text.split():
+            token = token.strip().lower()
+            if len(token) == 64 and all(c in "0123456789abcdef" for c in token):
+                return token
+        raise SystemExit(
+            _unreadable_sidecar(wanted, "it holds no SHA-256 in its first 4096 bytes")
+        )
+    return None
+
+
+def expected_sha256(release, asset):
+    """The SHA-256 to check *asset* against: the API digest, else the sidecar."""
+    return _advertised_sha256(asset) or _sha256_from_sibling(release, asset)
+
+
+def download_asset(asset, dest, verify=True, expected=None):
+    """Stream *asset* to *dest* and verify its SHA-256.
+
+    A release that advertises no digest and publishes no ``.sha256`` is a hard
+    failure, not a note. The shipped version printed one line here and returned
+    the file with exit status 0, which meant the caller could not tell "verified"
+    from "verification quietly did not happen" — the worse of the two, because it
+    looks exactly like success.
+
+    That refusal is decided **before** the transfer. It used to sit past the
+    read loop, so the whole installer — 118,902,541 bytes on the live release —
+    streamed to disk and the progress bar reached 100% before the file was
+    deleted again. Nothing about the decision depends on the bytes.
+    """
     url = asset["browser_download_url"]
     total = int(asset.get("size") or 0)
-    expected = _expected_sha256(asset) if verify else None
+    if verify:
+        if expected is None:
+            expected = _advertised_sha256(asset)
+        if not expected:
+            raise SystemExit(
+                "Cannot verify %s: the release advertises no SHA-256 digest and "
+                "publishes no %s.sha256 alongside it.\nNothing was downloaded. "
+                "Re-run with --no-verify if you accept an unverified installer."
+                % (asset["name"], asset["name"])
+            )
     hasher = hashlib.sha256()
     done = 0
     print("Downloading %s (%s) -> %s" % (asset["name"], _human(total), dest))
@@ -118,21 +206,26 @@ def download_asset(asset, dest, verify=True):
             done += len(chunk)
             _progress(done, total)
     sys.stdout.write("\n")
-    if expected:
-        actual = hasher.hexdigest()
-        if actual != expected:
-            try:
-                os.remove(dest)
-            except OSError:
-                pass
-            raise SystemExit(
-                "SHA-256 mismatch!\n  expected %s\n  actual   %s\n"
-                "The download was deleted; please try again." % (expected, actual)
-            )
-        print("SHA-256 verified: %s" % actual)
-    elif verify:
-        print("Note: release advertised no SHA-256 digest; verification skipped.")
+    if not verify:
+        print("SHA-256 verification skipped (--no-verify).")
+        return dest
+    actual = hasher.hexdigest()
+    if actual != expected:
+        _discard(dest)
+        raise SystemExit(
+            "SHA-256 mismatch!\n  expected %s\n  actual   %s\n"
+            "The download was deleted; please try again." % (expected, actual)
+        )
+    print("SHA-256 verified: %s" % actual)
     return dest
+
+
+def _discard(path):
+    """Remove a download that must not be left looking like a good one."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def _progress(done, total):
@@ -204,7 +297,11 @@ def main(argv=None):
         return 0
 
     print("Latest release: %s  (tag %s)" % (release.get("name") or tag, tag))
-    dest = download_asset(asset, args.output or asset["name"], verify=not args.no_verify)
+    verify = not args.no_verify
+    expected = expected_sha256(release, asset) if verify else None
+    dest = download_asset(
+        asset, args.output or asset["name"], verify=verify, expected=expected
+    )
     print("Done: %s" % os.path.abspath(dest))
     return 0
 

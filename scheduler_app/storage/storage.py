@@ -630,13 +630,49 @@ def load_encrypted_lines_since(path: str, skip: int) -> list:
 _OLD_DATA_DIR = os.path.join(os.path.expanduser("~"), ".class_scheduler")
 
 
+def _app_dir() -> str:
+    """The directory DERSİS was installed into — where ``scheduler_gui.py`` sits.
+
+    ST-ARCH-001 item 6. This used to resolve to ``os.path.dirname(__file__)``,
+    which is ``{app}/scheduler_app/storage`` — two levels below the "app
+    directory" the caller's docstring names, and a place the pre-Dersis
+    ``scheduler_config.json`` can never be. Measured: with the legacy payload
+    written beside ``scheduler_gui.py``, ``migrate_legacy_files()`` returned
+    ``[]`` and wrote no settings.
+
+    ``sys.executable`` is not the anchor either on the build the installer
+    ships: ``build_embed.bat`` compiles ``Dersis.exe`` as a C# wrapper that runs
+    ``{app}\\python\\pythonw.exe {app}\\scheduler_gui.py``, so ``sys.frozen`` is
+    never set and ``dirname(sys.executable)`` is ``{app}\\python``. The package
+    root is what tracks the app directory in every layout this project ships:
+    this module is always ``{app}/scheduler_app/storage/storage.py``.
+
+    The ``sys.frozen`` branch is kept for a PyInstaller-style bundle, where the
+    package is unpacked into a temporary ``_MEIPASS`` and the executable's own
+    directory is the only meaningful anchor.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
 def _old_app_config_path() -> str:
     """Legacy config location: scheduler_config.json in the app directory."""
-    if getattr(sys, "frozen", False):
-        app_dir = os.path.dirname(sys.executable)
-    else:
-        app_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(app_dir, "scheduler_config.json")
+    return os.path.join(_app_dir(), "scheduler_config.json")
+
+
+def _old_app_config_candidates() -> list[str]:
+    """Both documented homes of the pre-Dersis ``scheduler_config.json``.
+
+    The app directory is what this module has always claimed;
+    ``~/.class_scheduler`` is what
+    ``dersis-mapped/09_SETTINGS_LOCALIZATION_AND_PERSISTENCE_MAP.md`` documents
+    and where the other four legacy files live. Nobody now has a build that can
+    say which one the pre-Dersis release really used, so both are checked. The
+    basename is fixed, so neither candidate can pick up anything else.
+    """
+    return [_old_app_config_path(),
+            os.path.join(_OLD_DATA_DIR, "scheduler_config.json")]
 
 
 def _backup_original(src: str) -> None:
@@ -649,6 +685,28 @@ def _backup_original(src: str) -> None:
         ts = datetime.now().strftime("%Y%m%d%H%M%S")
         dst = os.path.join(sub_dir(BACKUPS_DIR), f"{base}_{ts}{ext}")
     shutil.move(src, dst)
+
+
+def _try_backup_original(src: str) -> bool:
+    """``_backup_original`` that reports failure instead of raising.
+
+    ``migrate_legacy_files()`` runs before any window exists — from
+    ``scheduler_gui.main()`` and again from ``SchedulerApp.__init__`` — and both
+    callers assume it returns. The one call that used to sit outside a migrator's
+    ``try`` was the ``_backup_original`` in the destination-already-exists
+    branch; measured with an ``msvcrt.locking`` byte-lock held on a legacy
+    ``learned_weights.json``, that raised ``PermissionError [WinError 33]``
+    straight out of ``main()``, so the user got a crash box and no window.
+
+    Nothing is discarded when this returns ``False``: ``shutil.move`` either
+    moves the file or leaves it exactly where it was (ST-DATA-001). The legacy
+    file stays put, the next launch retries, and the app starts either way.
+    """
+    try:
+        _backup_original(src)
+        return True
+    except Exception:
+        return False
 
 
 def quarantine_corrupt(src: str) -> str:
@@ -675,7 +733,7 @@ def _migrate_json_file(src: str, dest_sav: str) -> bool:
     if not os.path.exists(src):
         return False
     if os.path.exists(dest_sav):
-        _backup_original(src)
+        _try_backup_original(src)
         return False
     try:
         with open(src, "r", encoding="utf-8") as f:
@@ -692,7 +750,7 @@ def _migrate_jsonl_file(src: str, dest_sav: str) -> bool:
     if not os.path.exists(src):
         return False
     if os.path.exists(dest_sav):
-        _backup_original(src)
+        _try_backup_original(src)
         return False
     try:
         entries = []
@@ -716,9 +774,11 @@ def migrate_legacy_files() -> list:
     notes = []
 
     # 1. scheduler_config.json → settings/app_settings.egu
-    old_cfg = _old_app_config_path()
-    if _migrate_json_file(old_cfg, settings_path()):
-        notes.append(f"Migrated {os.path.basename(old_cfg)} → settings/app_settings.egu")
+    for old_cfg in _old_app_config_candidates():
+        if _migrate_json_file(old_cfg, settings_path()):
+            notes.append(
+                f"Migrated {os.path.basename(old_cfg)} → settings/app_settings.egu")
+            break
 
     # 2. ~/.class_scheduler/learned_weights.json → learning/learned_weights.egu
     old_weights = os.path.join(_OLD_DATA_DIR, "learned_weights.json")

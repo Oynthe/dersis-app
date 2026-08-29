@@ -9,13 +9,13 @@ Provides:
 import platform
 
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QLabel, QLineEdit, QPushButton, QComboBox,
-    QTextEdit, QWidget, QSizePolicy, QMessageBox, QApplication,
+    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
+    QPushButton, QComboBox, QTextEdit, QMessageBox, QApplication,
 )
 from PyQt6.QtCore import Qt, QUrl, QUrlQuery
 from PyQt6.QtGui import QColor, QPainter, QPen, QCursor, QDesktopServices
 
+from scheduler_app.core.text_safety import redact_user_paths
 from scheduler_app.translations import tr
 from scheduler_app._version import __version__ as APP_VERSION
 
@@ -158,17 +158,55 @@ def _make_subheading(text):
     return lbl
 
 
+def _percent_encoded(text):
+    r"""Encode *text* for a ``QUrlQuery`` value.
+
+    ``QUrlQuery.addQueryItem`` documents its value as **already** percent-
+    encoded, and DERSİS was handing it the reporter's raw prose. Turkish writes
+    every percentage as ``%50``, so the reporter's own sentence routinely
+    contains a percent sign followed by two characters that read as hex — and
+    Qt decoded them. Measured on the real dialog with the language set to
+    ``tr``:
+
+        'Ders yuku %20 artinca…'   -> 'Ders yuku   artinca…'
+        'Doluluk %50 iken…'        -> 'Doluluk P iken…'
+        'Basari orani %85…'        -> a byte that is not valid UTF-8
+
+    The damage happened inside ``addQueryItem``, before the URL was handed to
+    the mail client, so nothing downstream could undo it. The clipboard
+    fallback below writes the unencoded ``body`` and was always faithful, which
+    is how the same click could deliver two different reports.
+
+    Qt's own encoder rather than ``urllib.parse.quote``: ``urllib`` is on the
+    egress blacklist ``tests/test_offline_guarantee.py`` enforces over the whole
+    package, and importing it here would trade a corrupted bug report for a
+    broken offline guarantee. ``toPercentEncoding`` leaves only the unreserved
+    set alone, so ``&`` and ``=`` (which would split the value) and ``+``
+    (which half the mailto handlers in the wild read as a space) all go too.
+    """
+    return QUrl.toPercentEncoding(str(text)).data().decode("ascii")
+
+
 def _open_mailto(subject, body, parent=None):
     """Open the user's default email client with a prefilled message.
 
     Returns True if a mail client was launched. If none is available, the
     body is copied to the clipboard and a friendly dialog tells the user
     which address to write to. Nothing is sent automatically.
+
+    ST-SEC-008: this is the **only** function in DERSİS that puts text on a
+    path off the machine, so it is the only place the account name has to be
+    removed. One call covers both dialogs, the ``mailto:`` URL, and the
+    clipboard fallback below. The crash log on disk and the ``log_path`` the
+    crash dialog displays are deliberately left raw — they never leave the
+    machine, and they are the only unredacted copy a local maintainer has.
     """
+    body = redact_user_paths(body)
+
     url = QUrl(f"mailto:{BUG_REPORT_EMAIL}")
     query = QUrlQuery()
-    query.addQueryItem("subject", subject)
-    query.addQueryItem("body", body)
+    query.addQueryItem("subject", _percent_encoded(subject))
+    query.addQueryItem("body", _percent_encoded(body))
     url.setQuery(query)
 
     if QDesktopServices.openUrl(url):
@@ -181,10 +219,8 @@ def _open_mailto(subject, body, parent=None):
         pass
     QMessageBox.information(
         parent,
-        BUG_REPORT_SUBJECT,
-        "Could not open your email app automatically.\n\n"
-        f"Please email your report to:\n{BUG_REPORT_EMAIL}\n\n"
-        "The report text has been copied to your clipboard.",
+        tr('bug_report.title'),
+        tr('bug_report.no_mail_client', email=BUG_REPORT_EMAIL),
     )
     return False
 
