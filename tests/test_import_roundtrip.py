@@ -788,6 +788,8 @@ def test_lecturer_names_differing_only_in_case_are_not_silently_split(tmp_path):
     ("AYŞE YILMAZ", "Ayşe Yılmaz"),
     ("DILEK KAYA", "Dilek Kaya"),
     ("IRIS MURDOCH", "Iris Murdoch"),
+    ("İLHAN DEMİR", "Ilhan Demir"),
+    ("WILLIAM SMITH", "William Smith"),
 ])
 def test_the_importer_and_the_class_form_agree_on_what_counts_as_one_teacher(
         tmp_path, first, second):
@@ -801,17 +803,29 @@ def test_the_importer_and_the_class_form_agree_on_what_counts_as_one_teacher(
     than asserting either verdict, so it stays true whichever way the rule is
     later sharpened — and goes red the moment only one side is sharpened.
 
-    That is not hypothetical. ``casefold()`` misses the Turkish dotted/dotless
-    I, so ``AYŞE YILMAZ`` and ``Ayşe Yılmaz`` are two teachers on both sides
-    today. Making just the importer Turkish-aware was proposed and measured
-    here: a Turkish fold merges that pair, and also *splits* ``DILEK KAYA`` from
-    ``Dilek Kaya`` and ``IRIS MURDOCH`` from ``Iris Murdoch``, which are one
-    person on both sides today — an ASCII ``I`` folds to ``ı``. So the fold is
-    not a strict improvement, it is a different set of mistakes, and a
-    locale-dependent fold would make one roster merge or split according to a
-    UI setting. Closing it means changing both sides together, with a rule that
-    handles all four rows; the register entry is "name-keyed lecturer identity
-    has no canonical form".
+    That was not hypothetical, and it is now closed. ``casefold()`` misses the
+    Turkish dotted/dotless I, so ``AYŞE YILMAZ`` and ``Ayşe Yılmaz`` used to be
+    two teachers on both sides. Making just the importer *Turkish*-aware was
+    proposed and measured here: a Turkish fold merges that pair, and also
+    *splits* ``DILEK KAYA`` from ``Dilek Kaya`` and ``IRIS MURDOCH`` from
+    ``Iris Murdoch``, which were already one person on both sides — an ASCII
+    ``I`` folds to ``ı``. So that fold was not a strict improvement, it was a
+    different set of mistakes, and a locale-dependent fold would make one
+    roster merge or split according to a UI setting.
+
+    ``scheduler_app.i18n.text_fold.fold_text`` is the rule this docstring asked
+    for. It sends every dotted and dotless I to a plain ASCII ``i`` and changes
+    nothing else, so it handles all four original rows plus the two added
+    since: ``İLHAN DEMİR``/``Ilhan Demir``, which the old fold split, and
+    ``WILLIAM SMITH``/``William Smith``, which the *Turkish* fold would have
+    split. Both sides now call that one function — ``core/workflow.py`` and
+    ``data_io/importer.py`` — so the divergence this test watches for can no
+    longer be introduced one side at a time by accident; see
+    ``tests/test_text_fold.py``
+    ``test_one_fold_serves_the_day_keys_the_class_form_and_the_importer``.
+
+    This still asserts AGREEMENT rather than either verdict, so it remains an
+    honest anti-divergence guard whichever way the rule is later sharpened.
     """
     from scheduler_app.core.workflow import SchedulingWorkflow
 
@@ -835,6 +849,79 @@ def test_the_importer_and_the_class_form_agree_on_what_counts_as_one_teacher(
         f"{second!r}: class form says one teacher = {class_form_says_one}, "
         f"importer says one teacher = {importer_says_one} "
         f"(lecturers={lecturers}, report={messages(ds.report)})")
+
+
+def test_the_dotted_and_dotless_i_do_not_split_one_teacher():
+    """Pins ST-FUNC-012 / ST-UI-020 — one teacher, not two.
+
+    ``register_lecturer``'s own docstring has always promised that typing a
+    name in a different casing does not create a second teacher. Measured
+    before the fix, that promise was false for any Turkish name containing an
+    I: with ``İlhan Demir`` already on the roster, typing ``ilhan demir`` into
+    ``AddClassDialog``'s editable lecturer combo appended a SECOND entry.
+
+    What that costs the user, all of it silent: lecturer availability is keyed
+    on ``state['lecturer_availability']`` by the FIRST spelling, so the new
+    teacher has no unavailable hours and the optimizer will happily schedule
+    them at 08:00 on a day they told the app they cannot teach. The class is
+    still drawn and still counted, so nothing looks wrong until a timetable
+    goes out with a clash in it.
+
+    A hard assertion on the returned spelling, not a disjunction: the existing
+    spelling must win, because it is the one the availability record is keyed
+    on.
+    """
+    from scheduler_app.core.workflow import SchedulingWorkflow
+
+    probe = {"lecturers": ["İlhan Demir"]}
+
+    assert SchedulingWorkflow.register_lecturer(probe, "ilhan demir") == \
+        "İlhan Demir"
+    assert probe["lecturers"] == ["İlhan Demir"], (
+        "typing an existing teacher's name in another casing created a second "
+        "teacher; their availability record is keyed on the first spelling and "
+        "will never apply")
+
+    # The other three casings a user or an Excel UPPER() produces.
+    for typed in ("Ilhan Demir", "ILHAN DEMIR", "İLHAN DEMİR"):
+        assert SchedulingWorkflow.register_lecturer(probe, typed) == "İlhan Demir"
+    assert probe["lecturers"] == ["İlhan Demir"]
+
+
+@pytest.mark.parametrize("label", [
+    # Plain ASCII str.upper() of the shipped labels — what Excel's UPPER() on
+    # an English-locale machine produces, and the four that measurably failed.
+    "ÖĞRETIM ELEMANI",      # tr  labels.lecturer          'Öğretim Elemanı'
+    "ÖĞRETMEN ADI",         # tr  import.columns...        'Öğretmen Adı'
+    "ÖĞRETIM ELEMANLARI",   # tr  setup.lecturers          'Öğretim Elemanları'
+    "MÜƏLLIM ADI",          # az  import.columns...        'Müəllim Adı'
+    # And the Turkish-keyboard uppercase of the same label, dotted İ and all.
+    "ÖĞRETİM ELEMANI",
+])
+@pytest.mark.parametrize("running_language", ["tr", "en"])
+def test_a_turkish_roster_header_typed_in_capitals_still_names_the_roster(
+        label, running_language, ui_language):
+    """Pins ST-FUNC-011's guard against its own false negatives.
+
+    ``is_lecturer_name_header`` exists so that Setup ▸ Lecturers ▸ Import Excel
+    can tell a roster from a budget spreadsheet — before it, a sheet of
+    ``Kalem``/``Tutar`` line items reported three lecturers imported and put
+    them in the staff list. The guard folded headers with ``casefold()``, which
+    means it answered False for a genuine Turkish roster whose header row is
+    capitalised: measured, four real header labels were rejected. The guard
+    added to keep budgets out was keeping real Turkish rosters out too, and the
+    user is told only that no lecturers were found.
+
+    Asserted under both a Turkish and an English UI because the function scans
+    every shipped catalogue on purpose — a roster exported before a language
+    change must still import after it — so its answer must not depend on the
+    language the app happens to be running in.
+    """
+    ui_language(running_language)
+    assert schema.is_lecturer_name_header(label), (
+        f"{label!r} was not recognised as a staff-name header while the app "
+        f"was running in {running_language!r}; a real Turkish roster with a "
+        f"capitalised header row is rejected as if it were a budget sheet")
 
 
 # ── Known-defect pins (later phases) ────────────────────────────────────────

@@ -25,6 +25,11 @@ from scheduler_app.models import (
 # — neither checks grid membership or lecturer availability — and every
 # decision in this module now goes through ConstraintValidator instead.
 from scheduler_app.logic import find_slot_index, slots_fit, total_duration
+# The one case-folding rule; `data_io/importer.py::_process_teachers` imports
+# the same function so the two "is this the same teacher?" matchers cannot
+# drift apart. It lives in the i18n leaf because that is the only package both
+# `core` and `data_io` may import -- see tests/test_import_layering.py.
+from scheduler_app.i18n.text_fold import fold_text
 # ST-ARCH-010: the `optimized_*` entry points moved out of `logic.py` into
 # `core/facade.py` so that `logic` could stop importing the engine from inside
 # function bodies. This module is the only one under `core` allowed to import
@@ -939,9 +944,14 @@ class SchedulingWorkflow:
           the teacher's unavailable hours never applied;
         * the class was still counted and drawn, so nothing looked wrong.
 
-        Matching is casefold-based so "ayşe yılmaz" does not become a second
-        teacher beside "Ayşe Yılmaz"; the FIRST spelling wins and is returned,
-        because the existing one is the one availability records are keyed on.
+        Matching goes through ``scheduler_app.i18n.text_fold.fold_text`` so that
+        "ayşe yılmaz" does not become a second teacher beside "Ayşe Yılmaz" --
+        and neither does "ilhan demir" beside "İlhan Demir", which the bare
+        ``casefold()`` this used to call DID split, measured on this tree.
+        ``_process_teachers`` in the importer folds with the same function, so
+        the two sides cannot drift apart. The FIRST spelling wins and is
+        returned, because the existing one is the one availability records are
+        keyed on.
         Returns ``None`` for a blank name, which ``new_class()`` ships as the
         default and the core reads as "no lecturer constraint".
         """
@@ -949,9 +959,9 @@ class SchedulingWorkflow:
         if not clean:
             return None
         existing = state.setdefault("lecturers", [])
-        folded = clean.casefold()
+        folded = fold_text(clean)
         for known in existing:
-            if (known or "").strip().casefold() == folded:
+            if fold_text((known or "").strip()) == folded:
                 return known
         existing.append(clean)
         return clean
