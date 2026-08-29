@@ -3319,7 +3319,8 @@ class SchedulerApp(QMainWindow):
                     # user had placed -- the same silent drop the PDF had, in
                     # the file that gets emailed. A flat file has room for it.
                     si = find_slot_index(self.state_data, start)
-                    for t in c["targets"] or [{"year": "", "branch": ""}]:
+                    for t_idx, t in enumerate(
+                            c["targets"] or [{"year": "", "branch": ""}]):
                         # A non-joint lesson gives each group its own
                         # consecutive block ("If unchecked, each group gets its
                         # own consecutive time block"), and the dialog writes
@@ -3331,11 +3332,12 @@ class SchedulerApp(QMainWindow):
                         # says 1, so without the offset it states group B's
                         # session at group A's hour.
                         #
-                        # `.index(t)` rather than enumerate, deliberately: the
-                        # other three surfaces index the same way (see the
-                        # consistency note at renderer.py:1477), so duplicate
-                        # targets resolve identically here and on screen.
-                        t_idx = c["targets"].index(t) if c["targets"] else 0
+                        # `enumerate`, not `.index(t)` — ST-UI-016, fourth of
+                        # four sites; the reasoning is at the same construct in
+                        # ui/renderer.py. The `or [{...}]` fallback above is
+                        # what the old `if c["targets"] else 0` guard was for,
+                        # and it already covers the empty case, so the ternary
+                        # went with the `.index` call.
                         row_start = start
                         off = slot_offset_for_target(c, t_idx)
                         if si is not None and si + off < len(self.state_data["slots"]):

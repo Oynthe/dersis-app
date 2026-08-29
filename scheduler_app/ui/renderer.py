@@ -263,19 +263,31 @@ class RendererAdapter:
             start_si = slots.index(c_start)
             dur = c["duration"]
 
-            # Deliberately still `targets.index(t)`, not `enumerate`. `.index`
-            # compares dicts by ==, so a non-joint class carrying two identical
-            # target dicts resolves both to 0 and draws both sub-blocks at the
-            # same offset. `enumerate` would move the second — but the same
-            # `.index(t)` line lives in the PDF everything table
-            # (exporter.py) and the XLSX everything matrix (app.py), so
-            # changing it here alone would make the screen disagree with both
-            # exports for that class. Three surfaces, three answers is the
-            # failure this whole task is about. Fix all three together or none.
-            for t in c["targets"]:
+            # `enumerate`, not `targets.index(t)`. ST-UI-016, and the comment
+            # that used to stand here was wrong about its own subject: it said
+            # the four `.index` sites were deliberately uniform so that
+            # "duplicate targets resolve identically here and on screen", and
+            # that changing one alone would make the surfaces disagree.
+            #
+            # Measured, the surfaces ALREADY disagreed, because each collapses
+            # the duplicated claim differently: the screen laned the two
+            # zero-offset blocks side by side inside one cell, the XLSX
+            # de-duplicated by class identity and printed the lesson once, and
+            # the PDF de-duplicated by entry identity, found two entries in one
+            # cell and printed the stacked "conflict" paragraph — the same
+            # lesson twice, separated by a red rule, in grey instead of the
+            # year colour. Uniform `.index` bought nothing it claimed to buy.
+            #
+            # De-duplicating `targets` at the input was the other candidate and
+            # is wrong: two identical non-joint targets mean two consecutive
+            # sessions for one group, which is exactly what two DISTINCT
+            # targets mean for two groups, and `enumerate` renders both the
+            # same way. De-duplication would silently delete the user's second
+            # session. All four sites moved together
+            # (renderer, both exporter tables, the live CSV in ui/app.py).
+            for t_idx, t in enumerate(c["targets"]):
                 if t["year"] != year or t["branch"] not in branches:
                     continue
-                t_idx = c["targets"].index(t)
                 b_idx = branches.index(t["branch"])
                 actual_start = start_si + slot_offset_for_target(c, t_idx)
                 if actual_start >= len(slots):
