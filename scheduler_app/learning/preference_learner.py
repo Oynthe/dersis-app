@@ -13,6 +13,7 @@ Uses a simple online gradient approach: for each preference signal
 score(A) < score(B) (since lower is better).
 """
 
+import hashlib
 import os
 
 from scheduler_app.placement_scorer import DEFAULT_WEIGHTS
@@ -31,6 +32,23 @@ class PreferenceLearner:
     LEARNING_RATE = 0.05
     MOMENTUM = 0.9
     MIN_ENTRIES_TO_LEARN = 5
+    # Bytes per window of the cheap "did the log change underneath us?" check in
+    # _span_fingerprint. THREE windows — start, middle, end — so the check costs
+    # the same on a 2 000-record log as on a 10-record one. Hashing the whole
+    # consumed span instead was measured against
+    # tests/test_feedback_log_scaling.py::
+    # test_repeat_learn_cost_does_not_grow_with_log_size, which allows an idle
+    # pass over an 8x log to read 2x as much: a full-prefix hash reads 8x
+    # (70 288 B against 561 688 B on that test's own fixtures) and fails it
+    # outright, because a whole-prefix hash IS an O(n) read of the history.
+    # 24 576 B here, at either size.
+    #
+    # Measured 2026-08-29 on .venv-audit, best of 7: an idle learn() went from
+    # 0.017 ms to 0.068 ms, and — the number that matters — it is 0.068 ms on a
+    # 100-record log AND on a 2 000-record one. A full-prefix SHA-256 alone
+    # costs 0.133 ms at 100 records and 0.678 ms at 2 000, i.e. it puts the
+    # growth back.
+    _FINGERPRINT_WINDOW = 8192
 
     def __init__(self, data_dir=None):
         if data_dir is None:
@@ -52,6 +70,15 @@ class PreferenceLearner:
         # SchedulerApp._flush_startup_settings_report, which is what turns it
         # into something the user sees.
         self.last_read_lost = 0
+        # ``(size, fingerprint)`` of the log as of the last integrity read, or
+        # None when no integrity read has happened in THIS process.
+        # Deliberately NOT persisted next to the weights, unlike _learned_size:
+        # None on construction is exactly what forces one full integrity read
+        # per launch, and the launch pass is the only one whose verdict anybody
+        # reads (SchedulerApp._flush_startup_settings_report, once, at startup).
+        # Persisting it would make a corruption that arrived while DERSİS was
+        # closed survive unlooked-at forever, which is the B8 defect again.
+        self._checked_span = None
 
         self._load_weights()
 
@@ -63,6 +90,138 @@ class PreferenceLearner:
                 # Ensure weights don't go negative
                 weights[key] = max(0.01, weights[key] + delta)
         return weights
+
+    def _span_fingerprint(self, span):
+        """A cheap identity for the first *span* bytes of the feedback log.
+
+        SHA-256 over three bounded windows — start, middle, end — plus *span*
+        itself, so that a change of length and a change of content are both
+        visible and neither costs more on a long history than on a short one.
+        Returns None when the bytes cannot be read, which the caller treats as
+        "assume it changed" rather than as "unchanged".
+
+        Sampling instead of hashing the whole span is a conscious trade, and the
+        residue is this: a single flipped bit landing outside the three windows
+        of a log bigger than 3 * _FINGERPRINT_WINDOW is invisible to THIS check
+        for the rest of the session. It is not invisible to the user — the next
+        launch reads the whole log through _check_log_health() — so what the
+        trade costs is latency in the report, not silence. The alternative,
+        hashing the consumed prefix in full, is an O(n) read on every manual
+        move; see _FINGERPRINT_WINDOW for the number that rules it out.
+
+        No AES-GCM here on purpose: this runs on the hot path and must not
+        decrypt anything. It answers "did these bytes move?", not "are they
+        still readable?" — that second question is _check_log_health()'s, and it
+        is the expensive one.
+        """
+        if span <= 0:
+            return "empty"
+        window = self._FINGERPRINT_WINDOW
+        # A set, then sorted: on a log shorter than 3 windows these collapse to
+        # one offset and the whole file is hashed, which is the common case for
+        # a real user's feedback log and strictly the strongest answer.
+        offsets = sorted({0, max(0, (span - window) // 2), max(0, span - window)})
+        digest = hashlib.sha256()
+        digest.update(str(span).encode("ascii"))
+        try:
+            with open(self.feedback_logger.log_file, "rb") as handle:
+                for off in offsets:
+                    handle.seek(off)
+                    digest.update(handle.read(min(window, span - off)))
+        except OSError:
+            return None
+        return digest.hexdigest()
+
+    def _anchor_span(self, size):
+        """Remember the log's identity at *size* bytes — or forget it entirely.
+
+        A fingerprint that could not be computed is stored as None rather than
+        as a value, so the next call re-reads instead of trusting a comparison
+        between two failures.
+        """
+        digest = self._span_fingerprint(size)
+        self._checked_span = None if digest is None else (size, digest)
+
+    def _check_log_health(self, size):
+        """Set ``last_read_lost`` from the LOG, not from the learning gates.
+
+        ST-DATA-002 / B7-B9. ``last_read_lost`` used to be written in exactly
+        one place — *after* the three gates in learn() — so whether a person was
+        told their feedback history had stopped being readable depended on
+        whether a learning pass happened to be worth running. Measured
+        2026-08-29 over the six log shapes storage reports damage for, exactly
+        one reached the user:
+
+          * fewer than MIN_ENTRIES_TO_LEARN records: died on the count gate,
+            which returns before any read. The user with the shortest history is
+            the one told nothing about losing it (4 records, lost=4, reported 0);
+          * damaged in place after a full pass: died on the size fast-path — a
+            flipped ciphertext bit changes no length, so os.path.getsize is
+            byte-for-byte a fingerprint that cannot see it (8 records, lost=8,
+            reported 0), permanently, across every relaunch;
+          * the two shapes where LogRead.lost is -1 — the whole file
+            unidentifiable as a log, the strongest statement the format can make
+            — died on BOTH gates, because the same unreadability that sets -1
+            makes log_entry_count() return 0 and 0 < 5.
+
+        This reads the whole log and therefore decrypts it. Payload damage is
+        only visible at decrypt time: a framing-only walk over _walk_log_frames
+        reports lost == 0 for a flipped ciphertext bit, which is precisely the
+        commonest shape. That decrypt is the ST-PERF-005 cost (27.8 ms on a
+        2 000-record log), so it is spent only when something has actually
+        moved:
+
+          * once per process — the pass whose verdict the UI reads;
+          * whenever the bounded fingerprint of the already-checked span
+            changes, which is what an in-place bit flip looks like and what no
+            length comparison can see;
+          * NEVER on a plain append, which leaves that span byte-identical.
+            learn() runs after every manual move and every manual move appends,
+            so this is the case that decides whether the fix costs anything: it
+            costs one 24 KB re-hash. The appended records are covered by the
+            incremental read in learn(), which reports its own loss.
+
+        Residue, stated so it is not mistaken for coverage: bytes appended in a
+        shape that yields no new countable frame — a half-written record — leave
+        log_entry_count() unmoved, so learn() returns at ``_learned_through >=
+        total`` and no incremental read looks at them either. That damage waits
+        for the next launch's full read. It is bounded silence, not permanent
+        silence, which is the whole difference from what this replaced.
+
+        What that comes to, measured 2026-08-29 on .venv-audit, best of 7:
+
+          * manual move (append + learn) on a 2 000-record log: 17.8 ms against
+            16.6 ms before — inside the noise of the append's own fsync, which
+            dominates both;
+          * idle learn(): 0.068 ms against 0.017 ms, and flat in log size;
+          * relaunch over a caught-up log — the one case that really costs
+            something, because the size fast-path used to answer it for free:
+            0.27 ms at 10 records, 1.06 ms at 100, 4.51 ms at 500, 18.3 ms at
+            2 000 (1.2 MB), against 0.02-0.03 ms before. ONCE PER LAUNCH. The
+            cost ST-PERF-005 removed was 27.8 ms per manual move on the same
+            log; this is not that cost back, and it is what buys the report.
+
+        Returns the LogRead when it read, None when it did not.
+        """
+        checked = self._checked_span
+        if checked is not None:
+            prev_size, prev_digest = checked
+            digest = self._span_fingerprint(prev_size)
+            if digest is not None and size >= prev_size and digest == prev_digest:
+                if size != prev_size:
+                    # Grew, with everything already vouched for untouched:
+                    # re-anchor on the longer span so the next call is not left
+                    # comparing only the stale prefix.
+                    self._anchor_span(size)
+                return None
+        report = storage.load_encrypted_lines_report(self.feedback_logger.log_file)
+        # Assigned on every read, including a clean one, so a REPAIRED log stops
+        # reporting. That is why the fingerprint gate above must not be allowed
+        # to swallow a shrink: `size >= prev_size` is what sends a truncation
+        # here rather than treating it as an append.
+        self.last_read_lost = report.lost
+        self._anchor_span(size)
+        return report
 
     def learn(self):
         """Learn from feedback not already learned from.
@@ -81,10 +240,24 @@ class PreferenceLearner:
         Returns:
             Number of signals processed.
         """
+        size = self.feedback_logger.log_size()
+
+        # ST-DATA-002: ABOVE the three gates, and that placement is the whole
+        # fix. Whether a person is told their history stopped being readable is
+        # a property of the LOG; every gate below is a property of whether a
+        # learning pass is worth running, and all three return before anything
+        # is read. Relaxing them instead does not work: MIN_ENTRIES_TO_LEARN
+        # would still leave the two `lost == -1` shapes silent (they die on
+        # log_entry_count() == 0, upstream of every gate), and deleting the size
+        # fast-path alone leaves `_learned_through >= total` to return first on
+        # a caught-up log — measured, all three B8 tests still red.
+        health = self._check_log_health(size)
+
         # The cheapest possible gate first: if the log has not grown by a
         # single byte since the last pass, there is provably nothing new, and
         # this costs one stat call rather than a walk over the whole history.
-        size = self.feedback_logger.log_size()
+        # It is now a gate on LEARNING only — the integrity verdict above has
+        # already been taken, so returning here is no longer silence.
         if size and size == self._learned_size:
             return 0
 
@@ -96,13 +269,25 @@ class PreferenceLearner:
         if self._learned_through >= total:
             return 0  # nothing new; costs one stat call, no decryption
 
-        entries, lost = self.feedback_logger.get_entries_since_report(
-            self._learned_through)
-        # Reset on every pass that actually reads, so a repaired log stops
-        # reporting. The size fast-path above returns before this and leaves
-        # the previous value standing, which is what the UI wants: it reads
-        # this once at startup, after the first real read.
-        self.last_read_lost = lost
+        if health is not None and self._learned_through == 0:
+            # The health read above IS this read: load_encrypted_lines_since_report
+            # delegates to load_encrypted_lines_report for skip <= 0, on the same
+            # file, microseconds earlier. Doing it twice would double the O(n)
+            # AES-GCM cost of a first launch over a long history to buy nothing.
+            entries, lost = health
+        else:
+            entries, lost = self.feedback_logger.get_entries_since_report(
+                self._learned_through)
+        # RAISES the verdict, never lowers it — the assignment here used to be
+        # unconditional and that is now wrong, because this read decrypts only
+        # the frames at or after the cursor (storage.py:914) and so cannot see
+        # damage BEHIND it. One clean append past a damaged prefix would
+        # otherwise reset a verdict _check_log_health took from a read of the
+        # whole file. Clearing it is that method's job alone: it is the only
+        # read that looks at everything, which is what makes it the only one
+        # entitled to say a repaired log is healthy again.
+        if lost:
+            self.last_read_lost = lost
         if not entries:
             if lost:
                 # ST-DATA-002: the records are unreadable, not absent. The old
@@ -128,12 +313,25 @@ class PreferenceLearner:
                 # backup, OneDrive history, or a keys/ directory that did not
                 # travel with a copied Dersis folder.
                 #
-                # Open, and deliberately not closed by re-reading from 0, which
-                # is the O(n) cost ST-PERF-005 removed. Detecting a restore
-                # needs a fingerprint of the skipped BYTES (a hash of the span
-                # -- cheap, since it needs no AES-GCM decrypt). A fingerprint
-                # over their LENGTH does not work: the measurement above is the
-                # counterexample.
+                # Still open, and deliberately so. The fingerprint this comment
+                # asked for now exists -- _span_fingerprint, a hash of the
+                # skipped bytes and not of their length -- and a restore does
+                # change it, so _check_log_health() above notices and the user
+                # is told the log reads clean again (last_read_lost drops back
+                # to 0). What it deliberately does NOT do is rewind the cursor
+                # to re-learn the restored records.
+                #
+                # That is a decision, not an omission. Reporting and training
+                # are different jobs. Rewinding would re-apply every surviving
+                # record's signal a second time and tick train_count for
+                # feedback the user gave once, which is exactly the defect
+                # tests/test_feedback_log_scaling.py::
+                # test_repeat_learn_does_not_move_weights_it_already_applied
+                # pins -- a corrupted view of the user's preferences bought in
+                # exchange for a warning. Re-learning a restored log needs a
+                # cursor that can distinguish "read to report" from "read to
+                # learn"; until it has one, the honest behaviour is to tell the
+                # user and leave the weights alone.
                 self._learned_through = total
                 self._learned_size = self.feedback_logger.log_size()
                 self._save_weights()

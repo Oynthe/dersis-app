@@ -139,6 +139,32 @@ def make_app(qapp, dersis_home, monkeypatch):
     finally:
         for win in built:
             try:
+                # Drain the deferred-warning QUEUE before closing, or a modal
+                # this window armed fires inside a LATER test.
+                #
+                # `_deferred_warning` parents a 0 ms QTimer to the window
+                # precisely so it dies with it -- but `deleteLater()` below
+                # needs an event-loop turn that this teardown never takes, so
+                # the window and its armed timer both survive. The next test
+                # that calls `qapp.processEvents()` runs
+                # `_drain_deferred_warnings`, which puts a QMessageBox through
+                # whatever that test has monkeypatched.
+                #
+                # Measured 2026-08-29: tests/test_phase9_b8.py builds a window
+                # over a damaged feedback log and never pumps the loop;
+                # tests/test_phase9_b9.py's healthy_log row then pumps, and
+                # recorded a "feedback log damaged" warning for a log that is
+                # intact -- a false PASS-shaped failure in a test whose own app
+                # produced nothing. Both files pass alone; only the pair fails.
+                #
+                # This is exactly the leak this fixture's docstring exists to
+                # prevent ("a timer that outlives the test that armed it"). It
+                # was latent until a window in an earlier test had something to
+                # defer. Emptying the list is what makes it safe: the surviving
+                # timer still fires, and `_drain_deferred_warnings` then
+                # iterates nothing. Do not replace this with `processEvents()`
+                # -- that would SHOW the modal rather than discard it.
+                del getattr(win, "_deferred_warnings", [])[:]
                 win.close()
                 win.deleteLater()
             except Exception:

@@ -50,24 +50,30 @@ reported.
 
 Simulating the drag
 -------------------
-``_execute_drop`` is the *end* of a gesture that Qt starts. The three fields it
-reads — ``_dragging_cls``, ``_dragging_classes``, ``_drag_backup`` and
-``_drag_undo_pushed`` — are set by ``_start_drag_gfx`` (dragging a placed
-lesson out of the grid) and ``_start_drag_unplaced`` (dragging from the
-sidebar). Driving those needs a live ``QDrag`` and a rendered
-``LessonItem``, so the two helpers below reproduce exactly the field
-assignments each of them makes, including ``_start_drag_gfx``'s pre-emptive
-undo snapshot and its ``mark_unplaced`` — the lesson is already off the grid by
-the time the drop is validated, which is what frees its own room and its own
-cell.
+``_execute_drop`` is the *end* of a gesture that Qt starts. The fields it
+reads — ``_dragging_cls``, ``_dragging_classes``, ``_drag_backup``,
+``_drag_undo_pushed`` and ``_drag_undo_entry`` — are set by ``_start_drag_gfx``
+(dragging a placed lesson out of the grid) and ``_start_drag_unplaced``
+(dragging from the sidebar). Driving those needs a live ``QDrag`` and a
+rendered ``LessonItem``, so the two helpers below reproduce exactly the field
+assignments each of them makes, including ``_start_drag_gfx``'s *held*
+pre-gesture snapshot and its ``mark_unplaced`` — the lesson is already off the
+grid by the time the drop is validated, which is what frees its own room and
+its own cell.
 
-The helpers mirror production or they measure nothing: ``_drag_undo_pushed`` is
-what tells ``_execute_drop`` whether the entry on top of the undo stack is this
-drag's, so a helper that forgot to set it would send every grid drag down the
-branch meant for sidebar drags.
+The helpers mirror production or they measure nothing: ``_drag_undo_pushed``
+and ``_drag_undo_entry`` are what tell ``_execute_drop`` that the pre-gesture
+snapshot is this drag's to consume, so a helper that forgot to set them would
+send every grid drag down the branch meant for sidebar drags. Phase 9 moved
+that snapshot off the undo stack and into ``_drag_undo_entry`` — a gesture the
+user abandons must not clear redo or evict at the cap — and the helper moved
+with it. A helper still calling ``_push_undo`` would certify a path production
+no longer has.
 
 Findings guarded here: ST-ARCH-004, ST-ARCH-005, ST-ARCH-012.
 """
+import copy
+
 import pytest
 
 from scheduler_app.core.models import (
@@ -115,11 +121,19 @@ def _add_class(win, name):
 def _arm_drag_from_grid(win, cls, also=()):
     """Reproduce `_start_drag_gfx` in `ui/app.py` for a placed lesson.
 
-    Order matters and is production's: snapshot the placement, push the
-    pre-emptive "unplace" undo entry, raise `_drag_undo_pushed`, *then*
-    unplace. `_execute_drop` re-labels that entry rather than popping and
-    re-pushing it, which is what makes a whole drag a single Ctrl+Z that
+    Order matters and is production's: back the placement up, take the
+    "unplace" snapshot, raise `_drag_undo_pushed`, *then* unplace.
+    `_execute_drop` records that snapshot under the "move" label rather than
+    taking a fresh one, which is what makes a whole drag a single Ctrl+Z that
     actually restores the placement (ST-ARCH-012).
+
+    The snapshot is HELD in `_drag_undo_entry`, not pushed. It went straight
+    onto the undo stack until Phase 9, and that is what made an abandoned
+    gesture destructive: `_push_undo` clears the redo stack and, at the
+    50-entry cap, evicts `_undo_stack[0]`, and the `pop()` on the cancel path
+    put back neither. `test_a_cancelled_grid_drag_leaves_the_undo_stack_as_it
+    _found_it` and `test_a_cancelled_grid_drag_does_not_destroy_the_redo_stack`
+    drive that through the real starter.
 
     `also` carries the extra lessons of a multi-selection into
     `_dragging_classes`. Production backs up and unplaces only the primary —
@@ -134,7 +148,8 @@ def _arm_drag_from_grid(win, cls, also=()):
         "placed_time": cls["placed_time"],
         "placed_classroom": cls["placed_classroom"],
     }
-    win._push_undo(tr("actions.unplace").format(name=cls["name"]))
+    win._drag_undo_entry = (tr("actions.unplace").format(name=cls["name"]),
+                            copy.deepcopy(win.state_data))
     win._drag_undo_pushed = True
     mark_unplaced(cls)
     win._drag_success = False
@@ -146,15 +161,17 @@ def _arm_drag_from_sidebar(win, cls):
     The backup is all-None here, which is the case that leaves
     `_get_preferred_rooms` with nothing but the classroom filter to go on.
 
-    `_drag_undo_pushed` is False and that is the whole point: this starter
-    pushes NO undo entry, so whatever is on top of the stack belongs to some
-    earlier action and `_execute_drop` must not touch it.
+    `_drag_undo_pushed` is False and `_drag_undo_entry` is None, and that is
+    the whole point: this starter takes NO pre-gesture snapshot, so whatever is
+    on top of the stack belongs to some earlier action and `_execute_drop` must
+    push one of its own instead of consuming anything.
     """
     mark_unplaced(cls)
     win._dragging_cls = cls
     win._dragging_classes = [cls]
     win._drag_backup = {"placed": False, "placed_day": None,
                         "placed_time": None, "placed_classroom": None}
+    win._drag_undo_entry = None
     win._drag_undo_pushed = False
     win._drag_success = False
 
@@ -362,20 +379,27 @@ def test_a_lesson_that_needs_a_room_and_has_none_is_refused(win):
 def test_a_committed_drop_is_one_undo_entry(win):
     """ST-ARCH-012 — one gesture, one Ctrl+Z.
 
-    The drag start pushes an "unplace" snapshot pre-emptively so a *failed*
-    drag can be rolled back; a *successful* one re-labels that same entry
-    "move" in place. Push a second entry instead and every drag costs the user
+    The drag start takes an "unplace" snapshot and holds it so a *failed* drag
+    can be rolled back; a *successful* one records that same snapshot under the
+    "move" label. Take a fresh snapshot instead and every drag costs the user
     two undos, the first of which appears to do nothing.
 
-    Mutation: replace the relabel branch in `_execute_drop` with a bare
-    `self._push_undo(move_label)` and the depth assertion below goes red at 2.
+    Mutation: replace the record branch in `_execute_drop` with a bare
+    `self._push_undo(move_label)` and the placement assertion in
+    `test_one_undo_after_a_drag_puts_the_lesson_back_where_it_was` goes red
+    (the fresh snapshot holds the lesson as unplaced). Before Phase 9 the
+    depth assertion below caught that mutation too; it no longer can, because
+    the snapshot is not on the stack for a second push to double.
     """
     cls = _seed(win)
     depth_before = len(win._undo_stack)
 
     _arm_drag_from_grid(win, cls)
-    assert len(win._undo_stack) == depth_before + 1, (
-        "the drag start did not push its pre-emptive snapshot; this test "
+    assert len(win._undo_stack) == depth_before, (
+        "the drag start recorded its snapshot instead of holding it; a "
+        "gesture the user can still abandon must not touch the stacks")
+    assert win._drag_undo_entry is not None, (
+        "the drag start did not take its pre-gesture snapshot; this test "
         "would then be measuring nothing")
 
     win._execute_drop("tuesday", "10:00")
@@ -423,16 +447,22 @@ def test_one_undo_after_a_drag_puts_the_lesson_back_where_it_was(win):
 
 
 def test_a_refused_drop_leaves_the_undo_stack_alone(win):
-    """ST-ARCH-012 — a refusal must not eat the pre-emptive snapshot either.
+    """ST-ARCH-012 — a refusal must not consume the pre-gesture snapshot.
 
-    `_execute_drop` returns early on every refusal path without popping, and
-    leaves `_drag_undo_pushed` raised, so the entry is still the drag's to
-    consume. What actually puts the lesson back on the grid is
-    `_start_drag_gfx`'s own restore loop (`for k, v in
-    self._drag_backup.items(): cls[k] = v`); the undo entry is a second,
-    belt-and-braces copy of the same placement, and it is the one the user
-    reaches with Ctrl+Z. Popping it here instead would leave the user with no
-    undo record of a lesson the app had already unplaced.
+    `_execute_drop` returns early on every refusal path without recording
+    anything, and leaves `_drag_undo_pushed` raised and `_drag_undo_entry`
+    held, so the snapshot is still the drag's. What actually puts the lesson
+    back on the grid is `_start_drag_gfx`'s own restore loop (`for k, v in
+    self._drag_backup.items(): cls[k] = v`); the held snapshot is a second,
+    belt-and-braces copy of the same placement, and it is what a *committed*
+    drop turns into the user's Ctrl+Z. Recording it here — or dropping it —
+    would leave a refused drop indistinguishable from a real edit.
+
+    Phase 9 moved that snapshot off the undo stack, so what this test pins
+    moved with it: the assertion used to be `depth == depth_before + 1`,
+    which said the pre-emptive push was still standing. It is now that the
+    refusal touched NEITHER stack. `tests/test_phase9_b1b2.py` holds the
+    other half — the redo stack a refused drop used to destroy.
 
     (This docstring used to credit `dragLeaveEvent`/`_cancel_drag` with the
     restore. There is no `_cancel_drag` anywhere in `scheduler_app`, and
@@ -440,19 +470,27 @@ def test_a_refused_drop_leaves_the_undo_stack_alone(win):
     The assertions were right; the explanation was not.)
     """
     cls = _seed(win)
+    win._push_undo("rename-lecturer")   # an earlier, unrelated action
     depth_before = len(win._undo_stack)
     _arm_drag_from_grid(win, cls)
 
     win._execute_drop("saturday", "09:00")
 
     assert win.refusals
-    assert len(win._undo_stack) == depth_before + 1, (
-        "the refusal path changed the undo depth to %d; the pre-emptive "
-        "snapshot is the only record of where the lesson was"
+    assert len(win._undo_stack) == depth_before, (
+        "the refusal path changed the undo depth by %d; a drop the app "
+        "rejected is not an edit and must record nothing"
         % (len(win._undo_stack) - depth_before,))
-    win.undo()
-    assert _placement(win.state_data["classes"][0]) == (
-        True, "monday", "09:00", "R001")
+    assert win._drag_undo_pushed is True and win._drag_undo_entry is not None, (
+        "the refusal consumed the pre-gesture snapshot; it is the only record "
+        "of where the lesson was, and _start_drag_gfx's tail still needs it")
+
+    held_label, held_state = win._drag_undo_entry
+    assert held_label == tr("actions.unplace").format(name="Fizik")
+    assert _placement(held_state["classes"][0]) == (
+        True, "monday", "09:00", "R001"), (
+        "the held snapshot no longer holds the pre-gesture placement: %r"
+        % (_placement(held_state["classes"][0]),))
 
 
 # ── the sidebar drag, which pushed nothing and popped anyway ────────────────
@@ -684,6 +722,10 @@ def test_the_real_start_drag_gfx_wires_up_the_undo_entry(win, monkeypatch):
         # other test in this module ever observes.
         captured["flag_during_drag"] = win._drag_undo_pushed
         captured["depth_during_drag"] = len(win._undo_stack)
+        held = win._drag_undo_entry
+        captured["held_during_drag"] = (
+            None if held is None
+            else (held[0], _placement(held[1]["classes"][0])))
         win._execute_drop("tuesday", "10:00")
         return action
 
@@ -693,10 +735,23 @@ def test_the_real_start_drag_gfx_wires_up_the_undo_entry(win, monkeypatch):
 
     assert captured.get("flag_during_drag") is True, (
         "production _start_drag_gfx did not set _drag_undo_pushed before the "
-        "drag went live, so _execute_drop cannot tell whose snapshot is on "
-        "top of the stack")
-    assert captured.get("depth_during_drag") == 1, (
-        "the pre-emptive snapshot was not pushed; depth was %r"
+        "drag went live, so _execute_drop cannot tell whose snapshot it is "
+        "holding")
+    # Phase 9. This assertion was `depth_during_drag == 1` — the pre-emptive
+    # snapshot sitting on the undo stack while the gesture was still
+    # speculative, which is exactly what let an abandoned drag clear redo and
+    # evict at the cap. What has to be true mid-gesture is that the snapshot
+    # EXISTS and holds the pre-gesture placement, not that it is on a stack.
+    assert captured.get("held_during_drag") == (
+        tr("actions.unplace").format(name="Fizik"),
+        (True, "monday", "09:00", "R001")), (
+        "production _start_drag_gfx did not hold the pre-gesture snapshot, or "
+        "took it after its own mark_unplaced: %r"
+        % (captured.get("held_during_drag"),))
+    assert captured.get("depth_during_drag") == 0, (
+        "the snapshot went onto the undo stack while the drag was still "
+        "live; depth was %r. A gesture the user can still abandon must not "
+        "be able to clear redo or evict at the cap"
         % (captured.get("depth_during_drag"),))
 
     live = win.state_data["classes"][0]
@@ -737,7 +792,7 @@ def test_a_cancelled_grid_drag_leaves_the_undo_stack_as_it_found_it(
     what Qt does when the user presses Esc or releases over a non-target.
     Production must then undo its own pre-emptive bookkeeping: put the
     placement back from ``_drag_backup``, and discard the ``unplace``
-    snapshot it pushed before ``mark_unplaced``.
+    snapshot it took before ``mark_unplaced``.
 
     The discriminator is the pre-drag edit to ``lecturers``. The phantom
     snapshot, if it survives, was taken AFTER that edit, so restoring it is
@@ -749,13 +804,19 @@ def test_a_cancelled_grid_drag_leaves_the_undo_stack_as_it_found_it(
     on the stack and the user's next Ctrl+Z undoes a gesture they abandoned
     instead of the action they actually took.
 
-    Deliberately NOT asserted here, because production gets them wrong today
-    and this test must not certify them: a cancelled drag clears the redo
-    stack (``_push_undo`` does it before the pop can put the entry back), and
-    at the 50-entry ``_max_undo`` cap the pre-emptive push evicts the oldest
-    entry, which the pop does not restore. Both are recorded for a later
-    session. This test pins only what the fix promises: the placement comes
-    back and the pre-emptive entry is discarded.
+    Phase 9 closed the two things this docstring used to record as measured
+    and deliberately un-asserted — a cancelled drag cleared the redo stack,
+    and at the 50-entry ``_max_undo`` cap it evicted the oldest undo entry,
+    neither of which the ``pop()`` on this path could put back. Both were
+    symptoms of the snapshot going onto the stack at drag START; it is now
+    held in ``_drag_undo_entry`` and recorded only at a commit point, so the
+    cancel path has nothing to compensate for. The mid-gesture assertion
+    below moved with that: it used to read
+    ``["rename-lecturer", unplace-label]`` — the phantom being visible on the
+    stack — and it is now that the stack is untouched while the snapshot is
+    held. ``test_a_cancelled_grid_drag_does_not_destroy_the_redo_stack``
+    below and ``tests/test_phase9_b1b2.py`` assert the redo and cap halves
+    outright.
     """
     cls = _seed(win)
 
@@ -772,11 +833,13 @@ def test_a_cancelled_grid_drag_leaves_the_undo_stack_as_it_found_it(
     captured = {}
 
     def _cancel_during_exec(self, action):
-        # Mid-gesture, before the user gives up: production has already
-        # pushed its snapshot and taken the lesson off the grid. If these
-        # two do not hold, the drag never really ran and the assertions
-        # after it would pass vacuously.
+        # Mid-gesture, before the user gives up: production has already taken
+        # its snapshot and taken the lesson off the grid. If these do not
+        # hold, the drag never really ran and the assertions after it would
+        # pass vacuously.
         captured["labels_during_drag"] = [e[0] for e in win._undo_stack]
+        captured["held_during_drag"] = (
+            None if win._drag_undo_entry is None else win._drag_undo_entry[0])
         captured["placement_during_drag"] = _placement(cls)
         return action  # the user pressed Esc: no drop
 
@@ -784,10 +847,15 @@ def test_a_cancelled_grid_drag_leaves_the_undo_stack_as_it_found_it(
 
     win._start_drag_gfx(cls, _StubItem())
 
-    assert captured.get("labels_during_drag") == [
-        "rename-lecturer", tr("actions.unplace").format(name="Fizik")], (
-        "the gesture never got as far as the pre-emptive snapshot, so the "
-        "cancel path below was not exercised; stack was %r"
+    assert captured.get("held_during_drag") == tr(
+        "actions.unplace").format(name="Fizik"), (
+        "the gesture never got as far as the pre-gesture snapshot, so the "
+        "cancel path below was not exercised; held entry was %r"
+        % (captured.get("held_during_drag"),))
+    assert captured.get("labels_during_drag") == ["rename-lecturer"], (
+        "the live gesture put its snapshot on the undo stack; labels were %r. "
+        "Holding it is the whole of the Phase 9 fix — on the stack it clears "
+        "redo and evicts at the cap for a drag that may never happen"
         % (captured.get("labels_during_drag"),))
     assert captured.get("placement_during_drag") == (
         False, None, None, None), (
@@ -807,7 +875,10 @@ def test_a_cancelled_grid_drag_leaves_the_undo_stack_as_it_found_it(
 
     assert win._drag_undo_pushed is False, (
         "the flag outlived the cancelled gesture, so it no longer states "
-        "whose entry is on top of the stack")
+        "whose snapshot the app is holding")
+    assert win._drag_undo_entry is None, (
+        "the abandoned gesture's snapshot outlived it; the next drop would "
+        "record a state from a drag the user gave up on")
 
     win.undo()
 
@@ -815,3 +886,147 @@ def test_a_cancelled_grid_drag_leaves_the_undo_stack_as_it_found_it(
         "one Ctrl+Z after a cancelled drag did not reach the action the "
         "user actually took; lecturers are %r"
         % (win.state_data["lecturers"],))
+
+
+def test_a_cancelled_grid_drag_does_not_destroy_the_redo_stack(
+        win, monkeypatch):
+    """Phase 9 B1 through the real starter — Esc must not kill Ctrl+Y.
+
+    The user undid something, then picked a lesson up and put it back down
+    where they found it. The timetable is byte-for-byte what it was, so the
+    undone action is still there to redo. Until Phase 9 it was not:
+    ``_start_drag_gfx`` pushed through ``_push_undo``, whose last statement is
+    ``_redo_stack.clear()``, before ``drag.exec()`` — and the cancel path's
+    ``pop()`` put back the undo entry and nothing else.
+
+    ``tests/test_phase9_b1b2.py`` carries this case too, and its Esc test is
+    blocked on a mid-gesture assertion that pins the OLD mechanism (the
+    snapshot being visible on the undo stack while the drag is live). This one
+    asserts the same outcome through the same production path with the
+    anti-vacuity check written against the state rather than the stack, so the
+    fix is pinned either way. The refused-drop half of B1 and both cap cases
+    of B2 pass in that file unmodified.
+    """
+    cls = _seed(win)
+
+    # A real action and a real Ctrl+Z, leaving exactly one redo entry. The
+    # discriminator is `lecturers`: whether redo still works is visible in
+    # the state, not only in a stack depth.
+    win._push_undo("rename-lecturer")
+    win.state_data["lecturers"] = ["Ada L."]
+    win.undo()
+    assert win.state_data["lecturers"] == ["Ada Lovelace"]
+    assert len(win._redo_stack) == 1, (
+        "the arrangement is wrong: there is no pending redo entry to lose")
+
+    # `undo` replaced every class dict; the seeded reference is an orphan now.
+    cls = win.state_data["classes"][0]
+
+    monkeypatch.setattr("scheduler_app.ui.app.QDrag", _FakeDrag)
+
+    captured = {}
+
+    def _cancel_during_exec(self, action):
+        captured["held_during_drag"] = (
+            None if win._drag_undo_entry is None else win._drag_undo_entry[0])
+        captured["redo_depth_during_drag"] = len(win._redo_stack)
+        return action  # the user pressed Esc: no drop
+
+    monkeypatch.setattr(_FakeDrag, "exec", _cancel_during_exec)
+
+    win._start_drag_gfx(cls, _StubItem())
+
+    assert captured.get("held_during_drag") == tr(
+        "actions.unplace").format(name="Fizik"), (
+        "the gesture never went live, so nothing below is measured: held "
+        "entry was %r" % (captured.get("held_during_drag"),))
+    assert captured.get("redo_depth_during_drag") == 1, (
+        "the redo stack was already destroyed while the drag was still live "
+        "(depth %r), which is the defect itself"
+        % (captured.get("redo_depth_during_drag"),))
+
+    assert _placement(win.state_data["classes"][0]) == (
+        True, "monday", "09:00", "R001"), (
+        "a cancelled drag did not put the lesson back: %r"
+        % (_placement(win.state_data["classes"][0]),))
+    assert len(win._redo_stack) == 1, (
+        "a cancelled drag destroyed the pending redo entry (depth %d). The "
+        "gesture changed nothing on the timetable, so Ctrl+Y must survive it"
+        % len(win._redo_stack))
+
+    win.redo()
+    assert win.state_data["lecturers"] == ["Ada L."], (
+        "redo after a cancelled drag did not re-apply the undone action; "
+        "lecturers are %r" % (win.state_data["lecturers"],))
+
+
+def test_a_drag_onto_the_unplaced_sidebar_is_one_undo_entry(win, monkeypatch):
+    """The third commit point, and the one no test had ever reached.
+
+    Dropping a placed lesson onto the unplaced list is how the user unplaces
+    by gesture. ``DraggableUnplacedList.dropEvent`` calls ``mark_unplaced``
+    and sets ``_drag_success``; it deliberately records no undo entry of its
+    own, because ``_start_drag_gfx``'s pre-gesture snapshot is already the
+    right one and a fresh one taken here would deep-copy the lesson as
+    ALREADY unplaced.
+
+    That worked by accident until Phase 9: the snapshot was pushed at drag
+    start, so a successful sidebar drop simply left it there under its
+    "unplace" label. With the snapshot held instead, something has to record
+    it, and the only code that knows the gesture committed is the tail of
+    ``_start_drag_gfx``. Nothing in this suite exercised that path — measured
+    2026-08-29: no test in ``tests/`` referenced ``dropEvent``,
+    ``status.class_unplaced_drag`` or the list widget's drop handling at all —
+    so the whole gesture could have silently stopped being undoable.
+    """
+    from PyQt6.QtCore import QMimeData
+
+    cls = _seed(win)
+    win._push_undo("rename-lecturer")   # an earlier action, then a Ctrl+Z, so
+    win.state_data["lecturers"] = ["Ada L."]   # there is a redo entry to lose
+    win.undo()
+    assert len(win._redo_stack) == 1
+    cls = win.state_data["classes"][0]
+    depth_before = len(win._undo_stack)
+
+    mime = QMimeData()
+    mime.setText("class_drag:%s" % cls.get("id", ""))
+
+    class _Event:
+        def mimeData(self):
+            return mime
+
+        def acceptProposedAction(self):
+            pass
+
+    monkeypatch.setattr("scheduler_app.ui.app.QDrag", _FakeDrag)
+
+    def _drop_on_the_sidebar(self, action):
+        win.unplaced_list.dropEvent(_Event())
+        return action
+
+    monkeypatch.setattr(_FakeDrag, "exec", _drop_on_the_sidebar)
+
+    win._start_drag_gfx(cls, _StubItem())
+
+    live = win.state_data["classes"][0]
+    assert _placement(live) == (False, None, None, None), (
+        "the drop onto the sidebar did not unplace the lesson: %r"
+        % (_placement(live),))
+    assert len(win._undo_stack) == depth_before + 1, (
+        "unplacing by drag left %d undo entries instead of one; the held "
+        "snapshot was dropped on the floor or recorded twice"
+        % (len(win._undo_stack) - depth_before,))
+    assert win._undo_stack[-1][0] == tr("actions.unplace").format(
+        name="Fizik"), (
+        "the entry is labelled %r; a drop onto the sidebar is an unplace, not "
+        "a move" % (win._undo_stack[-1][0],))
+    assert win._redo_stack == [], (
+        "unplacing by drag left %d redo entries; it is a real edit and must "
+        "invalidate redo" % len(win._redo_stack))
+
+    win.undo()
+    assert _placement(win.state_data["classes"][0]) == (
+        True, "monday", "09:00", "R001"), (
+        "one Ctrl+Z after unplacing by drag did not put the lesson back where "
+        "it was: %r" % (_placement(win.state_data["classes"][0]),))

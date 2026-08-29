@@ -848,12 +848,95 @@ def _resolve_joint_groups(dataset: SchedulerDataset):
         primary = classes[0]
         primary["joint_session"] = True
         seen_targets = {(t["year"], t["branch"]) for t in primary.get("targets", [])}
+        # B5 / ST-FUNC-009 — the room constraints have to be merged too.
+        #
+        # `_process_classes` resolves `required_room_type` into
+        # `required_classrooms` per ROW, and this loop used to keep row 1 and
+        # delete the rest, so every room constraint declared by any other row
+        # was thrown away. Measured on a two-row group whose SECOND row said
+        # `Laboratuvar`: the merged session imported with
+        # `required_classrooms=[]`, and `[]` is precisely what
+        # `get_physical_room_candidates` reads as "any room" — candidates came
+        # back `['Oda 1', 'Lab 1', 'Lab 2']`, i.e. the lecture hall was a legal
+        # placement for a lab. Row order carries no meaning in a spreadsheet
+        # and nothing tells a user the typed row must come first, so the same
+        # two rows swapped must produce the same session.
+        required = list(primary.get("required_classrooms") or [])
+        excluded = list(primary.get("excluded_classrooms") or [])
+        dropped_rooms: list = []
         for other in classes[1:]:
             for t in other.get("targets", []):
                 key = (t["year"], t["branch"])
                 if key not in seen_targets:
                     primary["targets"].append(t)
                     seen_targets.add(key)
+            other_required = other.get("required_classrooms") or []
+            if other_required:
+                if not required:
+                    required = list(other_required)
+                else:
+                    narrowed = [r for r in required if r in other_required]
+                    if narrowed:
+                        required = narrowed
+                    else:
+                        # Disjoint lists. NEVER write the empty intersection:
+                        # `[]` means "any room", so intersecting `Derslik`
+                        # (`['Oda 1']`) with `Laboratuvar` (`['Lab 1','Lab 2']`)
+                        # would turn the one session TWO rows constrained into
+                        # the least constrained class in the file. That is the
+                        # ST-FUNC-009 inversion itself, which Phase 8 shipped
+                        # once inside `_process_classes`; it is guarded by
+                        # `test_a_joint_merge_never_widens_a_group_whose_rows_declare_room_types`.
+                        #
+                        # The EARLIER row wins and the user is told. A joint
+                        # session is one physical session in one room, so two
+                        # disjoint room constraints are a data error only the
+                        # user can settle — silently choosing either one puts
+                        # the session where their own sheet says it must not
+                        # go, so the choice has to be announced rather than
+                        # made well. "Most constrained wins" was rejected: the
+                        # shortest list is an artefact of how many rooms happen
+                        # to carry each type, so adding one room to the Rooms
+                        # sheet would silently flip which of two unrelated rows
+                        # decides this group. Row order is visible in the file
+                        # and stable under edits elsewhere in it.
+                        dropped_rooms.extend(r for r in other_required
+                                             if r not in dropped_rooms)
+            # `excluded_classrooms` has the same hole — checked, not assumed:
+            # measured with `excluded_rooms='Lab 1'` on row 2 of a joint pair,
+            # the merged session came out `excluded_classrooms=[]` with
+            # candidates `['Oda 1', 'Lab 1', 'Lab 2']`; it is now `['Lab 1']`
+            # and `['Oda 1', 'Lab 2']`. The rule here is the opposite one,
+            # because an exclusion is a prohibition: the UNION is the only
+            # merge that can neither widen the session nor depend on row order,
+            # and unlike the intersection above it can never contradict itself,
+            # so there is nothing to report. (A union that leaves the session
+            # nowhere to go is the pre-existing gap of HANDOFF-PHASE9 §C, the
+            # same one a single row's `allowed_rooms` already has.)
+            for room in other.get("excluded_classrooms") or []:
+                if room not in excluded:
+                    excluded.append(room)
             # Remove the duplicate class from state
             if other in dataset.state["classes"]:
                 dataset.state["classes"].remove(other)
+        primary["required_classrooms"] = required
+        primary["excluded_classrooms"] = excluded
+        if dropped_rooms:
+            # Reported against the GROUP, not against a row (`row=None`). The
+            # row that declared the losing constraint has just been deleted
+            # from state, so a per-row line would describe a class the user
+            # will never see in the app — and a warning has to be true of the
+            # thing it is attached to (935c84b). It names rooms rather than
+            # room types on purpose: the same disjointness arises from two rows
+            # whose `allowed_rooms` simply do not overlap, and a sentence about
+            # "room types" would be false of that workbook while the room names
+            # are true of both.
+            dataset.report.add_warning(
+                tr("labels.classes"), None,
+                tr("warnings.joint_group_room_conflict").format(
+                    group_field=_column_label("classes", "joint_class_group"),
+                    group=group_name,
+                    kept=", ".join(required),
+                    dropped=", ".join(dropped_rooms),
+                    type_field=_column_label("classes", "required_room_type"),
+                    rooms_field=_column_label("classes", "allowed_rooms")))
