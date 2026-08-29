@@ -240,7 +240,7 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
     # Both sides must move together or they disagree; that is why the fold
     # lives in a leaf module both layers can import rather than in either one.
     first_spelling: dict[str, str] = {}
-    duplicate_names: dict[str, list[str]] = {}
+    duplicate_names: list[tuple[int, str, str]] = []
     for idx, row in df.iterrows():
         row_num = idx + 2  # Excel row (1-indexed header + 1-indexed data)
         tid = _cell_text(row["teacher_id"])
@@ -251,7 +251,7 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
 
         folded = fold_text(name)
         if folded in first_spelling:
-            duplicate_names.setdefault(folded, [first_spelling[folded]]).append(name)
+            duplicate_names.append((row_num, first_spelling[folded], name))
         else:
             first_spelling[folded] = name
 
@@ -273,11 +273,23 @@ def _process_teachers(df, report: DataValidationReport, dataset: SchedulerDatase
     # whole (`_import_from_excel` returns on `not report.is_valid`) — a roster
     # imported with one teacher's hours silently overwritten is worse than a
     # roster the user is asked to give two distinct names.
-    for spellings in duplicate_names.values():
-        report.add_error(tr("labels.teachers"), None,
-                         tr("errors.duplicate_values").format(
-                             id_col=_column_label("teachers", "name"),
-                             values=", ".join(spellings)))
+    #
+    # It gets its own key rather than reusing `errors.duplicate_values`, which
+    # `_check_duplicates` uses for genuinely identical teacher_id cells. There
+    # the two printed values are the same string and the word "duplicate"
+    # explains itself; here they are visibly different — "Sıla Kaya, Sila Kaya"
+    # — and the generic message asserts an equality the user can see is false,
+    # which reads as the app being broken rather than as something to fix. The
+    # message therefore names both spellings, states the rule that merged them,
+    # and asks for the remedy the comment above only ever stated to other
+    # programmers. The row number is the colliding row, not None: every other
+    # error in this function carries one (see `errors.teacher_id_required`
+    # above), and without it a 200-row roster gives the user nowhere to look.
+    for row_num, first, second in duplicate_names:
+        report.add_error(tr("labels.teachers"), row_num,
+                         tr("errors.teacher_names_fold_together").format(
+                             field=_column_label("teachers", "name"),
+                             first=first, second=second))
 
     dataset.state["lecturers"] = lecturers
     dataset.state["lecturer_availability"] = availability
@@ -464,6 +476,11 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
 
         required_type = _cell_text(row.get("required_room_type"))
         if required_type:
+            # Set by the excluded-rooms fallback below. Once it fires,
+            # `required_classrooms` is no longer the type-resolved list, so the
+            # capacity check that follows would be reporting a list the user
+            # was already told was not applied.
+            fell_back = False
             matching = [r for r in rooms_by_type.get(fold_text(required_type), [])
                         if r in room_names]
             if not matching:
@@ -517,6 +534,60 @@ def _process_classes(df, report: DataValidationReport, dataset: SchedulerDataset
                             type=required_type,
                             type_field=_column_label("classes", "required_room_type"),
                             rooms_field=_column_label("classes", "excluded_rooms")))
+                    fell_back = True
+
+            # ST-FUNC-009, third contradiction: the resolved list versus the
+            # head count in the very same row. `get_physical_room_candidates`
+            # filters by `required_classrooms` FIRST and by `room_fits_class`
+            # second, so a type that resolves only to rooms too small for
+            # `participants` collapses the candidate set to [] just as
+            # completely as the two cases above.
+            #
+            # The app's own shipped template was such a row: C001 asked for the
+            # lab type with 25 students while the only lab seats 20, and
+            # `generate_excel_template -> load_scheduler_data_from_excel` gave
+            # `is_valid=True`, `warnings: []`, `required ['Laboratuvar A']`,
+            # `candidates []`. The template is repaired at its source
+            # (template.py C001 now says 18), and this catches the user's own
+            # workbook saying the same thing.
+            #
+            # Deliberately a WARNING that changes nothing, not a relaxation:
+            # widening back to "any room" is the exact ST-FUNC-009 inversion
+            # `test_a_room_type_no_room_has_is_reported_and_never_widens_the_class`
+            # exists to catch, and the user may genuinely intend to buy chairs.
+            #
+            # Deliberately NOT left to the solver, even though the solver's own
+            # reason is accurate and localized -- measured on the template, the
+            # unplaced list said "İzin verilen hiçbir dersliğin yeterli
+            # kapasitesi yok". That sentence only arrives after the user has
+            # built a full Setup (days and times) and run a solve, and it
+            # arrives as one line among every other class that failed for
+            # ordinary reasons. This contradiction is between two cells of one
+            # row, both of which the importer is holding at this moment, and
+            # File ▸ Import Excel is where the app promises to "report any
+            # problems before adding the classes".
+            #
+            # Scoped to the type-resolved list on purpose. A class whose
+            # `allowed_rooms` are all too small reaches the same dead end and
+            # is equally silent, but that path behaves exactly as it did at
+            # 82f558e and is not this change's to fix.
+            if matching and cls["required_classrooms"] and not fell_back:
+                capacities = dataset.state.get("classroom_capacities", {})
+                # Capacity 0 means unlimited, matching `room_fits_class`; a
+                # class of 0 participants fits anywhere, so it never warns.
+                seats = {r: capacities.get(r, 0) for r in cls["required_classrooms"]}
+                if student_count > 0 and all(
+                        0 < cap < student_count for cap in seats.values()):
+                    biggest = max(seats, key=lambda r: seats[r])
+                    report.add_warning(
+                        tr("labels.classes"), row_num,
+                        tr("warnings.room_type_too_small").format(
+                            type=required_type,
+                            type_field=_column_label("classes", "required_room_type"),
+                            participants=student_count,
+                            count_field=_column_label("classes", "student_count"),
+                            room=biggest,
+                            capacity=seats[biggest]))
 
         if excluded_rooms:
             cls["excluded_classrooms"] = excluded_rooms
