@@ -600,3 +600,108 @@ def test_a_multi_select_drag_is_one_undo_for_what_actually_moved(win):
     assert _placement(back_secondary) == (True, "monday", "10:00", "R002"), (
         "one undo disturbed a lesson the drag never moved: %r"
         % (_placement(back_secondary),))
+
+
+# ── the production starter, not a hand copy of it ───────────────────────────
+
+class _FakeDrag:
+    """Stand-in for ``QDrag`` that runs the drop instead of blocking on Qt.
+
+    ``_start_drag_gfx`` ends in ``drag.exec(...)``, which blocks until the user
+    releases the mouse and is what makes the real starter untestable in a
+    headless run. Substituting the module-level ``QDrag`` name lets the gesture
+    run end to end through production code: ``exec`` is where the drop happens
+    in real life, so it is where the drop happens here.
+    """
+
+    def __init__(self, parent):
+        self._on_exec = None
+
+    def setMimeData(self, mime):
+        pass
+
+    def setPixmap(self, pm):
+        pass
+
+    def setHotSpot(self, pt):
+        pass
+
+    def exec(self, action):
+        if self._on_exec is not None:
+            self._on_exec()
+        return action
+
+
+class _StubItem:
+    """The minimum ``LessonItem`` surface ``_start_drag_gfx`` touches.
+
+    ``scene()`` returning None short-circuits the pixmap block (which is
+    already wrapped in ``except Exception: pass``), and the absence of
+    ``set_ghost`` skips the ghosting. Neither participates in the undo
+    contract under test.
+    """
+
+    def scene(self):
+        return None
+
+
+def test_the_real_start_drag_gfx_wires_up_the_undo_entry(win, monkeypatch):
+    """ST-ARCH-012 — the production starter must set the flag the fix reads.
+
+    THIS TEST EXISTS BECAUSE EVERY OTHER TEST IN THIS MODULE HAND-COPIES
+    ``_start_drag_gfx`` INSTEAD OF CALLING IT. Measured on the tree that
+    shipped the fix: deleting ``self._drag_undo_pushed = True`` from production
+    ``_start_drag_gfx`` left this whole module — and ``test_full_state_undo.py``
+    — green, exit 0. The helpers set the flag themselves, so the production
+    line that sets it was executed by nothing. The fix worked and its wiring
+    was unverified, which is exactly how Phase 7's headline fix shipped
+    inert: "the test passed because it stubbed the path".
+
+    A failure means one Ctrl+Z after a real drag does not put the lesson back
+    where the user found it — the defect ST-ARCH-012 is about — even though the
+    hand-copied tests above still pass.
+    """
+    cls = _seed(win)
+    monkeypatch.setattr("scheduler_app.ui.app.QDrag", _FakeDrag)
+
+    captured = {}
+    real_exec = _FakeDrag.exec
+
+    def _drop_during_exec(self, action):
+        # Mid-gesture: this is the state the fix depends on, and the state no
+        # other test in this module ever observes.
+        captured["flag_during_drag"] = win._drag_undo_pushed
+        captured["depth_during_drag"] = len(win._undo_stack)
+        win._execute_drop("tuesday", "10:00")
+        return action
+
+    monkeypatch.setattr(_FakeDrag, "exec", _drop_during_exec)
+
+    win._start_drag_gfx(cls, _StubItem())
+
+    assert captured.get("flag_during_drag") is True, (
+        "production _start_drag_gfx did not set _drag_undo_pushed before the "
+        "drag went live, so _execute_drop cannot tell whose snapshot is on "
+        "top of the stack")
+    assert captured.get("depth_during_drag") == 1, (
+        "the pre-emptive snapshot was not pushed; depth was %r"
+        % (captured.get("depth_during_drag"),))
+
+    live = win.state_data["classes"][0]
+    assert _placement(live) == (True, "tuesday", "10:00", "R001"), (
+        "the drag did not commit through the real starter: %r"
+        % (_placement(live),))
+    assert len(win._undo_stack) == 1, (
+        "a whole drag must be exactly one Ctrl+Z; depth is %d"
+        % len(win._undo_stack))
+    assert win._undo_stack[-1][0] == tr("actions.move").format(name="Fizik")
+    assert win._drag_undo_pushed is False, (
+        "the flag outlived the gesture; the next sidebar drag would pop an "
+        "entry it never pushed")
+
+    win.undo()
+
+    back = win.state_data["classes"][0]
+    assert _placement(back) == (True, "monday", "09:00", "R001"), (
+        "one undo after a REAL drag did not put the lesson back where the "
+        "drag found it: %r" % (_placement(back),))
