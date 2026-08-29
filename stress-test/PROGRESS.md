@@ -20,6 +20,10 @@ what has changed since. Per-finding state also lives in the
 
 ## Phase 7 — complete
 
+> **Picking the work up?** → [`HANDOFF-PHASE8.md`](HANDOFF-PHASE8.md). The
+> roadmap has no rows left; that file lists what is still open, in the order
+> worth doing, with the two live defects that produce a wrong timetable first.
+
 **Suite: 1026 tests — 1018 pass, 8 known-defect pins, 0 failures.** Both lanes
 exit 0. (725 at the start of the phase: **+301 tests, and 7 pins deleted**; two
 were added that document newly-measured open defects.) `mypy` is clean over the
