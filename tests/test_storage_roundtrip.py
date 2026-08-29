@@ -925,23 +925,185 @@ def test_a_damaged_length_prefix_cannot_fabricate_a_record(dersis_home):
 
     This also proves the resync loop terminates: a length prefix that failed to
     advance ``off`` would hang the run instead of failing it.
+
+    The assertion is deliberately "nothing outside the written set, and the
+    damaged record specifically gone", NOT a fixed entry list. It used to pin
+    ``entries == []``, which was the *pre-resync* reader's behaviour — that
+    reader followed the shrunk length, desynchronised, and lost records 1 and 2
+    as collateral. Recovering two records the user really wrote is the point of
+    the resync; pinning the collateral damage would have made this test forbid
+    the fix. What must never happen is an entry that was never written.
     """
     healthy_frames = []
+    written = [{"a": 1}, {"b": 2}, {"c": 3}]
 
     def _shrink_first_prefix(blob):
         healthy_frames.extend(_frames(bytes(blob)))
         struct.pack_into(storage._LOG_RECLEN_FMT, blob, healthy_frames[0][0], 40)
 
-    path = _damaged_log(dersis_home, [{"a": 1}, {"b": 2}, {"c": 3}],
-                        _shrink_first_prefix)
+    path = _damaged_log(dersis_home, written, _shrink_first_prefix)
     assert healthy_frames[0][1] != 40, "the fixture did not change anything"
 
     entries, lost = storage.load_encrypted_lines_report(path)
-    assert entries == [], (
+    invented = [e for e in entries if e not in written]
+    assert invented == [], (
         "the reader resynced onto garbage and FABRICATED %r — no window of "
         "arbitrary bytes should ever survive magic + checksum + GCM tag"
-        % (entries,))
-    assert lost == 2, f"expected lost == 2 from a shrunk prefix, got {lost}"
+        % (invented,))
+    assert {"a": 1} not in entries, (
+        "record 0's own frame was destroyed; decoding it anyway would mean the "
+        "container checks are not gating what the resync hands back")
+    assert len(entries) <= len(written) - 1, (
+        "more records came back than survived the damage: %r" % (entries,))
+    assert lost >= 1, (
+        "a destroyed length prefix was reported as a clean read (lost=%r)"
+        % (lost,))
+
+
+def _six_record_log(dersis_home):
+    """A real 6-record EGL1 log plus its healthy bytes and frame table."""
+    path = os.path.join(str(dersis_home), storage.LOGS_DIR, "feedback.egu")
+    for i in range(6):
+        storage.append_encrypted_entry({"i": i}, path)
+    healthy = open(path, "rb").read()
+    frames = _frames(healthy)
+    assert len(frames) == 6, "the fixture did not produce six frames"
+    return path, healthy, frames
+
+
+def test_a_flipped_length_prefix_does_not_freeze_the_entry_count(dersis_home):
+    """ST-DATA-002: one bad bit in a LENGTH PREFIX must not stop the count.
+
+    ``PreferenceLearner.learn()`` gates on ``_learned_through >= entry_count()``
+    and returns *before any read*, so a count that cannot grow is a permanent,
+    silent learning outage: every later correction the user makes is written to
+    disk and never read back, and ``last_read_lost`` keeps its constructor 0 so
+    ``_report_damaged_feedback_log`` says nothing.
+
+    Measured on this fixture before the fix, flipping ONE bit in record 2's
+    prefix (117 -> 119): ``log_entry_count`` fell 6 -> 3 and stayed at 3 after
+    three further real appends grew the file from 732 to 1101 bytes. Every
+    ``EGU1`` record start was still in the file the whole time.
+
+    The prefix is the one field a prefix-walking reader cannot check, which is
+    why the walk anchors on the container magic instead.
+    """
+    path, healthy, frames = _six_record_log(dersis_home)
+    assert storage.log_entry_count(path) == 6
+
+    off, rec_len = frames[2]
+    damaged = bytearray(healthy)
+    struct.pack_into(storage._LOG_RECLEN_FMT, damaged, off, rec_len ^ 0x2)
+    with open(path, "wb") as handle:
+        handle.write(bytes(damaged))
+    assert bytes(damaged).count(storage._MAGIC) == 6, (
+        "the fixture destroyed a record start; this test is about the PREFIX")
+
+    frozen_at = storage.log_entry_count(path)
+    assert frozen_at >= 5, (
+        "one flipped prefix bit dropped the count from 6 to %r: every record "
+        "after it is unreachable to the walk, so the learner's gate can never "
+        "open again" % (frozen_at,))
+
+    for i in range(3):
+        storage.append_encrypted_entry({"later": i}, path)
+    assert storage.log_entry_count(path) == frozen_at + 3, (
+        "the count did not grow by the three records that were really "
+        "appended (%r -> %r): learning is frozen for good"
+        % (frozen_at, storage.log_entry_count(path)))
+
+    report = storage.load_encrypted_lines_report(path)
+    assert report.lost >= 1, (
+        "a destroyed frame was read as a clean log (lost=%r)" % (report.lost,))
+    assert {"later": 0} in report.entries, (
+        "records appended after the damage are still not readable")
+
+
+def test_the_two_log_walks_agree_on_frame_count_after_prefix_damage(dersis_home):
+    """The learner's cursor is a frame index one walk makes and another spends.
+
+    ``log_entry_count`` cannot decrypt, so it counts frames; the learner passes
+    that number back as ``skip`` to ``load_encrypted_lines_since_report``. If
+    the two disagree about what a frame is on a damaged file, the cursor lands
+    in the wrong place and the learner re-learns or skips entries — the drift
+    ``storage.py`` warns about in as many words.
+
+    Measured before the fix on a 6-record log with one bit flipped in record
+    2's prefix: ``log_entry_count`` said 3 while the since-walk saw 4 frames.
+    """
+    path, healthy, frames = _six_record_log(dersis_home)
+
+    for idx in range(6):
+        off, rec_len = frames[idx]
+        damaged = bytearray(healthy)
+        struct.pack_into(storage._LOG_RECLEN_FMT, damaged, off, rec_len ^ 0x2)
+        with open(path, "wb") as handle:
+            handle.write(bytes(damaged))
+
+        total = storage.log_entry_count(path)
+        whole = storage.load_encrypted_lines_report(path).entries
+        assert storage.load_encrypted_lines_since_report(path, total).entries == [], (
+            "the since-walk still had records left at the cursor "
+            "log_entry_count reported (%r) with record %r's prefix damaged: "
+            "the learner would never read them" % (total, idx))
+        for skip in range(total + 1):
+            tail = storage.load_encrypted_lines_since_report(path, skip).entries
+            assert tail == whole[len(whole) - len(tail):], (
+                "since(%r) is not a suffix of the whole read with record %r's "
+                "prefix damaged: whole=%r tail=%r"
+                % (skip, idx, whole, tail))
+
+
+def test_a_tail_torn_just_past_a_record_boundary_is_not_a_clean_end(dersis_home):
+    """ST-DATA-002: records gone, ``lost`` reporting 0.
+
+    ``app.py``'s ``_report_damaged_feedback_log`` opens with ``if not lost:
+    return``, so ``lost == 0`` is the difference between the user being told
+    their history was damaged and being told nothing at all. The frame loop
+    ended on ``off + 4 <= len(blob)`` and had no loss accounting on that exit,
+    so a truncation landing in the 4-byte window after any record boundary
+    swallowed every later record and reported a clean read.
+
+    Measured over every truncation length of this 6-record log before the fix:
+    24 lengths lost records while reporting ``lost == 0``, 0 false alarms.
+    After: 6 — exactly the cuts that land ON a record boundary, which no reader
+    of this format can tell from a shorter log — and still 0 false alarms.
+    """
+    path, healthy, frames = _six_record_log(dersis_home)
+    boundary = frames[3][0]  # first byte of record 3's length prefix
+
+    for extra in (1, 2, 3):
+        with open(path, "wb") as handle:
+            handle.write(healthy[:boundary + extra])
+        entries, lost = storage.load_encrypted_lines_report(path)
+        assert len(entries) == 3, (
+            "the complete records before the tear were not kept (%r)" % (entries,))
+        assert lost >= 1, (
+            "%d byte(s) past a record boundary: three records are gone and the "
+            "read reported a clean end (lost=%r), so the user is told nothing"
+            % (extra, lost))
+
+    # The property that must NOT regress: a healthy log, and a log cut exactly
+    # at a boundary, are clean reads. Over-reporting would warn every user on
+    # every launch and make the signal worthless.
+    with open(path, "wb") as handle:
+        handle.write(healthy)
+    assert storage.load_encrypted_lines_report(path).lost == 0, (
+        "a healthy log reported a loss")
+    silent, false_alarms = [], []
+    for cut in range(struct.calcsize(storage._LOG_HEADER_FMT), len(healthy)):
+        with open(path, "wb") as handle:
+            handle.write(healthy[:cut])
+        entries, lost = storage.load_encrypted_lines_report(path)
+        if len(entries) < 6 and lost == 0:
+            silent.append(cut)
+        if len(entries) == 6 and lost != 0:
+            false_alarms.append(cut)
+    assert false_alarms == [], (
+        "truncations that lost nothing reported a loss: %r" % (false_alarms,))
+    assert silent == [f[0] for f in frames], (
+        "the only truncations allowed to read as a clean end are the ones that "
+        "land exactly on a record boundary; got %r" % (silent,))
 
 
 def test_both_readers_agree_about_damage_after_the_cursor(dersis_home):

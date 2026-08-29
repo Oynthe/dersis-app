@@ -789,3 +789,110 @@ def test_the_learner_does_not_re_read_an_unreadable_log_forever(dersis_home):
     storage.save_encrypted_lines([_raw_entry(i) for i in range(6)],
                                  fresh_home_path)
     assert storage.load_encrypted_lines_report(fresh_home_path).lost == 0
+
+
+def _flip_one_prefix_bit(path, index):
+    """Flip a single bit in record *index*'s 4-byte LENGTH PREFIX.
+
+    Deliberately NOT what ``_wreck_every_record`` does. That helper's own
+    docstring says it "leaves the framing intact ... so the MIN_ENTRIES_TO_LEARN
+    gate is still cleared and learn() really does reach the code under test" —
+    every other ST-DATA-002 test in this suite damages payloads only, and the
+    prefix is the one field a prefix-walking reader has no way to check.
+    Returns the number of ``EGU1`` record starts still present, so the caller
+    can assert the records themselves were not touched.
+    """
+    blob = bytearray(open(path, "rb").read())
+    assert bytes(blob[:4]) == storage._LOG_MAGIC, (
+        "not an EGL1 log (%r); this helper's frame arithmetic would be "
+        "meaningless" % (bytes(blob[:4]),))
+    off = struct.calcsize(storage._LOG_HEADER_FMT)
+    seen = 0
+    while off + 4 <= len(blob):
+        (rec_len,) = struct.unpack_from(storage._LOG_RECLEN_FMT, blob, off)
+        if rec_len <= 0 or off + 4 + rec_len > len(blob):
+            break
+        if seen == index:
+            struct.pack_into(storage._LOG_RECLEN_FMT, blob, off, rec_len ^ 0x2)
+            with open(path, "wb") as handle:
+                handle.write(bytes(blob))
+            return bytes(blob).count(storage._MAGIC)
+        seen += 1
+        off += 4 + rec_len
+    raise AssertionError("the log has no record %r" % (index,))
+
+
+def test_a_flipped_length_prefix_does_not_end_learning_for_good(dersis_home):
+    """ST-DATA-002: the damage shape that produces the WORST outcome.
+
+    ``learn()`` gates on ``self._learned_through >= total`` and returns before
+    reading anything, so a frozen ``entry_count()`` is a learning outage that
+    can never end: the cursor is never overtaken, ``last_read_lost`` keeps its
+    constructor value of 0, and ``_report_damaged_feedback_log``
+    (``ui/app.py``, ``if not lost: return``) therefore says nothing. The user
+    goes on correcting the timetable, every correction is written to disk, and
+    none of it is ever read again.
+
+    The damage is placed AFTER the cursor on purpose. That is the shape where
+    the learner really loses something it had not read yet, so it is the shape
+    that must reach ``last_read_lost``; and it is also the shape that used to
+    freeze the count at a value the cursor then caught up to and never passed
+    again.
+
+    Measured before the fix on this exact fixture: one flipped bit in record
+    14's length prefix took ``entry_count()`` from 18 to 15, the restarted
+    learner drained it to a cursor of 15, and four further real ``manual_move``
+    appends (file 5766 bytes and growing) left the count at 15 and ``learn()``
+    at 0 for ever after, with ``last_read_lost`` back at 0. Every ``EGU1``
+    record start was still in the file the whole time.
+
+    A failure means learning is dead and silent, which is ST-DATA-002 itself.
+    """
+    path = storage.feedback_log_path()
+    logger = FeedbackLogger()
+    for i in range(12):
+        _log_move(logger, i)
+    assert logger.entry_count() == 12
+
+    learner = PreferenceLearner()
+    assert learner.learn() > 0, "the healthy log produced no signals"
+    assert learner._learned_through == 12, (
+        "the fixture did not leave the cursor at the end of the healthy log "
+        "(%r); the gate under test would not be the one that fires"
+        % (learner._learned_through,))
+
+    for i in range(100, 106):
+        _log_move(logger, i)
+    assert logger.entry_count() == 18
+
+    starts = _flip_one_prefix_bit(path, 14)
+    assert starts == 18, (
+        "the fixture destroyed a record start (%r left); this test is about "
+        "the PREFIX, not the record" % (starts,))
+
+    restarted = PreferenceLearner()
+    assert restarted._learned_through == 12, "the cursor did not survive the restart"
+    assert restarted.learn() > 0, (
+        "one flipped bit in a length prefix stopped learning: entry_count() "
+        "is %r against a cursor of 12"
+        % (restarted.feedback_logger.entry_count(),))
+    assert restarted.last_read_lost >= 1, (
+        "a record past the cursor was destroyed and the learner reported no "
+        "loss (last_read_lost=%r), so _report_damaged_feedback_log returns at "
+        "its `if not lost` and the user is told nothing"
+        % (restarted.last_read_lost,))
+    drained = restarted._learned_through
+
+    # The permanence half: four more real corrections must still be learned
+    # from. A count frozen by the damage can never be overtaken again, so this
+    # is what separates "one damaged record" from "learning is over".
+    for i in range(200, 204):
+        _log_move(logger, i)
+    relaunched = PreferenceLearner()
+    assert relaunched.feedback_logger.entry_count() >= drained + 4, (
+        "the entry count did not grow by the four records that were really "
+        "appended (%r against a cursor of %r): the learner's gate can never "
+        "open again" % (relaunched.feedback_logger.entry_count(), drained))
+    assert relaunched.learn() > 0, (
+        "the four corrections the user made after the damage produced no "
+        "training signals; they are on disk and will never be read")

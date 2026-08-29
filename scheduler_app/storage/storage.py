@@ -43,7 +43,7 @@ import secrets
 import shutil
 import struct
 import sys
-from typing import NamedTuple
+from typing import Iterator, NamedTuple, Optional, Tuple
 
 from scheduler_app.core.models import normalize_state_classes
 from scheduler_app.translations import tr
@@ -186,6 +186,12 @@ _LOG_VERSION = 1
 _LOG_HEADER_FMT = "!4sH"
 _LOG_RECLEN_FMT = "!I"
 
+# The smallest byte count a real EGU1 container can occupy: header + salt + IV +
+# payload length + checksum, with a zero-length payload. Any length prefix
+# claiming less than this is damage, whatever else it looks like.
+_MIN_CONTAINER = (struct.calcsize(_HEADER_FMT) + _SALT_LEN + _IV_LEN
+                  + struct.calcsize(_PAYLOAD_LEN_FMT) + _CHECKSUM_LEN)
+
 
 class LogRead(NamedTuple):
     """What one log read produced, and what it could not read.
@@ -201,6 +207,17 @@ class LogRead(NamedTuple):
     ``lost`` is a floor, not an exact count: a torn tail is one loss however
     many records it swallowed, because the framing that would have counted them
     is exactly what is missing. Nothing user-facing may print it as a number.
+
+    The one shape this cannot see, stated so the sentence above is not read as
+    more than it is: a truncation landing EXACTLY on a record boundary leaves a
+    file that is byte-for-byte a shorter healthy log, and no reader of this
+    format can tell it from one — the header carries no record count. Measured
+    over every truncation length of a 6-record log: 6 such lengths, one per
+    boundary, against 24 silently-lost lengths before the tail accounting was
+    added. Putting a count in the EGL1 header would close it, at the price of
+    turning the O(1) append into a read-modify-write of the header and creating
+    a window where the count and the records disagree after a crash; that trade
+    was not taken.
     """
     entries: list
     lost: int
@@ -518,6 +535,94 @@ def _write_log(entries: list, path: str) -> None:
         raise
 
 
+def _walk_log_frames(blob: bytes) -> Iterator[Optional[Tuple[int, int]]]:
+    """Walk the record frames of an EGL1 blob, resyncing on the EGU1 magic.
+
+    THE one framing rule for this format. Every walk over an EGL1 log goes
+    through here — ``_read_log_records_report``, ``log_entry_count`` and
+    ``load_encrypted_lines_since_report`` — because the learner's cursor is a
+    *frame index* produced by one of them and consumed by another, so any
+    disagreement about what counts as a frame makes it re-learn or skip
+    entries.
+
+    Yields ``(payload_start, payload_len)`` for every structurally intact
+    frame, in file order, and ``None`` once for each span that had to be
+    skipped. A ``None`` is NOT a frame: it never advances the cursor unit.
+
+    Resyncing on the magic instead of trusting the length prefix is what makes
+    a damaged prefix survivable. The old walk advanced by the *claimed* length,
+    so one flipped bit in a prefix desynchronised it permanently and every
+    later record became unreachable — measured on a 6-record log, a single bit
+    flipped in record 2's prefix took the count from 6 to 3 and froze it there
+    across every subsequent append. Scanning forward to the next ``EGU1`` start
+    recovers the records after the damage instead.
+
+    A resync cannot INVENT a record: a frame is only yielded when its payload
+    begins with a container magic and is at least ``_MIN_CONTAINER`` bytes, and
+    the caller still has to get past that container's SHA-256 and AES-GCM tag.
+    Measured with an exhaustive single-bit sweep over a healthy log: zero
+    fabricated entries.
+
+    The forward scan runs ONLY after a frame fails to check out. A healthy log
+    is still walked by seeking from one prefix to the next — eight bytes read
+    per record instead of four, no scanning — so ``log_entry_count`` keeps the
+    cost ST-PERF-005 exists for.
+
+    Termination: a yielded frame advances ``off`` by at least
+    ``len_size + _MIN_CONTAINER``, and a resync advances it by at least 1
+    because the search starts past the current frame's own payload magic.
+    """
+    len_size = struct.calcsize(_LOG_RECLEN_FMT)
+    magic_size = len(_MAGIC)
+    off = struct.calcsize(_LOG_HEADER_FMT)
+    end = len(blob)
+    while off + len_size <= end:
+        (rec_len,) = struct.unpack_from(_LOG_RECLEN_FMT, blob, off)
+        start = off + len_size
+        if (rec_len >= _MIN_CONTAINER and start + rec_len <= end
+                and blob[start:start + magic_size] in (_MAGIC, _LEGACY_MAGIC)):
+            # A frame: the payload is a container start and it fits. Whether the
+            # container itself decrypts is the caller's business, not framing's.
+            yield (start, rec_len)
+            after = start + rec_len
+            if (after == end
+                    or blob[after + len_size:after + len_size + magic_size]
+                    in (_MAGIC, _LEGACY_MAGIC)):
+                off = after  # the claimed length lands on the next record
+                continue
+            # It does not. The magic said "a record starts here" and the length
+            # said "the next one starts nowhere in particular", so the length is
+            # the damaged half. Following it is what desynchronised the old walk
+            # for the whole rest of the file; resync instead. No loss is counted
+            # when the scan succeeds: this record was already yielded and the
+            # scan lands on the very next record start, so nothing was skipped.
+            already_lost = False
+        else:
+            # This prefix cannot be trusted — it may itself be the damaged
+            # bytes. Whatever it framed is unreadable: count one loss.
+            yield None
+            already_lost = True
+        nxt = blob.find(_MAGIC, start + 1)
+        if nxt < len_size:  # not found, or no room for a length prefix ahead of it
+            if not already_lost:
+                # Bytes follow this record but no record start does: the rest of
+                # the file is a torn or damaged tail, not a clean end.
+                yield None
+            return
+        off = nxt - len_size
+    if off < end:
+        # 1-3 bytes left over: a record was torn away mid-prefix. Falling out of
+        # the loop here used to report a clean end, so a truncation landing in
+        # that 4-byte window swallowed whole records and reported lost == 0 —
+        # the ST-DATA-002 lie in a new place, and a direct contradiction of the
+        # ``LogRead`` contract ("a torn tail is one loss however many records it
+        # swallowed"). Measured over every truncation of a 6-record log: 24
+        # silent-loss lengths before, 6 after (the 6 that land exactly on a
+        # record boundary, which no reader of this format can detect), with
+        # false alarms staying at 0.
+        yield None
+
+
 def _read_log_records(blob: bytes) -> list:
     """Decode an EGL1 blob, keeping every record that still decrypts."""
     return _read_log_records_report(blob).entries
@@ -534,16 +639,18 @@ def _read_log_records_report(blob: bytes) -> LogRead:
     Skipping a bad record is safe because of the framing, not in spite of it:
     every record carries its own length prefix, EGU1 magic, SHA-256 and
     AES-GCM tag, so a reader that resyncs can lose records but cannot invent
-    one — a window of arbitrary bytes fails all three checks. Measured with
-    record 0's length prefix rewritten to 40: ``([], 2)``, no fabricated entry.
-    The loop terminates because ``rec_len <= 0`` breaks and ``off`` otherwise
-    grows by at least ``len_size`` each turn.
+    one — a window of arbitrary bytes fails all three checks. Measured with an
+    exhaustive single-bit sweep over a healthy 6-record log (5,856 flips): zero
+    fabricated entries.
+
+    Framing is delegated to :func:`_walk_log_frames`, which is shared with
+    ``log_entry_count`` and ``load_encrypted_lines_since_report`` so all three
+    agree on what a frame is.
 
     ``lost`` is a floor, not a count: a torn tail is one loss however many
     records it swallowed, because the framing that would have counted them is
     exactly what is missing.
     """
-    header_size = struct.calcsize(_LOG_HEADER_FMT)
     magic, version = struct.unpack_from(_LOG_HEADER_FMT, blob, 0)
     if magic != _LOG_MAGIC:
         raise EguFileError(tr("errors.invalid_egu_header"))
@@ -553,20 +660,16 @@ def _read_log_records_report(blob: bytes) -> LogRead:
                 version=version, supported=_LOG_VERSION))
     entries = []
     lost = 0
-    off = header_size
-    len_size = struct.calcsize(_LOG_RECLEN_FMT)
-    while off + len_size <= len(blob):
-        (rec_len,) = struct.unpack_from(_LOG_RECLEN_FMT, blob, off)
-        off += len_size
-        if rec_len <= 0 or off + rec_len > len(blob):
-            lost += 1  # torn tail: keep every complete record before it
-            break
+    for frame in _walk_log_frames(blob):
+        if frame is None:
+            lost += 1  # a skipped span: a torn tail, or a frame we resynced past
+            continue
+        start, rec_len = frame
         try:
             entries.append(json.loads(
-                _parse_container(blob[off:off + rec_len]).decode("utf-8")))
+                _parse_container(blob[start:start + rec_len]).decode("utf-8")))
         except Exception:
             lost += 1  # one unreadable record; the next frame is still framed
-        off += rec_len
     return LogRead(entries, lost)
 
 
@@ -659,14 +762,29 @@ def log_size(path: str) -> int:
 
 
 def log_entry_count(path: str) -> int:
-    """Number of records, without reading or decrypting their payloads.
+    """Number of record frames, without reading or decrypting their payloads.
 
-    Seeks over each record rather than reading the file in: only the 4-byte
-    length prefixes are ever read, so counting a large log stays cheap.
+    Seeks over each record rather than reading the file in: on a healthy log
+    only the 4-byte length prefix and the 4-byte container magic of each record
+    are ever read, so counting a large log stays cheap.
+
+    The magic check is not decoration. Without it this walk trusted the length
+    prefix, which is exactly the byte that may be damaged: one flipped bit in a
+    prefix made the count collapse (6 -> 3 on a measured 6-record log) and stay
+    collapsed through every later append, because the learner's gate is
+    ``learned_through >= log_entry_count(...)`` and the count could never grow
+    past the damage again. Learning died silently and permanently.
+
+    When a frame does not check out, counting past it needs the resync walk,
+    and it MUST be the SAME walk ``load_encrypted_lines_since_report`` uses —
+    the number returned here is the unit that function's ``skip`` is expressed
+    in. So the damaged path reads the file in and defers to
+    :func:`_walk_log_frames` rather than reimplementing the resync.
     """
     if not os.path.exists(path):
         return 0
     len_size = struct.calcsize(_LOG_RECLEN_FMT)
+    magic_size = len(_MAGIC)
     try:
         with open(path, "rb") as f:
             if f.read(4) != _LOG_MAGIC:
@@ -677,15 +795,20 @@ def log_entry_count(path: str) -> int:
             while True:
                 raw = f.read(len_size)
                 if len(raw) < len_size:
-                    break
+                    return count  # clean end, or a 1-3 byte torn tail
                 (rec_len,) = struct.unpack(_LOG_RECLEN_FMT, raw)
-                if rec_len <= 0 or f.tell() + rec_len > total:
+                start = f.tell()
+                if rec_len < _MIN_CONTAINER or start + rec_len > total:
                     break
-                f.seek(rec_len, 1)
+                if f.read(magic_size) not in (_MAGIC, _LEGACY_MAGIC):
+                    break
+                f.seek(start + rec_len)
                 count += 1
-            return count
+        with open(path, "rb") as f:
+            blob = f.read()
     except OSError:
         return 0
+    return sum(1 for frame in _walk_log_frames(blob) if frame is not None)
 
 
 def load_encrypted_lines_since(path: str, skip: int) -> list:
@@ -726,28 +849,25 @@ def load_encrypted_lines_since_report(path: str, skip: int) -> LogRead:
         return LogRead(whole.entries[skip:], whole.lost)
     entries = []
     lost = 0
-    off = struct.calcsize(_LOG_HEADER_FMT)
-    len_size = struct.calcsize(_LOG_RECLEN_FMT)
     seen = 0
-    while off + len_size <= len(blob):
-        (rec_len,) = struct.unpack_from(_LOG_RECLEN_FMT, blob, off)
-        off += len_size
-        if rec_len <= 0 or off + rec_len > len(blob):
-            lost += 1
-            break
+    # Counts FRAMES, not decoded records, so the learner's cursor stays in the
+    # same unit as log_entry_count() — which walks the same _walk_log_frames()
+    # and cannot decrypt — even when a record in the middle is unreadable. The
+    # two used to be separate loops that could disagree on a damaged file; they
+    # are now one walk, so they cannot drift and make the learner re-learn or
+    # skip entries.
+    for frame in _walk_log_frames(blob):
+        if frame is None:
+            lost += 1  # a skipped span is a loss, never a frame
+            continue
+        start, rec_len = frame
         if seen >= skip:
             try:
                 entries.append(json.loads(
-                    _parse_container(blob[off:off + rec_len]).decode("utf-8")))
+                    _parse_container(blob[start:start + rec_len]).decode("utf-8")))
             except Exception:
                 lost += 1
-        # Counts FRAMES, not decoded records, so the learner's cursor stays in
-        # the same unit as log_entry_count() — which walks length prefixes
-        # without decrypting — even when a record in the middle is unreadable.
-        # If log_entry_count ever starts skipping undecodable frames, the two
-        # drift and the learner re-learns or skips entries.
         seen += 1
-        off += rec_len
     return LogRead(entries, lost)
 
 
