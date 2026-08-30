@@ -33,7 +33,7 @@ try:
 except ImportError:
     openpyxl = None
 
-from scheduler_app.constants import OPEN_SLOTS_FG_ROOM
+from scheduler_app.constants import OPEN_SLOTS_FG_ROOM, STATUS_FG_WARN
 from scheduler_app.translations import tr, get_language, set_language, is_rtl
 from scheduler_app.core.text_safety import csv_safe
 from scheduler_app.i18n.day_keys import (
@@ -1042,8 +1042,30 @@ def _class_form_result(parent, state, edit_cls):
     """
     unchanged = edit_cls.get("lecturer")
     seed = edit_cls
+    # ST-UI-021. The caption, not a parameter. `seed` becomes `dlg.result` on
+    # the re-show, and `AddClassDialog` has exactly one channel for a seed —
+    # `edit_cls=` — from which `__init__` derives the title. So the second
+    # showing of the ADD form called itself "Edit Class": every field correct,
+    # only the caption lying, and only on the add path's second showing.
+    #
+    # `captions[0]` is by construction the FIRST showing's caption, which
+    # `__init__` derived from the real `edit_cls` — so the add path keeps the
+    # add caption and the edit path keeps the edit caption, without either
+    # this function or the dialog having to know which path it is on.
+    #
+    # The prescribed fix — a keyword-only `title=None` on
+    # `AddClassDialog.__init__` — was built and measured and costs +1 in BOTH
+    # files: the `title or (edit-derived default)` is a BoolOp inside the
+    # codebase's only F-band function (46), and the caller needs a second one
+    # to learn the first showing's title. Both files are on their ceilings.
+    # Three bare statements here are +0, and `setWindowTitle` is called
+    # exactly once in `AddClassDialog` — in `__init__`, with nothing
+    # recomputing it — which is the fact that makes overriding it safe.
+    captions = []
     while True:
         dlg = AddClassDialog(parent, state, edit_cls=seed)
+        captions.append(dlg.windowTitle())
+        dlg.setWindowTitle(captions[0])
         if dlg.exec() != AddClassDialog.DialogCode.Accepted or not dlg.result:
             return None
         typed = dlg.result.get("lecturer")
@@ -1985,8 +2007,8 @@ class SchedulerApp(QMainWindow):
             badge.setStyleSheet(
                 "QToolButton { background: #FEF3C7; border: 1px solid #F59E0B;"
                 " border-radius: 6px; padding: 5px 14px; font-size: 9pt;"
-                " font-weight: bold; color: #D97706; }"
-                "QToolButton:hover { background: #FDE68A; }")
+                " font-weight: bold; color: %s; }"
+                "QToolButton:hover { background: #FDE68A; }" % STATUS_FG_WARN)
             if container:
                 container.setVisible(True)
             if action:
@@ -3319,7 +3341,8 @@ class SchedulerApp(QMainWindow):
                     # user had placed -- the same silent drop the PDF had, in
                     # the file that gets emailed. A flat file has room for it.
                     si = find_slot_index(self.state_data, start)
-                    for t in c["targets"] or [{"year": "", "branch": ""}]:
+                    for t_idx, t in enumerate(
+                            c["targets"] or [{"year": "", "branch": ""}]):
                         # A non-joint lesson gives each group its own
                         # consecutive block ("If unchecked, each group gets its
                         # own consecutive time block"), and the dialog writes
@@ -3331,11 +3354,12 @@ class SchedulerApp(QMainWindow):
                         # says 1, so without the offset it states group B's
                         # session at group A's hour.
                         #
-                        # `.index(t)` rather than enumerate, deliberately: the
-                        # other three surfaces index the same way (see the
-                        # consistency note at renderer.py:1477), so duplicate
-                        # targets resolve identically here and on screen.
-                        t_idx = c["targets"].index(t) if c["targets"] else 0
+                        # `enumerate`, not `.index(t)` — ST-UI-016, fourth of
+                        # four sites; the reasoning is at the same construct in
+                        # ui/renderer.py. The `or [{...}]` fallback above is
+                        # what the old `if c["targets"] else 0` guard was for,
+                        # and it already covers the empty case, so the ternary
+                        # went with the `.index` call.
                         row_start = start
                         off = slot_offset_for_target(c, t_idx)
                         if si is not None and si + off < len(self.state_data["slots"]):
@@ -3424,10 +3448,49 @@ class SchedulerApp(QMainWindow):
         # state does not list -- and the next Setup OK unplaces it.
         cls["lecturer"] = SchedulingWorkflow.register_lecturer(
             self.state_data, cls.get("lecturer")) or ""
+        # B1/B2, THIRD site (`bulk_add_classes` below is the fourth). This was
+        # `self._push_undo(...)` right here, above a call that can end in
+        # `SchedulingWorkflow.rollback_schedule` — the user adds a class, the
+        # results dialog opens, they press Cancel, and the rollback puts the
+        # placements back but cannot put back the redo stack `_push_undo`
+        # cleared nor the `_undo_stack[0]` it evicted at the 50-entry cap.
+        # `_push_undo`'s own docstring forbids this shape: snapshot AND commit
+        # in one statement is only for a change that is already certain.
+        #
+        # THE GATE IS THE STATE, NOT `_schedule_new_classes`'s BOOLEAN. That
+        # boolean is wrong at two of its five exits, measured:
+        #
+        #   1 single_success          state CHANGED    returns True   undo YES
+        #   2 single_failed + pinned   state UNCHANGED  returns False  undo NO
+        #   3 single_failed + unpinned state UNCHANGED  returns TRUE   undo NO
+        #   4 accepted                state CHANGED    returns True   undo YES
+        #   5 rejected (rollback)     state UNCHANGED  returns False  undo NO
+        #
+        # Exits 2, 3 and 5 all reach here. At exit 3 the workflow has ALREADY
+        # removed the class, so the `True` is a lie and today it also fires
+        # `_note_structural_change` for a state that did not change; at exit 5
+        # it is the reported defect. One comparison is right at all five, so
+        # `_schedule_new_classes`'s contract needs no change at all — which is
+        # the half of the prescribed fix that turned out to be unnecessary.
+        #
+        # Not a count and not `result.rescheduled`, for the reasons
+        # `_place_classes_batch` records at length: `placed_count` counts only
+        # the candidates while Phase 2 of `optimized_batch_schedule` re-solves
+        # every already-placed unpinned lesson, and `rescheduled` is returned
+        # True unconditionally (re-verified at core/facade.py and
+        # core/workflow.py for this phase).
+        #
+        # The whole state rather than `snapshot_placements`, because this
+        # gesture can add and remove CLASSES, which a placement map cannot see.
         snap_before = capture_snapshot(self.state_data)
-        self._push_undo(tr("actions.add").format(name=cls["name"]))
+        before_add = copy.deepcopy(self.state_data)
         split_classes = split_non_joint(cls)
-        if self._schedule_new_classes(split_classes):
+        self._schedule_new_classes(split_classes)
+        if self.state_data != before_add:
+            _commit_undo_entry(self._undo_stack, self._redo_stack,
+                               self._max_undo,
+                               tr("actions.add").format(name=cls["name"]),
+                               before_add)
             desc = tr("impact.trigger.classes_added").format(n=len(split_classes))
             self._note_structural_change(snap_before, description=desc)
         self.refresh_grid()
@@ -3456,9 +3519,17 @@ class SchedulerApp(QMainWindow):
         for rc in raw_classes:
             new_classes.extend(split_non_joint(rc))
 
+        # B1/B2, fourth site. Same shape, same gate, same five exits — see the
+        # accounting in `add_class` above. Bulk Add reaches exit 5 (the user
+        # presses Cancel in the results dialog) most often of the four sites,
+        # because it is the one that always opens that dialog.
         snap_before = capture_snapshot(self.state_data)
-        self._push_undo(tr("actions.bulk_schedule"))
-        if self._schedule_new_classes(new_classes):
+        before_add = copy.deepcopy(self.state_data)
+        self._schedule_new_classes(new_classes)
+        if self.state_data != before_add:
+            _commit_undo_entry(self._undo_stack, self._redo_stack,
+                               self._max_undo, tr("actions.bulk_schedule"),
+                               before_add)
             desc = tr("impact.trigger.classes_added").format(n=len(new_classes))
             self._note_structural_change(snap_before, description=desc)
         self.refresh_grid()
@@ -3534,10 +3605,32 @@ class SchedulerApp(QMainWindow):
             QMessageBox.information(self, tr("dialogs.edit_classes.title"),
                                    tr("dialogs.edit_classes.no_classes"))
             return
+        # The snapshot used to be taken HERE, unconditionally, above
+        # `dlg.exec()`. Opening Edit Classes and closing it unchanged
+        # therefore cleared the redo stack — measured: redo depth 1 -> 0 for a
+        # gesture that left `state_data` byte-identical — and at the 50-entry
+        # cap it also evicted `_undo_stack[0]`, which no `pop()` puts back.
+        #
+        # It is not moved BELOW `dlg.exec()`, which is the obvious repair and
+        # is wrong: `edit_callback` is `_edit_class`, which pushes its own
+        # entry while the modal is still up. An entry committed after `exec()`
+        # returns is then younger than entries recorded before it, and one
+        # Ctrl+Z jumps forward in time — measured on delete-then-rename, the
+        # second undo re-deleted the class the first had just restored.
+        # Re-ordering the stack afterwards fixes that below the cap and is
+        # silently off by one AT the cap, because the inner push has already
+        # shifted every index left.
+        #
+        # So the snapshot goes where the mutation is. `_delete_selected` is
+        # the only place this dialog writes `state_data` directly; everything
+        # else it does goes through `_edit_class`, which already records its
+        # own entry at its own instant. Nothing speculative is ever pushed and
+        # the ordering question cannot arise.
         snap_before = capture_snapshot(self.state_data)
-        self._push_undo(tr("actions.edit").format(name="classes"))
-        dlg = EditClassesDialog(self, self.state_data,
-                                edit_callback=self._edit_class)
+        dlg = EditClassesDialog(
+            self, self.state_data, edit_callback=self._edit_class,
+            snapshot_callback=lambda: self._push_undo(
+                tr("actions.edit").format(name="classes")))
         dlg.exec()
         # Validate placements via workflow
         invalidated = SchedulingWorkflow.validate_placements_after_edit(
@@ -4256,15 +4349,39 @@ class SchedulerApp(QMainWindow):
 
             # Slot rows
             for slot_time, room in entries:
+                # ST-UI-017. NO pointing hand and NO :hover rule. This row is
+                # a bare QWidget with nothing connected — measured: the click
+                # arrives (an event filter records press and release from a
+                # real QTest.mouseClick) and is then IGNORED by QWidget's
+                # default handler, and 16 clicks across every row left a
+                # 14-field snapshot of the window byte-identical. It carried
+                # both cues anyway, so the panel promised a gesture it did not
+                # have.
+                #
+                # Removed rather than wired, and the costing is the reason.
+                # Reusing `_place_unplaced_class_at_slot` — the method the
+                # empty-cell context menu already calls — is free at the
+                # ratchet, but it ignores `room` entirely and re-derives it
+                # from `find_valid_options` plus the classroom filter, so
+                # clicking the row labelled "R002" can place into R001: a
+                # false affordance replaced by a lying one. The gesture the
+                # affordance actually implies — place the selected lesson
+                # here, choose one when none is selected — measures
+                # app.py 920 -> 923 and would need the ceiling raised. That is
+                # the wrong purchase for a Low-severity honesty defect, and
+                # every real placement gesture is elsewhere anyway (drag from
+                # Unplaced, right-click an empty cell, Ctrl+P).
+                #
+                # The hover tint went with the cursor deliberately. It is a
+                # useful reading aid in a long list, and on a row that does
+                # nothing it is also the second half of the promise; keeping
+                # it would have meant weakening the probe to suit the code.
                 row = QWidget()
                 row.setObjectName("slotRow")
-                row.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
                 row.setStyleSheet(
                     "QWidget#slotRow {"
                     "  background: #FFFFFF; border-radius: 6px;"
-                    "  padding: 8px 10px; margin: 1px 0px; }"
-                    "QWidget#slotRow:hover {"
-                    "  background: #ECFDF5; }")
+                    "  padding: 8px 10px; margin: 1px 0px; }")
                 row_layout = QHBoxLayout(row)
                 row_layout.setContentsMargins(10, 6, 10, 6)
                 row_layout.setSpacing(0)
@@ -5028,8 +5145,29 @@ class SchedulerApp(QMainWindow):
         """Handle drops that are not over a specific timetable cell."""
         drag_group = list(getattr(self, "_dragging_classes", []) or [])
         if len(drag_group) > 1 and all(not c.get("placed") for c in drag_group):
+            # `= True` unconditionally, until this phase, whatever the batch
+            # did. It showed no false toast — but only because
+            # `_start_drag_unplaced` toasts solely for `len(drag_classes) == 1`
+            # while this method runs solely for `len(drag_group) > 1`. Those
+            # two conditions are disjoint by accident, two methods apart, and
+            # nothing stated it. `_drag_success` is not only a toast flag:
+            # `_start_drag_gfx` reads it to decide whether the gesture was a
+            # no-op, which is the mechanism Phase 9 rebuilt for B1/B2, so
+            # "true for a batch that placed nothing" is that family's untruth
+            # in a place no test could see.
+            #
+            # DELETING the line would be wrong the other way — a successful
+            # batch drop would stop setting the flag and the gesture would
+            # read as abandoned. The comparison is the same one
+            # `_place_classes_batch` makes internally for its undo gate.
+            #
+            # Placements, not the whole state as in `add_class`: a drop cannot
+            # add or remove classes, only move them. The two gates are
+            # deliberately different predicates.
+            before_drop = snapshot_placements(self.state_data)
             self._place_classes_batch(drag_group)
-            self._drag_success = True
+            self._drag_success = (
+                snapshot_placements(self.state_data) != before_drop)
 
     def _execute_drop(self, day, slot):
         """Finalize the drop: validate fully and either commit or reject."""
@@ -5361,7 +5499,25 @@ class SchedulerApp(QMainWindow):
         lines = []
         tab_idx = self.notebook.currentIndex()
 
-        if tab_idx == 3:
+        # ST-FUNC-008. `>=`, not `== 3`: the else-branch below indexes a
+        # THREE-element list with `tab_idx`, and the Dashboard is tab 4. With
+        # `== 3` that is an IndexError raised inside a QShortcut slot, and
+        # `scheduler_gui.py` installs an exception hook, so the user is shown
+        # the crash-report dialog — DERSIS announcing that it has crashed —
+        # gets a crash-log entry, and gets nothing on the clipboard. Measured
+        # through the real Ctrl+C shortcut: tabs 0-3 copy, tab 4 raises.
+        #
+        # "Everything" is the right answer for the Dashboard and not a guess:
+        # `_export_to_excel` and `_export_to_pdf` both carry
+        # {0: classroom, 1: group, 2: lecturer, 3: everything, 4: everything},
+        # driving the real Excel export from tab 3 and tab 4 produces
+        # identical workbooks, and `DashboardWidget.refresh` is handed the
+        # whole state — there is no subset for a filter function to select.
+        #
+        # `>= 3` rather than `in (3, 4)` so a sixth tab added later gets the
+        # everything matrix instead of re-entering the crash. That is the same
+        # fallback the export dict already takes (`.get(tab_idx, "everything")`).
+        if tab_idx >= 3:
             days = s["days"]
             slots = s["slots"]
             for yr in sorted(s["years"].keys()):

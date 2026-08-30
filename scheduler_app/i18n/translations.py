@@ -16720,7 +16720,7 @@ TRANSLATIONS = {'en': {
         'errors.time_not_allowed': "समय '{t}' अनुमत प्रारंभ समय में नहीं है: {ts}",
         'errors.unknown_rooms': 'allowed_rooms अज्ञात कमरों को संदर्भित करता है: {rooms}',
         'errors.unrecognized_file_format': 'फ़ाइल प्रारूप पहचाना नहीं जा सका।',
-        'errors.unsupported_egu_version': 'असमर्थित फ़ाइल संस्करण: {version}',
+        'errors.unsupported_egu_version': 'असमर्थित फ़ाइल संस्करण: {version} (अपेक्षित {supported})।',
         'errors.unsupported_format': "असमर्थित निर्यात प्रारूप: {fmt}। 'xlsx', 'csv', या 'pdf' का उपयोग करें।",
         'explanation.alternative_summary': '{day} {slot} ({room}): {score:+.2f} ({diff:+.2f} {worse})',
         'explanation.bonus_of': '{v:.2f} का बोनस',

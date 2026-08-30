@@ -11,6 +11,8 @@ dist/
 !Dersis-mac.spec
 *.tmp
 .tools/
+# Nuitka drops this beside the repo root on a failed compile.
+nuitka-crash-report.xml
 .venv/
 .venv-audit/
 .pytest_cache/

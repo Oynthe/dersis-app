@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 echo ============================================
 echo  DERSIS - Nuitka Production Build
 echo  Mode: Standalone Directory
@@ -23,12 +24,61 @@ set COMPANY=Uygun
 
 :: ── Step 1: Check Python ────────────────────────────────────────────────
 echo [1/6] Checking Python...
-python --version 2>nul
-if errorlevel 1 (
-    echo ERROR: Python not found. Install Python 3.10+ and add to PATH.
+set "BUILDPY="
+set "HOSTPY="
+set "NUITKA_ENV=.tools\nuitka-venv"
+set "NUITKA_CACHE_DIR=%CD%\.tools\nuitka-cache"
+
+:: Never install the pinned shipping set into .venv-audit or the user's normal
+:: development environment. requirements-lock.txt intentionally differs from
+:: both; doing so silently downgrades the test environment during a build. A
+:: copied embeddable runtime is not suitable either: Nuitka re-execs itself
+:: with `-S`, while python*._pth forces `import site`, producing an unbounded
+:: `nuitka --version` relaunch loop. Use a standard, dedicated venv.
+if exist "%NUITKA_ENV%\Scripts\python.exe" (
+    "%NUITKA_ENV%\Scripts\python.exe" -c "import sys, pip; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+    if not errorlevel 1 set "BUILDPY=%NUITKA_ENV%\Scripts\python.exe"
+)
+
+if not defined BUILDPY (
+    if exist ".venv\Scripts\python.exe" (
+        ".venv\Scripts\python.exe" -c "import sys, venv; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+        if not errorlevel 1 set "HOSTPY=.venv\Scripts\python.exe"
+    )
+    if not defined HOSTPY if exist ".venv-audit\Scripts\python.exe" (
+        ".venv-audit\Scripts\python.exe" -c "import sys, venv; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+        if not errorlevel 1 set "HOSTPY=.venv-audit\Scripts\python.exe"
+    )
+    if not defined HOSTPY for /f "delims=" %%p in ('py -3 -c "import sys, venv; print(sys.executable)" 2^>nul') do if not defined HOSTPY set "HOSTPY=%%p"
+    if not defined HOSTPY for /f "delims=" %%p in ('python -c "import sys, venv; print(sys.executable)" 2^>nul') do if not defined HOSTPY set "HOSTPY=%%p"
+)
+
+if not defined BUILDPY if defined HOSTPY (
+    if not exist ".tools" mkdir ".tools"
+    echo   Creating isolated Nuitka environment with !HOSTPY! ...
+    "!HOSTPY!" -m venv "%NUITKA_ENV%"
+    if errorlevel 1 (
+        echo ERROR: could not create %NUITKA_ENV%.
+        pause
+        exit /b 1
+    )
+    set "BUILDPY=%NUITKA_ENV%\Scripts\python.exe"
+)
+
+if not defined BUILDPY (
+    echo ERROR: Nuitka needs a standard Python 3.10+ installation with venv.
+    echo        The embeddable build still works; use build_embed.bat instead.
     pause
     exit /b 1
 )
+"%BUILDPY%" -c "import sys, pip; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: %BUILDPY% is not a usable Python 3.10+ build environment.
+    pause
+    exit /b 1
+)
+echo   Using %BUILDPY%
+"%BUILDPY%" --version
 echo.
 
 :: ── Step 2: Install ALL dependencies ────────────────────────────────────
@@ -36,21 +86,21 @@ echo [2/6] Installing all dependencies...
 echo.
 
 :: Install all runtime deps (pinned for reproducibility) + build tools
-pip install --upgrade pip
+"%BUILDPY%" -m pip install --upgrade pip
 if errorlevel 1 (
     echo ERROR: Failed to upgrade pip.
     pause
     exit /b 1
 )
 
-pip install -r requirements-lock.txt
+"%BUILDPY%" -m pip install -r requirements-lock.txt
 if errorlevel 1 (
     echo ERROR: Failed to install runtime dependencies.
     pause
     exit /b 1
 )
 
-pip install nuitka ordered-set
+"%BUILDPY%" -m pip install nuitka ordered-set
 if errorlevel 1 (
     echo ERROR: Failed to install Nuitka.
     pause
@@ -58,7 +108,7 @@ if errorlevel 1 (
 )
 
 :: Verify no dependency conflicts
-pip check
+"%BUILDPY%" -m pip check
 if errorlevel 1 (
     echo WARNING: pip check reported dependency issues.
 )
@@ -66,7 +116,7 @@ echo.
 
 :: ── Step 3: Verify all packages are importable ──────────────────────────
 echo [3/6] Verifying all packages are importable...
-python verify_deps.py
+"%BUILDPY%" verify_deps.py
 if errorlevel 1 (
     echo.
     echo Cannot proceed — fix the missing packages above.
@@ -76,7 +126,7 @@ if errorlevel 1 (
 echo.
 
 :: Pre-download C compiler so Nuitka doesn't prompt
-python -m nuitka --version >nul 2>&1
+"%BUILDPY%" -m nuitka --version >nul 2>&1
 
 :: ── Step 4: Build with Nuitka ───────────────────────────────────────────
 echo ============================================
@@ -85,11 +135,18 @@ echo       This may take 5-15 minutes.
 echo ============================================
 echo.
 
-python -m nuitka ^
+:: Build into a lane-specific staging directory. A previous embeddable build
+:: may already own build\Dersis.dist; verifying that stale directory after a
+:: Nuitka run would report success for the wrong artifact.
+if not exist "build\nuitka" mkdir "build\nuitka"
+if exist "build\nuitka\scheduler_gui.dist" rmdir /s /q "build\nuitka\scheduler_gui.dist"
+if exist "build\nuitka\scheduler_gui.build" rmdir /s /q "build\nuitka\scheduler_gui.build"
+
+"%BUILDPY%" -m nuitka ^
     --standalone ^
     --enable-plugin=pyqt6 ^
-    --disable-console ^
-    --output-dir=build ^
+    --windows-console-mode=disable ^
+    --output-dir=build\nuitka ^
     --jobs=%NUMBER_OF_PROCESSORS% ^
     --follow-imports ^
     --nofollow-import-to=test_* ^
@@ -146,7 +203,7 @@ echo.
 :: ── Step 5: Rename output ───────────────────────────────────────────────
 echo [5/6] Renaming build output...
 
-set SRC_DIST=build\scheduler_gui.dist
+set SRC_DIST=build\nuitka\scheduler_gui.dist
 if not exist "%SRC_DIST%" (
     echo ERROR: Expected %SRC_DIST% not found.
     dir /b /ad build\*.dist 2>nul
@@ -160,10 +217,14 @@ if exist "%SRC_DIST%\scheduler_gui.exe" (
     echo   Renamed scheduler_gui.exe to Dersis.exe
 )
 
-if not exist "%DIST_DIR%" (
-    rename "%SRC_DIST%" "Dersis.dist"
-    echo   Renamed folder to Dersis.dist
+if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
+move /y "%SRC_DIST%" "%DIST_DIR%" >nul
+if errorlevel 1 (
+    echo ERROR: Could not promote the Nuitka output to %DIST_DIR%.
+    pause
+    exit /b 1
 )
+echo   Promoted Nuitka output to %DIST_DIR%
 
 :: Generate the installer version include, exactly as build_embed.bat does.
 :: installer.iss does #ifexist "build\version.iss" / #else #define AppVersion

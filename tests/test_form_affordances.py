@@ -147,13 +147,47 @@ def test_the_add_class_paths_register_before_snapshotting():
     lecturer the restored state does not list.
     """
     import inspect
+    import re
+
     from scheduler_app.ui.app import SchedulerApp
 
+    # Every spelling of "take the snapshot", and the search runs over CODE
+    # ONLY. Both halves are load-bearing and both were learned here:
+    #
+    #  * Phase 10 replaced `add_class`'s `_push_undo(...)` with a held
+    #    `copy.deepcopy` committed by `_commit_undo_entry` on a state
+    #    comparison (B1/B2, third site), so a single literal `_push_undo`
+    #    no longer describes both methods. `_edit_class` still uses it.
+    #  * With comments included, this assertion passed on the Phase 10 tree
+    #    for the worst possible reason: the new code carries a COMMENT
+    #    explaining why `_push_undo` was removed, `str.index` found the word
+    #    there, and the test went green while measuring prose. Stripping
+    #    comments is what keeps it looking at the program.
+    snapshot_markers = ("_push_undo", "copy.deepcopy(self.state_data)",
+                        "_commit_undo_entry(")
+
+    def _code_only(src):
+        """*src* with `#` comments and docstrings blanked, offsets preserved.
+
+        Blanked rather than deleted so every index below still refers to the
+        same character position in the original source.
+        """
+        out = re.sub(r'(?m)#[^\n]*', lambda m: " " * len(m.group(0)), src)
+        return re.sub(r'(?s)("""|\x27\x27\x27).*?\1',
+                      lambda m: " " * len(m.group(0)), out)
+
     for method in (SchedulerApp.add_class, SchedulerApp._edit_class):
-        src = inspect.getsource(method)
+        src = _code_only(inspect.getsource(method))
         assert "register_lecturer" in src, (
             "%s does not register the typed lecturer" % method.__name__)
-        assert src.index("register_lecturer") < src.index("_push_undo"), (
+        present = [m for m in snapshot_markers if m in src]
+        assert present, (
+            "%s takes no undo snapshot by any spelling this test knows about; "
+            "it looked for %r. If the call was renamed again, add the new name "
+            "here rather than deleting the test." % (method.__name__,
+                                                     snapshot_markers))
+        assert src.index("register_lecturer") < min(src.index(m)
+                                                    for m in present), (
             "%s registers the lecturer after taking the undo snapshot, so "
             "undo can restore a state that does not know the name"
             % method.__name__)

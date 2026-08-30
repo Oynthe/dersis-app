@@ -653,12 +653,17 @@ def _export_excel(schedule, filepath, mode="everything"):
                 is_joint = c.get("joint_session", True)
                 n_targets = len(c.get("targets", []))
                 dur = c["duration"]
-                for t in c["targets"]:
+                # `enumerate`, not `targets.index(t)` — ST-UI-016. See the
+                # accounting at the same construct in ui/renderer.py: `.index`
+                # compares dicts by ==, so two identical non-joint targets both
+                # resolved to 0 and this sheet printed the lesson once where
+                # the screen drew it twice in one cell and the PDF below drew
+                # the stacked conflict paragraph. All four sites moved together.
+                for t_idx, t in enumerate(c["targets"]):
                     if t["year"] != yr or t["branch"] not in branches:
                         continue
                     b_idx = branches.index(t["branch"])
                     if not is_joint and n_targets > 1:
-                        t_idx = c["targets"].index(t)
                         slot_off = t_idx * dur
                     else:
                         slot_off = 0
@@ -1790,11 +1795,12 @@ def _export_pdf(schedule: FinalSchedule, filepath: str, mode: str = "everything"
             d_idx = days.index(c_day)
             start_si = slots.index(c_start)
             dur = c["duration"]
-            for t in c["targets"]:
+            # `enumerate`, not `targets.index(t)` — ST-UI-016, third of four
+            # sites; the reasoning is at the same construct in ui/renderer.py.
+            for t_idx, t in enumerate(c["targets"]):
                 if t["year"] != yr or t["branch"] not in branches:
                     continue
                 b_idx = branches.index(t["branch"])
-                t_idx = c["targets"].index(t)
                 slot_off = slot_offset_for_target(c, t_idx)
                 actual_start = start_si + slot_off
                 if actual_start >= len(slots):
