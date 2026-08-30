@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+cd /d "%~dp0"
 echo ============================================
 echo  DERSIS - Embeddable Python Build
 echo  No Nuitka required. Fast and reliable.
@@ -40,19 +41,20 @@ set DIST_DIR=build\Dersis.dist
 set PY_DIR=%DIST_DIR%\python
 
 :: ── Step 1: Install build-time dependencies in current environment ──────
-echo [1/8] Installing build-time dependencies...
+echo [1/8] Checking Windows build tools...
 echo.
 
-python --version 2>nul
+powershell -NoProfile -Command "$null = $PSVersionTable.PSVersion" >nul 2>&1
 if errorlevel 1 (
-    echo ERROR: Python not found. Install Python 3.10+ and add to PATH.
+    echo ERROR: Windows PowerShell is required to verify and extract Python.
     pause
     exit /b 1
 )
 
-:: Install Inno Setup helper and Pillow (for wizard images if needed)
-pip install --quiet Pillow 2>nul
-echo   [OK] Build-time deps ready
+:: This lane bootstraps its own pinned Python below. Requiring an unrelated
+:: PATH Python here made a self-contained build fail after a host Python
+:: uninstall, even though no host package was used by any later step.
+echo   [OK] PowerShell ready; no host Python is required
 echo.
 
 :: ── Step 2: Download Python embeddable ──────────────────────────────────
