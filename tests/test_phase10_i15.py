@@ -56,7 +56,7 @@ Not every green/amber in these two files is a defect
 ``#92400E`` on ``#FEF3C7`` (the reschedule notice, 6.37:1) and on ``#FDE68A``
 (the list selection, 5.69:1) already clear AA. ``ui/app.py`` therefore already
 contains the accessible amber this item needs; the failing badge at
-``ui/app.py:1988`` is the one place in that file that reaches for ``#D97706``
+``ui/app.py`` is the one place in that file that reaches for ``#D97706``
 instead. That makes this a substitution, not a design task.
 
 Threshold: 4.5:1 throughout. Every site here is a QLabel or table item at
@@ -297,7 +297,7 @@ def test_the_results_dialog_status_text_clears_aa(light_palette, grade):
 
     Three grades because the quality line picks its colour from a dict --
     ``A`` green ``#16A34A``, ``C`` amber ``#D97706``, ``D`` orange ``#EA580C``
-    (dialogs.py:3969) -- and a single grade would exercise one third of it.
+    (dialogs.py) -- and a single grade would exercise one third of it.
 
     A failure means the line saying every class was placed, and the line
     saying the schedule scored 91/100, are the least legible text on the
@@ -330,7 +330,7 @@ def test_the_results_dialog_status_text_clears_aa(light_palette, grade):
 def test_the_negotiation_report_status_text_clears_aa(light_palette):
     """Item 15 -- the per-class verdict in the negotiation tab.
 
-    ``dialogs.py:4174-4177`` colours each unplaced class by how bad its
+    ``dialogs.py`` colours each unplaced class by how bad its
     situation is: ``ok`` ``#16A34A``, ``constrained`` ``#D97706``,
     ``infeasible`` ``#DC2626``. The green and the amber are the two that carry
     "this one is nearly fixable" -- exactly the rows a user acts on.
@@ -367,7 +367,7 @@ def test_the_negotiation_report_status_text_clears_aa(light_palette):
 def test_the_class_table_status_column_clears_aa(light_palette):
     """Item 15 -- "placed"/"unplaced" in the class list, on both row colours.
 
-    ``dialogs.py:4586-4588`` sets the item foreground directly, so the colour
+    ``dialogs.py`` sets the item foreground directly, so the colour
     is read back off the item the production code populated. The table has
     ``setAlternatingRowColors(True)``, so half the rows are ``#F1F5F9`` and
     half ``#FFFFFF`` -- both are measured off the rendered viewport, because
@@ -413,7 +413,7 @@ def test_the_class_table_status_column_clears_aa(light_palette):
 def test_the_accept_results_button_label_clears_aa(light_palette):
     """Item 15 -- white on the green "accept results" button.
 
-    ``dialogs.py:4128-4129`` sets ``background: #16A34A; color: white``. Both
+    ``dialogs.py`` sets ``background: #16A34A; color: white``. Both
     halves come off the button the dialog built, so this is the pairing the
     product actually draws, not one this test invented. Button *labels* are
     text under WCAG 1.4.3, so the threshold is 4.5:1, not the 3:1 that governs

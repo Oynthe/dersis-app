@@ -4349,15 +4349,39 @@ class SchedulerApp(QMainWindow):
 
             # Slot rows
             for slot_time, room in entries:
+                # ST-UI-017. NO pointing hand and NO :hover rule. This row is
+                # a bare QWidget with nothing connected — measured: the click
+                # arrives (an event filter records press and release from a
+                # real QTest.mouseClick) and is then IGNORED by QWidget's
+                # default handler, and 16 clicks across every row left a
+                # 14-field snapshot of the window byte-identical. It carried
+                # both cues anyway, so the panel promised a gesture it did not
+                # have.
+                #
+                # Removed rather than wired, and the costing is the reason.
+                # Reusing `_place_unplaced_class_at_slot` — the method the
+                # empty-cell context menu already calls — is free at the
+                # ratchet, but it ignores `room` entirely and re-derives it
+                # from `find_valid_options` plus the classroom filter, so
+                # clicking the row labelled "R002" can place into R001: a
+                # false affordance replaced by a lying one. The gesture the
+                # affordance actually implies — place the selected lesson
+                # here, choose one when none is selected — measures
+                # app.py 920 -> 923 and would need the ceiling raised. That is
+                # the wrong purchase for a Low-severity honesty defect, and
+                # every real placement gesture is elsewhere anyway (drag from
+                # Unplaced, right-click an empty cell, Ctrl+P).
+                #
+                # The hover tint went with the cursor deliberately. It is a
+                # useful reading aid in a long list, and on a row that does
+                # nothing it is also the second half of the promise; keeping
+                # it would have meant weakening the probe to suit the code.
                 row = QWidget()
                 row.setObjectName("slotRow")
-                row.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
                 row.setStyleSheet(
                     "QWidget#slotRow {"
                     "  background: #FFFFFF; border-radius: 6px;"
-                    "  padding: 8px 10px; margin: 1px 0px; }"
-                    "QWidget#slotRow:hover {"
-                    "  background: #ECFDF5; }")
+                    "  padding: 8px 10px; margin: 1px 0px; }")
                 row_layout = QHBoxLayout(row)
                 row_layout.setContentsMargins(10, 6, 10, 6)
                 row_layout.setSpacing(0)

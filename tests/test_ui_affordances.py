@@ -293,9 +293,24 @@ def test_add_class_at_actually_consults_the_requested_cell(
 
         def __init__(self, *a, **kw):
             self.result = cls
+            self._title = "stub"
 
         def exec(self):
             return self.DialogCode.Accepted
+
+        # `_class_form_result` carries the FIRST showing's caption across the
+        # re-show loop, because the only channel it has for a seed is
+        # `edit_cls=` and the dialog derives its title from that -- so the add
+        # form's second showing used to call itself "Edit Class" (ST-UI-021).
+        # A stand-in for a QDialog has to answer these two, or it stops
+        # standing in for the thing under test. It is not asserted here: this
+        # test is about which CELL `_add_class_at` consults, and
+        # tests/test_phase10_i17.py drives the real dialog for the caption.
+        def windowTitle(self):
+            return self._title
+
+        def setWindowTitle(self, title):
+            self._title = title
 
     monkeypatch.setattr(app_module, "AddClassDialog", _StubDialog)
     monkeypatch.setattr(window, "_show_toast", lambda *a, **kw: None)
