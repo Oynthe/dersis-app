@@ -109,8 +109,16 @@ def get_special_location_resource(cls_or_location_type):
     """Return the system-defined effective resource label for a special location."""
     if isinstance(cls_or_location_type, dict):
         lt = location_type_of(cls_or_location_type)
+        lecturer = str(cls_or_location_type.get("lecturer", "") or "").strip()
     else:
         lt = cls_or_location_type if cls_or_location_type in LOCATION_TYPES else LOCATION_FACE_TO_FACE
+        lecturer = ""
+    if lt == LOCATION_LECTURER_OFFICE and lecturer:
+        # A lecturer's office is not one institution-wide virtual classroom.
+        # Keep the translated location label, but qualify it with the lecturer
+        # so views, exports and analytics distinguish simultaneous office
+        # lessons belonging to different people.
+        return f"{get_location_label(lt)} — {lecturer}"
     if is_virtual_location_type(lt):
         return get_location_label(lt)
     return None
@@ -140,6 +148,24 @@ def get_display_location_label(cls, room_override=_ROOM_UNSET):
     return get_effective_room_resource_for_class(cls, room_override=room_override)
 
 
+def get_lecturer_office_options(lecturers):
+    """Return ``(lecturer, label)`` pairs for the classroom-view filter."""
+    options = []
+    seen = set()
+    for lecturer in lecturers or []:
+        lecturer = str(lecturer or "").strip()
+        if not lecturer or lecturer in seen:
+            continue
+        seen.add(lecturer)
+        office_cls = {
+            "location_type": LOCATION_LECTURER_OFFICE,
+            "lecturer": lecturer,
+        }
+        options.append(
+            (lecturer, get_effective_room_resource_for_class(office_cls)))
+    return options
+
+
 def display_room(cls):
     """Backward-compatible wrapper for effective room/resource display."""
     return get_display_location_label(cls)
@@ -160,17 +186,17 @@ def get_classroom_export_labels(classrooms, classes):
         labels.append(room)
         seen.add(room)
 
-    used_virtual_types = set()
-    for cls in classes or []:
-        location_type = location_type_of(cls)
-        if is_virtual_location_type(location_type):
-            used_virtual_types.add(location_type)
-
+    # Keep virtual types grouped in their established order, while retaining
+    # one distinct office resource per lecturer. Online is intentionally still
+    # a shared display category: it is not a room owned by one lecturer.
     for location_type in VIRTUAL_LOCATION_TYPES:
-        label = get_location_label(location_type)
-        if location_type in used_virtual_types and label not in seen:
-            labels.append(label)
-            seen.add(label)
+        for cls in classes or []:
+            if location_type_of(cls) != location_type:
+                continue
+            label = get_effective_room_resource_for_class(cls)
+            if label and label not in seen:
+                labels.append(label)
+                seen.add(label)
     return labels
 
 

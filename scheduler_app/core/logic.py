@@ -308,7 +308,8 @@ def classroom_of(cls):
     """Return the display room/location for a placed class.
 
     For face-to-face classes, returns the physical classroom.
-    For online/office classes, returns the virtual location label.
+    For online classes, returns the shared virtual location label. Lecturer
+    offices are qualified with the lecturer name so they remain distinct.
     """
     return display_room(cls)
 

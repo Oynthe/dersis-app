@@ -44,7 +44,7 @@ from scheduler_app.models import (
     LOCATION_LECTURER_OFFICE, get_location_label, is_virtual_location_type,
     normalize_state_classes, effective_day, effective_time, mark_placed,
     mark_unplaced, needs_physical_room, get_effective_room_resource_for_class,
-    cls_key, slot_offset_for_target,
+    get_lecturer_office_options, cls_key, slot_offset_for_target,
 )
 from scheduler_app.logic import (
     get_placed_classes, occupied_slots_of, classroom_of, find_slot_index,
@@ -81,6 +81,7 @@ from scheduler_app.icons import (
 
 _CLASSROOM_FILTER_ROOM_PREFIX = "room::"
 _CLASSROOM_FILTER_VIRTUAL_PREFIX = "virtual::"
+_CLASSROOM_FILTER_OFFICE_PREFIX = "office::"
 
 
 def _encode_classroom_filter_room(room):
@@ -91,8 +92,14 @@ def _encode_classroom_filter_virtual(location_type):
     return f"{_CLASSROOM_FILTER_VIRTUAL_PREFIX}{location_type}"
 
 
+def _encode_classroom_filter_office(lecturer):
+    return f"{_CLASSROOM_FILTER_OFFICE_PREFIX}{lecturer}"
+
+
 def _decode_classroom_filter_value(value):
     text = str(value or "")
+    if text.startswith(_CLASSROOM_FILTER_OFFICE_PREFIX):
+        return "office", text[len(_CLASSROOM_FILTER_OFFICE_PREFIX):]
     if text.startswith(_CLASSROOM_FILTER_VIRTUAL_PREFIX):
         return "virtual", text[len(_CLASSROOM_FILTER_VIRTUAL_PREFIX):]
     if text.startswith(_CLASSROOM_FILTER_ROOM_PREFIX):
@@ -2567,10 +2574,15 @@ class SchedulerApp(QMainWindow):
         self.classroom_filter.clear()
         for room in s["classrooms"]:
             self.classroom_filter.addItem(room, _encode_classroom_filter_room(room))
-        for location_type in (LOCATION_ONLINE, LOCATION_LECTURER_OFFICE):
+        self.classroom_filter.addItem(
+            get_location_label(LOCATION_ONLINE),
+            _encode_classroom_filter_virtual(LOCATION_ONLINE),
+        )
+        for lecturer, office_label in get_lecturer_office_options(
+                s.get("lecturers", [])):
             self.classroom_filter.addItem(
-                get_location_label(location_type),
-                _encode_classroom_filter_virtual(location_type),
+                office_label,
+                _encode_classroom_filter_office(lecturer),
             )
         idx = self.classroom_filter.findData(cur)
         if idx < 0 and isinstance(cur, str):
@@ -2733,6 +2745,10 @@ class SchedulerApp(QMainWindow):
     def _filter_classroom(self, cls):
         selected = self.classroom_filter.currentData()
         kind, value = _decode_classroom_filter_value(selected)
+        if kind == "office":
+            return (cls.get("location_type", LOCATION_FACE_TO_FACE)
+                    == LOCATION_LECTURER_OFFICE
+                    and str(cls.get("lecturer", "") or "").strip() == value)
         if kind == "virtual":
             return cls.get("location_type", LOCATION_FACE_TO_FACE) == value
         if kind == "room":
@@ -2753,7 +2769,10 @@ class SchedulerApp(QMainWindow):
         """Return the renderer mode for the active filtered timetable tab."""
         selected = self.classroom_filter.currentData()
         kind, value = _decode_classroom_filter_value(selected)
-        if tab_idx == 0 and kind == "virtual" and is_virtual_location_type(value):
+        is_virtual_filter = (
+            kind == "virtual" and is_virtual_location_type(value)
+        ) or kind == "office"
+        if tab_idx == 0 and is_virtual_filter:
             return FILTER_MODE_VIRTUAL_CLASSROOM_OVERLAP
         return FILTER_MODE_DEFAULT
 
@@ -4410,8 +4429,9 @@ class SchedulerApp(QMainWindow):
 
                 # A None room is the "needs no classroom" sentinel, not a
                 # missing value: render it as the resource the rest of the app
-                # names it by ("Çevrimiçi", "Ofis (Öğr. Elem.)"), which is what
-                # the classroom filter and the cell already show.
+                # names it by ("Çevrimiçi" or the lecturer-qualified
+                # "Ofis (Öğr. Elem.) — <hoca>"), which is what the classroom
+                # filter and the cell already show.
                 room_label = QLabel(
                     get_effective_room_resource_for_class(
                         selected_cls, room_override=room)
