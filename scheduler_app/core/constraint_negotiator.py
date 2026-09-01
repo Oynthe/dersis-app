@@ -31,7 +31,7 @@ from collections import defaultdict
 from scheduler_app.logic import (
     slot_index, find_slot_index, slots_fit, total_duration,
     get_placed_classes, classroom_of,
-    _active_targets, targets_overlap,
+    _active_targets, student_targets_conflict,
 )
 from scheduler_app.models import (
     cls_key, find_off_grid_placements,
@@ -288,7 +288,7 @@ class InfeasibilityAnalyzer:
                         if room in self.validator.room_occ.get(key, set()):
                             is_room = True
                         for t in _active_targets(cls, off):
-                            if (t["year"], t["branch"]) in self.validator.group_occ.get(key, set()):
+                            if self.validator.group_target_blocked(cls, key, t):
                                 is_group = True
 
                     if is_lect:
@@ -782,8 +782,9 @@ class RelaxationSuggester:
                             # Group conflict
                             off = slots_list.index(s) if s in slots_list else 0
                             ex_off = list(ex_slots).index(s) if s in ex_slots else 0
-                            if targets_overlap(
-                                    _active_targets(cls, off),
+                            if student_targets_conflict(
+                                    cls, _active_targets(cls, off),
+                                    existing,
                                     _active_targets(existing, ex_off)):
                                 blocked = True
                                 break

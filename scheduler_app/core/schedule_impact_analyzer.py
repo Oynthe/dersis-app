@@ -59,6 +59,8 @@ _HARD_CONSTRAINT_CLASS_FIELDS = {
     "pinned", "pinned_day", "pinned_time", "pinned_classroom",
     "allowed_days", "allowed_times", "excluded_days", "excluded_times",
     "required_classrooms", "excluded_classrooms",
+    "course_requirement", "student_overlap_group", "student_overlap_policy",
+    "keep_same_classroom",
 }
 
 _SOFT_CLASS_FIELDS = {

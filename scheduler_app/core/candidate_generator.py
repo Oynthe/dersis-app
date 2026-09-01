@@ -96,7 +96,7 @@ class CandidateGenerator:
         Returns None if any pinned class would be displaced (impossible).
         """
         from scheduler_app.logic import (
-            occupied_slots_of, _active_targets, targets_overlap,
+            occupied_slots_of, _active_targets, student_targets_conflict,
             classroom_of, slot_index as si_fn,
         )
         td = total_duration(cls)
@@ -130,7 +130,8 @@ class CandidateGenerator:
                 cand_targets = _active_targets(cls, i)
                 ex_offset = ns_idx - ex_start_idx
                 ex_targets = _active_targets(existing, ex_offset)
-                if targets_overlap(ex_targets, cand_targets):
+                if student_targets_conflict(
+                        existing, ex_targets, cls, cand_targets):
                     dominated = True
                     break
             if dominated:

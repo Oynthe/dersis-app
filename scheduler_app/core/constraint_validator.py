@@ -9,7 +9,7 @@ for O(1) conflict lookups.
 
 from scheduler_app.logic import (
     find_slot_index, slot_index, total_duration, _active_targets,
-    build_occupancy, occ_claim, occ_release,
+    build_occupancy, occ_claim, occ_release, student_targets_conflict,
 )
 from scheduler_app.translations import tr
 from scheduler_app.models import (
@@ -18,6 +18,7 @@ from scheduler_app.models import (
     get_room_candidates, effective_day, effective_time,
     filter_class_days, filter_class_times,
     apply_lecturer_availability_filters,
+    classroom_series_key, same_classroom_series_required,
 )
 from scheduler_app.i18n.day_keys import display_day
 
@@ -40,12 +41,102 @@ class ConstraintValidator:
         self.room_occ = {}    # (day, slot) -> {room name: refcount}
         self.lect_occ = {}    # (day, slot) -> {lecturer name: refcount}
         self.group_occ = {}   # (day, slot) -> {(year, branch): refcount}
+        self.group_class_occ = {}  # cell -> target -> class-id -> class/count
+        # lecturer/course series -> class-id -> {class, room}.  This spans
+        # different times: its purpose is to stop room-hopping between parallel
+        # sections, not to detect simultaneous room use.
+        self.room_series_occ = {}
         self._build_occupancy()
 
     def _build_occupancy(self):
         """Build occupancy maps from currently placed/pinned classes."""
-        self.room_occ, self.lect_occ, self.group_occ = build_occupancy(
-            self.state, self.exclude_ids)
+        (self.room_occ, self.lect_occ, self.group_occ,
+         self.group_class_occ) = build_occupancy(
+             self.state, self.exclude_ids)
+        self.room_series_occ = {}
+        for existing in self.state.get("classes", []):
+            eid = cls_key(existing)
+            if eid in self.exclude_ids:
+                continue
+            if not (existing.get("placed") or existing.get("pinned")):
+                continue
+            key = classroom_series_key(existing)
+            room = (existing.get("pinned_classroom") if existing.get("pinned")
+                    else existing.get("placed_classroom"))
+            if key is not None and room:
+                self.room_series_occ.setdefault(key, {})[eid] = {
+                    "class": existing, "room": room,
+                }
+
+    def room_series_mismatches(self, cls, room):
+        """Return rooms used by linked sections that disagree with *room*."""
+        key = classroom_series_key(cls)
+        if key is None or not room:
+            return []
+        cid = cls_key(cls)
+        mismatches = []
+        for other_id, record in self.room_series_occ.get(key, {}).items():
+            if other_id == cid:
+                continue
+            if (same_classroom_series_required(cls, record["class"])
+                    and record["room"] != room):
+                mismatches.append(record["room"])
+        return sorted(set(mismatches))
+
+    def group_target_blocked(self, cls, key, target):
+        """Whether *target* at *key* is held by a conflicting class.
+
+        ``group_occ`` intentionally remains aggregate for the scorer.  Hard
+        validation uses this identity-preserving companion index so two
+        classes in one explicitly configured overlap group can share a cell
+        without also becoming invisible to ordinary compulsory lessons.
+        """
+        target_key = (target["year"], target["branch"])
+        class_index = getattr(self, "group_class_occ", None)
+        if class_index is None:
+            # Compatibility for hand-built validators in older tests/plugins.
+            return target_key in self.group_occ.get(key, set())
+        occupants = class_index.get(key, {}).get(target_key, {})
+        candidate_id = cls_key(cls)
+        for occupant_id, record in occupants.items():
+            if occupant_id == candidate_id:
+                continue
+            existing = record["class"]
+            if student_targets_conflict(cls, [target], existing, [target]):
+                return True
+        return False
+
+    def _claim_group_class(self, key, target, cls):
+        target_key = (target["year"], target["branch"])
+        by_class = self.group_class_occ.setdefault(key, {}).setdefault(
+            target_key, {})
+        cid = cls_key(cls)
+        record = by_class.get(cid)
+        if record is None:
+            by_class[cid] = {"class": cls, "count": 1}
+        else:
+            record["count"] += 1
+
+    def _release_group_class(self, key, target, cls):
+        target_key = (target["year"], target["branch"])
+        by_target = self.group_class_occ.get(key)
+        if not by_target:
+            return
+        by_class = by_target.get(target_key)
+        if not by_class:
+            return
+        cid = cls_key(cls)
+        record = by_class.get(cid)
+        if record is None:
+            return
+        if record["count"] <= 1:
+            del by_class[cid]
+            if not by_class:
+                del by_target[target_key]
+            if not by_target:
+                del self.group_class_occ[key]
+        else:
+            record["count"] -= 1
 
     def respects_constraints(self, cls, day, slot, room):
         """Check if (day, slot, room) satisfies the class's own constraints."""
@@ -71,6 +162,8 @@ class ConstraintValidator:
             if cls["excluded_classrooms"] and room in cls["excluded_classrooms"]:
                 return False
             if not room_fits_class(self.state, room, cls):
+                return False
+            if self.room_series_mismatches(cls, room):
                 return False
         # Lecturer availability — check ALL slots for multi-duration classes
         lecturer = cls.get("lecturer", "")
@@ -108,7 +201,7 @@ class ConstraintValidator:
             if cls["lecturer"] in self.lect_occ.get(key, set()):
                 return False
             for t in _active_targets(cls, off):
-                if (t["year"], t["branch"]) in self.group_occ.get(key, set()):
+                if self.group_target_blocked(cls, key, t):
                     return False
         return True
 
@@ -156,6 +249,10 @@ class ConstraintValidator:
                 reasons.append(
                     tr("validation.room_capacity").format(
                         room, cap, cls.get('participants', 0)))
+            mismatches = self.room_series_mismatches(cls, room)
+            if mismatches:
+                reasons.append(tr("validation.same_classroom_series").format(
+                    room=room, expected=", ".join(mismatches)))
 
         # Lecturer availability — check ALL slots for multi-duration classes
         lecturer = cls.get("lecturer", "")
@@ -205,7 +302,7 @@ class ConstraintValidator:
                         tr("validation.lecturer_busy").format(
                             cls['lecturer'], display_day_value, s))
                 for t in _active_targets(cls, off):
-                    if (t["year"], t["branch"]) in self.group_occ.get(key, set()):
+                    if self.group_target_blocked(cls, key, t):
                         reasons.append(
                             tr("validation.group_busy").format(
                                 t['year'], t['branch'], display_day_value, s))
@@ -261,6 +358,11 @@ class ConstraintValidator:
                     conflicts.append(
                         tr("validation.room_capacity").format(
                             room, cap, cls.get('participants', 0)))
+                mismatches = self.room_series_mismatches(cls, room)
+                if mismatches:
+                    conflicts.append(
+                        tr("validation.same_classroom_series").format(
+                            room=room, expected=", ".join(mismatches)))
         check_room = needs_physical_room(cls) and room is not None
         slots_list = self.state["slots"][si:si + td]
         lecturer = cls.get("lecturer", "")
@@ -280,7 +382,7 @@ class ConstraintValidator:
                     tr("validation.lecturer_busy").format(
                         cls['lecturer'], display_day_value, s))
             for t in _active_targets(cls, off):
-                if (t["year"], t["branch"]) in self.group_occ.get(key, set()):
+                if self.group_target_blocked(cls, key, t):
                     conflicts.append(
                         tr("validation.group_busy").format(
                             t['year'], t['branch'], display_day_value, s))
@@ -300,6 +402,11 @@ class ConstraintValidator:
         twice takes two removals to free it. See ``logic.occ_claim``.
         """
         td = total_duration(cls)
+        series_key = classroom_series_key(cls)
+        if series_key is not None and room:
+            self.room_series_occ.setdefault(series_key, {})[cls_key(cls)] = {
+                "class": cls, "room": room,
+            }
         si = find_slot_index(self.state, start_slot)
         if si is None or day not in self.state["days"]:
             return  # orphaned placement — occupies no cell on this grid
@@ -312,6 +419,7 @@ class ConstraintValidator:
             occ_claim(self.lect_occ, key, cls["lecturer"])
             for t in _active_targets(cls, off):
                 occ_claim(self.group_occ, key, (t["year"], t["branch"]))
+                self._claim_group_class(key, t, cls)
 
     def remove_placement(self, cls, day, start_slot, room):
         """Remove a placement from the occupancy maps.
@@ -320,6 +428,13 @@ class ConstraintValidator:
         class still claims it (ST-SCHED-010).
         """
         td = total_duration(cls)
+        series_key = classroom_series_key(cls)
+        if series_key is not None:
+            by_class = self.room_series_occ.get(series_key)
+            if by_class is not None:
+                by_class.pop(cls_key(cls), None)
+                if not by_class:
+                    self.room_series_occ.pop(series_key, None)
         si = find_slot_index(self.state, start_slot)
         if si is None or day not in self.state["days"]:
             return  # orphaned placement — occupies no cell on this grid
@@ -332,6 +447,7 @@ class ConstraintValidator:
             occ_release(self.lect_occ, key, cls["lecturer"])
             for t in _active_targets(cls, off):
                 occ_release(self.group_occ, key, (t["year"], t["branch"]))
+                self._release_group_class(key, t, cls)
 
     def _get_constrained_search_space(self, cls):
         """Return (days, times, rooms) filtered by class + lecturer constraints.

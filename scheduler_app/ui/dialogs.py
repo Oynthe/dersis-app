@@ -23,6 +23,9 @@ from scheduler_app.models import (
     LOCATION_FACE_TO_FACE, normalize_class_data,
     get_effective_room_resource_for_class, get_location_label,
     get_protection_label, parse_location_type_label, validate_class_fields,
+    COURSE_REQUIREMENTS, COURSE_REQUIREMENT_UNSPECIFIED,
+    STUDENT_OVERLAP_POLICIES, STUDENT_OVERLAP_NEVER,
+    get_course_requirement_label, get_student_overlap_policy_label,
 )
 from scheduler_app import storage
 from scheduler_app.logic import (
@@ -2306,6 +2309,23 @@ class AddClassDialog(QDialog):
         loc_row.addStretch()
         f.addLayout(loc_row)
 
+        # ── Course requirement ──
+        req_row = QHBoxLayout()
+        req_row.addWidget(QLabel(tr("course_requirement.label") + ":"))
+        self.course_requirement_combo = QComboBox()
+        for requirement in COURSE_REQUIREMENTS:
+            self.course_requirement_combo.addItem(
+                get_course_requirement_label(requirement), requirement)
+        current_requirement = (
+            edit_cls.get("course_requirement", COURSE_REQUIREMENT_UNSPECIFIED)
+            if edit_cls else COURSE_REQUIREMENT_UNSPECIFIED)
+        req_index = self.course_requirement_combo.findData(current_requirement)
+        if req_index >= 0:
+            self.course_requirement_combo.setCurrentIndex(req_index)
+        req_row.addWidget(self.course_requirement_combo)
+        req_row.addStretch()
+        f.addLayout(req_row)
+
         # ── Import / Generate Template ──
         io_row = QHBoxLayout()
         io_row.addStretch()
@@ -2444,6 +2464,48 @@ class AddClassDialog(QDialog):
         cw_layout = QVBoxLayout(self._constraints_widget)
         cw_layout.setContentsMargins(0, 0, 0, 0)
 
+        # Student-overlap policy is explicit and pair-based.  The group name
+        # lets unrelated exceptions stay unrelated (for example, AES
+        # electives do not automatically overlap INÖ4005 practice sessions).
+        overlap_box = QGroupBox(tr("student_overlap.title"))
+        overlap_form = QFormLayout(overlap_box)
+        self.student_overlap_group_edit = QLineEdit(
+            edit_cls.get("student_overlap_group", "") if edit_cls else "")
+        self.student_overlap_group_edit.setPlaceholderText(
+            tr("student_overlap.group_placeholder"))
+        overlap_form.addRow(
+            tr("student_overlap.group_label"), self.student_overlap_group_edit)
+        self.student_overlap_policy_combo = QComboBox()
+        for policy in STUDENT_OVERLAP_POLICIES:
+            self.student_overlap_policy_combo.addItem(
+                get_student_overlap_policy_label(policy), policy)
+        current_policy = (
+            edit_cls.get("student_overlap_policy", STUDENT_OVERLAP_NEVER)
+            if edit_cls else STUDENT_OVERLAP_NEVER)
+        policy_index = self.student_overlap_policy_combo.findData(current_policy)
+        if policy_index >= 0:
+            self.student_overlap_policy_combo.setCurrentIndex(policy_index)
+        overlap_form.addRow(
+            tr("student_overlap.policy_label"), self.student_overlap_policy_combo)
+        overlap_hint = QLabel(tr("student_overlap.help"))
+        overlap_hint.setStyleSheet("color: #64748B; font-size: 8pt;")
+        overlap_hint.setWordWrap(True)
+        overlap_form.addRow("", overlap_hint)
+        cw_layout.addWidget(overlap_box)
+
+        # One checkbox anchors a lecturer/course series.  The engine applies
+        # it to every matching branch, including sections added later.
+        self.keep_same_classroom_cb = QCheckBox(
+            tr("classroom_series.label"))
+        self.keep_same_classroom_cb.setChecked(bool(
+            edit_cls.get("keep_same_classroom", False) if edit_cls else False))
+        self.keep_same_classroom_cb.setToolTip(tr("classroom_series.help"))
+        cw_layout.addWidget(self.keep_same_classroom_cb)
+        same_room_hint = QLabel(tr("classroom_series.help"))
+        same_room_hint.setStyleSheet("color: #64748B; font-size: 8pt;")
+        same_room_hint.setWordWrap(True)
+        cw_layout.addWidget(same_room_hint)
+
         # Allowed days
         cw_layout.addWidget(QLabel(tr("constraints.allowed_days")))
         ad_row = QHBoxLayout()
@@ -2527,6 +2589,9 @@ class AddClassDialog(QDialog):
             edit_cls.get("allowed_days"), edit_cls.get("excluded_days", []),
             edit_cls.get("allowed_times"), edit_cls.get("excluded_times", []),
             edit_cls.get("required_classrooms"), edit_cls.get("excluded_classrooms"),
+            edit_cls.get("student_overlap_group"),
+            edit_cls.get("student_overlap_policy") not in (None, STUDENT_OVERLAP_NEVER),
+            edit_cls.get("keep_same_classroom", False),
         ])
         self._constraints_widget.setVisible(bool(has_constraints))
         if has_constraints:
@@ -2579,6 +2644,8 @@ class AddClassDialog(QDialog):
         # Toggle classroom constraints
         if hasattr(self, "_classroom_constraints_widget"):
             self._classroom_constraints_widget.setVisible(is_physical)
+        if hasattr(self, "keep_same_classroom_cb"):
+            self.keep_same_classroom_cb.setEnabled(is_physical)
         # Toggle pin-room selector
         if hasattr(self, "pin_room"):
             self.pin_room.setVisible(is_physical)
@@ -2596,6 +2663,10 @@ class AddClassDialog(QDialog):
         self.lecturer_combo.setCurrentText(cls.get("lecturer", ""))
         self.duration_spin.setValue(max(1, cls.get("duration", 1)))
         self.participants_spin.setValue(max(0, cls.get("participants", 0)))
+        req_index = self.course_requirement_combo.findData(
+            cls.get("course_requirement", COURSE_REQUIREMENT_UNSPECIFIED))
+        if req_index >= 0:
+            self.course_requirement_combo.setCurrentIndex(req_index)
         # Set location type from import
         lt = cls.get("location_type", LOCATION_FACE_TO_FACE)
         idx = self.location_type_combo.findData(lt)
@@ -2607,6 +2678,14 @@ class AddClassDialog(QDialog):
             if cb:
                 cb.setChecked(True)
         self.joint_cb.setChecked(bool(cls.get("joint_session", False)))
+        self.student_overlap_group_edit.setText(
+            cls.get("student_overlap_group", ""))
+        policy_index = self.student_overlap_policy_combo.findData(
+            cls.get("student_overlap_policy", STUDENT_OVERLAP_NEVER))
+        if policy_index >= 0:
+            self.student_overlap_policy_combo.setCurrentIndex(policy_index)
+        self.keep_same_classroom_cb.setChecked(bool(
+            cls.get("keep_same_classroom", False)))
 
         self.pinned_cb.setChecked(bool(cls.get("pinned", False)))
         if cls.get("pinned_day"):
@@ -2665,6 +2744,15 @@ class AddClassDialog(QDialog):
         cls["duration"] = self.duration_spin.value()
         cls["participants"] = self.participants_spin.value()
         cls["location_type"] = self.location_type_combo.currentData() or LOCATION_FACE_TO_FACE
+        cls["course_requirement"] = (
+            self.course_requirement_combo.currentData()
+            or COURSE_REQUIREMENT_UNSPECIFIED)
+        cls["student_overlap_group"] = (
+            self.student_overlap_group_edit.text().strip())
+        cls["student_overlap_policy"] = (
+            self.student_overlap_policy_combo.currentData()
+            or STUDENT_OVERLAP_NEVER)
+        cls["keep_same_classroom"] = self.keep_same_classroom_cb.isChecked()
         cls["joint_session"] = self.joint_cb.isChecked() if len(targets) > 1 else True
         cls["protection"] = self.protection_combo.currentData() or "none"
 
@@ -4230,6 +4318,8 @@ class RescheduleDialog(QDialog):
         self.setMinimumWidth(520)
         self.result_mode = None   # "standard" or "deep"
         self.result_goals = None  # None = use defaults
+        self.result_require_all = False
+        self.result_release_protections = False
 
         from scheduler_app.optimization_goals import (
             GOAL_KEYS, DEFAULT_GOALS, PRESETS, PRESET_LABEL_KEYS, DEFAULT_PRESET,
@@ -4339,6 +4429,30 @@ class RescheduleDialog(QDialog):
 
         layout.addWidget(self._goals_panel)
 
+        complete_box = QGroupBox(tr("optimization.complete_title"))
+        complete_layout = QVBoxLayout(complete_box)
+        self._require_all_cb = QCheckBox(
+            tr("optimization.require_all"))
+        self._require_all_cb.setEnabled(has_ortools)
+        self._require_all_cb.setToolTip(tr("optimization.require_all_help"))
+        self._require_all_cb.toggled.connect(self._on_require_all_toggled)
+        complete_layout.addWidget(self._require_all_cb)
+        require_hint = QLabel(tr("optimization.require_all_help"))
+        require_hint.setWordWrap(True)
+        require_hint.setStyleSheet("color: #64748B; font-size: 8pt;")
+        complete_layout.addWidget(require_hint)
+
+        self._release_protections_cb = QCheckBox(
+            tr("optimization.release_protections"))
+        self._release_protections_cb.setToolTip(
+            tr("optimization.release_protections_help"))
+        complete_layout.addWidget(self._release_protections_cb)
+        release_hint = QLabel(tr("optimization.release_protections_help"))
+        release_hint.setWordWrap(True)
+        release_hint.setStyleSheet("color: #64748B; font-size: 8pt;")
+        complete_layout.addWidget(release_hint)
+        layout.addWidget(complete_box)
+
         # ── Bottom buttons ──
         layout.addWidget(self._separator())
         bottom = QHBoxLayout()
@@ -4367,6 +4481,7 @@ class RescheduleDialog(QDialog):
         std_btn.setDefault(True)
         std_btn.setAutoDefault(True)
         std_btn.clicked.connect(lambda: self._accept_mode("standard"))
+        self._standard_btn = std_btn
         bottom.addWidget(std_btn)
 
         if has_ortools:
@@ -4384,6 +4499,7 @@ class RescheduleDialog(QDialog):
                 + "\n⚠ " + tr("optimization.not_reproducible"))
             deep_btn.setDefault(False)
             deep_btn.clicked.connect(lambda: self._accept_mode("deep"))
+            self._deep_btn = deep_btn
             bottom.addWidget(deep_btn)
         else:
             # Without OR-Tools the button simply was not rendered, so a user
@@ -4456,8 +4572,21 @@ class RescheduleDialog(QDialog):
     def _get_current_goals(self):
         return {key: slider.value() for key, slider in self._sliders.items()}
 
+    def _on_require_all_toggled(self, checked):
+        """A mandatory complete solve is a CP-SAT operation, not Quick LNS."""
+        if hasattr(self, "_standard_btn"):
+            self._standard_btn.setEnabled(not checked)
+        if checked and hasattr(self, "_deep_btn"):
+            self._deep_btn.setDefault(True)
+            self._deep_btn.setFocus()
+
     def _accept_mode(self, mode):
+        if self._require_all_cb.isChecked():
+            mode = "deep"
         self.result_mode = mode
+        self.result_require_all = self._require_all_cb.isChecked()
+        self.result_release_protections = (
+            self._release_protections_cb.isChecked())
         # Only set goals if user actually opened and modified the panel
         if self._goals_modified or self._goals_panel.isVisible():
             self.result_goals = self._get_current_goals()
@@ -4579,7 +4708,9 @@ class EditClassesDialog(QDialog):
     _COLUMNS = [
         "labels.class_code", "labels.class_name", "labels.lecturer",
         "labels.duration", "labels.participants", "labels.targets",
-        "labels.joint", "labels.status", "protection.title",
+        "course_requirement.label", "classroom_series.column",
+        "labels.joint", "labels.status",
+        "protection.title",
     ]
 
     def _build_table(self):
@@ -4608,6 +4739,11 @@ class EditClassesDialog(QDialog):
         target_str = ", ".join(f"{t['year']}/{t['branch']}" for t in targets)
         self.table.setItem(row, 5, QTableWidgetItem(target_str))
         self.table.setItem(row, 6, QTableWidgetItem(
+            get_course_requirement_label(cls.get(
+                "course_requirement", COURSE_REQUIREMENT_UNSPECIFIED))))
+        self.table.setItem(row, 7, QTableWidgetItem(
+            _translated_bool(cls.get("keep_same_classroom", False))))
+        self.table.setItem(row, 8, QTableWidgetItem(
             _translated_bool(cls.get("joint_session", True))))
         placed = cls.get("placed", False) or cls.get("pinned", False)
         status = tr("dialogs.edit_classes.placed_badge") if placed else tr("dialogs.edit_classes.unplaced_badge")
@@ -4616,9 +4752,9 @@ class EditClassesDialog(QDialog):
             status_item.setForeground(QColor(STATUS_FG_OK))
         else:
             status_item.setForeground(QColor(STATUS_FG_WARN))
-        self.table.setItem(row, 7, status_item)
+        self.table.setItem(row, 9, status_item)
         prot = cls.get("protection", "none")
-        self.table.setItem(row, 8, QTableWidgetItem(
+        self.table.setItem(row, 10, QTableWidgetItem(
             get_protection_label(prot)))
 
     def _apply_filter(self, text):

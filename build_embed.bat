@@ -9,6 +9,10 @@ echo.
 
 :: ── Configuration ───────────────────────────────────────────────────────
 set APP_NAME=Dersis
+:: The build only needs modules shipped with Windows PowerShell.  Keeping
+:: OneDrive-backed user module paths here can make Expand-Archive fail with an
+:: unrelated access-denied error on otherwise healthy machines.
+set "PSModulePath=%SystemRoot%\system32\WindowsPowerShell\v1.0\Modules;%ProgramFiles%\WindowsPowerShell\Modules"
 :: Read version from the single source of truth: VERSION file.
 :: Use for /f (not set /p) so a trailing CR from CRLF line endings is stripped.
 set "APP_VERSION="
@@ -60,13 +64,32 @@ echo.
 :: ── Step 2: Download Python embeddable ──────────────────────────────────
 echo [2/8] Downloading Python %PY_VERSION% embeddable...
 
-if not exist "build" mkdir build
+if not exist "build" (
+    mkdir build
+    if errorlevel 1 (
+        echo ERROR: Could not create the build directory.
+        exit /b 1
+    )
+)
 if exist "%DIST_DIR%" (
     echo   Cleaning previous build...
     rmdir /s /q "%DIST_DIR%"
+    if exist "%DIST_DIR%" (
+        echo ERROR: Could not remove the previous build at %DIST_DIR%.
+        echo        Close any running DERSIS instance and retry.
+        exit /b 1
+    )
 )
 mkdir "%DIST_DIR%"
+if errorlevel 1 (
+    echo ERROR: Could not create %DIST_DIR%.
+    exit /b 1
+)
 mkdir "%PY_DIR%"
+if errorlevel 1 (
+    echo ERROR: Could not create %PY_DIR%.
+    exit /b 1
+)
 
 if not exist "build\%PY_ZIP%" (
     echo   Downloading %PY_URL%...
@@ -96,7 +119,15 @@ if errorlevel 1 (
 )
 
 echo   Extracting to %PY_DIR%...
-powershell -Command "Expand-Archive -Force 'build\%PY_ZIP%' '%PY_DIR%'"
+powershell -NoProfile -Command "Expand-Archive -Force 'build\%PY_ZIP%' '%PY_DIR%'"
+if errorlevel 1 (
+    echo ERROR: Failed to extract the embeddable Python archive.
+    exit /b 1
+)
+if not exist "%PY_DIR%\python.exe" (
+    echo ERROR: Python extraction completed without python.exe.
+    exit /b 1
+)
 echo   [OK] Python embeddable ready
 echo.
 
@@ -111,6 +142,10 @@ echo [3/8] Setting up pip in embeddable Python...
 :: "import scheduler_app" fails and the app closes silently under pythonw.exe.
 for %%f in ("%PY_DIR%\python*._pth") do (
     powershell -NoProfile -Command "$f='%%f'; $c = Get-Content $f; $c = $c -replace '^#\s*import site','import site'; if ($c -notcontains '..') { $c += '..' }; Set-Content -Path $f -Value $c"
+    if errorlevel 1 (
+        echo ERROR: Failed to update %%~nxf.
+        exit /b 1
+    )
     echo   Updated %%~nxf - added app dir to sys.path, enabled site
 )
 
@@ -123,6 +158,10 @@ if not exist "build\get-pip.py" (
     )
 )
 "%PY_DIR%\python.exe" "build\get-pip.py" --no-warn-script-location
+if errorlevel 1 (
+    echo ERROR: Failed to install pip into the embedded Python runtime.
+    exit /b 1
+)
 echo   [OK] pip installed
 echo.
 
@@ -158,6 +197,10 @@ echo [6/8] Copying application files...
 
 :: Main entry point
 copy /y scheduler_gui.py "%DIST_DIR%\" >nul
+if errorlevel 1 (
+    echo ERROR: Failed to copy scheduler_gui.py.
+    exit /b 1
+)
 
 :: Application package (exclude __pycache__ and .pyc files).
 :: Use robocopy instead of "xcopy /exclude" — xcopy's /exclude with a quoted
@@ -175,22 +218,47 @@ ver >nul
 
 :: Flag icons
 xcopy /s /e /i /q /y flags "%DIST_DIR%\flags" >nul
+if errorlevel 1 (
+    echo ERROR: Failed to copy flags.
+    exit /b 1
+)
 
 :: Logo
-if not exist "%DIST_DIR%\docs" mkdir "%DIST_DIR%\docs"
+if not exist "%DIST_DIR%\docs" (
+    mkdir "%DIST_DIR%\docs"
+    if errorlevel 1 (
+        echo ERROR: Failed to create the docs directory.
+        exit /b 1
+    )
+)
 copy /y docs\dersis.png "%DIST_DIR%\docs\" >nul
+if errorlevel 1 (
+    echo ERROR: Failed to copy docs\dersis.png.
+    exit /b 1
+)
 
 :: VERSION file (single source of truth, read at runtime by _version.py)
 copy /y VERSION "%DIST_DIR%\" >nul
+if errorlevel 1 (
+    echo ERROR: Failed to copy VERSION.
+    exit /b 1
+)
 
 :: License
 if exist "installer\LICENSE.txt" (
     copy /y installer\LICENSE.txt "%DIST_DIR%\" >nul
+    if errorlevel 1 (
+        echo ERROR: Failed to copy installer\LICENSE.txt.
+        exit /b 1
+    )
 )
 
 :: Generate installer version include file for Inno Setup
-if not exist "build" mkdir build
 echo #define AppVersion "%APP_VERSION%"> "build\version.iss"
+if errorlevel 1 (
+    echo ERROR: Failed to generate build\version.iss.
+    exit /b 1
+)
 echo   [OK] Generated build\version.iss with version %APP_VERSION%
 
 echo   [OK] Application files copied
@@ -201,12 +269,26 @@ echo [7/8] Compiling Python files to bytecode...
 
 :: Compile all .py files to .pyc for faster startup and basic obfuscation
 "%PY_DIR%\python.exe" -m compileall -q -b "%DIST_DIR%\scheduler_app"
+if errorlevel 1 (
+    echo ERROR: Failed to compile scheduler_app.
+    exit /b 1
+)
 "%PY_DIR%\python.exe" -m compileall -q -b "%DIST_DIR%\scheduler_gui.py"
+if errorlevel 1 (
+    echo ERROR: Failed to compile scheduler_gui.py.
+    exit /b 1
+)
 
 :: Remove .py source files (keep only .pyc) for obfuscation
 :: The .pyc files are placed alongside .py with -b flag
 del /q "%DIST_DIR%\scheduler_gui.py" 2>nul
 for /r "%DIST_DIR%\scheduler_app" %%f in (*.py) do del "%%f" 2>nul
+set SOURCES_LEFT=0
+for /r "%DIST_DIR%\scheduler_app" %%f in (*.py) do if exist "%%f" set SOURCES_LEFT=1
+if !SOURCES_LEFT! NEQ 0 (
+    echo ERROR: Could not remove one or more scheduler_app source files.
+    exit /b 1
+)
 
 :: Rename scheduler_gui.pyc to scheduler_gui.py so the launcher finds it
 :: (Python can run .pyc files directly when named .pyc)
@@ -214,6 +296,10 @@ for /r "%DIST_DIR%\scheduler_app" %%f in (*.py) do del "%%f" 2>nul
 :: Let's keep the .py entry point and only compile the package
 :: Restore scheduler_gui.py
 copy /y scheduler_gui.py "%DIST_DIR%\" >nul
+if errorlevel 1 (
+    echo ERROR: Failed to restore scheduler_gui.py.
+    exit /b 1
+)
 
 echo   [OK] Bytecode compiled, source removed from scheduler_app
 echo.
@@ -262,6 +348,10 @@ if errorlevel 1 (
 
 :: Copy icon into dist for shortcuts
 copy /y scheduler_app\assets\app_icon.ico "%DIST_DIR%\scheduler_app\assets\" >nul 2>nul
+if errorlevel 1 (
+    echo ERROR: Failed to copy the application icon.
+    exit /b 1
+)
 
 :: ── Verify ──────────────────────────────────────────────────────────────
 echo.
@@ -329,13 +419,13 @@ if exist "%DIST_DIR%\scheduler_app\ui\app.pyc" (
 :: and confirm it can import the app package. Catches python*._pth / sys.path
 :: regressions that otherwise surface only as a silent crash on the user's PC.
 echo   Running import smoke test...
-"%PY_DIR%\python.exe" -c "from scheduler_app.app import SchedulerApp"
+"%PY_DIR%\python.exe" -c "from scheduler_app.app import SchedulerApp; from scheduler_app.models import new_class; c = new_class(); assert 'course_requirement' in c; assert 'student_overlap_policy' in c; assert 'keep_same_classroom' in c"
 if errorlevel 1 (
     echo   [FAIL] embedded Python cannot import scheduler_app.app
-    echo          ^(check that python*._pth contains the ".." app-dir line^)
+    echo          or the build does not contain the current scheduling fields.
     set /a ERRORS+=1
 ) else (
-    echo   [OK] embedded Python imports scheduler_app.app
+    echo   [OK] embedded Python imports the app and current scheduling fields
 )
 
 set /a TOTAL=0

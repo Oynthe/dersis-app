@@ -117,7 +117,14 @@ EN = TRANSLATIONS["en"]
 # by 20 for its own key and each arriving at 2528; the merge is what revealed
 # that two keys had landed. Anyone planning a batch of new English strings
 # should measure **with the tier catalogue imported** before assuming room.
-MAX_MISSING_LOCALE_KEY_PAIRS = 2548
+#
+# The student-overlap feature adds 16 English/Turkish UI strings: four course
+# type strings (heading plus three values), eight overlap form/policy/help
+# strings and four context-menu strings.  The other 20 locales deliberately
+# fall back to English until translated, so this reviewed feature moves the
+# ceiling by 16 x 20 = 320.  Complete-schedule controls and the same-classroom
+# series rule add another 12 reviewed English/Turkish strings (12 x 20 = 240).
+MAX_MISSING_LOCALE_KEY_PAIRS = 3108
 MAX_PLACEHOLDER_SUBSETS = 0
 
 

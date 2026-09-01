@@ -14,6 +14,7 @@ from scheduler_app.models import (
     filter_class_days, filter_class_times,
     apply_lecturer_availability_filters,
     cls_key,
+    classroom_series_key, same_classroom_series_required,
 )
 from scheduler_app.translations import tr
 from scheduler_app.i18n.day_keys import display_day
@@ -322,6 +323,47 @@ def targets_overlap(targets_a, targets_b):
     return False
 
 
+def student_overlap_allowed(cls_a, cls_b):
+    """Return whether a shared target may overlap for this exact class pair.
+
+    Overlap is deliberately pair-based.  A lesson tagged ``AES`` may overlap
+    another ``AES`` lesson without ceasing to conflict with an ordinary core
+    lesson that targets the same year/branch.  ``electives_only`` additionally
+    requires both lessons to be explicitly classified as elective; an old
+    file's migration-safe ``unspecified`` value therefore never grants an
+    overlap by accident.
+    """
+    from scheduler_app.models import (
+        COURSE_REQUIREMENT_ELECTIVE,
+        STUDENT_OVERLAP_SAME_GROUP,
+        STUDENT_OVERLAP_ELECTIVES_ONLY,
+    )
+
+    group_a = str(cls_a.get("student_overlap_group", "") or "").strip()
+    group_b = str(cls_b.get("student_overlap_group", "") or "").strip()
+    if not group_a or group_a != group_b:
+        return False
+
+    policy_a = cls_a.get("student_overlap_policy", "never")
+    policy_b = cls_b.get("student_overlap_policy", "never")
+    if policy_a != policy_b:
+        return False
+    if policy_a == STUDENT_OVERLAP_SAME_GROUP:
+        return True
+    if policy_a == STUDENT_OVERLAP_ELECTIVES_ONLY:
+        return (
+            cls_a.get("course_requirement") == COURSE_REQUIREMENT_ELECTIVE
+            and cls_b.get("course_requirement") == COURSE_REQUIREMENT_ELECTIVE
+        )
+    return False
+
+
+def student_targets_conflict(cls_a, targets_a, cls_b, targets_b):
+    """Return True when the active targets overlap and the pair may not."""
+    return (targets_overlap(targets_a, targets_b)
+            and not student_overlap_allowed(cls_a, cls_b))
+
+
 def _active_targets(cls, slot_offset):
     """Return the targets active at *slot_offset* within a placed class block.
 
@@ -378,7 +420,8 @@ def _detect_occupancy_conflicts(state, candidate, day, start_slot, classroom):
             ns_idx = slot_index(state, ns)
             ex_offset = ns_idx - ex_start_idx
             ex_targets = _active_targets(existing, ex_offset)
-            if targets_overlap(ex_targets, cand_targets):
+            if student_targets_conflict(
+                    existing, ex_targets, candidate, cand_targets):
                 yield existing, ns, 'target'
 
 
@@ -405,6 +448,19 @@ def find_conflicts(state, candidate, day, start_slot, classroom):
                 conflicts.append(
                     tr("validation.lecturer_unavailable").format(
                         lecturer, display_day_value, ns))
+
+    # Cross-time room continuity for parallel sections of one lecturer/course.
+    if needs_physical_room(candidate) and classroom:
+        for existing in get_placed_classes(state):
+            if existing is candidate:
+                continue
+            if (same_classroom_series_required(candidate, existing)
+                    and classroom_of(existing)
+                    and classroom_of(existing) != classroom):
+                conflicts.append(
+                    tr("validation.same_classroom_series").format(
+                        room=classroom, expected=classroom_of(existing)))
+                break
 
     for existing, ns, conflict_type in _detect_occupancy_conflicts(
             state, candidate, day, start_slot, classroom):
@@ -460,7 +516,7 @@ def find_schedule_conflicts(state):
 
     ``(a, b)`` is ordered by ``cls_key`` so a pair is reported once, ``day``/
     ``slot`` is the first contested cell, and ``kinds`` is a sorted tuple drawn
-    from ``'room'`` / ``'lecturer'`` / ``'target'``.
+    from ``'room'`` / ``'lecturer'`` / ``'target'`` / ``'room_consistency'``.
 
     The occupancy rules follow ``_detect_occupancy_conflicts``: a room clash
     only between two lessons that both need a physical room — two online
@@ -524,7 +580,7 @@ def find_schedule_conflicts(state):
                     kinds.add("room")
                 if cls_a["lecturer"] and cls_a["lecturer"] == cls_b["lecturer"]:
                     kinds.add("lecturer")
-                if targets_overlap(tgt_a, tgt_b):
+                if student_targets_conflict(cls_a, tgt_a, cls_b, tgt_b):
                     kinds.add("target")
                 if not kinds:
                     continue
@@ -537,6 +593,38 @@ def find_schedule_conflicts(state):
                                   "slot": slot, "kinds": kinds}
                 else:
                     rec["kinds"] |= kinds
+
+    # Cross-time classroom continuity.  Two branches can be hours or days
+    # apart and still violate the rule by making their lecturer change rooms.
+    series = {}
+    for cls in get_placed_classes(state):
+        key = classroom_series_key(cls)
+        room = display_room(cls)
+        day, slot = effective_day(cls), effective_time(cls)
+        if key is not None and room and day in days and slot in state.get("slots", []):
+            series.setdefault(key, []).append(cls)
+    for members in series.values():
+        for i in range(len(members)):
+            cls_a = members[i]
+            for j in range(i + 1, len(members)):
+                cls_b = members[j]
+                if not same_classroom_series_required(cls_a, cls_b):
+                    continue
+                if display_room(cls_a) == display_room(cls_b):
+                    continue
+                ka, kb = cls_key(cls_a), cls_key(cls_b)
+                first, second = ((cls_a, cls_b) if ka <= kb else (cls_b, cls_a))
+                key = (ka, kb) if ka <= kb else (kb, ka)
+                rec = pairs.get(key)
+                if rec is None:
+                    pairs[key] = {
+                        "a": first, "b": second,
+                        "day": effective_day(second),
+                        "slot": effective_time(second),
+                        "kinds": {"room_consistency"},
+                    }
+                else:
+                    rec["kinds"].add("room_consistency")
 
     out = list(pairs.values())
     for rec in out:
@@ -784,14 +872,17 @@ def occ_release(occ, key, entity):
 def build_occupancy(state, exclude_ids=None):
     """Build occupancy maps for rooms, lecturers, and student groups.
 
-    Returns (room_occ, lect_occ, group_occ) where each is a dict mapping
-    (day, slot) -> {identifier: refcount}. See ``occ_claim`` for why the cell
-    is ref-counted rather than a plain set (ST-SCHED-010).
+    Returns ``(room_occ, lect_occ, group_occ, group_class_occ)``.  The first
+    three retain their historical aggregate shape for scoring.  The fourth
+    preserves class identity per group/cell so the validator can apply
+    pair-specific overlap permissions without weakening conflicts against
+    ordinary lessons.
     """
     exclude_ids = exclude_ids or set()
     room_occ = {}
     lect_occ = {}
     group_occ = {}
+    group_class_occ = {}
     for cls in get_placed_classes(state):
         if cls_key(cls) in exclude_ids:
             continue
@@ -810,8 +901,17 @@ def build_occupancy(state, exclude_ids=None):
                 occ_claim(room_occ, key, room)
             occ_claim(lect_occ, key, cls["lecturer"])
             for t in _active_targets(cls, off):
-                occ_claim(group_occ, key, (t["year"], t["branch"]))
-    return room_occ, lect_occ, group_occ
+                target = (t["year"], t["branch"])
+                occ_claim(group_occ, key, target)
+                by_target = group_class_occ.setdefault(key, {}).setdefault(
+                    target, {})
+                cid = cls_key(cls)
+                rec = by_target.get(cid)
+                if rec is None:
+                    by_target[cid] = {"class": cls, "count": 1}
+                else:
+                    rec["count"] += 1
+    return room_occ, lect_occ, group_occ, group_class_occ
 
 
 def _compactness_gap(state, day, slot_idx, entity_key, occ_map, entity_getter):

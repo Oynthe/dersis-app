@@ -14,7 +14,7 @@ No external graph libraries — uses simple adjacency lists and BFS.
 
 from collections import deque
 
-from scheduler_app.logic import targets_overlap
+from scheduler_app.logic import student_targets_conflict
 from scheduler_app.models import needs_physical_room, cls_key
 
 
@@ -113,7 +113,7 @@ class ConflictGraphBuilder:
 
     Edge creation rules:
       - Lecturer edge: two classes share the same lecturer (weight=1.0)
-      - Group edge: targets_overlap() is True (weight=1.0)
+      - Group edge: active targets conflict for the class pair (weight=1.0)
       - Room constraint edge: both classes have required_classrooms
         and their intersection is small (≤2 rooms), indicating
         they compete for scarce rooms (weight=0.5)
@@ -159,7 +159,9 @@ class ConflictGraphBuilder:
                 continue
             for j in range(i + 1, n):
                 targets_j = self.classes[j].get("targets", [])
-                if targets_j and targets_overlap(targets_i, targets_j):
+                if targets_j and student_targets_conflict(
+                        self.classes[i], targets_i,
+                        self.classes[j], targets_j):
                     graph.add_edge(i, j, "group", weight=1.0)
 
     def _build_room_edges(self, graph):

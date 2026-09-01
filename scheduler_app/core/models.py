@@ -225,6 +225,54 @@ PROTECTION_LEVELS = [
     PROTECTION_LOCKED,
 ]
 
+# ── Course requirement / student-overlap policy ────────────────────────────
+# ``unspecified`` is the migration-safe default for schedules saved before
+# the field existed.  It behaves conservatively: no elective-only overlap is
+# granted until the user explicitly classifies the lesson.
+COURSE_REQUIREMENT_UNSPECIFIED = "unspecified"
+COURSE_REQUIREMENT_REQUIRED = "required"
+COURSE_REQUIREMENT_ELECTIVE = "elective"
+
+COURSE_REQUIREMENTS = [
+    COURSE_REQUIREMENT_UNSPECIFIED,
+    COURSE_REQUIREMENT_REQUIRED,
+    COURSE_REQUIREMENT_ELECTIVE,
+]
+
+COURSE_REQUIREMENT_LABEL_KEYS = {
+    COURSE_REQUIREMENT_UNSPECIFIED: "course_requirement.unspecified",
+    COURSE_REQUIREMENT_REQUIRED: "course_requirement.required",
+    COURSE_REQUIREMENT_ELECTIVE: "course_requirement.elective",
+}
+
+STUDENT_OVERLAP_NEVER = "never"
+STUDENT_OVERLAP_SAME_GROUP = "same_group"
+STUDENT_OVERLAP_ELECTIVES_ONLY = "electives_only"
+
+STUDENT_OVERLAP_POLICIES = [
+    STUDENT_OVERLAP_NEVER,
+    STUDENT_OVERLAP_SAME_GROUP,
+    STUDENT_OVERLAP_ELECTIVES_ONLY,
+]
+
+STUDENT_OVERLAP_POLICY_LABEL_KEYS = {
+    STUDENT_OVERLAP_NEVER: "student_overlap.never",
+    STUDENT_OVERLAP_SAME_GROUP: "student_overlap.same_group",
+    STUDENT_OVERLAP_ELECTIVES_ONLY: "student_overlap.electives_only",
+}
+
+
+def get_course_requirement_label(requirement):
+    key = COURSE_REQUIREMENT_LABEL_KEYS.get(
+        requirement, COURSE_REQUIREMENT_LABEL_KEYS[COURSE_REQUIREMENT_UNSPECIFIED])
+    return tr(key)
+
+
+def get_student_overlap_policy_label(policy):
+    key = STUDENT_OVERLAP_POLICY_LABEL_KEYS.get(
+        policy, STUDENT_OVERLAP_POLICY_LABEL_KEYS[STUDENT_OVERLAP_NEVER])
+    return tr(key)
+
 PROTECTION_LABELS = {
     PROTECTION_NONE: "Movable",
     PROTECTION_SOFT: "Softly Protected",
@@ -328,7 +376,7 @@ class TargetDict(TypedDict):
 
 
 class ClassDict(TypedDict, total=False):
-    """The 24 fields ``new_class()`` writes.
+    """The fields ``new_class()`` writes.
 
     ST-ARCH-013. Read this as **documentation with a test behind it**, not as a
     safety net, because it is worth being precise about what a TypedDict does
@@ -360,6 +408,10 @@ class ClassDict(TypedDict, total=False):
     duration: int
     participants: int
     location_type: str
+    course_requirement: str
+    student_overlap_group: str
+    student_overlap_policy: str
+    keep_same_classroom: bool
     joint_session: bool
     pinned: bool
     pinned_day: Optional[str]
@@ -611,6 +663,10 @@ def new_class():
         "duration": 1,
         "participants": 0,
         "location_type": LOCATION_FACE_TO_FACE,
+        "course_requirement": COURSE_REQUIREMENT_UNSPECIFIED,
+        "student_overlap_group": "",
+        "student_overlap_policy": STUDENT_OVERLAP_NEVER,
+        "keep_same_classroom": False,
         "joint_session": True,
         "pinned": False,
         "pinned_day": None,
@@ -652,6 +708,10 @@ _EDITABLE_CLASS_FIELDS = (
     "duration",
     "participants",
     "location_type",
+    "course_requirement",
+    "student_overlap_group",
+    "student_overlap_policy",
+    "keep_same_classroom",
     "joint_session",
     "pinned",
     "pinned_day",
@@ -671,6 +731,7 @@ def normalize_class_location_fields(cls):
     """Normalize location-specific fields so inactive physical rooms stay inactive."""
     cls["location_type"] = location_type_of(cls)
     if not class_uses_physical_room(cls):
+        cls["keep_same_classroom"] = False
         cls["required_classrooms"] = []
         cls["excluded_classrooms"] = []
         cls["pinned_classroom"] = None
@@ -701,7 +762,44 @@ def normalize_class_data(cls):
                 cls[key] = dict(default)
             else:
                 cls[key] = default
+    if cls.get("course_requirement") not in COURSE_REQUIREMENTS:
+        cls["course_requirement"] = COURSE_REQUIREMENT_UNSPECIFIED
+    if cls.get("student_overlap_policy") not in STUDENT_OVERLAP_POLICIES:
+        cls["student_overlap_policy"] = STUDENT_OVERLAP_NEVER
+    cls["student_overlap_group"] = str(
+        cls.get("student_overlap_group", "") or "").strip()
+    if not cls["student_overlap_group"]:
+        cls["student_overlap_policy"] = STUDENT_OVERLAP_NEVER
+    cls["keep_same_classroom"] = bool(cls.get("keep_same_classroom", False))
     return normalize_class_location_fields(cls)
+
+
+def classroom_series_key(cls):
+    """Return the lecturer/course identity used by the same-room rule."""
+    if not needs_physical_room(cls):
+        return None
+    lecturer = str(cls.get("lecturer", "") or "").strip()
+    course = str(cls.get("class_code", "") or "").strip()
+    if not course:
+        course = str(cls.get("name", "") or "").strip()
+    if not lecturer or not course:
+        return None
+    return fold_text(lecturer), fold_text(course)
+
+
+def same_classroom_series_required(cls_a, cls_b):
+    """Whether this pair must use one room across its parallel sections.
+
+    Enabling the option on any one section activates the matching series, so a
+    later B/C section follows an already configured A section automatically.
+    """
+    key_a = classroom_series_key(cls_a)
+    return bool(
+        key_a is not None
+        and key_a == classroom_series_key(cls_b)
+        and (cls_a.get("keep_same_classroom", False)
+             or cls_b.get("keep_same_classroom", False))
+    )
 
 
 def find_off_grid_placements(state):

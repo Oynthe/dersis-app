@@ -3951,8 +3951,11 @@ class SchedulerApp(QMainWindow):
             return  # a solve is already running; the UI is disabled anyway
 
         self._solve_snapshots = snapshots
-        task = SolverTask(self._workflow, weights, use_cpsat=use_cpsat,
-                          parent=self)
+        task = SolverTask(
+            self._workflow, weights, use_cpsat=use_cpsat,
+            require_all=resched_dlg.result_require_all,
+            release_protections=resched_dlg.result_release_protections,
+            parent=self)
         self._solver_task = task
         task.progress.connect(self._on_solve_progress)
         task.finished.connect(self._on_solve_finished)
@@ -3983,8 +3986,15 @@ class SchedulerApp(QMainWindow):
             reschedule_explanation=result.explanation,
             negotiation_source=lambda: result.negotiation_result,
             infeasibility=infeasibility)
-        accepted = (results_dlg.exec() == BulkResultsDialog.DialogCode.Accepted
-                    and results_dlg.result)
+        dialog_accepted = (
+            results_dlg.exec() == BulkResultsDialog.DialogCode.Accepted
+            and results_dlg.result)
+        complete_failed = bool(
+            summary.get("complete_required")
+            and not summary.get("complete_achieved"))
+        accepted = dialog_accepted and not complete_failed
+        if dialog_accepted and complete_failed:
+            self._show_toast(tr("status.complete_timetable_not_found"), "warning")
 
         if accepted:
             self._push_undo(tr("actions.reschedule"))
@@ -4585,6 +4595,7 @@ class SchedulerApp(QMainWindow):
         "room": "conflicts.room",
         "lecturer": "conflicts.lecturer",
         "target": "conflicts.student_group",
+        "room_consistency": "conflicts.room_consistency",
     }
 
     def _conflict_log_entries(self):
@@ -4925,6 +4936,44 @@ class SchedulerApp(QMainWindow):
                 level=get_protection_label(level)),
             "success")
         self.refresh_grid()
+
+    def _clear_student_overlap_rule(self, cls):
+        """Clear a class's overlap exception through the normal edit path."""
+        from scheduler_app.models import STUDENT_OVERLAP_NEVER
+
+        snap_before = capture_snapshot(self.state_data)
+        updated = copy.deepcopy(cls)
+        updated["student_overlap_group"] = ""
+        updated["student_overlap_policy"] = STUDENT_OVERLAP_NEVER
+        self._push_undo(tr("menus.student_overlap_clear"))
+        edit_result = SchedulingWorkflow.apply_class_edit(
+            self.state_data, cls, updated)
+        if edit_result.placement_cleared:
+            self._show_toast(tr("status.class_unplaced_after_edit"), "warning")
+        self.refresh_grid()
+        self._run_impact_analysis(snap_before)
+
+    def _set_same_classroom_series(self, cls, enabled):
+        """Enable/disable the room-continuity rule for the whole series."""
+        from scheduler_app.models import classroom_series_key
+
+        key = classroom_series_key(cls)
+        if key is None:
+            self._edit_class(cls)
+            return
+        snap_before = capture_snapshot(self.state_data)
+        matching = [
+            item for item in self.state_data.get("classes", [])
+            if classroom_series_key(item) == key
+        ]
+        if not any(bool(item.get("keep_same_classroom", False)) != bool(enabled)
+                   for item in matching):
+            return
+        self._push_undo(tr("menus.same_classroom_series"))
+        for item in matching:
+            item["keep_same_classroom"] = bool(enabled)
+        self.refresh_grid()
+        self._run_impact_analysis(snap_before)
 
     def _start_drag_gfx(self, cls, item):
         """Start a drag from a LessonItem (graphics-based)."""

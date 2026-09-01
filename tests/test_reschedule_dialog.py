@@ -183,6 +183,29 @@ def test_the_quick_mode_is_the_visually_primary_one(qapp):
         dlg.deleteLater()
 
 
+def test_require_all_selects_thorough_and_disables_quick(qapp):
+    dlg = _dialog()
+    try:
+        quick = _button(dlg, tr("optimization.standard"))
+        dlg._require_all_cb.setChecked(True)
+        assert not quick.isEnabled()
+        dlg._accept_mode("standard")
+        assert dlg.result_mode == "deep"
+        assert dlg.result_require_all is True
+    finally:
+        dlg.deleteLater()
+
+
+def test_release_protections_option_is_returned(qapp):
+    dlg = _dialog()
+    try:
+        dlg._release_protections_cb.setChecked(True)
+        dlg._accept_mode("deep")
+        assert dlg.result_release_protections is True
+    finally:
+        dlg.deleteLater()
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  2. The result must report reproducibility honestly
 # ══════════════════════════════════════════════════════════════════════

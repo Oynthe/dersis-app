@@ -62,12 +62,17 @@ def _make_cpsat_state_snapshot(state):
     """
     def _copy_class(cls):
         return {
+            "class_code": cls.get("class_code", ""),
             "name": cls.get("name", ""),
             "lecturer": cls.get("lecturer", ""),
             "targets": [dict(t) for t in cls.get("targets", [])],
             "duration": cls.get("duration", 1),
             "participants": cls.get("participants", 0),
             "location_type": cls.get("location_type", "face_to_face"),
+            "course_requirement": cls.get("course_requirement", "unspecified"),
+            "student_overlap_group": cls.get("student_overlap_group", ""),
+            "student_overlap_policy": cls.get("student_overlap_policy", "never"),
+            "keep_same_classroom": cls.get("keep_same_classroom", False),
             "joint_session": cls.get("joint_session", True),
             "allowed_days": list(cls.get("allowed_days") or []),
             "excluded_days": list(cls.get("excluded_days") or []),
@@ -100,7 +105,8 @@ def _make_cpsat_state_snapshot(state):
 def _cpsat_subprocess_worker(state_snap, weights, time_limit,
                              protected_indices, heuristic_indices,
                              result_queue, seed=DEFAULT_OPTIMIZER_SEED,
-                             language=None):
+                             language=None, require_all=False,
+                             release_protections=False):
     """Run CP-SAT solver in an isolated subprocess.
 
     All arguments are plain serializable Python objects. Results are
@@ -133,7 +139,8 @@ def _cpsat_subprocess_worker(state_snap, weights, time_limit,
             state_snap, weights=weights,
             time_limit=time_limit,
             protected_ids=protected_ids,
-            seed=seed)
+            seed=seed, require_all=require_all,
+            release_protections=release_protections)
 
         heuristic_solution = None
         if heuristic_indices:
@@ -188,7 +195,8 @@ class ScheduleOptimizer:
                  parallel_workers=0,
                  sa_initial_temp=2.0, sa_cooling_rate=0.995,
                  seed=DEFAULT_OPTIMIZER_SEED, deterministic_budget=True,
-                 cancel_token=None):
+                 cancel_token=None, require_all=False,
+                 release_protections=False):
         """
         Args:
             state: The schedule state dict.
@@ -260,6 +268,8 @@ class ScheduleOptimizer:
         # single `is not None` test — measured at no cost on an 80-class
         # greedy-dominated run.
         self.cancel_token = cancel_token
+        self.require_all = bool(require_all)
+        self.release_protections = bool(release_protections)
 
     def _check_cancelled(self):
         """Raise SolveCancelled if the user has asked this solve to stop."""
@@ -283,15 +293,18 @@ class ScheduleOptimizer:
         )
         pinned = [c for c in self.state["classes"] if c["pinned"]]
         # "locked" placed classes are treated identically to pinned
-        locked = [c for c in self.state["classes"]
-                  if not c["pinned"]
-                  and c.get("protection") == PROTECTION_LOCKED and c["placed"]]
+        locked = ([] if self.release_protections else [
+            c for c in self.state["classes"]
+            if not c["pinned"]
+            and c.get("protection") == PROTECTION_LOCKED and c["placed"]])
         # Merge explicit protected_ids with "soft" protection
-        effective_protected_ids = set(self.protected_ids)
-        for c in self.state["classes"]:
-            if (not c["pinned"] and c.get("protection") == PROTECTION_SOFT
-                    and c["placed"]):
-                effective_protected_ids.add(cls_key(c))
+        effective_protected_ids = (
+            set() if self.release_protections else set(self.protected_ids))
+        if not self.release_protections:
+            for c in self.state["classes"]:
+                if (not c["pinned"] and c.get("protection") == PROTECTION_SOFT
+                        and c["placed"]):
+                    effective_protected_ids.add(cls_key(c))
         immovable_ids = ({cls_key(c) for c in pinned}
                          | {cls_key(c) for c in locked})
         protected = [c for c in self.state["classes"]
@@ -306,6 +319,8 @@ class ScheduleOptimizer:
         # Build same-day constraint map for "same_day" protected classes
         same_day_map = {}
         for c in flexible:
+            if self.release_protections:
+                continue
             if c.get("protection") == PROTECTION_SAME_DAY and c["placed"]:
                 same_day_map[cls_key(c)] = c["placed_day"]
         # improve_only baselines: a class may only move to a placement that
@@ -342,10 +357,10 @@ class ScheduleOptimizer:
 
             # improve_only baselines are computed per run, below, against that
             # run's PlacementScorer — see the comment there for why.
-            improve_only_classes = [
+            improve_only_classes = ([] if self.release_protections else [
                 c for c in flexible
                 if c.get("protection") == PROTECTION_IMPROVE_ONLY and c["placed"]
-            ]
+            ])
 
             before_placements = []
             for cls in pinned:
@@ -704,6 +719,9 @@ class ScheduleOptimizer:
                 "classes_moved": len(changes),
                 "classes_placed": len(placed_list),
                 "classes_unplaced": len(unplaced_list),
+                "complete_required": self.require_all,
+                "complete_achieved": not unplaced_list,
+                "protections_released": self.release_protections,
                 "cpsat_used": cpsat_used,
                 # Why deep mode did not contribute, when it was asked for and
                 # did not run. None when it ran, or was never requested.
@@ -1370,7 +1388,8 @@ class ScheduleOptimizer:
             args=(state_snap, dict(self.weights or {}),
                   self.cpsat_time_limit, protected_indices,
                   heuristic_indices, result_queue, self.seed,
-                  get_language()))
+                  get_language(), self.require_all,
+                  self.release_protections))
         proc.start()
 
         # Poll until the subprocess finishes, calling progress callback

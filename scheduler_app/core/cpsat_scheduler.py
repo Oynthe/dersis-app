@@ -25,12 +25,13 @@ try:
 except ImportError:
     HAS_ORTOOLS = False
 
-from scheduler_app.logic import total_duration
+from scheduler_app.logic import total_duration, student_targets_conflict
 from scheduler_app.models import (
     DEFAULT_OPTIMIZER_SEED, PROTECTION_LOCKED, PROTECTION_SOFT,
     PROTECTION_SAME_DAY, PROTECTION_IMPROVE_ONLY, cls_key, needs_physical_room,
     get_physical_room_candidates, filter_class_days, filter_class_times,
     apply_lecturer_availability_filters,
+    classroom_series_key,
 )
 from scheduler_app.placement_scorer import DEFAULT_WEIGHTS
 from scheduler_app.translations import tr
@@ -51,7 +52,8 @@ class CPSATScheduler:
 
     def __init__(self, state, weights=None, time_limit=15.0,
                  protected_ids=None, progress_callback=None,
-                 seed=DEFAULT_OPTIMIZER_SEED):
+                 seed=DEFAULT_OPTIMIZER_SEED, require_all=False,
+                 release_protections=False):
         """
         Args:
             state: Schedule state dict.
@@ -66,6 +68,11 @@ class CPSATScheduler:
                   summary['deterministic'], which is False whenever CP-SAT ran.
                   A deterministic budget (max_deterministic_time) needs
                   per-scale calibration and belongs with Phase 3.
+            require_all: When true, treat every flexible class as mandatory.
+                This is intended for an explicit "complete timetable" run;
+                the normal interactive optimizer keeps its historical ability
+                to return the best partial schedule when the data is
+                infeasible.
         """
         if not HAS_ORTOOLS:
             raise RuntimeError(
@@ -79,6 +86,8 @@ class CPSATScheduler:
         self.protected_ids = protected_ids or set()
         self.progress_callback = progress_callback
         self.seed = int(seed)
+        self.require_all = bool(require_all)
+        self.release_protections = bool(release_protections)
 
         self._days = state["days"]
         self._slots = state["slots"]
@@ -126,9 +135,10 @@ class CPSATScheduler:
         # way LOCKED already was: CPSATScheduler runs in a subprocess over a
         # state snapshot, and `_make_cpsat_state_snapshot` carries `protection`.
         pinned = [c for c in self.state["classes"] if c["pinned"]]
-        locked = [c for c in self.state["classes"]
-                  if not c["pinned"]
-                  and c.get("protection") == PROTECTION_LOCKED and c["placed"]]
+        locked = ([] if self.release_protections else [
+            c for c in self.state["classes"]
+            if not c["pinned"]
+            and c.get("protection") == PROTECTION_LOCKED and c["placed"]])
         locked_ids = {cls_key(c) for c in locked}
 
         # Treated as immovable, i.e. re-asserted at their current placement:
@@ -142,16 +152,16 @@ class CPSATScheduler:
         #     CP-SAT declines to improve such a class rather than risk making
         #     it worse. The heuristic phase still optimizes it properly.
         frozen_protections = (PROTECTION_SOFT, PROTECTION_IMPROVE_ONLY)
-        protected = [c for c in self.state["classes"]
+        protected = ([] if self.release_protections else [c for c in self.state["classes"]
                      if not c["pinned"] and cls_key(c) not in locked_ids
                      and c["placed"]
                      and (cls_key(c) in self.protected_ids
-                          or c.get("protection") in frozen_protections)]
+                          or c.get("protection") in frozen_protections)])
         protected_ids = {cls_key(c) for c in protected}
 
         # `same_day` classes stay flexible — they may move, but only within the
         # day they are on. Enforced by restricting their day domain below.
-        same_day_of = {
+        same_day_of = {} if self.release_protections else {
             cls_key(c): c["placed_day"]
             for c in self.state["classes"]
             if not c["pinned"] and cls_key(c) not in locked_ids
@@ -247,6 +257,10 @@ class CPSATScheduler:
             slot_domains[cid] = set(slot_domain)
             room_domains[cid] = set(room_domain)
 
+        if self.require_all:
+            for placed in placed_vars.values():
+                model.Add(placed == 1)
+
         # ══════════════════════════════════════════════════════════════
         #  HARD CONSTRAINTS
         # ══════════════════════════════════════════════════════════════
@@ -290,6 +304,42 @@ class CPSATScheduler:
                 "duration": total_duration(cls),
                 "fixed": True,
             })
+
+        # Same lecturer + same course may be configured to keep one physical
+        # classroom across all of its sections.  This is a cross-time rule, so
+        # it is separate from ordinary room collision constraints below.
+        series_groups = {}
+        for cls in pinned + locked + protected + flexible:
+            key = classroom_series_key(cls)
+            if key is not None:
+                series_groups.setdefault(key, []).append(cls)
+
+        fixed_by_id = {
+            cls_key(entry["cls"]): entry for entry in all_placed_fixed
+        }
+        for members in series_groups.values():
+            if not any(c.get("keep_same_classroom", False) for c in members):
+                continue
+            fixed_rooms = {
+                fixed_by_id[cls_key(c)]["room"] for c in members
+                if cls_key(c) in fixed_by_id
+            }
+            if len(fixed_rooms) > 1:
+                model.AddBoolOr([])  # inconsistent pins/protections
+                continue
+            fixed_room = next(iter(fixed_rooms), None)
+            flex_members = [c for c in members if cls_key(c) in placed_vars]
+            for c in flex_members:
+                cid = cls_key(c)
+                if fixed_room is not None:
+                    model.Add(room_vars[cid] == fixed_room).OnlyEnforceIf(
+                        placed_vars[cid])
+            for i in range(len(flex_members)):
+                aid = cls_key(flex_members[i])
+                for j in range(i + 1, len(flex_members)):
+                    bid = cls_key(flex_members[j])
+                    model.Add(room_vars[aid] == room_vars[bid]).OnlyEnforceIf(
+                        [placed_vars[aid], placed_vars[bid]])
 
         # Pre-compute valid rooms per flexible class for conflict filtering
         flex_valid_rooms = {}
@@ -736,10 +786,10 @@ class CPSATScheduler:
         if cls_a["lecturer"] and cls_a["lecturer"] == cls_b["lecturer"]:
             return True
         # Overlapping student groups
-        for ta in cls_a.get("targets", []):
-            for tb in cls_b.get("targets", []):
-                if ta["year"] == tb["year"] and ta["branch"] == tb["branch"]:
-                    return True
+        if student_targets_conflict(
+                cls_a, cls_a.get("targets", []),
+                cls_b, cls_b.get("targets", [])):
+            return True
         # Overlapping possible rooms — only between two physical classes.
         # Non-physical classes never have room conflicts.
         if (needs_physical_room(cls_a) and needs_physical_room(cls_b)
@@ -867,9 +917,7 @@ class CPSATScheduler:
             model.AddImplication(active, nto)
 
     def _targets_overlap(self, cls_a, cls_b):
-        """Check if classes share any student group target."""
-        for ta in cls_a.get("targets", []):
-            for tb in cls_b.get("targets", []):
-                if ta["year"] == tb["year"] and ta["branch"] == tb["branch"]:
-                    return True
-        return False
+        """Check if classes share a target that this pair may not overlap."""
+        return student_targets_conflict(
+            cls_a, cls_a.get("targets", []),
+            cls_b, cls_b.get("targets", []))

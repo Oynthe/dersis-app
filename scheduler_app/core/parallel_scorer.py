@@ -13,6 +13,7 @@ Integration:
   the expensive lookahead phase across workers.
 """
 
+import copy
 import os
 from concurrent.futures import ProcessPoolExecutor
 
@@ -35,6 +36,7 @@ def create_occupancy_snapshot(validator):
         "room_occ": {k: dict(v) for k, v in validator.room_occ.items()},
         "lect_occ": {k: dict(v) for k, v in validator.lect_occ.items()},
         "group_occ": {k: dict(v) for k, v in validator.group_occ.items()},
+        "group_class_occ": copy.deepcopy(validator.group_class_occ),
     }
 
 
@@ -59,12 +61,18 @@ def create_state_snapshot(state):
 def _serialize_class(cls):
     """Serialize a class dict for cross-process transfer."""
     return {
+        "class_uid": cls.get("class_uid", ""),
+        "class_code": cls.get("class_code", ""),
         "name": cls.get("name", ""),
         "lecturer": cls.get("lecturer", ""),
         "targets": [dict(t) for t in cls.get("targets", [])],
         "duration": cls.get("duration", 1),
         "participants": cls.get("participants", 0),
         "location_type": cls.get("location_type", "face_to_face"),
+        "course_requirement": cls.get("course_requirement", "unspecified"),
+        "student_overlap_group": cls.get("student_overlap_group", ""),
+        "student_overlap_policy": cls.get("student_overlap_policy", "never"),
+        "keep_same_classroom": cls.get("keep_same_classroom", False),
         "joint_session": cls.get("joint_session", True),
         "allowed_days": list(cls.get("allowed_days") or []),
         "excluded_days": list(cls.get("excluded_days") or []),
@@ -116,6 +124,7 @@ def _score_lookahead_batch(payload):
     validator.room_occ = occ_snap["room_occ"]
     validator.lect_occ = occ_snap["lect_occ"]
     validator.group_occ = occ_snap["group_occ"]
+    validator.group_class_occ = occ_snap["group_class_occ"]
 
     generator = CandidateGenerator(state_snap, validator=validator)
 

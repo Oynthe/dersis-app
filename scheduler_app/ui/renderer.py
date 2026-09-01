@@ -870,6 +870,30 @@ class LessonItem(QGraphicsRectItem):
                 act.triggered.connect(
                     lambda checked, lv=level: self.app._set_protection(
                         self.cls, lv))
+        overlap_menu = menu.addMenu("\U0001F517  " + tr("menus.student_overlap"))
+        if self.cls.get("student_overlap_group"):
+            edit_overlap_act = overlap_menu.addAction(
+                tr("menus.student_overlap_edit"))
+            edit_overlap_act.triggered.connect(
+                lambda: self.app._edit_class(self.cls))
+            clear_overlap_act = overlap_menu.addAction(
+                tr("menus.student_overlap_clear"))
+            clear_overlap_act.triggered.connect(
+                lambda: self.app._clear_student_overlap_rule(self.cls))
+        else:
+            set_overlap_act = overlap_menu.addAction(
+                tr("menus.student_overlap_set"))
+            set_overlap_act.triggered.connect(
+                lambda: self.app._edit_class(self.cls))
+        same_room_act = menu.addAction(
+            "\U0001F3EB  " + tr("menus.same_classroom_series"))
+        same_room_act.setCheckable(True)
+        same_room_act.setChecked(bool(
+            self.cls.get("keep_same_classroom", False)))
+        same_room_act.setToolTip(tr("classroom_series.help"))
+        same_room_act.triggered.connect(
+            lambda checked: self.app._set_same_classroom_series(
+                self.cls, checked))
         menu.addSeparator()
         remove_act = menu.addAction("\u2715  " + tr("buttons.remove"))
         remove_act.triggered.connect(
@@ -1107,6 +1131,30 @@ class MatrixLessonItem(QGraphicsRectItem):
                 act.triggered.connect(
                     lambda checked, lv=level: self.app._set_protection(
                         self.cls, lv))
+        overlap_menu = menu.addMenu("\U0001F517  " + tr("menus.student_overlap"))
+        if self.cls.get("student_overlap_group"):
+            edit_overlap_act = overlap_menu.addAction(
+                tr("menus.student_overlap_edit"))
+            edit_overlap_act.triggered.connect(
+                lambda: self.app._edit_class(self.cls))
+            clear_overlap_act = overlap_menu.addAction(
+                tr("menus.student_overlap_clear"))
+            clear_overlap_act.triggered.connect(
+                lambda: self.app._clear_student_overlap_rule(self.cls))
+        else:
+            set_overlap_act = overlap_menu.addAction(
+                tr("menus.student_overlap_set"))
+            set_overlap_act.triggered.connect(
+                lambda: self.app._edit_class(self.cls))
+        same_room_act = menu.addAction(
+            "\U0001F3EB  " + tr("menus.same_classroom_series"))
+        same_room_act.setCheckable(True)
+        same_room_act.setChecked(bool(
+            self.cls.get("keep_same_classroom", False)))
+        same_room_act.setToolTip(tr("classroom_series.help"))
+        same_room_act.triggered.connect(
+            lambda checked: self.app._set_same_classroom_series(
+                self.cls, checked))
         menu.addSeparator()
         remove_act = menu.addAction("\u2715  " + tr("buttons.remove"))
         remove_act.triggered.connect(
