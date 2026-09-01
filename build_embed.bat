@@ -171,7 +171,10 @@ echo.
 
 :: Install all runtime dependencies from the lock file for reproducibility.
 :: The lock file pins exact versions so builds are deterministic.
-"%PY_DIR%\python.exe" -m pip install --no-warn-script-location -r requirements-lock.txt
+:: Do not trust the host pip HTTP cache for release artifacts. A truncated
+:: cached python-dateutil wheel can still carry valid metadata while omitting
+:: modules, causing pandas to fail only during the import check below.
+"%PY_DIR%\python.exe" -m pip install --no-cache-dir --no-warn-script-location -r requirements-lock.txt
 
 if errorlevel 1 (
     echo.
